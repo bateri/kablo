@@ -128,6 +128,69 @@ the stream continues without a gap, a repeat, or a word to the client.
 What a terminal app does with that is its own business; the protocol is in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+## Forwarding a port
+
+```sh
+kablo forward 8080:localhost:3000 -- ssh devbox kablo attach
+```
+
+`kablo forward` does what `ssh -L 8080:localhost:3000 devbox` does: connections
+to port 8080 on this machine are carried to port 3000 on the server. The
+difference is the road they take. They go through the one connection of
+`kablo attach`, so sshd is asked for no forwarding at all, and it works where
+sshd has forwarding turned off (`AllowTcpForwarding no`, `DisableForwarding
+yes`). The command after `--` is run as it is, so ssh's options, jump hosts, keys
+and password prompts stay in your ssh configuration: anything that ends in
+`kablo attach` on the server will do.
+
+```sh
+kablo forward [--bind ADDRESS] (PORT | LOCAL:HOST:PORT)... -- COMMAND [ARGUMENT]...
+```
+
+- `PORT` is the same port here and on the server's `localhost`;
+  `LOCAL:HOST:PORT` names the local port and where the server connects to. The
+  **server** resolves and connects to `HOST` (a name or an address, IPv6 in
+  brackets, `localhost` being the server's own), as `ssh -L` does. Give as many
+  forwardings as you like.
+- A local port of 0 lets the system choose. Once the server has said it takes
+  connections, `kablo forward` prints a line on standard output for each
+  address it listens on, `forwarding 127.0.0.1:41234 to localhost:3000`; a
+  script can wait for it and connect.
+- **Only the loopback listens** (`127.0.0.1` and, where there is one, `::1`)
+  unless you say otherwise with `--bind ADDRESS` (an IP address): a forwarded
+  port is a way into the server's network for whoever can connect to it. (As
+  with `ssh -L`, that includes the other users of the machine `kablo forward`
+  runs on, since a loopback port is open to all of them.)
+- A port that is taken, a server whose kablo is too old to carry connections
+  and a server whose administrator turned this off (below) are each said at
+  once, and nothing keeps running. A target that cannot be reached is said and
+  that connection closes; the others go on.
+- When the command ends, `kablo forward` closes the connections and exits with
+  status 1; it does not connect again. Ctrl-C (or a `SIGTERM`) ends it with
+  128 plus the signal's number.
+- The connections share the pipe with the sessions that travel over the same
+  `kablo attach`, and neither waits behind the other: what you type and what
+  a program prints are not held up by a large download, and a program that
+  never stops printing does not stop a transfer. (The buffers of ssh and TCP
+  themselves are still in the road.)
+
+**What it can reach.** The server connects wherever its user can: the bridge is
+the user's own process, and anything it can reach it could reach with `nc` or
+`socat`. That is the same as `ssh -L`, and it is what sshd's own manual says
+about `AllowTcpForwarding no`: it does not keep a user who has a shell from
+forwarding. kablo opens no port on the server, only connections out of it.
+
+**Turning it off on a server.** An administrator who does not want connections
+carried through kablo creates the file `/etc/kablo/no-forwarding` (its contents
+are not read). Every bridge, running ones included, then refuses new
+connections: `kablo forward` says "turned off by the server's administrator"
+and apps are told the same in the protocol. This states an intent so that kablo
+does not quietly go around a decision; it is not a barrier, because a user can
+run a forwarder of their own, as with any program that can open a connection.
+Connections that are already open are not closed. If the bridge cannot tell
+whether the file is there (its directory is not one the user may look in), it
+counts as if it were, and says that it could not check.
+
 ## Replacing kablo under running sessions
 
 Each session is two processes: a *warden*, which is the shell's parent and
@@ -159,9 +222,10 @@ memory of where its relay comes from (see *Limits*).
   0700, owned by you. Anything else is refused, not repaired. Every
   connection to a session's socket is checked for the uid of the process on
   the other end (`SO_PEERCRED`, `getpeereid`), and another user's is closed.
-- kablo opens no network port. Remote access is your ssh login running one
-  command; whoever can log in as you can use your sessions, as they can use
-  any other process of yours.
+- kablo opens no network port on the server. Remote access is your ssh login
+  running one command; whoever can log in as you can use your sessions, as
+  they can use any other process of yours. (`kablo forward` listens on the
+  machine it runs on, on the loopback only unless you ask otherwise.)
 - A new session's program is an argument vector, never a shell string: nothing
   that arrives over the wire is joined into a command line, and the arguments
   and environment are not written to any log.
@@ -232,13 +296,22 @@ memory of where its relay comes from (see *Limits*).
 - **The systemd scope** is tested against a stand-in `systemd-run`, not yet on
   a machine with a real systemd. The `setsid` route is what the end-to-end
   tests (a real sshd in a container) run.
+- **Forwarding is local to remote and TCP only.** No `-R` (the server
+  listening for you), no `-D` (SOCKS), no unix sockets, no UDP. One connection
+  of `kablo attach` carries at most 128 connections open at once and connects
+  16 at a time (one more is told "too many"); a target has 10 seconds to
+  answer. `kablo forward` does not reconnect when its command ends.
 - Windows and the BSDs are not supported, and a server with SELinux enforcing
-  has not been tried (the ssh route asks for no socket or port forwarding).
+  has not been tried (the ssh route asks sshd for no socket or port
+  forwarding).
 
 ## For apps that drive kablo
 
 - **The protocol** is in [docs/PROTOCOL.md](docs/PROTOCOL.md) and implemented
-  by the `kablo-proto` crate, which does no I/O and has no dependencies. A
+  by the `kablo-proto` crate, which does no I/O and has no dependencies. It
+  also carries TCP connections (streams, on their own channel): an app asks
+  `features` and, right behind it, `ping`, and relies on streams only if the
+  answer to `features` comes first and says they are on. A
   build reads its own wire version and the one before it, and the bytes of
   every message of every shipped version are kept as test fixtures.
   `kablo version` prints one line of `key=value` tokens

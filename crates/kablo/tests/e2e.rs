@@ -17,11 +17,17 @@
 
 mod common;
 
-use std::process::Command;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Bridge, PATIENCE, rebuilt, same, whole};
+use common::{Bridge, Env, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, whole};
 use kablo_proto::v1::{ErrorCode, Message, NewSession, State};
+
+/// The port of the TCP echo server inside the container (tests/e2e/Dockerfile),
+/// which only the server's own `127.0.0.1` reaches.
+const ECHO_PORT: u16 = 7001;
 
 /// The sessions of the 15-at-once scenario: more than sshd's default
 /// `MaxSessions` of 10.
@@ -48,6 +54,13 @@ fn server() -> Server {
 impl Server {
     /// `ssh -T tester@server <remote command>`.
     fn ssh(&self, remote: &str) -> Command {
+        let mut command = self.ssh_options();
+        command.arg("tester@127.0.0.1").arg(remote);
+        command
+    }
+
+    /// `ssh` with the options of every connection to this server, and no host.
+    fn ssh_options(&self) -> Command {
         let mut command = Command::new("ssh");
         command
             .args(["-T", "-p", &self.port, "-i", &self.key])
@@ -61,9 +74,7 @@ impl Server {
             .args(["-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10"])
             // One ssh connection per client: nothing is borrowed from a
             // master that the machine's own configuration might have.
-            .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
-            .arg("tester@127.0.0.1")
-            .arg(remote);
+            .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
         command
     }
 
@@ -461,4 +472,151 @@ fn a_long_gap_over_ssh_comes_back_as_the_right_screen() {
 /// Where the stream `id` has reached, as `bridge` has it.
 fn first_next(bridge: &Bridge, id: &str) -> u64 {
     bridge.sessions.get(id).map_or(0, |seen| seen.next)
+}
+
+/// The arguments of `kablo forward` for the echo server, with `ssh host kablo
+/// attach` as the carrier.
+fn forward_args(server: &Server) -> Vec<String> {
+    let carrier = server.ssh("kablo attach");
+    let mut args = vec![
+        "--bind".to_owned(),
+        "127.0.0.1".to_owned(),
+        format!("0:127.0.0.1:{ECHO_PORT}"),
+        "--".to_owned(),
+        carrier.get_program().to_str().unwrap().to_owned(),
+    ];
+    args.extend(carrier.get_args().map(|a| a.to_str().unwrap().to_owned()));
+    args
+}
+
+fn start_forward(env: &Env, server: &Server) -> Forward {
+    let args = forward_args(server);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Forward::start(env, &args)
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn the_server_refuses_forwarding_and_has_an_echo_server_for_the_scenarios_that_use_it() {
+    let server = server();
+    let config = server.exec("sshd", &["-T"]);
+    assert!(
+        config.lines().any(|l| l == "disableforwarding yes"),
+        "the premise of the forwarding scenarios is a sshd that refuses it: {config}"
+    );
+    // The echo server answers on the server's own loopback.
+    let said = server.exec(
+        "bash",
+        &[
+            "-c",
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{ECHO_PORT}; echo ping >&3; read -r line <&3; echo \"$line\""),
+        ],
+    );
+    assert_eq!(said.trim(), "ping");
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn kablo_forward_carries_what_sshs_own_forwarding_is_refused() {
+    let server = server();
+
+    // The control: `ssh -L` to the same echo server. The tunnel comes up (it
+    // is the local half) and sshd refuses the connection made through it.
+    let free = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut tunnel = server
+        .ssh_options()
+        // `-v` for the line that says why sshd refused: it is not an error
+        // for ssh, so the options' LogLevel would hide it.
+        .args(["-o", "ExitOnForwardFailure=yes"])
+        .args(["-v", "-N", "-L", &format!("{free}:127.0.0.1:{ECHO_PORT}")])
+        .arg("tester@127.0.0.1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    let mut through = loop {
+        match TcpStream::connect(("127.0.0.1", free)) {
+            Ok(socket) => break socket,
+            Err(_) => {
+                assert!(start.elapsed() < PATIENCE, "ssh never listened on {free}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    through.set_read_timeout(Some(PATIENCE)).unwrap();
+    through.write_all(b"through ssh -L").unwrap();
+    let mut heard = Vec::new();
+    let _ = through.read_to_end(&mut heard);
+    assert!(
+        heard.is_empty(),
+        "sshd forwarded although it was told not to: {heard:?}"
+    );
+    let _ = tunnel.kill();
+    let mut said = String::new();
+    let _ = tunnel.stderr.take().unwrap().read_to_string(&mut said);
+    let _ = tunnel.wait();
+    assert!(
+        said.contains("administratively prohibited"),
+        "ssh did not say why: {said:?}"
+    );
+
+    // The same server, the same echo, by kablo.
+    let env = Env::new();
+    let mut forward = start_forward(&env, &server);
+    let address = forward.announced(1)[0];
+    let mut first = client(address);
+    let mut second = client(address);
+    first.write_all(b"request from the first").unwrap();
+    second.write_all(b"request from the second").unwrap();
+    assert_eq!(
+        read_exactly(&mut second, "request from the second".len()),
+        b"request from the second"
+    );
+    assert_eq!(
+        read_exactly(&mut first, "request from the first".len()),
+        b"request from the first"
+    );
+    // One of them says it is done and still hears the end of the other half.
+    first.shutdown(Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    first.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    second.write_all(b" and more").unwrap();
+    assert_eq!(read_exactly(&mut second, 9), b" and more");
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn kablo_forward_ends_when_its_ssh_is_killed() {
+    let server = server();
+    let env = Env::new();
+    let mut forward = start_forward(&env, &server);
+    let address = forward.announced(1)[0];
+    let mut socket = client(address);
+    socket.write_all(b"alive").unwrap();
+    assert_eq!(read_exactly(&mut socket, 5), b"alive");
+
+    // The ssh that carries it is the one child `kablo forward` has.
+    let children = Command::new("pgrep")
+        .args(["-P", &forward.pid().to_string()])
+        .output()
+        .unwrap();
+    let ssh: libc::pid_t = String::from_utf8_lossy(&children.stdout)
+        .lines()
+        .next()
+        .expect("kablo forward has a child")
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: the pid of the ssh this test's `kablo forward` started.
+    unsafe { libc::kill(ssh, libc::SIGKILL) };
+
+    assert_eq!(forward.wait_exit().code(), Some(1));
+    forward.said("ssh was killed by signal 9");
+    assert!(is_over(&mut socket), "the connection outlived its carrier");
 }

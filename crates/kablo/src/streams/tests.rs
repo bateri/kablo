@@ -76,7 +76,18 @@ fn failed(out: &[Packet]) -> Vec<(u32, FailCode)> {
 /// An open server-side stream whose target is `theirs`: opened with `window`
 /// as the client's window, and the window this end offers is `config.window`.
 fn opened(config: Config, client_window: u32) -> (Streams, TcpStream, Vec<Packet>) {
+    let (server, theirs, _, out) = opened_keeping(config, client_window);
+    (server, theirs, out)
+}
+
+/// [`opened`], and a second handle on the server's socket for the test to do
+/// what only the owner of a socket can (shut its writing half, say).
+fn opened_keeping(
+    config: Config,
+    client_window: u32,
+) -> (Streams, TcpStream, TcpStream, Vec<Packet>) {
     let (ours, theirs) = pair();
+    let handle = ours.try_clone().unwrap();
     let config = Config {
         dial: Arc::new({
             let ours = Mutex::new(Some(ours));
@@ -98,7 +109,7 @@ fn opened(config: Config, client_window: u32) -> (Streams, TcpStream, Vec<Packet
         Some(Message::Opened { .. })
     ));
     out.clear();
-    (server, theirs, out)
+    (server, theirs, handle, out)
 }
 
 // --- both ends, over loopback ------------------------------------------------
@@ -372,10 +383,10 @@ fn a_connection_that_is_reset_closes_the_stream_at_both_ends() {
 #[test]
 fn a_dial_that_refuses_fails_the_stream_at_the_client() {
     let mut rig = Rig::new(MAX_WINDOW);
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // A port below the range the system hands out: nothing listens on it, and
+    // none of the listeners of the tests running side by side can be given it
+    // (a port that was bound and let go can be).
+    let port = 1;
     let (_app, local) = pair();
     let id = rig
         .client
@@ -428,6 +439,33 @@ fn an_open_that_connects_is_opened_and_one_that_does_not_is_failed() {
         Some(FailCode::REFUSED)
     );
     assert_eq!(server.len(), 1);
+}
+
+#[test]
+fn a_name_that_does_not_resolve_is_failed_as_unresolved() {
+    // The path from a resolver's failure to the wire, without a network: the
+    // resolver is a test's own.
+    let config = Config {
+        dial: Arc::new(|target, deadline| {
+            dial::connect_via(target, deadline, &|_, _| {
+                Err(io::Error::other("no such host"))
+            })
+        }),
+        ..Config::default()
+    };
+    let mut server = server_with(config);
+    let mut out = Vec::new();
+    server.handle(
+        Side::Client,
+        Packet::new(1, open(1000, 80, "nowhere.example")),
+        &mut out,
+    );
+    reports(&mut server, &mut out, |s| s.connecting.is_empty());
+    assert_eq!(failed(&out), [(1, FailCode::UNRESOLVED)]);
+    assert!(matches!(
+        out.first().map(|p| &p.message),
+        Some(Message::Failed { text, .. }) if text == "name not found"
+    ));
 }
 
 #[test]
@@ -753,6 +791,82 @@ fn the_targets_data_and_then_its_end_are_queued_in_that_order() {
     }
     assert_eq!(seen, [Message::Data(vec![9; 3]), Message::Eof]);
     assert!(out.is_empty());
+}
+
+#[test]
+fn a_socket_that_takes_no_more_still_has_what_it_says_carried() {
+    // The target answers and hangs up while the client is still sending: the
+    // server can no longer write to it, and what it read is not lost to that.
+    let config = Config {
+        window: 1000,
+        ..Config::default()
+    };
+    let (mut server, mut target, handle, mut out) = opened_keeping(config, 1000);
+    target.write_all(b"the answer").unwrap();
+    target.shutdown(Shutdown::Write).unwrap();
+    let start = Instant::now();
+    while server.data.len() < 2 {
+        server.ready(Token::Stream(1), libc::POLLIN, &mut out);
+        assert!(start.elapsed() < PATIENCE);
+    }
+    // Reading is done; the answer sits in the queue, not yet on the wire, as
+    // it does when the wire is slow. Now writing fails.
+    handle.shutdown(Shutdown::Write).unwrap();
+    server.handle(
+        Side::Client,
+        Packet::new(1, Message::Data(vec![7; 600])),
+        &mut out,
+    );
+    server.settle(&mut out);
+    assert!(
+        out.iter().all(|p| p.message != Message::Close),
+        "a write that failed ended the stream: {out:?}"
+    );
+    // What was dropped counts as taken, so the client is not held up by it...
+    assert!(
+        out.iter()
+            .any(|p| matches!(p.message, Message::Credit(600))),
+        "{out:?}"
+    );
+    server.handle(
+        Side::Client,
+        Packet::new(1, Message::Data(vec![7; 100])),
+        &mut out,
+    );
+    server.settle(&mut out);
+    server.handle(
+        Side::Client,
+        Packet::new(1, Message::Data(vec![7; 400])),
+        &mut out,
+    );
+    server.settle(&mut out);
+    let credited: u32 = out
+        .iter()
+        .filter_map(|p| match p.message {
+            Message::Credit(n) => Some(n),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(credited, 1100);
+    // ...and the answer and its end are still there to be sent, in order.
+    let mut frames = Vec::new();
+    while let Some(frame) = server.take() {
+        frames.push(frame);
+    }
+    let mut decoder = IncomingDecoder::new();
+    for frame in &frames {
+        decoder.push(frame);
+    }
+    let mut seen = Vec::new();
+    while let Some(Incoming::Stream { packet, .. }) = decoder.next_incoming().unwrap() {
+        seen.push(packet.message);
+    }
+    assert_eq!(seen, [Message::Data(b"the answer".to_vec()), Message::Eof]);
+    // The stream is over when the client has said its end too.
+    assert!(!server.is_empty());
+    server.handle(Side::Client, Packet::new(1, Message::Eof), &mut out);
+    server.settle(&mut out);
+    assert!(server.is_empty());
 }
 
 #[test]

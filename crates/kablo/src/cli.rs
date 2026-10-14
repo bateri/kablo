@@ -9,7 +9,8 @@ use kablo_proto::SessionId;
 use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_ROWS, NewSession, Size};
 
 use crate::{
-    bridge, connect, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade, warden,
+    bridge, connect, forward, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade,
+    warden,
 };
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
@@ -23,6 +24,8 @@ commands:
   connect   use a session from this terminal (Ctrl-\\ leaves it running)
   attach    carry every session over this program's input and output; for
             programs (`ssh host kablo attach`), not for people
+  forward   carry connections to local ports to ports the server reaches, as
+            `ssh -L` does, over a command that runs `kablo attach` there
   upgrade   run a session's relay from another kablo binary, without ending
             the session or dropping the clients
   version   print the version and the protocol versions this build speaks
@@ -34,6 +37,7 @@ kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
 kablo list [--json]
 kablo connect [--fresh] ID
 kablo attach
+kablo forward [--bind ADDRESS] (PORT | LOCAL:HOST:PORT)... -- COMMAND [ARGUMENT]...
 kablo upgrade (--all | ID) PATH
 ";
 
@@ -62,6 +66,7 @@ where
             Some("list") => return command_list(rest, out, err),
             Some("connect") => return command_connect(rest, err),
             Some("attach") => return command_attach(rest, err),
+            Some("forward") => return command_forward(rest, out, err),
             Some("upgrade") => return command_upgrade(rest, out, err),
             // The two halves of a session; `kablo new` starts the first and the
             // first starts the second. Not for people.
@@ -321,6 +326,13 @@ fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
         return 1;
     }
     bridge::run(dir)
+}
+
+fn command_forward(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match forward::parse(args) {
+        Ok(options) => forward::run(options, out, err),
+        Err(why) => usage_error(err, &why),
+    }
 }
 
 fn command_upgrade(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {

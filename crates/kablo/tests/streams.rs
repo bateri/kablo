@@ -17,61 +17,15 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::Shutdown;
+use std::sync::Mutex;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
-use common::{Bridge, Env, PATIENCE};
+use common::{Bridge, Env, PATIENCE, closed_port, echo, pattern, target};
 use kablo::streams::{self as engine, Verdict};
 use kablo_proto::tlv;
 use kablo_proto::v1::stream::{self, FailCode, MAX_STREAMS, MAX_WINDOW};
 use kablo_proto::v1::{Message, Packet, PacketDecoder};
-
-/// A listener of this test's own that runs `handler` on a thread of its own
-/// for every connection it takes. Returns the port.
-fn target(handler: impl Fn(TcpStream) + Send + Sync + 'static) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let handler = Arc::new(handler);
-    std::thread::spawn(move || {
-        for connection in listener.incoming() {
-            let Ok(connection) = connection else { continue };
-            let handler = Arc::clone(&handler);
-            std::thread::spawn(move || handler(connection));
-        }
-    });
-    port
-}
-
-/// Gives back what it is sent, and its end when it hears the end.
-fn echo(mut connection: TcpStream) {
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        match connection.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if connection.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    let _ = connection.shutdown(Shutdown::Write);
-}
-
-/// A port nothing listens on.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
-/// Bytes that show where they are in a stream: a swapped or dropped piece
-/// changes them.
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|i| (i % 251) as u8 ^ seed ^ (i / 251) as u8)
-        .collect()
-}
 
 /// A session that echoes what is typed, attached from the start.
 fn echo_session(env: &mut Env, bridge: &mut Bridge, label: &str) -> String {
@@ -154,10 +108,10 @@ fn a_target_that_cannot_be_reached_is_failed_and_nothing_else_is_touched() {
         (FailCode::REFUSED, "connection refused")
     );
 
-    let (_, code, _) = bridge
-        .connect_stream("kablo-test.invalid", 80, MAX_WINDOW)
-        .unwrap_err();
-    assert_eq!(code, FailCode::UNRESOLVED);
+    // (A name that does not resolve is not tried here: a real resolver's time
+    // for a name that is not there is the network's to say. What a failed
+    // resolution is called is tested in `dial` with a resolver of its own, and
+    // how a refusal reaches the client in the engine's tests.)
 
     // What a conforming client cannot write: port 0 and no host, in an `open`
     // of a number above the others.

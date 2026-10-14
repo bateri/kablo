@@ -497,7 +497,9 @@ it works where sshd's forwarding is off. One TCP connection is one **stream**.
   so in `features_reply` (`streams` clear, with a `reason`) and answers an
   `open` that comes anyway with `failed` (6). The bridge asks again at each
   `open`, so a decision applies to the streams opened after it; open streams
-  go on.
+  go on. A server that cannot tell whether its administrator has decided (the
+  place where the decision is kept cannot be looked at by the bridge's user)
+  counts as one that has, and says so in the `reason`.
 
 ## 6. Limits
 

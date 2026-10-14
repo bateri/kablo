@@ -148,6 +148,11 @@ struct Stream {
     got_eof: bool,
     /// The writing half of the socket is shut.
     shut: bool,
+    /// Writing to the socket failed for good (the other end of it is gone):
+    /// what arrives for it is dropped, with credit given for it so the other
+    /// end is not held up, and the reading half goes on, so that what the
+    /// socket said before and after is still carried.
+    write_dead: bool,
 }
 
 impl Stream {
@@ -162,6 +167,7 @@ impl Stream {
             sent_eof: false,
             got_eof: false,
             shut: false,
+            write_dead: false,
         }
     }
 
@@ -340,6 +346,16 @@ impl Streams {
     /// Whether there are no streams.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Client end: how many streams were opened and not yet answered. A server
+    /// connects only so many at once and fails the rest, so a client that
+    /// would open more waits for answers instead.
+    pub fn opening(&self) -> usize {
+        self.streams
+            .values()
+            .filter(|stream| stream.opening)
+            .count()
     }
 
     /// Server end: turns streams off, with the reason `open` is answered with
@@ -605,8 +621,14 @@ impl Streams {
             self.reset(id, out);
             return;
         }
-        stream.recv_window -= u32::try_from(size).unwrap_or(0);
-        stream.inbox.extend(bytes);
+        let size = u32::try_from(size).unwrap_or(0);
+        stream.recv_window -= size;
+        if stream.write_dead {
+            // Nowhere to write it: it counts as taken.
+            stream.uncredited = stream.uncredited.saturating_add(size);
+        } else {
+            stream.inbox.extend(bytes);
+        }
         self.dirty.insert(id);
     }
 
@@ -714,7 +736,6 @@ impl Streams {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        let mut broken = false;
         while !stream.inbox.is_empty() {
             let (front, _) = stream.inbox.as_slices();
             match stream.socket.write(front) {
@@ -727,22 +748,26 @@ impl Streams {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // The socket will take no more. That is the end of what can
+                // be written to it, not of what it says: the stream goes on
+                // as far as its reading half does (a target that answered and
+                // hung up has its answer carried; a reset socket fails the
+                // read too, and that ends the stream).
                 Err(_) => {
-                    broken = true;
+                    let dropped = u32::try_from(stream.inbox.len()).unwrap_or(u32::MAX);
+                    stream.uncredited = stream.uncredited.saturating_add(dropped);
+                    stream.inbox.clear();
+                    stream.write_dead = true;
                     break;
                 }
             }
-        }
-        if broken {
-            self.reset(id, out);
-            return;
         }
         if stream.uncredited >= step {
             let bytes = std::mem::take(&mut stream.uncredited);
             stream.recv_window = stream.recv_window.saturating_add(bytes);
             out.push(Packet::new(id, Message::Credit(bytes)));
         }
-        if stream.got_eof && stream.inbox.is_empty() && !stream.shut {
+        if ((stream.got_eof && stream.inbox.is_empty()) || stream.write_dead) && !stream.shut {
             let _ = stream.socket.shutdown(Shutdown::Write);
             stream.shut = true;
         }

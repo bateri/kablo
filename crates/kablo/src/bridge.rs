@@ -46,7 +46,7 @@ use kablo_proto::{SessionId, WIRE};
 use crate::handshake::{self, Step};
 use crate::launch::{self, Failure};
 use crate::link::Link;
-use crate::outbound::Outbound;
+use crate::outbound::{self, Outbound};
 use crate::scan::{self, Scan};
 use crate::streams::{self, Streams};
 use crate::{journal, sockdir, sys};
@@ -57,14 +57,18 @@ pub const NO_FORWARDING: &str = "/etc/kablo/no-forwarding";
 /// What a client is told when [`NO_FORWARDING`] is there.
 pub const FORWARDING_OFF: &str = "turned off by the server's administrator";
 
+/// What a client is told when [`NO_FORWARDING`] cannot be looked at (see
+/// [`forwarding_off`]).
+pub const FORWARDING_UNCHECKED: &str = "the server's administrator switch cannot be checked";
+
 /// Unsent bytes for the client above which relays are not read.
 const OUT_SOFT: usize = 1 << 20;
 
 /// Unsent bytes for the client above which the client is not read either.
-const OUT_HARD: usize = 8 << 20;
+const OUT_HARD: usize = outbound::HARD;
 
 /// Bytes read from the client at a time.
-const READ_CHUNK: usize = 64 * 1024;
+const READ_CHUNK: usize = outbound::CHUNK;
 
 /// What a descriptor in the poll set stands for.
 enum Source {
@@ -220,8 +224,7 @@ impl Bridge {
             // A stream's frame goes in behind the sessions' bytes every turn,
             // unless the client is so far behind that nothing is read from it
             // either.
-            let force = self.pending() < OUT_HARD;
-            self.out.admit(&mut self.streams, force);
+            self.out.end_turn(&mut self.streams);
             if !self.flush() && self.stop.is_none() {
                 // The client's end is gone; so is the reason to be here.
                 self.stop = Some(0);
@@ -498,9 +501,22 @@ fn features(switch: &Path) -> Features {
     }
 }
 
-/// Why streams are off, if the file at `switch` says so by being there.
+/// Why streams are off, if the file at `switch` says so by being there, or if
+/// there is no telling.
+///
+/// Only a file that is **not there** leaves streams on. A bridge runs as the
+/// user, who may not be able to look in the directory (an administrator who
+/// hides the switch behind `0700` on its directory has still made a decision):
+/// an error that is not "no such file" is not read as "no file", or the
+/// decision would bind everyone but the users it is meant for.
 pub fn forwarding_off(switch: &Path) -> Option<&'static str> {
-    switch.exists().then_some(FORWARDING_OFF)
+    use std::io::ErrorKind;
+    match std::fs::symlink_metadata(switch) {
+        Ok(_) => Some(FORWARDING_OFF),
+        // A parent that is a file, not a directory, has nothing in it either.
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => None,
+        Err(_) => Some(FORWARDING_UNCHECKED),
+    }
 }
 
 /// Whether a client may send this message to a session.
@@ -564,6 +580,36 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(forwarding_off(&path), None);
         assert!(features(&path).streams);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_that_cannot_be_looked_for_is_not_taken_for_one_that_is_not_there() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root can look anywhere: there is no such directory for it.
+            return;
+        }
+        let (dir, path) = switch("hidden");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(forwarding_off(&path), Some(FORWARDING_UNCHECKED));
+        assert!(!features(&path).streams);
+        assert_eq!(
+            features(&path).reason.as_deref(),
+            Some(FORWARDING_UNCHECKED)
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(forwarding_off(&path), Some(FORWARDING_OFF));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_parent_that_is_a_file_has_no_switch_in_it() {
+        let (dir, file) = switch("parent");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(forwarding_off(&file.join("no-forwarding")), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

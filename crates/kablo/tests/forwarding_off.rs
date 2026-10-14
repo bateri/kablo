@@ -5,7 +5,8 @@
 //! container of `make linux`) and says it was skipped when it is not. It has a
 //! test binary to itself, which cargo runs apart from the others, so the file
 //! does not turn streams off under a test that is using them; the one test
-//! here removes the file whatever happens.
+//! here removes the file it made whatever happens, and does not run (it says
+//! so) where an administrator's file is already there.
 
 // Test support: a failure here is a failed test.
 #![allow(
@@ -21,7 +22,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
 
-use common::{Bridge, Env};
+use common::{Bridge, Env, Forward, client, read_exactly};
 use kablo::bridge::{FORWARDING_OFF, NO_FORWARDING};
 use kablo_proto::v1::Message;
 use kablo_proto::v1::stream::{FailCode, MAX_WINDOW};
@@ -33,22 +34,32 @@ struct Switch {
     dir: Option<PathBuf>,
 }
 
+/// What the tests write in the file, so that it is known to be theirs.
+const MARK: &str = "written by the tests of kablo; safe to remove\n";
+
 impl Switch {
-    fn new() -> Switch {
+    /// `None` when the file is there and is not the tests' own: it is an
+    /// administrator's, and this runs as root, which is no reason to take it
+    /// away. (One left by an earlier run that was killed is theirs, and goes:
+    /// it would turn streams off before a test asks for it.)
+    fn new() -> Option<Switch> {
         let file = PathBuf::from(NO_FORWARDING);
+        if file.symlink_metadata().is_ok() {
+            match std::fs::read_to_string(&file) {
+                Ok(text) if text == MARK => std::fs::remove_file(&file).unwrap(),
+                _ => return None,
+            }
+        }
         let dir = file.parent().map(Path::to_path_buf);
         let made = dir.filter(|dir| !dir.exists());
         if let Some(dir) = &made {
             std::fs::create_dir_all(dir).unwrap();
         }
-        // A file left by an earlier run that was killed would turn streams off
-        // before the test asks for it.
-        let _ = std::fs::remove_file(&file);
-        Switch { file, dir: made }
+        Some(Switch { file, dir: made })
     }
 
     fn on(&self) {
-        std::fs::write(&self.file, "").unwrap();
+        std::fs::write(&self.file, MARK).unwrap();
     }
 
     fn off(&self) {
@@ -72,7 +83,10 @@ fn the_administrator_turns_streams_off_and_on_for_a_bridge_that_is_running() {
         eprintln!("SKIPPED: {NO_FORWARDING} can only be made by root");
         return;
     }
-    let switch = Switch::new();
+    let Some(switch) = Switch::new() else {
+        eprintln!("SKIPPED: {NO_FORWARDING} is there and is not this test's to take away");
+        return;
+    };
     let env = Env::new();
     let mut bridge = Bridge::start(&env);
 
@@ -128,4 +142,21 @@ fn the_administrator_turns_streams_off_and_on_for_a_bridge_that_is_running() {
         .unwrap();
     bridge.stream_send(again, b"again", 100);
     bridge.until("the echo", |b| b.flows[&again].data == b"again");
+
+    // `kablo forward` on a server where the file is there says why it does
+    // nothing, and starts nothing; when the file is gone it carries.
+    let kablo = env!("CARGO_BIN_EXE_kablo");
+    let spec = format!("0:127.0.0.1:{port}");
+    let args = ["--bind", "127.0.0.1", &spec, "--", kablo, "attach"];
+    switch.on();
+    let mut refused = Forward::start(&env, &args);
+    assert_eq!(refused.wait_exit().code(), Some(1));
+    refused.said(FORWARDING_OFF);
+    refused.announced_nothing();
+    switch.off();
+    let mut carried = Forward::start(&env, &args);
+    let address = carried.announced(1)[0];
+    let mut socket = client(address);
+    socket.write_all(b"through the forwarding").unwrap();
+    assert_eq!(read_exactly(&mut socket, 22), b"through the forwarding");
 }

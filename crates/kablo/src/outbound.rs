@@ -10,10 +10,13 @@
 //! - when the main queue has been written out, stream frames follow until
 //!   about a [`SLICE`] of them is queued, so a session frame made meanwhile
 //!   waits for one slice of stream bytes at most;
-//! - at the end of every turn that `force`s it, at least one stream frame goes
-//!   in behind the main queue however much is queued there, so a session that
-//!   never stops producing (a program writing without end) cannot keep a
-//!   stream from moving.
+//! - at the end of every turn that `force`s it, one stream frame goes in behind
+//!   the main queue however much is queued there, so a session that never stops
+//!   producing (a program writing without end) cannot keep a stream from
+//!   moving; but only one such frame is ever waiting in the queue (the next is
+//!   let in once that one has been written), so a pipe that has stopped taking
+//!   bytes does not fill the queue with a transfer that a session frame made
+//!   afterwards would have to wait behind.
 //!
 //! The main queue goes first and the stream frames are few and small, which is
 //! what keeps typing, replies and the credit that opens the other direction of
@@ -28,6 +31,14 @@ use kablo_proto::v1::stream::MAX_DATA;
 /// How many bytes of stream frames follow a drained main queue before the
 /// queue is looked at again: one full `data`.
 pub const SLICE: usize = MAX_DATA;
+
+/// Unsent bytes above which the other end is so far behind that nothing more
+/// is moved in for it at the end of a turn (the stream frames waiting stay
+/// where they are), and above which a bridge stops reading its client.
+pub const HARD: usize = 8 << 20;
+
+/// Bytes read from the other end, and written to it, at a time.
+pub const CHUNK: usize = 64 * 1024;
 
 /// A queue of encoded stream frames.
 pub trait Frames {
@@ -54,6 +65,11 @@ pub struct Outbound {
     sent: usize,
     /// The most bytes written in one call.
     chunk: usize,
+    /// Every byte ever written (`sent` starts over when the buffer does).
+    written: u64,
+    /// The value of `written` once the last frame that was moved in by force
+    /// has been written.
+    forced_until: u64,
 }
 
 impl Outbound {
@@ -63,6 +79,8 @@ impl Outbound {
             buf: Vec::new(),
             sent: 0,
             chunk: chunk.max(1),
+            written: 0,
+            forced_until: 0,
         }
     }
 
@@ -90,12 +108,28 @@ impl Outbound {
             if !forced && self.pending() >= SLICE {
                 break;
             }
+            let by_force = forced;
             forced = false;
             match frames.take() {
                 Some(frame) => self.buf.extend_from_slice(&frame),
                 None => break,
             }
+            if by_force {
+                self.forced_until = self.written.saturating_add(self.pending() as u64);
+            }
         }
+    }
+
+    /// What an end does with its stream frames at the end of every turn: one
+    /// goes in behind the queue however much is queued there, so a session that
+    /// never stops producing cannot keep a stream from moving, unless the other
+    /// end is [`HARD`] behind, and not while the frame that was let in the last
+    /// time is still waiting to be written (a pipe that takes nothing would
+    /// otherwise be given a frame every turn, and a session frame made later
+    /// would wait behind all of them). The one rule of both ends.
+    pub fn end_turn(&mut self, frames: &mut impl Frames) {
+        let force = self.pending() < HARD && self.written >= self.forced_until;
+        self.admit(frames, force);
     }
 
     /// Writes with `write` until it takes no more, moving stream frames in as
@@ -114,7 +148,10 @@ impl Outbound {
                         self.compact();
                         return true;
                     }
-                    Ok(n) => self.sent += n,
+                    Ok(n) => {
+                        self.sent += n;
+                        self.written = self.written.saturating_add(n as u64);
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         self.compact();
                         return true;
@@ -230,15 +267,18 @@ mod tests {
         };
         // A session that makes a 100-byte frame every turn and a pipe that
         // takes 90: the queue is never empty at the end of a turn, and a
-        // stream that waited for it to be would never move.
-        for _ in 0..5 {
+        // stream that waited for it to be would never move. (One frame at a
+        // time is let in, so it takes the turns the pipe needs to write it.)
+        let mut turns = 0;
+        while !streams.is_empty() {
+            turns += 1;
+            assert!(turns <= 60, "{} frames still waiting", streams.len());
             out.push(&frame(b'y', 100));
-            out.admit(&mut streams, true);
+            out.end_turn(&mut streams);
             pipe.room = 90;
             assert!(out.flush(&mut streams, &mut |b| pipe.write(b)));
             assert!(out.pending() > 0);
         }
-        assert!(streams.is_empty(), "{} frames still waiting", streams.len());
         // Everything is written, in the order it was queued: each stream
         // frame behind the session frames queued before it.
         pipe.room = usize::MAX;
@@ -255,6 +295,54 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_that_takes_nothing_is_not_filled_with_a_transfer_a_session_frame_waits_behind() {
+        let mut out = Outbound::new(1 << 20);
+        let mut streams: VecDeque<Vec<u8>> = (0..100).map(|_| frame(b's', SLICE)).collect();
+        let mut pipe = Pipe {
+            room: 0,
+            taken: Vec::new(),
+        };
+        // Turn after turn a session frame is made and the pipe takes none of
+        // it: one stream frame is in the queue, not one for each turn.
+        for _ in 0..10 {
+            out.push(&frame(b'a', 50));
+            out.end_turn(&mut streams);
+            assert!(out.flush(&mut streams, &mut |b| pipe.write(b)));
+        }
+        assert_eq!(streams.len(), 99, "one frame, however many turns");
+        assert_eq!(out.pending(), 10 * 50 + SLICE);
+
+        // When the pipe opens, no session frame is behind more than that one.
+        pipe.room = usize::MAX;
+        assert!(out.flush(&mut streams, &mut |b| pipe.write(b)));
+        let before_last = pipe.taken.iter().rposition(|&b| b == b'a').unwrap();
+        let streamed = pipe.taken[..before_last]
+            .iter()
+            .filter(|&&b| b == b's')
+            .count();
+        assert!(streamed <= SLICE, "{streamed} bytes of stream before it");
+    }
+
+    #[test]
+    fn the_frame_let_in_by_force_is_followed_by_another_once_it_is_written() {
+        let mut out = Outbound::new(1 << 20);
+        let mut streams: VecDeque<Vec<u8>> = (0..3).map(|_| frame(b's', 10)).collect();
+        out.push(&frame(b'y', 2 * SLICE));
+        out.end_turn(&mut streams);
+        assert_eq!(streams.len(), 2);
+        out.end_turn(&mut streams);
+        assert_eq!(streams.len(), 2, "the first is still waiting to be written");
+        let mut pipe = Pipe {
+            room: usize::MAX,
+            taken: Vec::new(),
+        };
+        // Written out, and the stream frames that follow a drained queue go
+        // in behind it; a new turn may force one again.
+        assert!(out.flush(&mut streams, &mut |b| pipe.write(b)));
+        assert!(streams.is_empty());
+    }
+
+    #[test]
     fn without_force_a_stream_waits_for_a_busy_queue() {
         let mut out = Outbound::new(1 << 20);
         let mut streams: VecDeque<Vec<u8>> = VecDeque::from([frame(b's', 10)]);
@@ -264,6 +352,18 @@ mod tests {
         out.admit(&mut streams, true);
         assert!(streams.is_empty());
         assert_eq!(out.pending(), 2 * SLICE + 10);
+    }
+
+    #[test]
+    fn the_end_of_a_turn_moves_one_frame_in_unless_the_other_end_is_far_behind() {
+        let mut out = Outbound::new(1 << 20);
+        let mut streams: VecDeque<Vec<u8>> = VecDeque::from([frame(b's', 10), frame(b's', 10)]);
+        out.push(&frame(b'y', 2 * SLICE));
+        out.end_turn(&mut streams);
+        assert_eq!(streams.len(), 1, "one frame, however busy the queue is");
+        out.push(&frame(b'y', HARD));
+        out.end_turn(&mut streams);
+        assert_eq!(streams.len(), 1, "none behind that much unsent");
     }
 
     #[test]

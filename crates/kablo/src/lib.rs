@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod cli;
 pub mod connect;
 pub mod dial;
+pub mod forward;
 pub mod handshake;
 pub mod inner;
 pub mod journal;

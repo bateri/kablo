@@ -19,12 +19,15 @@
 )]
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
@@ -1073,6 +1076,215 @@ impl Bridge {
 }
 
 impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// --- TCP targets -------------------------------------------------------------
+
+/// A listener of this test's own that runs `handler` on a thread of its own
+/// for every connection it takes. Returns the port.
+pub fn target(handler: impl Fn(TcpStream) + Send + Sync + 'static) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handler = Arc::new(handler);
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(connection) = connection else { continue };
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || handler(connection));
+        }
+    });
+    port
+}
+
+/// Gives back what it is sent, and its end when it hears the end.
+pub fn echo(mut connection: TcpStream) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match connection.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if connection.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = connection.shutdown(Shutdown::Write);
+}
+
+/// A port that refuses connections. It is below the range the system hands
+/// out, so no listener of a test running side by side is given it (a port that
+/// was bound and let go can be, before the connection is made), and nothing
+/// listens on it. (A socket that is bound and never listens is not a way to
+/// hold a port that refuses: macOS drops the connection instead of refusing.)
+pub fn closed_port() -> u16 {
+    1
+}
+
+/// Bytes that show where they are in a stream: a swapped or dropped piece
+/// changes them.
+pub fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i % 251) as u8 ^ seed ^ (i / 251) as u8)
+        .collect()
+}
+
+/// A connection to `address` that gives up reading after the patience, so a
+/// test that is wrong fails instead of hanging.
+pub fn client(address: SocketAddr) -> TcpStream {
+    let socket = TcpStream::connect(address).unwrap();
+    socket.set_read_timeout(Some(PATIENCE)).unwrap();
+    socket
+}
+
+/// Whether a connection was ended on the other side, as a client sees it: an
+/// end, or a reset. (A read that only ran out of patience is not an end.)
+pub fn is_over(socket: &mut TcpStream) -> bool {
+    let mut byte = [0u8; 1];
+    match socket.read(&mut byte) {
+        Ok(n) => n == 0,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+    }
+}
+
+/// Reads exactly `len` bytes.
+pub fn read_exactly(socket: &mut TcpStream, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    socket.read_exact(&mut bytes).unwrap();
+    bytes
+}
+
+// --- `kablo forward` -----------------------------------------------------------
+
+/// A `kablo forward` in this test's directory (and so the carrier it starts:
+/// the environment is inherited), with what it says on standard output and
+/// standard error kept as lines.
+pub struct Forward {
+    child: Child,
+    stdout: mpsc::Receiver<String>,
+    stderr: mpsc::Receiver<String>,
+    said: Vec<String>,
+}
+
+impl Forward {
+    /// Starts `kablo forward <args>`.
+    pub fn start(env: &Env, args: &[&str]) -> Forward {
+        let mut command = env.kablo();
+        command
+            .arg("forward")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let lines = |source: Box<dyn Read + Send>| {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(source).lines().map_while(Result::ok) {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            receiver
+        };
+        let stdout = lines(Box::new(child.stdout.take().unwrap()));
+        let stderr = lines(Box::new(child.stderr.take().unwrap()));
+        Forward {
+            child,
+            stdout,
+            stderr,
+            said: Vec::new(),
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Waits for `count` lines of `forwarding ADDRESS to TARGET` and returns
+    /// the addresses.
+    pub fn announced(&mut self, count: usize) -> Vec<SocketAddr> {
+        let mut found = Vec::new();
+        while found.len() < count {
+            let line = match self.stdout.recv_timeout(PATIENCE) {
+                Ok(line) => line,
+                Err(_) => panic!(
+                    "no announcement (got {} of {count}); it said {:?}",
+                    found.len(),
+                    self.drain()
+                ),
+            };
+            let rest = line
+                .strip_prefix("forwarding ")
+                .unwrap_or_else(|| panic!("not an announcement: {line:?}"));
+            let (address, _) = rest.split_once(" to ").unwrap();
+            found.push(address.parse().unwrap());
+        }
+        found
+    }
+
+    /// Asserts that nothing was announced and nothing will be: standard output
+    /// has ended without a line.
+    pub fn announced_nothing(&mut self) {
+        match self.stdout.recv_timeout(PATIENCE) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => panic!("expected no announcement, got {other:?}"),
+        }
+    }
+
+    fn drain(&mut self) -> &[String] {
+        while let Ok(line) = self.stderr.try_recv() {
+            self.said.push(line);
+        }
+        &self.said
+    }
+
+    /// Waits for a line on standard error that has `needle` in it and returns
+    /// it.
+    pub fn said(&mut self, needle: &str) -> String {
+        loop {
+            if let Some(line) = self.said.iter().find(|line| line.contains(needle)) {
+                return line.clone();
+            }
+            match self.stderr.recv_timeout(PATIENCE) {
+                Ok(line) => self.said.push(line),
+                Err(_) => panic!(
+                    "never said {needle:?}; it said {:?}; the process: {:?}",
+                    self.said,
+                    self.child.try_wait()
+                ),
+            }
+        }
+    }
+
+    /// Waits for the process to end.
+    pub fn wait_exit(&mut self) -> ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                start.elapsed() < PATIENCE,
+                "`kablo forward` never ended; it said {:?}",
+                self.drain()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Forward {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
