@@ -185,30 +185,7 @@ fn login_shell(request_env: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 
 /// The shell in the user's passwd entry.
 fn passwd_shell() -> Option<Vec<u8>> {
-    // SAFETY: an all-zero `passwd` is valid; `getpwuid_r` fills it.
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0 as libc::c_char; 4096];
-    let mut found: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: `entry`, `buf` and `found` belong to this frame; the buffer
-    // length passed is its length.
-    let status = unsafe {
-        libc::getpwuid_r(
-            sys::effective_uid(),
-            &raw mut entry,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut found,
-        )
-    };
-    if status != 0 || found.is_null() || entry.pw_shell.is_null() {
-        return None;
-    }
-    // SAFETY: `pw_shell` points into `buf`, NUL-terminated.
-    Some(
-        unsafe { CStr::from_ptr(entry.pw_shell) }
-            .to_bytes()
-            .to_vec(),
-    )
+    sys::passwd().map(|entry| entry.shell)
 }
 
 /// How a program ended, as the protocol says it.

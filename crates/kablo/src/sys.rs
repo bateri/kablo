@@ -36,6 +36,51 @@ pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }).map(drop)
 }
 
+/// What the passwd database says of the user this process acts as.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Passwd {
+    /// The login name.
+    pub name: Vec<u8>,
+    /// The login shell, empty when the entry has none.
+    pub shell: Vec<u8>,
+}
+
+/// The passwd entry of the effective user, if there is one.
+pub fn passwd() -> Option<Passwd> {
+    // SAFETY: an all-zero `passwd` is valid; `getpwuid_r` fills it.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `entry`, `buf` and `found` belong to this frame; the buffer
+    // length passed is its length.
+    let status = unsafe {
+        libc::getpwuid_r(
+            effective_uid(),
+            &raw mut entry,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return None;
+    }
+    let text = |field: *const libc::c_char| {
+        if field.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: a non-null string field of the entry points into `buf`,
+        // NUL-terminated.
+        unsafe { std::ffi::CStr::from_ptr(field) }
+            .to_bytes()
+            .to_vec()
+    };
+    Some(Passwd {
+        name: text(entry.pw_name),
+        shell: text(entry.pw_shell),
+    })
+}
+
 /// The uid this process acts as.
 pub fn effective_uid() -> u32 {
     // SAFETY: no arguments, cannot fail.

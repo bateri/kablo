@@ -139,6 +139,35 @@ impl Env {
             .map(|(pid, _, _)| pid)
     }
 
+    /// The command line of the `role` (`warden` or `relay`) of session `id`.
+    pub fn command_of(&self, role: &str, id: &str) -> Option<String> {
+        let wanted = format!("kablo {role} --id {id}");
+        self.processes()
+            .into_iter()
+            .map(|(_, _, command)| command)
+            .find(|command| command.contains(&wanted))
+    }
+
+    /// A copy of the `kablo` under test in a directory of its own, to upgrade
+    /// to: a file somebody can run, named `kablo` so that the processes
+    /// started from it are found by their command lines like any other.
+    pub fn newer_kablo(&self, label: &str) -> PathBuf {
+        let dir = self.dir.join(format!("newer-{label}"));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("kablo");
+        std::fs::copy(env!("CARGO_BIN_EXE_kablo"), &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// An executable file with this text in it, in this test's directory.
+    pub fn script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Waits until session `id` has no process and no socket left.
     pub fn wait_gone(&self, id: &str) {
         let start = Instant::now();

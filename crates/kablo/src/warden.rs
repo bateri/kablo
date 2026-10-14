@@ -15,13 +15,28 @@
 //! that could be wrong in a way a relay could not work around. Behaviour
 //! belongs in the relay.
 //!
+//! **Replacing the relay.** A relay that was asked to (`upgrade`) hands the
+//! request on; the warden checks the binary named, starts it as a *second*
+//! relay beside the first and gives it the session. Only when that one says it
+//! is set up (`Ready`) does the first get `Quit`; when the first has let go of
+//! the terminal (`Released`, or it is simply gone) the second is told `Go` and
+//! is the relay. At every moment one process at most reads the terminal, which
+//! is what keeps "exactly the bytes it missed" true across the change. A second
+//! relay that fails before `Ready` costs nothing: the first never stopped, and
+//! is told so (`UpgradeFailed`). After the change the warden starts relays
+//! from the new binary.
+//!
 //! It waits on file descriptors only: the shell's exit watch, the terminal
-//! while it reads it, the relay's channel. The one timer is the end of an
-//! ended session that no client has heard of: [`ENDED_HOLD`] after the shell
-//! exits the warden gives up waiting and cleans up.
+//! while it reads it, the channels of its relays. Its timers are named and
+//! end: [`ENDED_HOLD`] after the shell exits and no client has heard of it,
+//! the warden gives up waiting and cleans up; [`QUIT_WAIT`] is how long a relay
+//! that was told to quit has to answer.
 
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -46,6 +61,11 @@ pub const RELAY_STRIKES: u32 = 5;
 /// A relay that dies sooner than this after it was started counts as a strike;
 /// one that served longer than this was working, and the count starts over.
 pub const RELAY_YOUTH: Duration = Duration::from_secs(10);
+
+/// How long a relay that was told to quit has to answer, and let go of the
+/// terminal, before it is killed: neither an upgrade nor the end of a session
+/// waits for one that is stuck.
+pub const QUIT_WAIT: Duration = Duration::from_secs(5);
 
 /// The most program bytes one read of the terminal takes.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -163,6 +183,9 @@ fn refuse(control: &mut UnixStream, why: &str) -> u8 {
 
 /// A relay as the warden sees it.
 struct RelayLink {
+    /// Which relay this is, for the life of the warden: the places a relay is
+    /// kept change when it takes over, the number does not.
+    serial: u64,
     child: Child,
     chan: UnixStream,
     stage: Stage,
@@ -172,6 +195,8 @@ struct RelayLink {
     /// Bytes waiting to be written to the channel.
     out: Vec<u8>,
     started: Instant,
+    /// The binary it was started from.
+    exe: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -180,8 +205,21 @@ enum Stage {
     Hello,
     /// It has the session and has not said it is set up.
     AwaitReady,
+    /// Set up and waiting for the relay that has the terminal to let go.
+    Standby,
     /// It reads the terminal and writes the journal.
     Active,
+    /// It was told to quit and has not yet let go of the terminal.
+    Retiring,
+}
+
+/// Where a relay is kept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// The one that serves: `Active`, or `Retiring` while it hands over.
+    Serving,
+    /// One being brought up, to take over.
+    Next,
 }
 
 struct Warden {
@@ -197,7 +235,14 @@ struct Warden {
     delivered: bool,
     master_open: bool,
     relay: Option<RelayLink>,
+    /// A relay on its way to taking over: the first of a session, a restart,
+    /// or the replacement an upgrade asked for.
+    next: Option<RelayLink>,
+    /// When a relay that was told to quit is killed for not answering.
+    retire_by: Option<Instant>,
+    /// The binary relays are started from.
     relay_exe: PathBuf,
+    serials: u64,
     strikes: u32,
     ever_ready: bool,
     quitting: bool,
@@ -260,7 +305,10 @@ impl Warden {
             delivered: false,
             master_open: true,
             relay: None,
+            next: None,
+            retire_by: None,
             relay_exe,
+            serials: 0,
             strikes: 0,
             ever_ready: false,
             quitting: false,
@@ -283,15 +331,27 @@ impl Warden {
                 self.finish();
                 return 0;
             }
-            let deadline = self.ended_at.map(|at| at + ENDED_HOLD);
-            if deadline.is_some_and(|at| Instant::now() >= at) {
+            let now = Instant::now();
+            let ended_by = self.ended_at.map(|at| at + ENDED_HOLD);
+            if ended_by.is_some_and(|at| now >= at) {
                 self.finish();
                 return 0;
             }
-            let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            if self.retire_by.is_some_and(|at| now >= at) {
+                // The relay that was told to quit did not: it is not waited
+                // for. The journal is whole up to what it published, so the
+                // next relay can take over from there.
+                self.promote();
+                continue;
+            }
+            let deadline = match (ended_by, self.retire_by) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let timeout = deadline.map(|at| at.saturating_duration_since(now));
 
-            let mut set = Vec::with_capacity(3);
-            let mut sources = Vec::with_capacity(3);
+            let mut set = Vec::with_capacity(4);
+            let mut sources = Vec::with_capacity(4);
             if let Some(watch) = &self.watch {
                 set.push(sys::want(watch.as_raw_fd(), libc::POLLIN));
                 sources.push(Source::Child);
@@ -300,15 +360,15 @@ impl Warden {
                 set.push(sys::want(self.master.as_raw_fd(), libc::POLLIN));
                 sources.push(Source::Terminal);
             }
-            if let Some(relay) = &self.relay {
+            for link in self.relay.iter().chain(self.next.iter()) {
                 let events = libc::POLLIN
-                    | if relay.out.is_empty() {
+                    | if link.out.is_empty() {
                         0
                     } else {
                         libc::POLLOUT
                     };
-                set.push(sys::want(relay.chan.as_raw_fd(), events));
-                sources.push(Source::Relay);
+                set.push(sys::want(link.chan.as_raw_fd(), events));
+                sources.push(Source::Relay(link.serial));
             }
             if sys::poll(&mut set, timeout).is_err() {
                 // `poll` fails only for a bad argument or no memory; neither
@@ -323,7 +383,9 @@ impl Warden {
                 match source {
                     Source::Child => self.on_child_exit(),
                     Source::Terminal => self.read_terminal(),
-                    Source::Relay => self.on_relay(fd.revents),
+                    // A relay that took over or went in the meantime is
+                    // looked for by its number, not its place.
+                    Source::Relay(serial) => self.on_relay(*serial, fd.revents),
                 }
             }
         }
@@ -333,13 +395,17 @@ impl Warden {
     fn relay_owns_terminal(&self) -> bool {
         self.relay
             .as_ref()
-            .is_some_and(|relay| relay.stage == Stage::Active)
+            .is_some_and(|relay| matches!(relay.stage, Stage::Active | Stage::Retiring))
     }
 
     /// No relay has ever got going and none will: the session cannot be
     /// served, and `kablo new` is told so.
     fn give_up_on_start(&mut self) -> bool {
-        if self.ever_ready || self.relay.is_some() || self.strikes < RELAY_STRIKES {
+        if self.ever_ready
+            || self.relay.is_some()
+            || self.next.is_some()
+            || self.strikes < RELAY_STRIKES
+        {
             return false;
         }
         if let Some(mut control) = self.control.take() {
@@ -367,7 +433,7 @@ impl Warden {
         }
     }
 
-    /// The shell exited: collect it and tell the relay.
+    /// The shell exited: collect it and tell the relays that have the session.
     fn on_child_exit(&mut self) {
         self.watch = None;
         let exit = match self.child.wait() {
@@ -376,12 +442,16 @@ impl Warden {
         };
         self.exit = Some(exit);
         self.ended_at = Some(Instant::now());
-        if self
+        // A relay still shaking hands is told in what it adopts.
+        let told: Vec<u64> = self
             .relay
-            .as_ref()
-            .is_some_and(|relay| relay.stage != Stage::Hello)
-        {
-            self.send(&ToRelay::ChildEnded(exit));
+            .iter()
+            .chain(self.next.iter())
+            .filter(|link| link.stage != Stage::Hello)
+            .map(|link| link.serial)
+            .collect();
+        for serial in told {
+            self.send(serial, &ToRelay::ChildEnded(exit));
         }
     }
 
@@ -407,28 +477,64 @@ impl Warden {
         self.watch = None;
         self.quitting = true;
         if let Some(relay) = self.relay.take() {
-            let mut child = relay.child;
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(relay);
+        }
+        if let Some(relay) = self.next.take() {
+            reap(relay);
         }
     }
 
-    // --- the relay --------------------------------------------------------
+    // --- the relays -------------------------------------------------------
 
-    /// Starts a relay, or counts the failure to.
+    /// Which of the two places the relay called `serial` is in.
+    fn role(&self, serial: u64) -> Option<Role> {
+        if self
+            .relay
+            .as_ref()
+            .is_some_and(|link| link.serial == serial)
+        {
+            Some(Role::Serving)
+        } else if self.next.as_ref().is_some_and(|link| link.serial == serial) {
+            Some(Role::Next)
+        } else {
+            None
+        }
+    }
+
+    fn link(&mut self, serial: u64) -> Option<&mut RelayLink> {
+        self.relay
+            .iter_mut()
+            .chain(self.next.iter_mut())
+            .find(|link| link.serial == serial)
+    }
+
+    /// Takes the relay called `serial` out of the place it is in.
+    fn take(&mut self, serial: u64) -> Option<RelayLink> {
+        match self.role(serial)? {
+            Role::Serving => self.relay.take(),
+            Role::Next => self.next.take(),
+        }
+    }
+
+    /// Starts a relay from the current binary, or counts the failure to.
     fn start_relay(&mut self) {
-        while self.relay.is_none() && self.strikes < RELAY_STRIKES && !self.quitting {
-            match self.spawn_relay() {
-                Ok(link) => self.relay = Some(link),
+        while self.relay.is_none()
+            && self.next.is_none()
+            && self.strikes < RELAY_STRIKES
+            && !self.quitting
+        {
+            let exe = self.relay_exe.clone();
+            match self.spawn_relay(&exe) {
+                Ok(link) => self.next = Some(link),
                 Err(_) => self.strikes += 1,
             }
         }
     }
 
-    fn spawn_relay(&self) -> io::Result<RelayLink> {
+    fn spawn_relay(&mut self, exe: &Path) -> io::Result<RelayLink> {
         let (ours, theirs) = UnixStream::pair()?;
         ours.set_nonblocking(true)?;
-        let child = Command::new(&self.relay_exe)
+        let child = Command::new(exe)
             .arg("relay")
             .arg("--id")
             .arg(self.id.as_str())
@@ -436,7 +542,9 @@ impl Warden {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
+        self.serials = self.serials.wrapping_add(1);
         Ok(RelayLink {
+            serial: self.serials,
             child,
             chan: ours,
             stage: Stage::Hello,
@@ -444,13 +552,14 @@ impl Warden {
             decoder: Decoder::new(),
             out: Vec::new(),
             started: Instant::now(),
+            exe: exe.to_path_buf(),
         })
     }
 
-    /// The relay's channel is readable or writable, or hung up.
-    fn on_relay(&mut self, revents: libc::c_short) {
+    /// The channel of relay `serial` is readable or writable, or hung up.
+    fn on_relay(&mut self, serial: u64, revents: libc::c_short) {
         if revents & libc::POLLOUT != 0 {
-            self.flush_relay();
+            self.flush_relay(serial);
         }
         if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0 {
             return;
@@ -458,34 +567,34 @@ impl Warden {
         let mut buf = [0u8; 4096];
         let mut unexpected = Vec::new();
         loop {
-            let Some(relay) = self.relay.as_mut() else {
+            let Some(link) = self.link(serial) else {
                 return;
             };
-            match sys::recv_with_fds(relay.chan.as_fd(), &mut buf, &mut unexpected) {
-                Ok(0) => return self.relay_gone(),
+            match sys::recv_with_fds(link.chan.as_fd(), &mut buf, &mut unexpected) {
+                Ok(0) => return self.relay_gone(serial),
                 Ok(n) => {
                     // The relay never sends descriptors; any that came are
                     // closed with `unexpected` at the end of this call.
                     unexpected.clear();
                     let bytes = buf.get(..n).unwrap_or_default();
-                    if !self.relay_bytes(bytes) {
-                        return self.relay_gone();
+                    if !self.relay_bytes(serial, bytes) {
+                        return self.relay_gone(serial);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => return self.relay_gone(),
+                Err(_) => return self.relay_gone(serial),
             }
         }
     }
 
-    /// Bytes from the relay. `false` when the relay misbehaved.
-    fn relay_bytes(&mut self, bytes: &[u8]) -> bool {
-        let Some(relay) = self.relay.as_mut() else {
+    /// Bytes from a relay. `false` when the relay misbehaved.
+    fn relay_bytes(&mut self, serial: u64, bytes: &[u8]) -> bool {
+        let Some(link) = self.link(serial) else {
             return false;
         };
-        let rest = if relay.stage == Stage::Hello {
-            relay.hello.extend_from_slice(bytes);
-            let step = match crate::handshake::serve(&INNER, &relay.hello) {
+        let rest = if link.stage == Stage::Hello {
+            link.hello.extend_from_slice(bytes);
+            let step = match crate::handshake::serve(&INNER, &link.hello) {
                 Ok(step) => step,
                 Err(_) => return false,
             };
@@ -495,9 +604,9 @@ impl Warden {
                 crate::handshake::Step::Done {
                     reply, consumed, ..
                 } => {
-                    let leftover = relay.hello.get(consumed..).unwrap_or_default().to_vec();
-                    relay.hello.clear();
-                    if !self.adopt(&reply) {
+                    let leftover = link.hello.get(consumed..).unwrap_or_default().to_vec();
+                    link.hello.clear();
+                    if !self.adopt(serial, &reply) {
                         return false;
                     }
                     leftover
@@ -506,115 +615,202 @@ impl Warden {
         } else {
             bytes.to_vec()
         };
-        if let Some(relay) = self.relay.as_mut() {
-            relay.decoder.push(&rest);
-        }
-        loop {
-            let message = match self.relay.as_mut() {
-                Some(relay) => relay.decoder.next_message(),
-                None => return false,
-            };
-            match message {
-                Ok(Some(message)) => self.on_message(message),
-                Ok(None) => return true,
-                Err(e) if e.is_recoverable() => {}
-                Err(_) => return false,
-            }
-            if self.relay.is_none() {
+        // Everything the bytes hold is read before any of it is acted on: what
+        // a message does can move the relay it came from.
+        let mut messages = Vec::new();
+        {
+            let Some(link) = self.link(serial) else {
                 return false;
+            };
+            link.decoder.push(&rest);
+            loop {
+                match link.decoder.next_message() {
+                    Ok(Some(message)) => messages.push(message),
+                    Ok(None) => break,
+                    Err(e) if e.is_recoverable() => {}
+                    Err(_) => return false,
+                }
             }
         }
+        for message in messages {
+            self.on_message(serial, message);
+        }
+        true
     }
 
     /// Answers the relay's hello and gives it the session.
-    fn adopt(&mut self, reply: &[u8]) -> bool {
-        let Some(relay) = self.relay.as_mut() else {
-            return false;
-        };
-        // The reply is a few bytes into an empty socket buffer: it goes whole
-        // or the relay is not one to rely on.
-        match sys::write_fd(relay.chan.as_fd(), reply) {
-            Ok(n) if n == reply.len() => {}
-            _ => return false,
-        }
+    fn adopt(&mut self, serial: u64, reply: &[u8]) -> bool {
         let adopt = ToRelay::Adopt(Adopt {
             id: self.id.clone(),
             child_pid: self.child.id(),
             exit: self.exit,
         });
-        let mut bytes = Vec::new();
-        if inner::write(&mut bytes, &adopt).is_err() {
-            return false;
-        }
         let fds = [
             self.master.as_raw_fd(),
             self.journal.as_raw_fd(),
             self.listener.as_raw_fd(),
         ];
-        match sys::send_with_fds(relay.chan.as_fd(), &bytes, &fds) {
+        let Some(link) = self.link(serial) else {
+            return false;
+        };
+        // The reply is a few bytes into an empty socket buffer: it goes whole
+        // or the relay is not one to rely on.
+        match sys::write_fd(link.chan.as_fd(), reply) {
+            Ok(n) if n == reply.len() => {}
+            _ => return false,
+        }
+        let mut bytes = Vec::new();
+        if inner::write(&mut bytes, &adopt).is_err() {
+            return false;
+        }
+        match sys::send_with_fds(link.chan.as_fd(), &bytes, &fds) {
             Ok(n) if n == bytes.len() => {}
             _ => return false,
         }
-        relay.stage = Stage::AwaitReady;
+        link.stage = Stage::AwaitReady;
         true
     }
 
-    fn on_message(&mut self, message: ToWarden) {
+    fn on_message(&mut self, serial: u64, message: ToWarden) {
+        let Some(role) = self.role(serial) else {
+            return;
+        };
+        let stage = self.link(serial).map(|link| link.stage);
         match message {
             ToWarden::Ready => {
-                let ready = self
-                    .relay
-                    .as_mut()
-                    .is_some_and(|relay| relay.stage == Stage::AwaitReady);
-                if !ready {
-                    return;
-                }
-                // From here the relay reads the terminal and the warden does
-                // not: the exit from the poll set is the next turn's, and
-                // `Go` is what lets the relay begin.
-                if let Some(relay) = self.relay.as_mut() {
-                    relay.stage = Stage::Active;
-                }
-                self.ever_ready = true;
-                self.send(&ToRelay::Go);
-                if let Some(mut control) = self.control.take() {
-                    let _ = control.write_all(b"ok\n");
+                if role == Role::Next && stage == Some(Stage::AwaitReady) {
+                    self.on_next_ready();
                 }
             }
-            ToWarden::Terminate { force } => self.terminate(force),
+            ToWarden::Released { .. } => {
+                if role == Role::Serving && stage == Some(Stage::Retiring) {
+                    self.promote();
+                }
+            }
+            ToWarden::Terminate { force } => {
+                if role == Role::Serving {
+                    self.terminate(force);
+                }
+            }
             ToWarden::Delivered => {
-                if self.exit.is_some() {
+                if role == Role::Serving && self.exit.is_some() {
                     self.delivered = true;
                 }
             }
-            ToWarden::Upgrade { .. } => {
-                self.send(&ToRelay::UpgradeFailed(
-                    "this warden cannot start another relay".to_owned(),
-                ));
+            ToWarden::Upgrade { path } => {
+                if role == Role::Serving && stage == Some(Stage::Active) {
+                    self.upgrade(&path);
+                }
             }
-            ToWarden::Released { .. } => {}
         }
     }
 
-    /// Queues a message for the relay and writes what the channel takes.
-    fn send(&mut self, message: &ToRelay) {
-        let Some(relay) = self.relay.as_mut() else {
-            return;
-        };
-        if inner::write(&mut relay.out, message).is_err() {
-            return;
+    /// The relay being brought up is set up. If another relay has the
+    /// terminal it is asked to let go; if none does, this one takes over.
+    fn on_next_ready(&mut self) {
+        if let Some(next) = self.next.as_mut() {
+            next.stage = Stage::Standby;
         }
-        self.flush_relay();
+        let serving = self.relay.as_mut().map(|link| (link.serial, link.stage));
+        match serving {
+            Some((serial, Stage::Active)) => {
+                if let Some(link) = self.relay.as_mut() {
+                    link.stage = Stage::Retiring;
+                }
+                self.retire_by = Some(Instant::now() + QUIT_WAIT);
+                self.send(serial, &ToRelay::Quit);
+            }
+            // Told to quit already: the change finishes when it lets go.
+            Some(_) => {}
+            None => self.promote(),
+        }
     }
 
-    fn flush_relay(&mut self) {
-        let Some(relay) = self.relay.as_mut() else {
+    /// The relay that served has let go of the terminal (or is gone): the one
+    /// that was brought up takes over. If it is not set up yet it will, when
+    /// it is; until then nobody has the terminal and the warden reads it.
+    fn promote(&mut self) {
+        self.retire_by = None;
+        if let Some(old) = self.relay.take() {
+            reap(old);
+        }
+        let Some(mut next) = self.next.take() else {
+            self.start_relay();
             return;
         };
-        while !relay.out.is_empty() {
-            match sys::write_fd(relay.chan.as_fd(), &relay.out) {
+        if next.stage != Stage::Standby {
+            self.next = Some(next);
+            return;
+        }
+        next.stage = Stage::Active;
+        self.relay_exe.clone_from(&next.exe);
+        self.ever_ready = true;
+        let serial = next.serial;
+        self.relay = Some(next);
+        self.send(serial, &ToRelay::Go);
+        if let Some(mut control) = self.control.take() {
+            let _ = control.write_all(b"ok\n");
+        }
+    }
+
+    /// A relay asked for itself to be replaced by the binary at `path`.
+    fn upgrade(&mut self, path: &[u8]) {
+        if self.quitting {
+            return;
+        }
+        if self.exit.is_some() {
+            return self.upgrade_failed("the program has ended; there is nothing to move");
+        }
+        let exe = match check_binary(path) {
+            Ok(exe) => exe,
+            Err(why) => return self.upgrade_failed(&why),
+        };
+        if let Some(waiting) = self.next.take() {
+            if waiting.stage == Stage::Standby {
+                self.next = Some(waiting);
+                return self.upgrade_failed("an upgrade is finishing; try again in a moment");
+            }
+            // One that has not got ready by now is not waited for: a binary
+            // that never speaks must not make upgrades impossible.
+            reap(waiting);
+        }
+        match self.spawn_relay(&exe) {
+            Ok(link) => self.next = Some(link),
+            Err(e) => self.upgrade_failed(&format!("cannot start {}: {e}", exe.display())),
+        }
+    }
+
+    /// Tells the relay that asked that the upgrade did not happen.
+    fn upgrade_failed(&mut self, why: &str) {
+        let serving = self
+            .relay
+            .as_ref()
+            .filter(|link| link.stage == Stage::Active)
+            .map(|link| link.serial);
+        if let Some(serial) = serving {
+            self.send(serial, &ToRelay::UpgradeFailed(why.to_owned()));
+        }
+    }
+
+    /// Queues a message for relay `serial` and writes what the channel takes.
+    fn send(&mut self, serial: u64, message: &ToRelay) {
+        let Some(link) = self.link(serial) else {
+            return;
+        };
+        if inner::write(&mut link.out, message).is_err() {
+            return;
+        }
+        self.flush_relay(serial);
+    }
+
+    fn flush_relay(&mut self, serial: u64) {
+        let Some(link) = self.link(serial) else {
+            return;
+        };
+        while !link.out.is_empty() {
+            match sys::write_fd(link.chan.as_fd(), &link.out) {
                 Ok(n) if n > 0 => {
-                    relay.out.drain(..n.min(relay.out.len()));
+                    link.out.drain(..n.min(link.out.len()));
                 }
                 Ok(_) => return,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
@@ -624,64 +820,192 @@ impl Warden {
         }
     }
 
-    /// The relay's end of the channel closed: it died. Reap it and start the
-    /// next, unless it keeps dying young.
-    fn relay_gone(&mut self) {
-        let Some(relay) = self.relay.take() else {
+    /// A relay's end of the channel closed: it died (or let go and left).
+    /// Reap it and carry on: another is waiting to take over, or the next is
+    /// started, unless relays keep dying young.
+    fn relay_gone(&mut self, serial: u64) {
+        let Some(role) = self.role(serial) else {
             return;
         };
-        let mut child = relay.child;
-        // A relay that closed its channel and lives on is of no use.
-        let _ = child.kill();
-        let _ = child.wait();
-        if relay.started.elapsed() < RELAY_YOUTH {
-            self.strikes += 1;
-        } else {
-            self.strikes = 0;
-        }
-        self.start_relay();
-    }
-
-    /// Ends the session: the relay told to go and waited for. The socket path
-    /// is the caller's to remove.
-    fn finish(&mut self) {
-        self.quitting = true;
-        let Some(relay) = self.relay.as_ref() else {
+        let Some(link) = self.take(serial) else {
             return;
         };
-        if relay.stage != Stage::Hello {
-            self.send(&ToRelay::Quit);
-            // The relay answers and closes its end; wait for that, discarding
-            // what it says.
-            let mut buf = [0u8; 256];
-            let mut fds = Vec::new();
-            loop {
-                let Some(relay) = self.relay.as_ref() else {
-                    return;
-                };
-                let mut set = [sys::want(relay.chan.as_raw_fd(), libc::POLLIN)];
-                if sys::poll(&mut set, None).is_err() {
-                    break;
+        let (stage, young) = (link.stage, link.started.elapsed() < RELAY_YOUTH);
+        reap(link);
+        // A relay that was told to quit is not a relay that died.
+        let strike = |warden: &mut Warden| {
+            if young {
+                warden.strikes += 1;
+            } else {
+                warden.strikes = 0;
+            }
+        };
+        match role {
+            Role::Serving => {
+                if stage != Stage::Retiring {
+                    strike(self);
                 }
-                match sys::recv_with_fds(relay.chan.as_fd(), &mut buf, &mut fds) {
-                    Ok(0) => break,
-                    Ok(_) => fds.clear(),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
-                }
+                self.promote();
+            }
+            Role::Next if self.relay.is_none() => {
+                // A start that did not take.
+                strike(self);
+                self.start_relay();
+            }
+            Role::Next => {
+                // An upgrade that did not take: the relay that serves never
+                // stopped (or, if it was told to quit, will go and a relay
+                // from the old binary is started).
+                self.upgrade_failed("the new relay stopped before it took over");
             }
         }
-        if let Some(relay) = self.relay.take() {
-            let mut child = relay.child;
-            let _ = child.kill();
-            let _ = child.wait();
+    }
+
+    /// Ends the session: the relay told to go and waited for, but not for
+    /// long. The socket path is the caller's to remove.
+    fn finish(&mut self) {
+        self.quitting = true;
+        if let Some(waiting) = self.next.take() {
+            reap(waiting);
+        }
+        let Some(link) = self.relay.as_ref() else {
+            return;
+        };
+        let (serial, stage) = (link.serial, link.stage);
+        if stage == Stage::Active {
+            self.send(serial, &ToRelay::Quit);
+        }
+        // The relay answers and closes its end; wait for that, but only as
+        // long as it takes a relay that is working.
+        if let Some(link) = self.relay.as_ref() {
+            await_close(&link.chan, QUIT_WAIT);
+        }
+        if let Some(link) = self.relay.take() {
+            reap(link);
         }
     }
+}
+
+/// Reads and discards what comes on `chan` until the other end closes it or
+/// `within` has passed; whether it closed.
+fn await_close(chan: &UnixStream, within: Duration) -> bool {
+    let by = Instant::now() + within;
+    let mut buf = [0u8; 256];
+    let mut fds = Vec::new();
+    loop {
+        let left = by.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let mut set = [sys::want(chan.as_raw_fd(), libc::POLLIN)];
+        if sys::poll(&mut set, Some(left)).is_err() {
+            return false;
+        }
+        if set.iter().all(|fd| fd.revents == 0) {
+            continue;
+        }
+        match sys::recv_with_fds(chan.as_fd(), &mut buf, &mut fds) {
+            Ok(0) => return true,
+            Ok(_) => fds.clear(),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Ends a relay's process, whatever it is doing, and collects it.
+fn reap(link: RelayLink) {
+    let mut child = link.child;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The binary an upgrade names, if it is one to start: an absolute path to a
+/// regular file somebody can run, that is ours or the superuser's (what an
+/// administrator installs) and that nobody else can write to.
+fn check_binary(path: &[u8]) -> Result<PathBuf, String> {
+    let path = PathBuf::from(OsStr::from_bytes(path));
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path", path.display()));
+    }
+    let meta =
+        std::fs::metadata(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let owner = meta.uid();
+    if owner != sys::effective_uid() && owner != 0 {
+        return Err(format!("{} belongs to somebody else", path.display()));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{} can be written by others; it is not run",
+            path.display()
+        ));
+    }
+    if mode & 0o111 == 0 {
+        return Err(format!("{} is not executable", path.display()));
+    }
+    Ok(path)
 }
 
 /// What a descriptor in the poll set stands for.
 enum Source {
     Child,
     Terminal,
-    Relay,
+    /// The channel of the relay with this number.
+    Relay(u64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = PathBuf::from(format!("/tmp/kt-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn file(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn only_a_binary_that_can_be_run_and_not_changed_by_others_is_started() {
+        let dir = scratch("check-binary");
+        let good = file(&dir, "good", 0o755);
+        assert_eq!(check_binary(good.as_os_str().as_bytes()), Ok(good.clone()));
+        assert!(check_binary(file(&dir, "mine", 0o700).as_os_str().as_bytes()).is_ok());
+
+        let refused = |path: &Path| check_binary(path.as_os_str().as_bytes()).unwrap_err();
+        assert!(refused(Path::new("kablo")).contains("not an absolute path"));
+        assert!(refused(&dir.join("nothing")).contains("cannot read"));
+        assert!(refused(&dir).contains("not a regular file"));
+        assert!(refused(&file(&dir, "plain", 0o644)).contains("not executable"));
+        assert!(refused(&file(&dir, "group", 0o775)).contains("written by others"));
+        assert!(refused(&file(&dir, "world", 0o757)).contains("written by others"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_relay_that_never_answers_is_waited_for_a_while_and_no_longer() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        assert!(!await_close(&ours, Duration::from_millis(200)));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // What it says on the way out is read and thrown away; the end is the
+        // close.
+        (&theirs).write_all(b"released").unwrap();
+        drop(theirs);
+        assert!(await_close(&ours, Duration::from_secs(30)));
+    }
 }

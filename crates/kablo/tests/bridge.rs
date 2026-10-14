@@ -708,10 +708,29 @@ fn fake_systemd_run(env: &Env, log: &std::path::Path, works: bool) -> std::path:
     script
 }
 
+/// The directory systemd keeps its marks of lingering users in, with this
+/// user's mark in it when `lingering`.
+fn linger_dir(env: &Env, lingering: bool) -> std::path::PathBuf {
+    let dir = env
+        .dir
+        .join(if lingering { "linger-on" } else { "linger-off" });
+    std::fs::create_dir_all(&dir).unwrap();
+    if lingering {
+        let user = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap()
+            .stdout;
+        std::fs::write(dir.join(String::from_utf8(user).unwrap().trim()), "").unwrap();
+    }
+    dir
+}
+
 #[test]
 fn the_keeper_is_started_under_systemd_run_where_there_is_one_and_without_where_it_fails() {
     let mut env = Env::new();
     let log = env.dir.join("runner.log");
+    let linger = linger_dir(&env, true);
 
     // A `systemd-run` that works: the keeper runs under it.
     let works = fake_systemd_run(&env, &log, true);
@@ -720,6 +739,7 @@ fn the_keeper_is_started_under_systemd_run_where_there_is_one_and_without_where_
     let said = env
         .kablo()
         .env("KABLO_SYSTEMD_RUN", &works)
+        .env("KABLO_LINGER_DIR", &linger)
         .args(["new", "--id", &id, "--", "/bin/sh"])
         .output()
         .unwrap();
@@ -750,6 +770,7 @@ fn the_keeper_is_started_under_systemd_run_where_there_is_one_and_without_where_
     let said = env
         .kablo()
         .env("KABLO_SYSTEMD_RUN", &bad)
+        .env("KABLO_LINGER_DIR", &linger)
         .args(["new", "--id", &id, "--", "/bin/sh"])
         .output()
         .unwrap();
@@ -774,6 +795,7 @@ fn the_keeper_is_started_under_systemd_run_where_there_is_one_and_without_where_
         let said = env
             .kablo()
             .env("KABLO_SYSTEMD_RUN", runner)
+            .env("KABLO_LINGER_DIR", &linger)
             .args(["new", "--id", &id, "--", "/bin/sh"])
             .output()
             .unwrap();
@@ -786,16 +808,55 @@ fn the_keeper_is_started_under_systemd_run_where_there_is_one_and_without_where_
 }
 
 #[test]
+fn the_scope_is_for_a_user_who_lingers_and_nobody_else() {
+    // Without lingering the user manager stops after the last login and takes
+    // the scope, and the session with it: a plain `setsid` does better, so the
+    // runner is not used at all, however good it is.
+    let mut env = Env::new();
+    let log = env.dir.join("runner.log");
+    let works = fake_systemd_run(&env, &log, true);
+    for (label, linger) in [
+        ("nobody", linger_dir(&env, false)),
+        ("nothere", env.dir.join("no-such-linger-dir")),
+    ] {
+        let id = env.name(label);
+        env.track(&id);
+        let said = env
+            .kablo()
+            .env("KABLO_SYSTEMD_RUN", &works)
+            .env("KABLO_LINGER_DIR", &linger)
+            .args(["new", "--id", &id, "--", "/bin/sh"])
+            .output()
+            .unwrap();
+        assert!(
+            said.status.success(),
+            "{}",
+            String::from_utf8_lossy(&said.stderr)
+        );
+        assert!(
+            !log.exists(),
+            "the runner was used by a user who does not linger"
+        );
+        let mut conn = env.connect(&id);
+        conn.attach(0);
+        conn.type_in("echo plain-ok\n");
+        conn.wait_for("plain-ok\r\n", 0);
+    }
+}
+
+#[test]
 fn a_keeper_that_is_refused_is_not_tried_again_without_the_runner() {
     // A refusal in words (the name is taken) is the keeper's answer, not a
     // runner that failed: it is passed on, not retried.
     let mut env = Env::new();
     let log = env.dir.join("runner.log");
+    let linger = linger_dir(&env, true);
     let works = fake_systemd_run(&env, &log, true);
     let id = env.start("twice", &SH);
     let said = env
         .kablo()
         .env("KABLO_SYSTEMD_RUN", &works)
+        .env("KABLO_LINGER_DIR", &linger)
         .args(["new", "--id", &id])
         .output()
         .unwrap();

@@ -22,6 +22,13 @@
 //!
 //! The relay can be replaced while the shell lives: it keeps no state that a
 //! successor cannot rebuild from the journal's header and the descriptors.
+//! A client's `upgrade` is passed to the warden, which starts the other binary
+//! as a second relay; when that one is set up this one is told to quit
+//! (`Quit`): it stops reading the terminal, drops its clients by leaving, and
+//! says where the journal ends. The second relay serves nobody until the warden
+//! tells it `Go`, which is after that, so exactly one relay accepts clients and
+//! exactly one reads the terminal at any time; a client that was here comes
+//! back, to the relay that took over, with the offset it had.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -81,6 +88,9 @@ struct Client {
     /// Flush what is queued, then close.
     closing: bool,
     dead: bool,
+    /// It asked for the relay to be replaced and has not been told how that
+    /// went (when it went well it is told by the connection closing).
+    upgrading: bool,
 }
 
 struct Attach {
@@ -99,6 +109,9 @@ struct Relay {
     listener: UnixListener,
     child_pid: u32,
     exit: Option<Exit>,
+    /// This relay is the one that serves (it was told `Go`): it accepts
+    /// clients. Until then the listening socket is left to its other holders.
+    live: bool,
     /// This relay reads the terminal (it was told `Go`).
     reading: bool,
     master_done: bool,
@@ -179,6 +192,7 @@ impl Relay {
             listener,
             child_pid: adopt.child_pid,
             exit: adopt.exit,
+            live: false,
             reading: false,
             master_done: false,
             final_drained: false,
@@ -204,7 +218,7 @@ impl Relay {
                 set.push(sys::want(self.chan.as_raw_fd(), libc::POLLIN | out));
                 sources.push(Source::Chan);
             }
-            if self.clients.len() < MAX_CLIENTS {
+            if self.live && !self.quit && self.clients.len() < MAX_CLIENTS {
                 set.push(sys::want(self.listener.as_raw_fd(), libc::POLLIN));
                 sources.push(Source::Listener);
             }
@@ -262,8 +276,11 @@ impl Relay {
             }
             self.clients.retain(|client| !client.dead);
             if self.quit {
+                // The terminal is not read any more: what was typed and not
+                // yet taken is the last thing this relay does for it.
+                self.flush_input();
                 let offset = self.journal.total();
-                let _ = inner::write(&mut &self.chan, &ToWarden::Released { offset });
+                self.send_warden(&ToWarden::Released { offset });
                 return 0;
             }
         }
@@ -315,19 +332,42 @@ impl Relay {
     fn on_warden(&mut self, message: ToRelay) {
         match message {
             ToRelay::Go => {
+                self.live = true;
                 self.reading = true;
                 if self.exit.is_some() {
                     self.drain_to_the_end();
                 }
             }
-            ToRelay::Quit => self.quit = true,
+            ToRelay::Quit => {
+                self.quit = true;
+                self.reading = false;
+            }
             ToRelay::ChildEnded(exit) => {
                 self.exit = Some(exit);
                 if self.reading {
                     self.drain_to_the_end();
                 }
             }
-            ToRelay::Adopt(_) | ToRelay::UpgradeFailed(_) => {}
+            ToRelay::UpgradeFailed(why) => self.upgrade_failed(&why),
+            ToRelay::Adopt(_) => {}
+        }
+    }
+
+    /// The upgrade a client asked for did not happen: every client that asked
+    /// is told why.
+    fn upgrade_failed(&mut self, why: &str) {
+        let asked: Vec<usize> = self
+            .clients
+            .iter()
+            .enumerate()
+            .filter(|(_, client)| client.upgrading)
+            .map(|(i, _)| i)
+            .collect();
+        for i in asked {
+            if let Some(client) = self.clients.get_mut(i) {
+                client.upgrading = false;
+            }
+            self.error(i, ErrorCode::UPGRADE_FAILED, why);
         }
     }
 
@@ -434,7 +474,7 @@ impl Relay {
     }
 
     fn accept(&mut self) {
-        while self.clients.len() < MAX_CLIENTS {
+        while self.live && !self.quit && self.clients.len() < MAX_CLIENTS {
             let sock = match self.listener.accept() {
                 Ok((sock, _)) => sock,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
@@ -459,6 +499,7 @@ impl Relay {
                 ended_queued: false,
                 closing: false,
                 dead: false,
+                upgrading: false,
             });
         }
     }
@@ -598,11 +639,15 @@ impl Relay {
                     self.error(i, ErrorCode::UNAVAILABLE, "the session's warden is gone");
                 }
             }
-            Message::Upgrade { .. } => self.error(
-                i,
-                ErrorCode::UPGRADE_FAILED,
-                "replacing the relay is not available",
-            ),
+            Message::Upgrade { path } => {
+                if !self.chan_alive {
+                    return self.error(i, ErrorCode::UNAVAILABLE, "the session's warden is gone");
+                }
+                if let Some(client) = self.clients.get_mut(i) {
+                    client.upgrading = true;
+                }
+                self.send_warden(&ToWarden::Upgrade { path });
+            }
             _ => self.error(i, ErrorCode::BAD_REQUEST, "not a request"),
         }
     }

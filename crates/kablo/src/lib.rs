@@ -22,4 +22,5 @@ pub mod relay;
 pub mod scan;
 pub mod sockdir;
 pub mod sys;
+pub mod upgrade;
 pub mod warden;

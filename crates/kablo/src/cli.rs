@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use kablo_proto::SessionId;
 use kablo_proto::v1::{NewSession, Size};
 
-use crate::{bridge, connect, inner, journal, launch, listing, relay, scan, sockdir, sys, warden};
+use crate::{
+    bridge, connect, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade, warden,
+};
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
 pub const EXIT_USAGE: u8 = 64;
@@ -21,6 +23,8 @@ commands:
   connect   use a session from this terminal (Ctrl-\\ leaves it running)
   attach    carry every session over this program's input and output; for
             programs (`ssh host kablo attach`), not for people
+  upgrade   run a session's relay from another kablo binary, without ending
+            the session or dropping the clients
   version   print the version and the protocol versions this build speaks
   help      print this text
 
@@ -29,6 +33,7 @@ kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
 kablo list [--json]
 kablo connect [--fresh] ID
 kablo attach
+kablo upgrade (--all | ID) PATH
 ";
 
 /// The line `kablo version` prints: `key=value` tokens, to which keys may be
@@ -56,6 +61,7 @@ where
             Some("list") => return command_list(rest, out, err),
             Some("connect") => return command_connect(rest, err),
             Some("attach") => return command_attach(rest, err),
+            Some("upgrade") => return command_upgrade(rest, out, err),
             // The two halves of a session; `kablo new` starts the first and the
             // first starts the second. Not for people.
             Some("warden") => {
@@ -302,6 +308,43 @@ fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
         return 1;
     }
     bridge::run(dir)
+}
+
+fn command_upgrade(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let all = args.iter().any(|arg| arg == "--all");
+    let words: Vec<&OsString> = args.iter().filter(|arg| *arg != "--all").collect();
+    let (target, binary) = match (all, words.as_slice()) {
+        (true, [binary]) => (upgrade::Target::All, *binary),
+        (false, [id, binary]) => {
+            let id = id
+                .to_str()
+                .filter(|text| !text.starts_with('-'))
+                .and_then(|text| SessionId::new(text).ok());
+            match id {
+                Some(id) => (upgrade::Target::One(id), *binary),
+                None => return usage_error(err, "that is not a session id"),
+            }
+        }
+        _ => {
+            return usage_error(
+                err,
+                "upgrade takes --all or a session id, and the path of the new kablo",
+            );
+        }
+    };
+    // The session's keeper is somewhere else: a relative path would mean
+    // something else there.
+    let binary = match std::path::absolute(binary) {
+        Ok(binary) => binary,
+        Err(e) => {
+            let _ = writeln!(err, "kablo: {e}");
+            return 1;
+        }
+    };
+    let Some(dir) = directory(err) else {
+        return 1;
+    };
+    upgrade::run(&dir, target, &binary, out, err)
 }
 
 fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {

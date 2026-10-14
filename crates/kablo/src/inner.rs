@@ -34,6 +34,22 @@
 //! ```
 //!
 //! A new relay that dies before `Ready` leaves the old one serving.
+//!
+//! # Replacing a relay
+//!
+//! A client's `upgrade` reaches the serving relay, which passes it on as
+//! [`ToWarden::Upgrade`]. The warden starts the binary named as a second
+//! relay beside the first and runs the same sequence above for it, which is
+//! the whole of what an upgrade is: the old relay keeps serving until the new
+//! one says `Ready`, and is then told `Quit`. Nothing in this wire is
+//! specific to it except [`ToRelay::UpgradeFailed`], which tells the serving
+//! relay that the second one did not take (the path was refused or the new
+//! relay stopped first). The relay that leaves answers `Released` and exits,
+//! and the warden does not wait for one that does not: past a limit it is
+//! killed. What that can cost is the one read of the terminal it was in the
+//! middle of (taken from the terminal, not yet published to the journal); a
+//! relay that is stuck is not in the middle of one. A relay that is the second is not told `Go` while the
+//! first still reads, and a relay serves no client before `Go`.
 
 use std::io::{Read, Write};
 use std::marker::PhantomData;

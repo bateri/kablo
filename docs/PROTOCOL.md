@@ -218,6 +218,20 @@ told, and removed after a day at most.
 `terminate` does: a hang-up to the shell and its foreground process group, or
 SIGKILL with `force`.
 
+**Replacing the relay.** `upgrade` names the absolute path of another `kablo`
+binary; the session's relay is replaced by that one without ending the shell.
+The path must be a regular file that can be run, owned by the user or by the
+superuser and writable by nobody else. On success the server says nothing: the
+connection that asked, like every other connection to the session, is closed
+(the relay it was connected to is gone) and a client connects again, as it
+does after a relay dies, and attaches from the byte after the last it had.
+On failure the server answers `error` with `UPGRADE_FAILED` and a reason, the
+relay that was asked keeps serving and the connection stays open: the path is
+not one to run, the program has ended, or the new relay stopped before it took
+over. A new relay takes no clients and reads no output until the old one has
+let go, so exactly the bytes after the last one the old relay wrote are the
+new relay's, with none missing and none twice.
+
 **Pulse.** The client decides when to check that the other end is alive: it
 sends `ping` and the server answers `pong` with the same bytes. The server
 never speaks unprompted except to stream `output`, so an idle connection costs

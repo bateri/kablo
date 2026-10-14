@@ -307,3 +307,90 @@ fn a_session_the_server_does_not_have_is_an_answer_not_a_hang() {
     assert_eq!(session.as_deref(), Some("nobody-home"));
     assert_eq!(code, ErrorCode::UNKNOWN_SESSION);
 }
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn the_server_side_is_upgraded_while_the_ssh_connection_carries_on() {
+    let server = server();
+    let prefix = prefix("upgrade");
+    let (mut bridge, _) = server.bridge();
+    let ids: Vec<String> = (0..3).map(|n| format!("{prefix}-{n}")).collect();
+    let mut shells = Vec::new();
+    for id in &ids {
+        shells.push(
+            bridge
+                .try_new(Some(id), &["/bin/sh"])
+                .expect("a session")
+                .pid,
+        );
+        bridge.attach(id, 0);
+        // Numbered lines that go on all through the change.
+        bridge.type_in(
+            id,
+            "i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); sleep 0.02; done &\n",
+        );
+    }
+    for id in &ids {
+        bridge.wait_for(id, "line10\r\n");
+    }
+
+    // A newer kablo is put on the server (a copy of the installed one, which
+    // is what matters: another file, run by another path) and the sessions are
+    // moved to it over a second ssh connection, as an update would.
+    let home = "/home/tester/kablo-new";
+    let moves: Vec<String> = ids
+        .iter()
+        .map(|id| format!("kablo upgrade {id} {home}/kablo"))
+        .collect();
+    let remote = format!(
+        "mkdir -p {home} && cp /usr/local/bin/kablo {home}/kablo && chmod 755 {home}/kablo && {}",
+        moves.join(" && ")
+    );
+    let said = server.ssh(&remote).output().unwrap();
+    let stdout = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        said.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+    for id in &ids {
+        assert!(
+            stdout.contains(&format!("{id}: relay replaced")),
+            "{stdout}"
+        );
+    }
+
+    // The first connection never noticed.
+    for id in &ids {
+        bridge.wait_for(id, "line299\r\n");
+    }
+    assert!(!bridge.closed, "the ssh connection is still up");
+    assert!(bridge.errors.is_empty(), "{:?}", bridge.errors);
+    for (n, id) in ids.iter().enumerate() {
+        assert_eq!(bridge.seen(id).attached.len(), 1, "{id} was attached once");
+        let text = String::from_utf8_lossy(&bridge.seen(id).data).into_owned();
+        let numbers: Vec<u32> = text
+            .split("\r\n")
+            .filter_map(|l| l.rsplit_once("line"))
+            .filter_map(|(_, n)| n.parse().ok())
+            .collect();
+        assert_eq!(
+            numbers,
+            (0..300).collect::<Vec<u32>>(),
+            "{id}: not one byte more or less"
+        );
+        assert_eq!(
+            bridge.status(id).pid,
+            shells[n],
+            "{id}: the shell is the same"
+        );
+        assert_eq!(
+            server.count(&format!("{home}/kablo relay --id {id}")),
+            1,
+            "{id}: its relay runs from the new binary"
+        );
+        assert_eq!(server.count(&format!("kablo warden --id {id}")), 1);
+    }
+    drop(bridge);
+    server.clean_up(&prefix);
+}

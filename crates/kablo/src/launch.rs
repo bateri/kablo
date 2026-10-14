@@ -12,10 +12,17 @@
 //! the terminal's session and process group, which is all most machines ask.
 //! Where systemd kills a user's processes when their last login ends, the
 //! warden is started through `systemd-run --user --scope` instead, which puts
-//! it in a unit of its own that the login's end does not take with it. That is
-//! tried only where the machine looks like it has a user manager, and a
-//! `systemd-run` that does not start anything (no bus, an old version) is not
-//! an error: the warden is started again, without it.
+//! it in a unit of its own that the login's end does not take with it. That
+//! holds only while the user manager stays up, and the manager stops shortly
+//! after the last login unless the user *lingers*
+//! (`loginctl enable-linger`, which is a file under
+//! `/var/lib/systemd/linger`): without it the manager takes its units, the
+//! scope with them, and the sessions die at logout. So the scope is used only
+//! for a user who lingers; for anyone else a plain `setsid` is the better bet,
+//! since it lives in the login's own scope, which survives wherever
+//! `KillUserProcesses` is `no` (the usual default). A `systemd-run` that does
+//! not start anything (no bus, an old version) is not an error: the warden is
+//! started again, without it.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::Shutdown;
@@ -28,7 +35,7 @@ use std::time::Duration;
 use kablo_proto::SessionId;
 use kablo_proto::v1::{Message, NewSession, Packet};
 
-use crate::sockdir;
+use crate::{sockdir, sys};
 
 /// The longest reply line read from the warden.
 const REPLY_LIMIT: u64 = 4096;
@@ -39,6 +46,13 @@ const REPLY_WAIT: Duration = Duration::from_secs(10);
 /// The environment variable that names the `systemd-run` to use, or, empty,
 /// forbids using one. Without it the machine is looked at.
 pub const ENV_SYSTEMD_RUN: &str = "KABLO_SYSTEMD_RUN";
+
+/// The environment variable that names the directory in which systemd keeps
+/// its marks of users who linger. Without it, systemd's own.
+pub const ENV_LINGER_DIR: &str = "KABLO_LINGER_DIR";
+
+/// Where systemd keeps the marks of users who linger.
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
 /// Why a session did not start.
 #[derive(Debug, PartialEq, Eq)]
@@ -204,13 +218,36 @@ fn end(child: &mut Child) {
 }
 
 /// The `systemd-run` to start wardens under, if this machine looks like it has
-/// a user manager for it to ask. [`ENV_SYSTEMD_RUN`] overrides the looking.
+/// a user manager for it to ask **and** that manager outlives the user's last
+/// login (they linger). [`ENV_SYSTEMD_RUN`] overrides the looking for the
+/// program, not the lingering; [`ENV_LINGER_DIR`] moves the lingering's marks.
 pub fn scope_runner() -> Option<PathBuf> {
-    match std::env::var_os(ENV_SYSTEMD_RUN) {
+    let runner = match std::env::var_os(ENV_SYSTEMD_RUN) {
         Some(path) if path.is_empty() => return None,
-        Some(path) => return Some(PathBuf::from(path)),
-        None => {}
+        Some(path) => PathBuf::from(path),
+        None => detect_runner()?,
+    };
+    let dir = match std::env::var_os(ENV_LINGER_DIR) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(LINGER_DIR),
+    };
+    let user = sys::passwd()?.name;
+    lingers(&dir, &user).then_some(runner)
+}
+
+/// Whether systemd has the user called `name` lingering: its mark is a file of
+/// that name in `dir`.
+fn lingers(dir: &Path, name: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // A name that is a path would look somewhere else.
+    if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
+        return false;
     }
+    dir.join(std::ffi::OsStr::from_bytes(name)).exists()
+}
+
+/// The machine's `systemd-run`, if it has a systemd with a user manager.
+fn detect_runner() -> Option<PathBuf> {
     if !cfg!(target_os = "linux") || !Path::new("/run/systemd/system").is_dir() {
         return None;
     }
@@ -286,6 +323,27 @@ mod tests {
         assert_eq!(find_in_path("tool", &path), None);
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(find_in_path("tool", &path), Some(tool));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_lingers_when_systemd_has_a_mark_with_their_name() {
+        let dir = PathBuf::from(format!("/tmp/kt-{}-linger", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ada"), "").unwrap();
+        assert!(lingers(&dir, b"ada"));
+        assert!(!lingers(&dir, b"grace"), "somebody else's mark is not ours");
+        assert!(!lingers(&dir, b""));
+        assert!(
+            !lingers(&dir, b".."),
+            "a name is not a way out of the directory"
+        );
+        assert!(!lingers(&dir, b"../kt/ada"));
+        assert!(
+            !lingers(&dir.join("not-there"), b"ada"),
+            "no directory, no lingering"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
