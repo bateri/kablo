@@ -1,9 +1,14 @@
 //! The command line.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 
-use crate::inner;
+use kablo_proto::SessionId;
+use kablo_proto::v1::{NewSession, Size};
+
+use crate::{inner, journal, launch, relay, sockdir, warden};
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
 pub const EXIT_USAGE: u8 = 64;
@@ -11,8 +16,12 @@ pub const EXIT_USAGE: u8 = 64;
 const USAGE: &str = "usage: kablo <command>
 
 commands:
+  new       start a session that outlives its clients; prints its id
   version   print the version and the protocol versions this build speaks
   help      print this text
+
+kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
+          [--journal-size BYTES[K|M|G]] [-- PROGRAM [ARGUMENT]...]
 ";
 
 /// The line `kablo version` prints: `key=value` tokens, to which keys may be
@@ -34,6 +43,27 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let args: Vec<OsString> = args.into_iter().collect();
+    if let Some((command, rest)) = args.split_first() {
+        match command.to_str() {
+            Some("new") => return command_new(rest, out, err),
+            // The two halves of a session; `kablo new` starts the first and the
+            // first starts the second. Not for people.
+            Some("warden") => {
+                return match internal(rest) {
+                    Ok((id, Some(dir))) => warden::run(id, &dir),
+                    Ok((_, None)) => usage_error(err, "warden needs --dir"),
+                    Err(why) => usage_error(err, why),
+                };
+            }
+            Some("relay") => {
+                return match internal(rest) {
+                    Ok((id, _)) => relay::run(id),
+                    Err(why) => usage_error(err, why),
+                };
+            }
+            _ => {}
+        }
+    }
     let words: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
     let all_text = words.len() == args.len();
     match (all_text, words.as_slice()) {
@@ -48,6 +78,170 @@ where
         _ => {
             let _ = write!(err, "{USAGE}");
             EXIT_USAGE
+        }
+    }
+}
+
+fn usage_error(err: &mut dyn Write, why: &str) -> u8 {
+    let _ = writeln!(err, "kablo: {why}");
+    let _ = write!(err, "{USAGE}");
+    EXIT_USAGE
+}
+
+/// The arguments of `kablo warden` and `kablo relay`: `--id ID` and, for the
+/// warden, `--dir DIR`.
+fn internal(args: &[OsString]) -> Result<(SessionId, Option<PathBuf>), &'static str> {
+    let mut id = None;
+    let mut dir = None;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match (flag.to_str(), it.next()) {
+            (Some("--id"), Some(value)) => {
+                id = value.to_str().and_then(|v| SessionId::new(v).ok());
+            }
+            (Some("--dir"), Some(value)) => dir = Some(PathBuf::from(value)),
+            _ => return Err("unknown argument"),
+        }
+    }
+    id.map(|id| (id, dir))
+        .ok_or("--id is missing or not a session id")
+}
+
+/// What `kablo new` was asked for.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NewArgs {
+    id: Option<SessionId>,
+    request: NewSession,
+}
+
+fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
+    let mut parsed = NewArgs::default();
+    let (mut cols, mut rows) = (None, None);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        if flag == "--" {
+            parsed.request.argv = it.by_ref().map(|a| a.as_bytes().to_vec()).collect();
+            break;
+        }
+        let name = flag.to_str().unwrap_or("?");
+        let mut value = || it.next().ok_or_else(|| format!("{name} needs a value"));
+        match name {
+            "--id" => {
+                let value = value()?;
+                let text = value.to_str().ok_or("the id is not text")?;
+                parsed.id = Some(SessionId::new(text).map_err(|_| {
+                    "an id is 1 to 64 characters of letters, digits, '.', '_' and '-'".to_owned()
+                })?);
+            }
+            "--cols" => cols = Some(number(value()?, "--cols")?),
+            "--rows" => rows = Some(number(value()?, "--rows")?),
+            "--cwd" => {
+                let value = value()?;
+                let path = PathBuf::from(value);
+                // The keeper starts elsewhere than this process; a relative
+                // path would mean something else there.
+                let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+                parsed.request.cwd = Some(path.as_os_str().as_bytes().to_vec());
+            }
+            "--env" => {
+                let value = value()?.as_bytes();
+                let at = value
+                    .iter()
+                    .position(|&b| b == b'=')
+                    .filter(|&at| at > 0)
+                    .ok_or("--env takes NAME=VALUE")?;
+                let (name, rest) = value.split_at(at);
+                parsed
+                    .request
+                    .env
+                    .push((name.to_vec(), rest.get(1..).unwrap_or_default().to_vec()));
+            }
+            "--journal-size" => {
+                parsed.request.journal_size = Some(size_with_unit(value()?)?);
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    if cols.is_some() || rows.is_some() {
+        let default = crate::pty::DEFAULT_SIZE;
+        parsed.request.size = Some(Size {
+            cols: cols.unwrap_or(default.cols),
+            rows: rows.unwrap_or(default.rows),
+            xpixel: 0,
+            ypixel: 0,
+        });
+    }
+    Ok(parsed)
+}
+
+fn number(value: &OsStr, name: &str) -> Result<u16, String> {
+    value
+        .to_str()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("{name} takes a number from 1 to 65535"))
+}
+
+/// `1048576`, `64K`, `8M` or `1G`.
+fn size_with_unit(value: &OsStr) -> Result<u64, String> {
+    let wrong = || {
+        format!(
+            "--journal-size takes a size from {} to {} bytes, with K, M or G if you like",
+            journal::MIN_CAPACITY,
+            journal::MAX_CAPACITY
+        )
+    };
+    let text = value.to_str().ok_or_else(wrong)?;
+    let (digits, unit) = match text.char_indices().last() {
+        Some((at, c)) if c.is_ascii_alphabetic() => (text.get(..at).unwrap_or(""), Some(c)),
+        _ => (text, None),
+    };
+    let factor: u64 = match unit {
+        None => 1,
+        Some('k' | 'K') => 1 << 10,
+        Some('m' | 'M') => 1 << 20,
+        Some('g' | 'G') => 1 << 30,
+        Some(_) => return Err(wrong()),
+    };
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .filter(|n| (journal::MIN_CAPACITY..=journal::MAX_CAPACITY).contains(n))
+        .ok_or_else(wrong)?;
+    Ok(bytes)
+}
+
+fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let parsed = match parse_new(args) {
+        Ok(parsed) => parsed,
+        Err(why) => return usage_error(err, &why),
+    };
+    let dir = match sockdir::socket_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            let _ = writeln!(err, "kablo: {e}");
+            return 1;
+        }
+    };
+    let id = match parsed.id {
+        Some(id) => id,
+        None => match launch::fresh_id() {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = writeln!(err, "kablo: cannot make a session id: {e}");
+                return 1;
+            }
+        },
+    };
+    match launch::launch(&dir, &id, &parsed.request) {
+        Ok(()) => {
+            let _ = writeln!(out, "{id}");
+            0
+        }
+        Err(why) => {
+            let _ = writeln!(err, "kablo: {why}");
+            1
         }
     }
 }
@@ -118,5 +312,73 @@ mod tests {
             assert_eq!((code, err.as_str()), (0, ""));
             assert!(out.starts_with("usage: kablo"));
         }
+    }
+
+    fn os(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn new_reads_its_options_and_the_program_after_the_dashes() {
+        let parsed = parse_new(&os(&[
+            "--id",
+            "work",
+            "--cols",
+            "100",
+            "--env",
+            "A=b=c",
+            "--env",
+            "E=",
+            "--journal-size",
+            "64K",
+            "--",
+            "/bin/sh",
+            "-c",
+            "--id",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.id.unwrap().as_str(), "work");
+        let size = parsed.request.size.unwrap();
+        assert_eq!((size.cols, size.rows), (100, 24));
+        assert_eq!(
+            parsed.request.env,
+            vec![
+                (b"A".to_vec(), b"b=c".to_vec()),
+                (b"E".to_vec(), Vec::new())
+            ]
+        );
+        assert_eq!(parsed.request.journal_size, Some(64 * 1024));
+        assert_eq!(
+            parsed.request.argv,
+            vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"--id".to_vec()]
+        );
+        assert_eq!(parse_new(&[]).unwrap(), NewArgs::default());
+    }
+
+    #[test]
+    fn a_relative_directory_is_made_absolute_here() {
+        let parsed = parse_new(&os(&["--cwd", "sub"])).unwrap();
+        let cwd = parsed.request.cwd.unwrap();
+        assert!(cwd.starts_with(b"/") && cwd.ends_with(b"/sub"));
+    }
+
+    #[test]
+    fn what_new_cannot_use_is_named() {
+        for bad in [
+            &["--id"][..],
+            &["--id", "a/b"],
+            &["--cols", "0"],
+            &["--rows", "x"],
+            &["--env", "NOEQUALS"],
+            &["--env", "=v"],
+            &["--journal-size", "5"],
+            &["--journal-size", "2T"],
+            &["--journal-size", "1G1"],
+            &["--bogus"],
+        ] {
+            assert!(parse_new(&os(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(size_with_unit(OsStr::new("1G")), Ok(1 << 30));
+        assert!(size_with_unit(OsStr::new("2G")).is_err());
     }
 }

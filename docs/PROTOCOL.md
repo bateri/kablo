@@ -192,7 +192,10 @@ are contiguous: each one's offset is the previous one's plus its length. The
 `output` data is the program's bytes as written, and an `output` never carries
 more than 1 MiB minus 8 bytes. Several clients may attach to one session: all of
 them receive the output, input from any of them reaches the terminal, and the
-size is the last `resize`.
+size is the last `resize`. `input` and `resize` from a connection that is not
+attached are answered with `error` (`NOT_ATTACHED`) and do nothing; `detach`
+ends the stream and keeps the connection. An `attach` offset past the end of
+the stream is `BAD_REQUEST`.
 
 **Coming back.** A client that lost its connection attaches again with the
 offset after the last byte it received and gets exactly the bytes it missed, no
@@ -202,7 +205,10 @@ bounded journal.
 **Truncation.** When the journal no longer holds the offset asked for, the
 server answers `attached` with `truncated` set and an offset it can serve: the
 start of the first line in what remains (the byte after the first newline), so
-that the stream does not begin in the middle of an escape sequence.
+that the stream does not begin in the middle of an escape sequence. A
+truncated `attach` also makes the terminal one row smaller and back, so that a
+full-screen program, which gets `SIGWINCH` for each change, draws itself
+again.
 
 **Ending.** When the program exits, the server sends the rest of its output,
 then `ended` with how it exited. The session is kept until a client has been
@@ -219,7 +225,14 @@ nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
 the program: the server stops buffering for it, drops it, and it comes back
-with the offset it had.
+with the offset it had. A client is dropped when the journal has moved past
+the next byte it is owed; the only buffer a client costs is one frame.
+
+**A session's socket.** Each session has a socket of its own and a connection
+to it speaks about that one session: a message naming another session is
+answered with `UNKNOWN_SESSION`, a `list` lists that session alone, and a
+`new` is `BAD_REQUEST`. A `session` field left empty on a message that takes
+one means the session of the socket.
 
 ## 6. Limits
 

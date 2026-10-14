@@ -7,4 +7,13 @@
 //! ones that are not for clients.
 
 pub mod cli;
+pub mod handshake;
 pub mod inner;
+pub mod journal;
+pub mod launch;
+pub mod procinfo;
+pub mod pty;
+pub mod relay;
+pub mod sockdir;
+pub mod sys;
+pub mod warden;

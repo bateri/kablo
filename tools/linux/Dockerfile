@@ -8,12 +8,13 @@
 # the version lives only on this line.
 FROM rust:1.88-bookworm
 
-# `file` reports whether the release binary is statically linked. The musl
-# target is the host's own architecture (arm64 containers on Apple silicon,
+# `file` reports whether the release binary is statically linked; `ps` is
+# what the session tests use to find the processes of their own sessions.
+# The musl target is the host's own architecture (arm64 containers on Apple silicon,
 # x86_64 on CI): the shipped Linux binaries are static so they open on servers
 # with an older glibc.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends file \
+    && apt-get install -y --no-install-recommends file procps \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add clippy \
     && rustup target add "$(uname -m)-unknown-linux-musl"
