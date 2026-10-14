@@ -18,15 +18,16 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kablo_proto::v1::{ErrorCode, Exit, Message, Packet, PacketDecoder, Status};
+use kablo_proto::v1::{ErrorCode, Exit, Message, NewSession, Packet, PacketDecoder, Status};
 use kablo_proto::{SessionId, WIRE};
 
 /// How long a test waits for anything before it calls it failed.
@@ -96,6 +97,12 @@ impl Env {
             .unwrap_or_else(|why| panic!("kablo new failed: {why}"));
         assert_eq!(said, id);
         id
+    }
+
+    /// Has the end of this test clean up session `id`, which it did not start
+    /// with [`Env::start`] (a bridge made it, say).
+    pub fn track(&mut self, id: &str) {
+        self.sessions.push(id.to_owned());
     }
 
     pub fn socket(&self, id: &str) -> PathBuf {
@@ -369,5 +376,268 @@ impl Conn {
             self.pump(Duration::from_millis(20));
             assert!(start.elapsed() < PATIENCE, "the server never closed it");
         }
+    }
+}
+
+/// What a client of a bridge has seen of one session.
+#[derive(Default)]
+pub struct Seen {
+    /// Every program byte received, across attaches.
+    pub data: Vec<u8>,
+    /// The offset after the last byte received.
+    pub next: u64,
+    /// Every `attached` received: where the stream started, and whether it
+    /// was cut.
+    pub attached: Vec<(u64, bool)>,
+    pub ended: Option<Exit>,
+}
+
+/// A client of `kablo attach` (or of anything else that speaks the protocol
+/// over a connected socket, such as `ssh host kablo attach`): many sessions
+/// over one connection.
+pub struct Bridge {
+    sock: UnixStream,
+    decoder: PacketDecoder,
+    child: Child,
+    pub sessions: HashMap<String, Seen>,
+    pub listed: Vec<Vec<Status>>,
+    pub created: Vec<Status>,
+    pub statuses: Vec<Status>,
+    pub pongs: Vec<Vec<u8>>,
+    /// `(session, code, text)` of every `error`.
+    pub errors: Vec<(Option<String>, ErrorCode, String)>,
+    pub closed: bool,
+}
+
+impl Bridge {
+    /// Starts `command` with a socket as its standard input and output and
+    /// shakes hands over it. Returns what came before the signature.
+    pub fn over(mut command: Command) -> (Bridge, Vec<u8>) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let again = theirs.try_clone().unwrap();
+        command
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(again)))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)));
+        let child = command.spawn().unwrap();
+        let mut sock = ours;
+        sock.set_read_timeout(Some(PATIENCE)).unwrap();
+        // The handshake by hand, so that what precedes the reply is kept.
+        let mut hello = Vec::new();
+        WIRE.write_hello(&mut hello).unwrap();
+        sock.write_all(&hello).unwrap();
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        let signature = WIRE.signature;
+        while !seen.ends_with(signature) {
+            let got = sock
+                .read(&mut byte)
+                .expect("the bridge answers the handshake");
+            assert_eq!(got, 1, "the bridge closed before it answered");
+            seen.push(byte[0]);
+        }
+        let mut rest = [0u8; 3];
+        sock.read_exact(&mut rest).unwrap();
+        assert_eq!(rest[0], 1, "the bridge selects version 1");
+        let noise = seen[..seen.len() - signature.len()].to_vec();
+        sock.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        (
+            Bridge {
+                sock,
+                decoder: PacketDecoder::new(),
+                child,
+                sessions: HashMap::new(),
+                listed: Vec::new(),
+                created: Vec::new(),
+                statuses: Vec::new(),
+                pongs: Vec::new(),
+                errors: Vec::new(),
+                closed: false,
+            },
+            noise,
+        )
+    }
+
+    /// `kablo attach` in this test's directory.
+    pub fn start(env: &Env) -> Bridge {
+        let mut command = env.kablo();
+        command.arg("attach");
+        Bridge::over(command).0
+    }
+
+    pub fn send(&mut self, session: Option<&str>, message: Message) {
+        let session = session.map(|s| SessionId::new(s).unwrap());
+        let mut bytes = Vec::new();
+        Packet { session, message }.encode(&mut bytes).unwrap();
+        let _ = self.sock.write_all(&bytes);
+    }
+
+    /// Reads for up to `wait` and files what arrived.
+    pub fn pump(&mut self, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match self.sock.read(&mut buf) {
+                Ok(0) => {
+                    self.closed = true;
+                    break;
+                }
+                Ok(n) => self.decoder.push(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => {
+                    self.closed = true;
+                    break;
+                }
+            }
+            self.file();
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        self.file();
+    }
+
+    fn file(&mut self) {
+        while let Some(packet) = self.decoder.next_packet().unwrap() {
+            let name = packet.session.as_ref().map(|s| s.as_str().to_owned());
+            match packet.message {
+                Message::Attached { offset, truncated } => {
+                    let seen = self.sessions.entry(name.unwrap()).or_default();
+                    seen.attached.push((offset, truncated));
+                    seen.next = offset;
+                }
+                Message::Output { offset, data } => {
+                    let seen = self.sessions.entry(name.unwrap()).or_default();
+                    assert_eq!(offset, seen.next, "output is not contiguous");
+                    seen.next += data.len() as u64;
+                    seen.data.extend_from_slice(&data);
+                }
+                Message::Ended(exit) => {
+                    self.sessions.entry(name.unwrap()).or_default().ended = Some(exit)
+                }
+                Message::Error { code, text } => self.errors.push((name, code, text)),
+                Message::ListReply(statuses) => self.listed.push(statuses),
+                Message::Created(status) => self.created.push(status),
+                Message::StatusReply(status) => self.statuses.push(status),
+                Message::Pong(bytes) => self.pongs.push(bytes),
+                other => panic!("the bridge sent {other:?}"),
+            }
+        }
+    }
+
+    /// Pumps until `done` holds or the patience is out.
+    pub fn until(&mut self, what: &str, done: impl Fn(&Bridge) -> bool) {
+        let start = Instant::now();
+        loop {
+            self.pump(Duration::from_millis(20));
+            if done(self) {
+                return;
+            }
+            assert!(!self.closed, "the bridge closed while waiting for {what}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting for {what}");
+        }
+    }
+
+    pub fn seen(&mut self, id: &str) -> &mut Seen {
+        self.sessions.entry(id.to_owned()).or_default()
+    }
+
+    /// Starts a session through the bridge; the error is what it answered.
+    pub fn try_new(
+        &mut self,
+        id: Option<&str>,
+        argv: &[&str],
+    ) -> Result<Status, (ErrorCode, String)> {
+        let before = (self.created.len(), self.errors.len());
+        let new = NewSession {
+            argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            ..NewSession::default()
+        };
+        self.send(id, Message::New(new));
+        self.until("an answer to new", |b| {
+            b.created.len() > before.0 || b.errors.len() > before.1
+        });
+        if self.created.len() > before.0 {
+            Ok(self.created.pop().unwrap())
+        } else {
+            let (_, code, text) = self.errors.pop().unwrap();
+            Err((code, text))
+        }
+    }
+
+    pub fn attach(&mut self, id: &str, offset: u64) -> (u64, bool) {
+        let before = self.seen(id).attached.len();
+        self.send(Some(id), Message::Attach { offset });
+        self.until("attached", |b| {
+            b.sessions
+                .get(id)
+                .is_some_and(|s| s.attached.len() > before)
+        });
+        *self.seen(id).attached.last().unwrap()
+    }
+
+    pub fn type_in(&mut self, id: &str, text: &str) {
+        self.send(Some(id), Message::Input(text.as_bytes().to_vec()));
+    }
+
+    pub fn wait_for(&mut self, id: &str, needle: &str) {
+        let needle = needle.as_bytes().to_vec();
+        let id = id.to_owned();
+        self.until(
+            &format!("{:?}", String::from_utf8_lossy(&needle)),
+            move |b| {
+                b.sessions
+                    .get(&id)
+                    .is_some_and(|s| s.data.windows(needle.len()).any(|w| w == needle.as_slice()))
+            },
+        );
+    }
+
+    pub fn list(&mut self) -> Vec<Status> {
+        let before = self.listed.len();
+        self.send(None, Message::List);
+        self.until("a list", |b| b.listed.len() > before);
+        self.listed.pop().unwrap()
+    }
+
+    pub fn status(&mut self, id: &str) -> Status {
+        self.statuses.clear();
+        self.send(Some(id), Message::Status);
+        self.until("a status", |b| !b.statuses.is_empty());
+        self.statuses.pop().unwrap()
+    }
+
+    /// Pumps until an `error` arrives and returns it.
+    pub fn next_error(&mut self) -> (Option<String>, ErrorCode, String) {
+        self.until("an error", |b| !b.errors.is_empty());
+        self.errors.remove(0)
+    }
+
+    /// Closes our end of the connection, as a client that goes away does.
+    pub fn hang_up(&mut self) {
+        let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Waits for the process on the other end to exit.
+    pub fn wait_exit(&mut self) -> std::process::ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(start.elapsed() < PATIENCE, "the bridge never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }

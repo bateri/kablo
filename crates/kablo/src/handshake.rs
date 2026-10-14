@@ -1,6 +1,7 @@
-//! The server side of a handshake for a reader that cannot block.
+//! Both sides of a handshake for a reader that cannot block.
 //!
-//! [`kablo_proto::Protocol::server`] reads from a `Read`. A socket in
+//! [`kablo_proto::Protocol::server`] and [`kablo_proto::Protocol::read_reply`]
+//! read from a `Read`. A socket in
 //! non-blocking mode hands over the bytes that happen to have arrived, so the
 //! caller keeps them and asks again each time more come: a hello that is not
 //! all there yet reads as an unexpected end, which here means "wait". Nothing
@@ -44,6 +45,42 @@ pub fn serve(protocol: &Protocol, bytes: &[u8]) -> Result<Step> {
         }),
         Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => Ok(Step::Need),
         Err(Error::NoCommonVersion { .. }) => Ok(Step::Refused { reply }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Where the client side of a handshake stands.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientStep {
+    /// The server's reply is not all here yet.
+    Need,
+    /// The reply was read: speak `version`; the bytes after the first
+    /// `consumed` are the stream that follows.
+    Done {
+        /// The version selected.
+        version: u8,
+        /// How many of the bytes given were the reply (and the noise before
+        /// it).
+        consumed: usize,
+    },
+    /// The server speaks no version we do.
+    Refused,
+}
+
+/// Tries to read a server's reply from `bytes`, everything received so far.
+/// Bytes before the signature (a banner, a startup file's output) are skipped.
+pub fn reply(protocol: &Protocol, bytes: &[u8]) -> Result<ClientStep> {
+    let mut input = bytes;
+    match protocol.read_reply(&mut input) {
+        Ok(reply) if reply.selected == 0 => Ok(ClientStep::Refused),
+        Ok(reply) if (protocol.min..=protocol.max).contains(&reply.selected) => {
+            Ok(ClientStep::Done {
+                version: reply.selected,
+                consumed: bytes.len().saturating_sub(input.len()),
+            })
+        }
+        Ok(_) => Err(Error::BadHello),
+        Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => Ok(ClientStep::Need),
         Err(e) => Err(e),
     }
 }
@@ -98,5 +135,32 @@ mod tests {
         let noise = vec![b'x'; kablo_proto::NOISE_LIMIT + 8];
         assert!(serve(&WIRE, &noise).is_err());
         assert_eq!(serve(&WIRE, b"just a banner").unwrap(), Step::Need);
+    }
+    #[test]
+    fn a_reply_that_arrives_in_pieces_is_waited_for() {
+        let mut bytes = b"motd\n".to_vec();
+        WIRE.write_reply(&mut bytes, 1).unwrap();
+        for cut in 0..bytes.len() {
+            assert_eq!(
+                reply(&WIRE, &bytes[..cut]).unwrap(),
+                ClientStep::Need,
+                "{cut}"
+            );
+        }
+        bytes.extend_from_slice(&[7, 7]);
+        assert_eq!(
+            reply(&WIRE, &bytes).unwrap(),
+            ClientStep::Done {
+                version: 1,
+                consumed: bytes.len() - 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_server_with_nothing_in_common_is_refused() {
+        let mut bytes = Vec::new();
+        WIRE.write_reply(&mut bytes, 0).unwrap();
+        assert_eq!(reply(&WIRE, &bytes).unwrap(), ClientStep::Refused);
     }
 }

@@ -6,14 +6,20 @@
 //! The wire clients speak is the `kablo-proto` crate; the pieces here are the
 //! ones that are not for clients.
 
+pub mod bridge;
 pub mod cli;
+pub mod connect;
 pub mod handshake;
 pub mod inner;
 pub mod journal;
 pub mod launch;
+pub mod link;
+pub mod listing;
+pub mod peer;
 pub mod procinfo;
 pub mod pty;
 pub mod relay;
+pub mod scan;
 pub mod sockdir;
 pub mod sys;
 pub mod warden;

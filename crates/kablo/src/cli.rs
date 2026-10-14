@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use kablo_proto::SessionId;
 use kablo_proto::v1::{NewSession, Size};
 
-use crate::{inner, journal, launch, relay, sockdir, warden};
+use crate::{bridge, connect, inner, journal, launch, listing, relay, scan, sockdir, sys, warden};
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
 pub const EXIT_USAGE: u8 = 64;
@@ -17,11 +17,18 @@ const USAGE: &str = "usage: kablo <command>
 
 commands:
   new       start a session that outlives its clients; prints its id
+  list      show the sessions on this machine
+  connect   use a session from this terminal (Ctrl-\\ leaves it running)
+  attach    carry every session over this program's input and output; for
+            programs (`ssh host kablo attach`), not for people
   version   print the version and the protocol versions this build speaks
   help      print this text
 
 kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
           [--journal-size BYTES[K|M|G]] [-- PROGRAM [ARGUMENT]...]
+kablo list [--json]
+kablo connect [--fresh] ID
+kablo attach
 ";
 
 /// The line `kablo version` prints: `key=value` tokens, to which keys may be
@@ -46,6 +53,9 @@ where
     if let Some((command, rest)) = args.split_first() {
         match command.to_str() {
             Some("new") => return command_new(rest, out, err),
+            Some("list") => return command_list(rest, out, err),
+            Some("connect") => return command_connect(rest, err),
+            Some("attach") => return command_attach(rest, err),
             // The two halves of a session; `kablo new` starts the first and the
             // first starts the second. Not for people.
             Some("warden") => {
@@ -210,6 +220,88 @@ fn size_with_unit(value: &OsStr) -> Result<u64, String> {
         .filter(|n| (journal::MIN_CAPACITY..=journal::MAX_CAPACITY).contains(n))
         .ok_or_else(wrong)?;
     Ok(bytes)
+}
+
+/// The socket directory in force, or the reason there is none.
+fn directory(err: &mut dyn Write) -> Option<std::path::PathBuf> {
+    match sockdir::socket_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            let _ = writeln!(err, "kablo: {e}");
+            None
+        }
+    }
+}
+
+fn command_list(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let json = match args {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => return usage_error(err, "list takes only --json"),
+    };
+    let Some(dir) = directory(err) else {
+        return 1;
+    };
+    let statuses = match scan::Scan::start(&dir, scan::WAIT) {
+        Ok(scan) => scan.run(),
+        Err(e) => {
+            let _ = writeln!(err, "kablo: {e}");
+            return 1;
+        }
+    };
+    let text = if json {
+        listing::json(&statuses)
+    } else {
+        listing::table(&statuses)
+    };
+    let _ = out.write_all(text.as_bytes());
+    0
+}
+
+fn command_connect(args: &[OsString], err: &mut dyn Write) -> u8 {
+    let mut fresh = false;
+    let mut id = None;
+    for arg in args {
+        match arg.to_str() {
+            Some("--fresh") => fresh = true,
+            Some(text) if id.is_none() && !text.starts_with('-') => match SessionId::new(text) {
+                Ok(parsed) => id = Some(parsed),
+                Err(_) => return usage_error(err, "that is not a session id"),
+            },
+            _ => return usage_error(err, "connect takes a session id and --fresh"),
+        }
+    }
+    let Some(id) = id else {
+        return usage_error(err, "connect needs a session id");
+    };
+    let Some(dir) = directory(err) else {
+        return 1;
+    };
+    connect::run(&dir, id, fresh, err)
+}
+
+fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
+    if !args.is_empty() {
+        return usage_error(err, "attach takes no arguments");
+    }
+    // SAFETY: descriptor 0 is open for the life of the process.
+    let input = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+    if sys::is_tty(input) {
+        let _ = writeln!(
+            err,
+            "kablo: attach speaks the protocol on standard input and output, for programs; \
+             to use a session yourself, `kablo connect`"
+        );
+        return EXIT_USAGE;
+    }
+    let Some(dir) = directory(err) else {
+        return 1;
+    };
+    if let Err(e) = bridge::check_dir(&dir) {
+        let _ = writeln!(err, "kablo: {e}");
+        return 1;
+    }
+    bridge::run(dir)
 }
 
 fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {

@@ -358,6 +358,145 @@ fn watch_exit(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Connects to the Unix socket at `path` without ever blocking: a listener
+/// whose queue is full is `WouldBlock` rather than a wait. (A connection
+/// that is made sits in the listener's queue until it is accepted, so
+/// "connected" says nothing about whether anybody is serving.)
+pub fn connect_nonblocking(path: &std::path::Path) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero `sockaddr_un` is a valid value of a plain C struct.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a socket path",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as _;
+    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as _;
+    }
+    // SAFETY: no pointers; the result is checked.
+    let raw = cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) })?;
+    // SAFETY: a fresh descriptor nobody else owns.
+    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_cloexec(sock.as_raw_fd())?;
+    set_nonblocking(sock.as_raw_fd())?;
+    // SAFETY: `addr` is a valid address of the length given, for the call.
+    cvt(unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            (&raw const addr).cast(),
+            size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    })?;
+    Ok(sock)
+}
+
+/// Reads from a descriptor that may be non-blocking; `Interrupted` is retried.
+pub fn read_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: the buffer is valid for its length for the call.
+        let got = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if got >= 0 {
+            return Ok(got as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Whether `fd` is a terminal.
+pub fn is_tty(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: `fd` is open for the call.
+    unsafe { libc::isatty(fd.as_raw_fd()) == 1 }
+}
+
+/// A terminal put in raw mode; the settings it had come back when this is
+/// dropped.
+pub struct RawMode {
+    fd: RawFd,
+    saved: libc::termios,
+}
+
+impl RawMode {
+    /// Puts the terminal `fd` in raw mode.
+    pub fn enter(fd: BorrowedFd<'_>) -> io::Result<RawMode> {
+        // SAFETY: an all-zero `termios` is a valid value; the kernel fills it.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is open and `saved` is a valid out-pointer.
+        cvt(unsafe { libc::tcgetattr(fd.as_raw_fd(), &raw mut saved) })?;
+        let mut raw = saved;
+        // SAFETY: `raw` is a valid `termios`.
+        unsafe { libc::cfmakeraw(&raw mut raw) };
+        // SAFETY: `fd` is open and `raw` is a valid `termios`.
+        cvt(unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, &raw const raw) })?;
+        Ok(RawMode {
+            fd: fd.as_raw_fd(),
+            saved,
+        })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        // Now, not after the output has drained: a terminal that has stopped
+        // reading (a window being closed, flow control) must not keep this
+        // process from leaving.
+        // SAFETY: the descriptor is the terminal this was made for, still
+        // open (standard input outlives the guard) and `saved` is valid.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.saved) };
+    }
+}
+
+/// The write end of the pipe the signal handler uses.
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_signal(signal: libc::c_int) {
+    let fd = SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = signal as u8;
+        // SAFETY: `write` is async-signal-safe; one byte from this frame. A
+        // full pipe drops the byte, which only means "already pending".
+        unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+    }
+}
+
+/// Makes each of `signals` readable as a byte (its number) from the returned
+/// descriptor, so a `poll` loop can wait on them with everything else. At
+/// most one such pipe exists per process: a second call replaces the first.
+pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` holds the two descriptors `pipe` writes.
+    cvt(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
+    // SAFETY: both are fresh descriptors nobody else owns.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    for end in [&read, &write] {
+        set_cloexec(end.as_raw_fd())?;
+        set_nonblocking(end.as_raw_fd())?;
+    }
+    // The handler lives as long as the process, and so does its pipe.
+    SIGNAL_PIPE.store(
+        std::os::fd::IntoRawFd::into_raw_fd(write),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    for &signal in signals {
+        // SAFETY: an all-zero `sigaction` is valid.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: `action.sa_mask` is a valid out-pointer for the call.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: `action` is fully initialised; the handler is an
+        // `extern "C"` function that only calls `write`.
+        cvt(unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) })?;
+    }
+    Ok(read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

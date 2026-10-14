@@ -35,14 +35,23 @@ LINUX_DOCKERFILE = tools/linux/Dockerfile
 LINUX_RUST = $(shell sed -n 's/^FROM rust:\([0-9]*\.[0-9]*\)-.*/\1/p' $(LINUX_DOCKERFILE))
 LINUX_IMAGE = kablo-linux:$(LINUX_RUST)
 
-linux:
-	@local_rust=$$(rustc --version | sed -n 's/^rustc \([0-9]*\.[0-9]*\).*/\1/p'); \
+# Shell fragments the Docker targets share: the image's Rust must be the local
+# one, and Docker must answer.
+define match_rust
+local_rust=$$(rustc --version | sed -n 's/^rustc \([0-9]*\.[0-9]*\).*/\1/p'); \
 	if [ -z "$(LINUX_RUST)" ]; then \
-		echo "linux: could not read the rust version from the FROM line of $(LINUX_DOCKERFILE)"; exit 1; fi; \
+		echo "$(1): could not read the rust version from the FROM line of $(LINUX_DOCKERFILE)"; exit 1; fi; \
 	if [ "$$local_rust" != "$(LINUX_RUST)" ]; then \
-		echo "linux: local rustc $$local_rust, image rust:$(LINUX_RUST) — the versions do not match; bring the FROM line of $(LINUX_DOCKERFILE) to the local version"; exit 1; fi
-	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then \
-		echo "SKIPPED: Docker is missing or the daemon does not answer — make linux could not run"; exit 2; fi
+		echo "$(1): local rustc $$local_rust, image rust:$(LINUX_RUST) — the versions do not match; bring the FROM line of $(LINUX_DOCKERFILE) to the local version"; exit 1; fi
+endef
+define need_docker
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then \
+		echo "SKIPPED: Docker is missing or the daemon does not answer — make $(1) could not run"; exit 2; fi
+endef
+
+linux:
+	@$(call match_rust,linux)
+	@$(call need_docker,linux)
 	docker build -q -t $(LINUX_IMAGE) -f $(LINUX_DOCKERFILE) tools/linux
 	docker run --rm -v "$(CURDIR)":/w -v kablo-linux-cargo:/usr/local/cargo/registry \
 		-e CARGO_TARGET_DIR=/w/target/linux $(LINUX_IMAGE) sh -c '\
@@ -56,9 +65,21 @@ linux:
 		echo "$$described" | grep -Eq "statically linked|static-pie linked" || { echo "linux: $$bin is not statically linked"; exit 1; }; \
 		"$$bin" version'
 
-# Not built yet; they exit 1 so nothing mistakes them for a pass.
+# End to end, over a real sshd: the Linux binary of `make linux` goes into a
+# Debian container with an OpenSSH server (tests/e2e), and the scenarios in
+# crates/kablo/tests/e2e.rs run on this machine against it with
+# `ssh -T host kablo attach`. The container has no systemd, so the keeper
+# outlives the login by the `setsid` route; the server's sshd_config is the
+# distribution's, MaxSessions included. Without Docker: SKIPPED, exit 2.
 e2e:
-	@echo "e2e: not yet"; exit 1
+	@$(call match_rust,e2e)
+	@$(call need_docker,e2e)
+	docker build -q -t $(LINUX_IMAGE) -f $(LINUX_DOCKERFILE) tools/linux
+	docker run --rm -v "$(CURDIR)":/w -v kablo-linux-cargo:/usr/local/cargo/registry \
+		-e CARGO_TARGET_DIR=/w/target/linux $(LINUX_IMAGE) sh -c '\
+		set -e; cargo build --release --locked -p kablo --target "$$(uname -m)-unknown-linux-musl"'
+	tests/e2e/run.sh "$(CURDIR)/target/linux/$$(docker run --rm $(LINUX_IMAGE) uname -m)-unknown-linux-musl/release/kablo"
 
+# Not built yet; it exits 1 so nothing mistakes it for a pass.
 dist:
 	@echo "dist: not yet"; exit 1

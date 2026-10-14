@@ -81,10 +81,7 @@ pub fn run(id: SessionId, dir: &Path) -> u8 {
     let listener = match sockdir::listen(&path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            return refuse(
-                &mut control,
-                &format!("a session called {id} exists already"),
-            );
+            return refuse(&mut control, &crate::launch::exists_text(&id));
         }
         Err(e) => return refuse(&mut control, &e.to_string()),
     };

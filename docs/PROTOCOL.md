@@ -234,6 +234,31 @@ answered with `UNKNOWN_SESSION`, a `list` lists that session alone, and a
 `new` is `BAD_REQUEST`. A `session` field left empty on a message that takes
 one means the session of the socket.
 
+**Through the bridge.** A client on another machine does not connect to a
+session's socket: it runs `ssh host kablo attach`, and the standard input and
+output of that command carry this protocol for every session on the server at
+once, each message naming its session in the frame header. The bridge
+(`kablo attach`) forwards a request for a session to that session's socket and
+what comes back to the client, and answers three things itself because they
+are about the connection: `ping` (a `pong` with the same bytes), `list` (it asks
+every session for its status and replies with the sessions that answered) and
+`new` (it starts the session and replies `created` with its status).
+
+- A `list` leaves out a socket nobody listens on (a session that was killed
+  leaves its file behind) and reports a socket that takes connections but never
+  answers as `state` 2, *broken*: its relay is gone for good and its keeper
+  alone is left. That is told after a short wait (a second and a half).
+- A request for a session the server does not have is answered with
+  `UNKNOWN_SESSION`; one for a session that does not answer within five seconds
+  with `UNAVAILABLE`, after which the next request tries again.
+- A session's relay may die or be replaced while a client is attached. The
+  bridge connects again, attaches again from the byte after the last one it
+  gave the client and does not tell the client: the stream goes on with
+  contiguous offsets and no second `attached`. If the journal has already
+  moved past that byte the new `attached` carries `truncated` and is passed on.
+- When the client's end of the connection closes, the bridge ends and nothing
+  else does: no session is closed by it.
+
 ## 6. Limits
 
 | what | limit |
