@@ -10,15 +10,19 @@
 
 mod common;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE};
-use kablo_proto::WIRE;
-use kablo_proto::v1::{ErrorCode, Message, NewSession, OFFSET_END, Size, State};
+use kablo::link::{self, Link};
+use kablo_proto::v1::{
+    ErrorCode, Message, NewSession, OFFSET_END, Packet, PacketDecoder, Size, State,
+};
+use kablo_proto::{SessionId, WIRE};
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
 
@@ -562,6 +566,20 @@ impl Tty {
         kablo::sys::write_fd(self.master.as_fd(), text).unwrap();
     }
 
+    /// Types all of `text`, waiting for the terminal to take it.
+    fn type_all(&self, mut text: &[u8]) {
+        while !text.is_empty() {
+            let mut set = [kablo::sys::want(self.master.as_raw_fd(), libc::POLLOUT)];
+            kablo::sys::poll(&mut set, Some(PATIENCE)).unwrap();
+            assert!(set[0].revents != 0, "the terminal stopped taking input");
+            match kablo::sys::write_fd(self.master.as_fd(), text) {
+                Ok(n) => text = &text[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("typing failed: {e}"),
+            }
+        }
+    }
+
     /// Reads whatever the terminal shows in the next `wait`.
     fn drain(&mut self, wait: Duration) {
         let mut buf = [0u8; 4096];
@@ -915,4 +933,266 @@ fn a_keeper_that_is_refused_is_not_tried_again_without_the_runner() {
     assert_eq!(said.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&said.stderr).contains("exists already"));
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+}
+
+// --- a session that cannot take what is sent -------------------------------
+
+/// A stand-in for a session's relay: it takes the connection and the
+/// handshake, says when the client has attached, and then reads nothing until
+/// it is let to, so that what the client sends piles up. It returns the bytes
+/// typed at it, in order.
+struct Deaf {
+    attached: mpsc::Receiver<()>,
+    release: mpsc::Sender<usize>,
+    heard: mpsc::Receiver<Vec<u8>>,
+}
+
+impl Deaf {
+    /// Listens at `path`.
+    fn at(path: std::path::PathBuf) -> Deaf {
+        let listener = UnixListener::bind(path).unwrap();
+        let (said, attached) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (done, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            WIRE.server(&mut sock.try_clone().unwrap(), &mut sock)
+                .unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let mut decoder = PacketDecoder::new();
+            let mut typed = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut told = false;
+            // How many typed bytes to wait for, once it reads again.
+            let mut expect = None;
+            let start = Instant::now();
+            while start.elapsed() < PATIENCE * 2 && expect.is_none_or(|n| typed.len() < n) {
+                if told && expect.is_none() {
+                    // Not reading: this is the point.
+                    expect = released.recv_timeout(Duration::from_millis(50)).ok();
+                    continue;
+                }
+                match sock.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.push(&buf[..n]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+                while let Some(packet) = decoder.next_packet().unwrap() {
+                    match packet.message {
+                        Message::Attach { .. } if !told => {
+                            told = true;
+                            let _ = said.send(());
+                        }
+                        Message::Input(bytes) => typed.extend(bytes),
+                        _ => {}
+                    }
+                }
+            }
+            let _ = done.send(typed);
+            // The connection stays open until the test is done with it: a
+            // session that went away would end the client's.
+            let _ = released.recv();
+        });
+        Deaf {
+            attached,
+            release,
+            heard,
+        }
+    }
+
+    /// Waits for the client to attach.
+    fn wait_for_the_client(&self) {
+        self.attached
+            .recv_timeout(PATIENCE)
+            .expect("the client never attached");
+    }
+
+    /// Starts reading again, until `expect` typed bytes have come.
+    fn listen(&self, expect: usize) {
+        self.release.send(expect).unwrap();
+    }
+
+    /// Everything typed at it, once it has had what it expected.
+    fn try_heard(&self) -> Option<Vec<u8>> {
+        self.heard.try_recv().ok()
+    }
+}
+
+#[test]
+fn a_link_with_too_many_requests_waiting_hands_the_next_one_back_untouched() {
+    let env = Env::new();
+    let name = env.name("crowded-link");
+    let id = SessionId::new(&name).unwrap();
+    let chunk = |n: u8| {
+        Packet::about(
+            id.clone(),
+            Message::Input(std::iter::repeat_n(b'a' + n, 64 * 1024).collect()),
+        )
+    };
+    let deaf = Deaf::at(env.socket(&name));
+    let now = Instant::now();
+    let mut link = Link::open(&env.dir, id.clone(), now).unwrap();
+    let mut out = Vec::new();
+    link.send(
+        Packet::about(id.clone(), Message::Attach { offset: 0 }),
+        now,
+        &mut out,
+    );
+    deaf.wait_for_the_client();
+    let mut taken = 0u8;
+    let refused = loop {
+        assert!(taken < 100, "a link that never fills holds the whole world");
+        match link.offer(chunk(taken % 26), now, &mut out) {
+            Some(refused) => break refused,
+            None => taken += 1,
+        }
+    };
+    assert_eq!(
+        refused,
+        chunk(taken % 26),
+        "what is refused comes back whole"
+    );
+    assert!(out.is_empty(), "{out:?}");
+
+    // `send` is the same refusal in the form a bridge passes on.
+    link.send(refused.clone(), now, &mut out);
+    assert_eq!(out.len(), 1);
+    assert!(
+        matches!(
+            &out[0].message,
+            Message::Error { code, text } if *code == ErrorCode::UNAVAILABLE && text == link::BUSY
+        ),
+        "{out:?}"
+    );
+
+    // Once the session reads again the same request goes through, and what
+    // it hears is every chunk taken, then that one, in order.
+    let expected: Vec<u8> = (0..=taken)
+        .flat_map(|n| std::iter::repeat_n(b'a' + n % 26, 64 * 1024))
+        .collect();
+    deaf.listen(expected.len());
+    let start = Instant::now();
+    let mut pending = Some(refused);
+    let heard = loop {
+        assert!(start.elapsed() < PATIENCE, "the link never made room");
+        let mut set: Vec<libc::pollfd> = link.pollfd(true).into_iter().collect();
+        kablo::sys::poll(&mut set, Some(Duration::from_millis(20))).unwrap();
+        if let Some(fd) = set.first()
+            && fd.revents != 0
+        {
+            link.ready(fd.revents, Instant::now(), &mut out);
+        }
+        if let Some(packet) = pending.take() {
+            pending = link.offer(packet, Instant::now(), &mut out);
+        }
+        if let Some(heard) = deaf.try_heard() {
+            break heard;
+        }
+    };
+    assert!(
+        heard == expected,
+        "what the session heard is not what was taken"
+    );
+}
+
+#[test]
+fn connect_holds_its_typing_while_the_session_cannot_take_it_and_loses_none_of_it() {
+    let env = Env::new();
+    let id = env.name("crowded-connect");
+    // More than the link lets wait for a session (a megabyte), typed at a
+    // session that reads nothing for a while.
+    let total = 1_800_000;
+    let typed: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
+    let deaf = Deaf::at(env.socket(&id));
+    let mut tty = Tty::run(&env, &["connect", &id]);
+    deaf.wait_for_the_client();
+    tty.type_all(&typed);
+    // Time enough for the link to fill and the rest to be held: connect used
+    // to give up here, with "too many requests are waiting".
+    std::thread::sleep(Duration::from_millis(500));
+    tty.drain(Duration::from_millis(50));
+    assert!(
+        tty.child.try_wait().unwrap().is_none(),
+        "connect ended; the terminal showed {:?}",
+        tty.text()
+    );
+
+    deaf.listen(total);
+    let start = Instant::now();
+    let heard = loop {
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the session never heard it all; the terminal showed {:?}",
+            tty.text()
+        );
+        if let Some(heard) = deaf.try_heard() {
+            break heard;
+        }
+        tty.drain(Duration::from_millis(20));
+    };
+    assert!(heard == typed, "typing arrived lost or out of order");
+    assert!(!tty.text().contains("too many"), "{:?}", tty.text());
+    tty.type_in(&[0x1c]);
+    assert_eq!(tty.wait().code(), Some(0));
+}
+
+#[test]
+fn connect_ends_when_the_session_takes_nothing_for_good() {
+    let env = Env::new();
+    let id = env.name("never-connect");
+    let total = 1_800_000;
+    let typed: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
+    let deaf = Deaf::at(env.socket(&id));
+    let mut tty = Tty::run(&env, &["connect", &id]);
+    deaf.wait_for_the_client();
+    tty.type_all(&typed);
+    // A session that does not make room within the patience is stuck, and
+    // the person is told as before.
+    tty.show("too many requests are waiting");
+    assert_eq!(tty.wait().code(), Some(1));
+    drop(deaf);
+}
+
+#[test]
+fn a_bridge_passes_a_refused_input_on_and_the_session_stays_askable_and_endable() {
+    let mut env = Env::new();
+    // The terminal is raw so that its own line discipline does not throw the
+    // excess away: it stops taking bytes, as it does for a program that reads
+    // in its own time.
+    let id = env.start(
+        "deaf-bridge",
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty raw -echo; echo ready; exec sleep 300",
+        ],
+    );
+    let mut bridge = Bridge::start(&env);
+    bridge.attach(&id, 0);
+    bridge.wait_for(&id, "ready");
+    // A chunk at a time, so that the bridge's own limit on what waits for a
+    // session is never the one reached: it is the session that refuses.
+    let chunk = "x".repeat(256 * 1024);
+    for _ in 0..12 {
+        bridge.type_in(&id, &chunk);
+        bridge.pump(Duration::from_millis(30));
+    }
+    bridge.until("the input to be refused", |b| !b.errors.is_empty());
+    let (session, code, _) = bridge.next_error();
+    assert_eq!(session.as_deref(), Some(id.as_str()));
+    assert_eq!(code, ErrorCode::INPUT_FULL);
+
+    assert_eq!(bridge.status(&id).state, State::RUNNING);
+    bridge.send(Some(&id), Message::Terminate { force: false });
+    bridge.until("the end", |b| {
+        b.sessions.get(&id).is_some_and(|seen| seen.ended.is_some())
+    });
+    env.wait_gone(&id);
 }

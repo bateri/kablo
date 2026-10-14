@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use common::{Conn, Env, PATIENCE};
-use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Size};
+use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Size, State};
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
 
@@ -606,4 +606,62 @@ fn a_relay_out_of_descriptors_waits_for_a_client_to_leave_instead_of_spinning() 
     drop(crowd);
     let mut a = env.connect(&id);
     assert_eq!(a.status().id.as_str(), id);
+}
+
+/// Types more than a session holds for its program at a connection, and
+/// returns once the session has refused some of it.
+fn type_past_what_the_session_holds(typist: &mut Conn) {
+    let chunk = "x".repeat(256 * 1024);
+    for _ in 0..12 {
+        typist.type_in(&chunk);
+    }
+    typist.until("the input to be refused", |c| {
+        c.errors
+            .iter()
+            .any(|(code, _)| *code == ErrorCode::INPUT_FULL)
+    });
+}
+
+#[test]
+fn a_program_that_ignores_its_input_does_not_keep_anyone_from_asking_or_ending_it() {
+    let mut env = Env::new();
+    // `sleep` never reads the terminal. The terminal is raw so that its own
+    // line discipline does not throw the excess away: it stops taking bytes
+    // instead, as it does for a program that reads in its own time.
+    let id = env.start(
+        "deaf",
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty raw -echo; echo ready; exec sleep 300",
+        ],
+    );
+    let mut typist = env.connect(&id);
+    typist.attach(0);
+    typist.wait_for("ready", 0);
+    type_past_what_the_session_holds(&mut typist);
+
+    // The one who typed is told and still served.
+    assert_eq!(typist.status().state, State::RUNNING);
+    typist.send(Message::Resize(Size {
+        cols: 90,
+        rows: 30,
+        xpixel: 0,
+        ypixel: 0,
+    }));
+    let start = Instant::now();
+    while typist.status().size.cols != 90 {
+        assert!(start.elapsed() < PATIENCE, "the size never followed");
+    }
+    // So is everyone else, and a new connection.
+    let mut other = env.connect(&id);
+    assert_eq!(other.status().state, State::RUNNING);
+    let mut late = env.connect(&id);
+    assert!(late.status().pid > 1);
+
+    // And the session can be ended.
+    other.send(Message::Terminate { force: false });
+    typist.until("the end", |c| c.ended.is_some());
+    env.wait_gone(&id);
 }

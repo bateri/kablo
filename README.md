@@ -70,6 +70,10 @@ the terminal back; ending the program (`exit`) ends the session, and
 session printed while you were gone: kablo keeps the bytes the program wrote,
 so a full-screen program is drawn again from the start of what is kept, and
 the last frame wins. `--fresh` skips the past and shows only what comes next.
+When the session cannot take what you type for a moment, `connect` holds it
+and tries again (a few seconds at most, then it says why and exits); when the
+program is not reading its input at all, the terminal rings its bell for the
+keys that were refused and `connect` stays, so Ctrl-\ still works.
 
 `kablo list` is a table for people and `kablo list --json` is JSON for
 programs (keys are added to it, never removed). A session whose shell lives
@@ -168,12 +172,13 @@ memory of where its relay comes from (see *Limits*).
   redraw (the terminal is made one row smaller and back). A program that
   changes the screen without drawing it all again can look wrong until it
   redraws.
-- **A program that does not read its input** can lock its own session. Once
-  1 MiB of typed bytes is waiting for it, the relay reads none of its clients
-  until the program takes some, so every request to that session, the
-  protocol's `terminate` among them, and every new connection waits too
-  (`kablo list` shows it as `broken` after a moment). It clears when the
-  program reads or ends.
+- **A program that does not read its input** gets only so much of it. The
+  session holds 1 MiB of typed bytes for it; past that, an `input` is not
+  written and its sender is told (`INPUT_FULL` in the protocol; through the
+  bridge it reaches the client unchanged). Everything else about the session
+  keeps working: `status`, `list`, `resize`, `detach` and `terminate` are
+  answered, and its output goes on flowing. The refused bytes are not queued
+  anywhere, so send them again once the program reads.
 - **There is no command to end a session by force.** Apps do it with the
   protocol's `terminate`, which hangs up the shell; a program that ignores the
   hang-up, a stuck one, or a `broken` session is ended with `kill`: find the

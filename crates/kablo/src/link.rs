@@ -44,6 +44,11 @@ const RETRY: Duration = Duration::from_millis(100);
 /// that is not answering.
 const BACKLOG: usize = 1 << 20;
 
+/// What the client is told when its request was dropped because more than
+/// [`BACKLOG`] bytes of requests are waiting for the session. It passes: the
+/// session takes them, or the link gives up on it in [`WAIT`].
+pub const BUSY: &str = "too many requests are waiting";
+
 /// What the client asked to be attached to.
 #[derive(Clone, Debug)]
 struct Attach {
@@ -134,8 +139,23 @@ impl Link {
         }
     }
 
-    /// A request from the client.
+    /// A request from the client. One the link has no room for is answered
+    /// with an `unavailable` error and dropped (see [`Link::offer`] for a
+    /// caller that can wait instead).
     pub fn send(&mut self, packet: Packet, now: Instant, out: &mut Vec<Packet>) {
+        if self.offer(packet, now, out).is_some() {
+            out.push(unavailable(&self.id, BUSY));
+        }
+    }
+
+    /// A request from the client, handed back untouched and with nothing about
+    /// the link changed when too many requests are waiting for the session to
+    /// take them: the owner may offer it again later. `None` means the link
+    /// has it.
+    pub fn offer(&mut self, packet: Packet, now: Instant, out: &mut Vec<Packet>) -> Option<Packet> {
+        if self.is_full(&packet) {
+            return Some(packet);
+        }
         match &packet.message {
             Message::Attach { offset } => {
                 self.attach = Some(Attach {
@@ -150,35 +170,34 @@ impl Link {
         }
         let Some(peer) = self.peer.as_mut() else {
             // Attaching, detaching and asking for the status are remembered
-            // above and acted on when a connection is made; the rest waits,
-            // within reason.
+            // above and acted on when a connection is made; the rest waits.
             if !matches!(
                 packet.message,
                 Message::Attach { .. } | Message::Detach | Message::Status
             ) {
-                self.park(packet, out);
+                self.parked_bytes += parked_size(&packet);
+                self.parked.push(packet);
             }
-            return;
+            return None;
         };
-        if peer.pending() > BACKLOG {
-            return out.push(unavailable(&self.id, "too many requests are waiting"));
-        }
         peer.queue(&packet);
         if peer.flush().is_err() {
             self.lost(now, out);
         }
+        None
     }
 
-    fn park(&mut self, packet: Packet, out: &mut Vec<Packet>) {
-        let size = match &packet.message {
-            Message::Input(bytes) => bytes.len(),
-            _ => 64,
-        };
-        if self.parked_bytes + size > BACKLOG {
-            return out.push(unavailable(&self.id, "too many requests are waiting"));
+    /// Whether `packet` would go past what may wait for the session.
+    fn is_full(&self, packet: &Packet) -> bool {
+        match &self.peer {
+            Some(peer) => peer.pending() > BACKLOG,
+            None => {
+                !matches!(
+                    packet.message,
+                    Message::Attach { .. } | Message::Detach | Message::Status
+                ) && self.parked_bytes + parked_size(packet) > BACKLOG
+            }
         }
-        self.parked_bytes += size;
-        self.parked.push(packet);
     }
 
     /// The connection reported `revents`.
@@ -341,6 +360,14 @@ fn refusal(id: &SessionId, error: &io::Error) -> Packet {
             },
         ),
         _ => unavailable(id, &error.to_string()),
+    }
+}
+
+/// What a request counts for against [`BACKLOG`] while it waits.
+fn parked_size(packet: &Packet) -> usize {
+    match &packet.message {
+        Message::Input(bytes) => bytes.len(),
+        _ => 64,
     }
 }
 

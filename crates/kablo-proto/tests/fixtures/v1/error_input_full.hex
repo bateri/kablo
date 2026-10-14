@@ -1,0 +1,8 @@
+# error about "work": the input was refused because the program is not reading
+84                                            # kind 0x84: error
+00                                            # channel 0: terminal session
+04                                            # session id length 4
+00 00 00 21                                   # payload length 33
+77 6f 72 6b                                   # session id "work"
+00 07                                         # code 7: the program is not taking input
+74 68 65 20 70 72 6f 67 72 61 6d 20 69 73 20 6e 6f 74 20 74 61 6b 69 6e 67 20 69 6e 70 75 74  # text

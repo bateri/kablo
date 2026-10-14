@@ -179,6 +179,7 @@ status block.
 | 4 | the connection is not attached to the session |
 | 5 | the relay could not be replaced; the old one keeps serving |
 | 6 | the session cannot be served right now |
+| 7 | an `input` was not written: the program is not taking what was typed before it |
 
 A code a reader has no name for is still a valid error. The text is for logs: a
 client that shows it to a person removes control characters first.
@@ -254,10 +255,14 @@ them are waiting.
 
 **Many clients.** A session serves 64 connections at once. A 65th is not
 refused: it waits, unaccepted, until a seat frees. Typed input is handed to the
-program as it takes it; while 1 MiB of it is waiting, the session reads none of
-its clients, so a program that does not read its input holds up the requests
-to its own session, and nothing else: its output goes on flowing and other
-sessions are untouched.
+program as it takes it, and up to 1 MiB of it waits for a program that is not
+reading. An `input` that would take what is waiting past that is not written,
+not even its first part, and its sender gets `error` (`INPUT_FULL`, code 7);
+the bytes refused are ones the program was not going to read. Every other
+request is served as always, so a session whose program ignores its input can
+still be asked about (`status`) and ended (`terminate`), and its output goes
+on flowing. A client that wants the refused bytes to arrive sends them again
+once the program reads.
 
 **A session's socket.** Each session has a socket of its own and a connection
 to it speaks about that one session: a message naming another session is
@@ -300,7 +305,7 @@ every session for its status and replies with the sessions that answered) and
 | upgrade path | 4096 bytes |
 | journal capacity (`new`) | 16 KiB to 1 GiB, 8 MiB by default |
 | connections to one session | 64 |
-| input waiting for the program | 1 MiB, then clients are not read |
+| input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |
 
 ## 7. Compatibility

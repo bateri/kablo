@@ -184,6 +184,13 @@ fn messages() -> Vec<(&'static str, Packet)> {
             ),
         ),
         (
+            "error_input_full",
+            work(Message::Error {
+                code: v1::ErrorCode::INPUT_FULL,
+                text: "the program is not taking input".into(),
+            }),
+        ),
+        (
             "pong",
             Packet::connection(Message::Pong(b"pingdata".to_vec())),
         ),

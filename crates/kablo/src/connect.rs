@@ -13,17 +13,25 @@
 //! attaches at the end instead and shows only what comes next.
 //!
 //! The connection is a [`Link`], so a relay that is replaced while a person is
-//! connected does not show.
+//! connected does not show. Neither does a moment of crowding: when the link
+//! has too many requests waiting for the session, typing and resizes are held
+//! here and offered again after a short, growing pause ([`Held`]), and only a
+//! session that stays unable to take them for [`BUSY_PATIENCE`] ends the
+//! connection. A key the session refuses because its program is not reading
+//! rings the terminal's bell and the connection stays: it is the person's
+//! only way to say they have no more patience, and the way out (the detach
+//! key) must go on working.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{Exit, Message, OFFSET_END, Packet};
+use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Packet};
 
-use crate::link::Link;
+use crate::link::{self, Link};
 use crate::sys;
 
 /// The byte that leaves the session: Ctrl-\.
@@ -31,6 +39,23 @@ pub const DETACH_KEY: u8 = 0x1c;
 
 /// The exit status of a command that is used the wrong way (`EX_USAGE`).
 const EXIT_USAGE: u8 = 64;
+
+/// The pause before a request the link had no room for is offered again.
+const BUSY_FIRST: Duration = Duration::from_millis(20);
+
+/// The longest pause between two offers; the pause doubles up to it.
+const BUSY_LONGEST: Duration = Duration::from_millis(320);
+
+/// How long requests may wait for room, with the link taking none of them,
+/// before the connection ends: a session that does not make room in this long
+/// is stuck, not busy.
+const BUSY_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Bytes of typing held while the link is full. Past it the terminal is no
+/// longer read, so the rest waits in the terminal's own buffer and the
+/// detach key, which is read from it, is not lost for longer than the
+/// patience.
+const HELD_LIMIT: usize = 1 << 20;
 
 /// How a connection ended.
 enum End {
@@ -113,6 +138,7 @@ fn serve(
     signals: &std::os::fd::OwnedFd,
 ) -> End {
     let mut outgoing = Vec::new();
+    let mut held = Held::default();
     let now = Instant::now();
     let offset = if fresh { OFFSET_END } else { 0 };
     link.send(
@@ -120,7 +146,7 @@ fn serve(
         now,
         &mut outgoing,
     );
-    resize(&mut link, &id, input, now, &mut outgoing);
+    resize(&mut held, &mut link, &id, input, now, &mut outgoing);
     let mut buf = vec![0u8; 4096];
     loop {
         if let Some(end) = show(&outgoing, output) {
@@ -130,15 +156,18 @@ fn serve(
         if link.is_gone() {
             return End::Failed("the session is gone".to_owned());
         }
+        let typing = if held.has_room() { libc::POLLIN } else { 0 };
         let mut set = vec![
-            sys::want(input.as_raw_fd(), libc::POLLIN),
+            sys::want(input.as_raw_fd(), typing),
             sys::want(signals.as_raw_fd(), libc::POLLIN),
         ];
         let linked = link.pollfd(true);
         set.extend(linked);
-        let wait = link
-            .deadline()
-            .map(|at| at.saturating_duration_since(Instant::now()));
+        let wait = match (link.deadline(), held.deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .map(|at| at.saturating_duration_since(Instant::now()));
         if sys::poll(&mut set, wait).is_err() {
             return End::Failed("cannot wait for input".to_owned());
         }
@@ -149,7 +178,7 @@ fn serve(
             let got = sys::read_fd(signals.as_fd(), &mut byte).unwrap_or(0);
             for &signal in byte.get(..got).unwrap_or_default() {
                 match libc::c_int::from(signal) {
-                    libc::SIGWINCH => resize(&mut link, &id, input, now, &mut outgoing),
+                    libc::SIGWINCH => resize(&mut held, &mut link, &id, input, now, &mut outgoing),
                     _ => return End::Stopped,
                 }
             }
@@ -164,8 +193,8 @@ fn serve(
                         None => (typed, false),
                     };
                     if !keys.is_empty() {
-                        let input = Message::Input(keys.to_vec());
-                        link.send(Packet::about(id.clone(), input), now, &mut outgoing);
+                        let keys = Packet::about(id.clone(), Message::Input(keys.to_vec()));
+                        held.send(keys, now, |packet| link.offer(packet, now, &mut outgoing));
                     }
                     if detach {
                         return End::Detached;
@@ -177,11 +206,15 @@ fn serve(
             link.ready(ready(2), now, &mut outgoing);
         }
         link.tick(now, &mut outgoing);
+        if held.retry(now, |packet| link.offer(packet, now, &mut outgoing)) == Retry::Stuck {
+            return End::Failed(link::BUSY.to_owned());
+        }
     }
 }
 
 /// Tells the session the terminal's size.
 fn resize(
+    held: &mut Held,
     link: &mut Link,
     id: &SessionId,
     input: BorrowedFd<'_>,
@@ -192,11 +225,128 @@ fn resize(
         && size.cols > 0
         && size.rows > 0
     {
-        link.send(
-            Packet::about(id.clone(), Message::Resize(size)),
-            now,
-            outgoing,
-        );
+        let resize = Packet::about(id.clone(), Message::Resize(size));
+        held.send(resize, now, |packet| link.offer(packet, now, outgoing));
+    }
+}
+
+/// How a try at the requests that are held went.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    /// Nothing is held, or it is not time to offer again yet.
+    Idle,
+    /// Requests are still held, and the patience is not out.
+    Waiting,
+    /// The link has taken none of them for [`BUSY_PATIENCE`].
+    Stuck,
+}
+
+/// Requests the link had no room for, kept in the order they were made and
+/// offered again with a growing pause. A key or a resize that finds the link
+/// full is not lost and does not end the connection, as the link's own answer
+/// to it would.
+#[derive(Default)]
+struct Held {
+    packets: VecDeque<Packet>,
+    /// The typed bytes among `packets`.
+    bytes: usize,
+    /// Set while something is held.
+    stall: Option<Stall>,
+}
+
+struct Stall {
+    /// When requests last began to wait with nothing taken: the patience runs
+    /// from here, and any request the link takes starts it again.
+    since: Instant,
+    retry_at: Instant,
+    pause: Duration,
+}
+
+impl Held {
+    /// Whether more typing may be read from the terminal.
+    fn has_room(&self) -> bool {
+        self.bytes < HELD_LIMIT
+    }
+
+    /// When to offer again, while something is held.
+    fn deadline(&self) -> Option<Instant> {
+        self.stall.as_ref().map(|stall| stall.retry_at)
+    }
+
+    /// Offers `packet` through `offer`, which hands back what it has no room
+    /// for. Behind requests that are held it waits its turn: bytes typed
+    /// must not overtake bytes typed before them.
+    fn send(
+        &mut self,
+        packet: Packet,
+        now: Instant,
+        mut offer: impl FnMut(Packet) -> Option<Packet>,
+    ) {
+        if self.packets.is_empty() {
+            if let Some(refused) = offer(packet) {
+                self.hold(refused, now);
+            }
+        } else {
+            self.hold(packet, now);
+        }
+    }
+
+    fn hold(&mut self, packet: Packet, now: Instant) {
+        match &packet.message {
+            Message::Input(bytes) => self.bytes += bytes.len(),
+            // Only the latest size matters.
+            Message::Resize(_) => self
+                .packets
+                .retain(|held| !matches!(held.message, Message::Resize(_))),
+            _ => {}
+        }
+        self.packets.push_back(packet);
+        if self.stall.is_none() {
+            self.stall = Some(Stall {
+                since: now,
+                retry_at: now + BUSY_FIRST,
+                pause: BUSY_FIRST,
+            });
+        }
+    }
+
+    /// Offers what is held, oldest first, when it is time; stops at the first
+    /// request that is refused again.
+    fn retry(&mut self, now: Instant, mut offer: impl FnMut(Packet) -> Option<Packet>) -> Retry {
+        let Some(stall) = self.stall.as_mut() else {
+            return Retry::Idle;
+        };
+        if now < stall.retry_at {
+            return Retry::Waiting;
+        }
+        let mut taken = false;
+        while let Some(packet) = self.packets.pop_front() {
+            if let Message::Input(bytes) = &packet.message {
+                self.bytes = self.bytes.saturating_sub(bytes.len());
+            }
+            if let Some(refused) = offer(packet) {
+                if let Message::Input(bytes) = &refused.message {
+                    self.bytes += bytes.len();
+                }
+                self.packets.push_front(refused);
+                break;
+            }
+            taken = true;
+        }
+        if self.packets.is_empty() {
+            self.stall = None;
+            return Retry::Idle;
+        }
+        if taken {
+            stall.since = now;
+            stall.pause = BUSY_FIRST;
+        } else if now.saturating_duration_since(stall.since) >= BUSY_PATIENCE {
+            return Retry::Stuck;
+        } else {
+            stall.pause = (stall.pause * 2).min(BUSY_LONGEST);
+        }
+        stall.retry_at = now + stall.pause;
+        Retry::Waiting
     }
 }
 
@@ -211,6 +361,13 @@ fn show(packets: &[Packet], output: BorrowedFd<'_>) -> Option<End> {
                 }
             }
             Message::Ended(exit) => return Some(End::Ended(*exit)),
+            // The program is not reading what was typed: say so with the bell
+            // and let the person decide what to do.
+            Message::Error { code, .. } if *code == ErrorCode::INPUT_FULL => {
+                if write_all(output, b"\x07").is_err() {
+                    return Some(End::Stopped);
+                }
+            }
             Message::Error { .. } => return Some(End::Failed(describe(packet))),
             _ => {}
         }
@@ -239,4 +396,191 @@ fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kablo_proto::v1::Size;
+
+    fn id() -> SessionId {
+        SessionId::new("work").unwrap()
+    }
+
+    fn typed(text: &str) -> Packet {
+        Packet::about(id(), Message::Input(text.as_bytes().to_vec()))
+    }
+
+    fn resized(cols: u16) -> Packet {
+        Packet::about(
+            id(),
+            Message::Resize(Size {
+                cols,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            }),
+        )
+    }
+
+    /// A link that takes `room` more requests (`None`: any number) and keeps
+    /// them, handing back the rest.
+    struct Taker {
+        room: Option<usize>,
+        taken: Vec<Packet>,
+    }
+
+    impl Taker {
+        fn new(room: Option<usize>) -> Taker {
+            Taker {
+                room,
+                taken: Vec::new(),
+            }
+        }
+
+        fn offer(&mut self, packet: Packet) -> Option<Packet> {
+            match &mut self.room {
+                Some(0) => Some(packet),
+                room => {
+                    if let Some(left) = room {
+                        *left -= 1;
+                    }
+                    self.taken.push(packet);
+                    None
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn what_the_link_takes_is_not_held() {
+        let mut held = Held::default();
+        let mut link = Taker::new(None);
+        let now = Instant::now();
+        held.send(typed("a"), now, |p| link.offer(p));
+        assert_eq!(link.taken, [typed("a")]);
+        assert_eq!(held.deadline(), None);
+        assert_eq!(held.retry(now, |p| link.offer(p)), Retry::Idle);
+    }
+
+    #[test]
+    fn what_the_link_has_no_room_for_is_offered_again_in_order() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        for text in ["a", "b", "c"] {
+            held.send(typed(text), start, |p| link.offer(p));
+        }
+        assert!(link.taken.is_empty());
+        assert_eq!(held.deadline(), Some(start + BUSY_FIRST));
+
+        // Not yet time: nothing is offered.
+        link.room = None;
+        assert_eq!(held.retry(start, |p| link.offer(p)), Retry::Waiting);
+        assert!(link.taken.is_empty());
+
+        assert_eq!(
+            held.retry(start + BUSY_FIRST, |p| link.offer(p)),
+            Retry::Idle
+        );
+        assert_eq!(link.taken, [typed("a"), typed("b"), typed("c")]);
+        assert_eq!(held.deadline(), None);
+        assert!(held.has_room());
+    }
+
+    #[test]
+    fn typing_does_not_overtake_what_is_held() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        held.send(typed("first"), start, |p| link.offer(p));
+        // Room again, but "first" is still waiting for its turn.
+        link.room = None;
+        held.send(typed("second"), start, |p| link.offer(p));
+        assert!(link.taken.is_empty());
+        held.retry(start + BUSY_FIRST, |p| link.offer(p));
+        assert_eq!(link.taken, [typed("first"), typed("second")]);
+    }
+
+    #[test]
+    fn only_the_latest_size_is_held() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        held.send(resized(80), start, |p| link.offer(p));
+        held.send(typed("a"), start, |p| link.offer(p));
+        held.send(resized(100), start, |p| link.offer(p));
+        link.room = None;
+        held.retry(start + BUSY_FIRST, |p| link.offer(p));
+        assert_eq!(link.taken, [typed("a"), resized(100)]);
+    }
+
+    #[test]
+    fn typing_is_read_only_while_there_is_room_to_hold_it() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        held.send(typed(&"x".repeat(HELD_LIMIT - 1)), start, |p| link.offer(p));
+        assert!(held.has_room());
+        held.send(typed("yy"), start, |p| link.offer(p));
+        assert!(!held.has_room());
+        link.room = None;
+        held.retry(start + BUSY_FIRST, |p| link.offer(p));
+        assert!(held.has_room());
+    }
+
+    #[test]
+    fn the_pause_doubles_to_a_limit_and_the_patience_ends_it() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        held.send(typed("a"), start, |p| link.offer(p));
+        let mut pauses = Vec::new();
+        let mut now = start;
+        let stuck_at = loop {
+            let due = held.deadline().unwrap();
+            pauses.push(due.duration_since(now));
+            now = due;
+            if held.retry(now, |p| link.offer(p)) == Retry::Stuck {
+                break now.duration_since(start);
+            }
+            assert!(
+                now.duration_since(start) < BUSY_PATIENCE + BUSY_LONGEST,
+                "never gave up"
+            );
+        };
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(
+            pauses[..6],
+            [ms(20), ms(40), ms(80), ms(160), ms(320), ms(320)]
+        );
+        assert!(pauses.iter().all(|pause| *pause <= BUSY_LONGEST));
+        // It gives up at the first attempt past the patience, no sooner.
+        assert!(stuck_at >= BUSY_PATIENCE, "{stuck_at:?}");
+        assert!(stuck_at < BUSY_PATIENCE + BUSY_LONGEST, "{stuck_at:?}");
+        assert!(link.taken.is_empty());
+    }
+
+    #[test]
+    fn any_progress_starts_the_patience_again() {
+        let mut held = Held::default();
+        let mut link = Taker::new(Some(0));
+        let start = Instant::now();
+        for text in ["a", "b"] {
+            held.send(typed(text), start, |p| link.offer(p));
+        }
+        // Four and a half seconds of refusals, then one request goes through.
+        let almost = start + BUSY_PATIENCE - Duration::from_millis(500);
+        assert_eq!(held.retry(almost, |p| link.offer(p)), Retry::Waiting);
+        link.room = Some(1);
+        assert_eq!(
+            held.retry(almost + BUSY_LONGEST, |p| link.offer(p)),
+            Retry::Waiting
+        );
+        assert_eq!(link.taken, [typed("a")]);
+        // Past the original patience, but not past the new one.
+        link.room = Some(0);
+        let later = start + BUSY_PATIENCE + Duration::from_secs(1);
+        assert_eq!(held.retry(later, |p| link.offer(p)), Retry::Waiting);
+    }
 }

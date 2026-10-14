@@ -193,6 +193,11 @@ impl ErrorCode {
     pub const UPGRADE_FAILED: ErrorCode = ErrorCode(5);
     /// The session cannot be served right now.
     pub const UNAVAILABLE: ErrorCode = ErrorCode(6);
+    /// An `input` was not written: the program is not reading what was typed
+    /// before it, and these bytes would go past what the session holds for it.
+    /// None of the message was taken; the connection and every other request
+    /// are unaffected.
+    pub const INPUT_FULL: ErrorCode = ErrorCode(7);
 }
 
 /// What a `new` asks for. Every field is optional: an empty request starts

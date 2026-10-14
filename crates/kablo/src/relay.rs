@@ -55,7 +55,11 @@ const FRAMES_PER_TURN: usize = 8;
 /// (a client that asks and never reads).
 const OUT_LIMIT: usize = 4 << 20;
 
-/// Typed bytes waiting for the program before clients are no longer read.
+/// Typed bytes the relay holds for a program that is not reading them. An
+/// `input` that would take what is waiting past it is refused whole, with an
+/// error to its sender; clients are read all the same, because what a stuck
+/// program is owed must never keep a person from asking about the session or
+/// ending it.
 const INPUT_LIMIT: usize = 1 << 20;
 
 /// Connections at once. Past it the listening socket is left alone.
@@ -481,7 +485,7 @@ impl Relay {
     // --- clients ------------------------------------------------------------
 
     fn wants_read(&self, client: &Client) -> bool {
-        !client.dead && !client.closing && self.input_pending() < INPUT_LIMIT
+        !client.dead && !client.closing
     }
 
     fn wants_write(&self, client: &Client) -> bool {
@@ -758,6 +762,18 @@ impl Relay {
         }
         if self.exit.is_some() {
             return;
+        }
+        // The program may have started reading since the poll: settle what is
+        // waiting before counting it.
+        self.flush_input();
+        if self.input_pending().saturating_add(bytes.len()) > INPUT_LIMIT {
+            return self.error(i, ErrorCode::INPUT_FULL, "the program is not taking input");
+        }
+        if self.input_sent > 0 {
+            // Only what is still owed counts against the limit, and only that
+            // is kept.
+            self.input.drain(..self.input_sent);
+            self.input_sent = 0;
         }
         self.input.extend_from_slice(bytes);
         self.flush_input();
