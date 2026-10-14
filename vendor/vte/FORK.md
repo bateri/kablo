@@ -14,9 +14,9 @@ the package and this directory is the list of changes below. Upstream's code kee
 upstream's formatting: this directory is not a member of kablo's cargo workspace
 (`exclude` in the root `Cargo.toml`, which cargo also needs to find the package inside a
 git dependency), so `fmt` and `clippy` leave it alone. Its tests, upstream's and ours,
-run in `make check` and `make linux` (`cargo test --manifest-path vendor/vte/Cargo.toml
---all-targets --features ansi` — `ansi` is the feature `alacritty_terminal` turns on, and
-most of the changes below live behind it).
+run in `make check` and `make linux` (`cargo test -p vte --all-targets`: the `ansi`
+feature the changes below mostly live behind comes from `alacritty_terminal`, which the
+workspace depends on).
 
 ## Changes
 

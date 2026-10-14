@@ -21,11 +21,11 @@ clippy:
 # The terminal parser's fork (`vendor/vte`) is not a workspace member — the gate
 # does not reformat or lint upstream's code — but its tests, upstream's and ours,
 # run here, and bateri relies on them: it takes this directory by a pinned commit.
-# `ansi` is the feature `alacritty_terminal` turns on, and the fork's changes to
-# the handler live behind it; without it most of them go untested. The package
-# has no committed lock file, so there is no `--locked` on this line (nor in
-# `make linux`).
-VTE_TEST = test --manifest-path vendor/vte/Cargo.toml --all-targets --features ansi
+# `-p vte` finds it through `alacritty_terminal`, which also turns on the `ansi`
+# feature the fork's changes to the handler live behind (without it most of them
+# would go untested, so a graph that stops using `alacritty_terminal` stops
+# testing them: look for the 77 tests of its lib target in the output).
+VTE_TEST = test -p vte --all-targets
 
 test:
 	$(CARGO) test --workspace --all-targets
@@ -68,7 +68,7 @@ linux:
 		set -e; \
 		cargo clippy --workspace --all-targets --locked -- -D warnings; \
 		cargo test --workspace --all-targets --locked; \
-		cargo $(VTE_TEST); \
+		cargo $(VTE_TEST) --locked; \
 		t="$$(uname -m)-unknown-linux-musl"; \
 		cargo build --release --locked -p kablo --target "$$t"; \
 		bin="target/linux/$$t/release/kablo"; \

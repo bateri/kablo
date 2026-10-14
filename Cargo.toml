@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kablo-proto", "crates/kablo"]
+members = ["crates/kablo-proto", "crates/kablo-screen", "crates/kablo"]
 resolver = "3"
 # The fork of the terminal parser (`[patch.crates-io]` below) is upstream's code in
 # upstream's style: not a member, so `fmt` and `clippy` leave it alone. Its tests run from
@@ -22,10 +22,17 @@ expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
 
+# The terminal emulator the relay keeps a screen with and `kablo-screen` writes images
+# from: the same crate, at the same version, as bateri's (`=`: its private details are
+# probed from outside, see `kablo-screen`). The default feature (serde) is off: nothing
+# here serializes a terminal.
+[workspace.dependencies]
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+
 # `vte`, the parser inside `alacritty_terminal`, is a fork kept in `vendor/vte` (upstream
 # 0.15.0 plus the changes in its `FORK.md`): the relay and bateri parse with this one
 # source, and bateri takes it from this repository by a pinned commit. Same name and
-# version, so `alacritty_terminal` resolves to it unchanged. Nothing here depends on
-# `vte` yet, so cargo reports the patch as unused (and records it in `Cargo.lock`).
+# version, so `alacritty_terminal` resolves to it unchanged. When it stops applying
+# (a newer `vte` asked for) cargo only warns and builds the registry's one.
 [patch.crates-io]
 vte = { path = "vendor/vte" }

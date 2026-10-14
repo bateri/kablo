@@ -1,0 +1,13 @@
+[package]
+name = "kablo-screen"
+description = "A terminal's screen as VT bytes: keeps a screen from the bytes a program writes and writes an image that builds the same screen in another terminal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal = { workspace = true }
+
+[lints]
+workspace = true
