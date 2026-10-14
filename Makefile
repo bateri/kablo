@@ -18,8 +18,18 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
+# The terminal parser's fork (`vendor/vte`) is not a workspace member — the gate
+# does not reformat or lint upstream's code — but its tests, upstream's and ours,
+# run here, and bateri relies on them: it takes this directory by a pinned commit.
+# `ansi` is the feature `alacritty_terminal` turns on, and the fork's changes to
+# the handler live behind it; without it most of them go untested. The package
+# has no committed lock file, so there is no `--locked` on this line (nor in
+# `make linux`).
+VTE_TEST = test --manifest-path vendor/vte/Cargo.toml --all-targets --features ansi
+
 test:
 	$(CARGO) test --workspace --all-targets
+	$(CARGO) $(VTE_TEST)
 
 # The same gate on Linux, in the image from `tools/linux/Dockerfile`, with
 # `--locked` (a run that would change Cargo.lock fails), then the release build
@@ -58,6 +68,7 @@ linux:
 		set -e; \
 		cargo clippy --workspace --all-targets --locked -- -D warnings; \
 		cargo test --workspace --all-targets --locked; \
+		cargo $(VTE_TEST); \
 		t="$$(uname -m)-unknown-linux-musl"; \
 		cargo build --release --locked -p kablo --target "$$t"; \
 		bin="target/linux/$$t/release/kablo"; \

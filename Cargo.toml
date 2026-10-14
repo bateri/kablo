@@ -1,6 +1,12 @@
 [workspace]
 members = ["crates/kablo-proto", "crates/kablo"]
 resolver = "3"
+# The fork of the terminal parser (`[patch.crates-io]` below) is upstream's code in
+# upstream's style: not a member, so `fmt` and `clippy` leave it alone. Its tests run from
+# the Makefile. `exclude` is also what lets cargo find it inside a git dependency:
+# without it cargo takes `vendor/vte` for a member of this workspace and refuses to
+# load it from a checkout of this repository.
+exclude = ["vendor/vte"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,3 +21,11 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
+
+# `vte`, the parser inside `alacritty_terminal`, is a fork kept in `vendor/vte` (upstream
+# 0.15.0 plus the changes in its `FORK.md`): the relay and bateri parse with this one
+# source, and bateri takes it from this repository by a pinned commit. Same name and
+# version, so `alacritty_terminal` resolves to it unchanged. Nothing here depends on
+# `vte` yet, so cargo reports the patch as unused (and records it in `Cargo.lock`).
+[patch.crates-io]
+vte = { path = "vendor/vte" }
