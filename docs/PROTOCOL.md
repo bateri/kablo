@@ -168,6 +168,9 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 11 | text | `version`: the version of the relay serving the session |
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
+A status takes in what the session's connections had sent by the time the
+question came: a client that left, or sent `detach`, before somebody asked is
+not counted in `clients`, whichever connection either of them was on.
 `list_reply` is a block of entries with key 1 (`session`), each holding one
 status block.
 

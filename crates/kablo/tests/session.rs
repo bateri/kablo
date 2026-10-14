@@ -401,6 +401,75 @@ fn many_clients_see_the_same_stream_and_any_of_them_may_type() {
     }
 }
 
+/// Stops process `pid` (`SIGSTOP`) and waits until it has stopped.
+fn pause(pid: u32) {
+    // SAFETY: a signal to a relay of this test's own session.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    let start = Instant::now();
+    loop {
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| output.stdout)
+            .unwrap_or_default();
+        if state.trim_ascii_start().starts_with(b"T") {
+            return;
+        }
+        assert!(start.elapsed() < PATIENCE, "{pid} never stopped");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Lets a process stopped by [`pause`] go on.
+fn resume(pid: u32) {
+    // SAFETY: as in `pause`.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+}
+
+#[test]
+fn a_status_does_not_count_a_client_that_left_before_it_was_asked() {
+    let mut env = Env::new();
+    let id = env.start("asked", &SH);
+    // The one that asks connects first, so the relay looks at its connection
+    // before the others'.
+    let mut asker = env.connect(&id);
+    let mut closer = env.connect(&id);
+    let mut detacher = env.connect(&id);
+    let mut typist = env.connect(&id);
+    for client in [&mut closer, &mut detacher, &mut typist] {
+        client.attach(OFFSET_END);
+    }
+    assert_eq!(asker.status().clients, 3);
+
+    // While the relay is not looking, three clients go, each its own way, and
+    // then the question is asked, with an attach behind it: the relay finds it
+    // all at once.
+    let relay = env.find("relay", &id).unwrap();
+    pause(relay);
+    drop(closer);
+    detacher.send(Message::Detach);
+    typist.type_in("echo bye\n");
+    drop(typist);
+    asker.send(Message::Status);
+    asker.send(Message::attach(OFFSET_END));
+    resume(relay);
+
+    asker.until("a status", |c| {
+        c.replies
+            .iter()
+            .any(|p| matches!(p.message, Message::StatusReply(_)))
+    });
+    let Message::StatusReply(status) = asker.replies.remove(0).message else {
+        panic!("a status reply");
+    };
+    assert_eq!(
+        status.clients, 0,
+        "the three left before the question, and the asker attached after it"
+    );
+    asker.until("attached", |c| c.attached.is_some());
+    assert_eq!(asker.status().clients, 1, "the asker alone");
+}
+
 #[test]
 fn a_session_whose_relay_keeps_dying_still_has_its_terminal_read() {
     let mut env = Env::new();

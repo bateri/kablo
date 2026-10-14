@@ -112,6 +112,11 @@ const MAX_CLIENTS: usize = 64;
 /// Terminal reads in one turn before the other descriptors get a look.
 const READ_BUDGET: usize = 16;
 
+/// Reads of one client's socket in one turn, at most. A client that leaves
+/// with more than this many reads' worth unread is seen to have left a turn
+/// later, so a question asked in between still counts it.
+const CLIENT_READS: usize = 4;
+
 /// Runs the relay of session `id`; the warden's channel is standard input.
 /// Returns the process's exit status.
 pub fn run(id: SessionId) -> u8 {
@@ -139,6 +144,18 @@ struct Client {
     /// It asked for the relay to be replaced and has not been told how that
     /// went (when it went well it is told by the connection closing).
     upgrading: bool,
+    /// What it asked about the session and has not been answered yet; what
+    /// it sent after the question waits for the answer.
+    asked: Option<Question>,
+}
+
+/// A question about how the session stands. It is answered at the end of the
+/// turn it was read in ([`Relay::answer_questions`]), after everything the
+/// relay found on every connection in that turn.
+#[derive(Clone, Copy)]
+enum Question {
+    Status,
+    List,
 }
 
 struct Attach {
@@ -365,6 +382,7 @@ impl Relay {
                     }
                 }
             }
+            self.answer_questions();
             for i in 0..self.clients.len() {
                 self.drive(i);
             }
@@ -718,22 +736,29 @@ impl Relay {
                 closing: false,
                 dead: false,
                 upgrading: false,
+                asked: None,
             });
         }
     }
 
+    /// Reads what client `i` has sent, until its socket is empty or it has
+    /// gone ([`CLIENT_READS`] reads at most, so one busy client does not keep
+    /// the others waiting): a client that says something and leaves is seen to
+    /// have left in the same turn, before a question asked in it is answered.
     fn client_readable(&mut self, i: usize) {
         let mut buf = [0u8; 16 * 1024];
-        let read = match self.clients.get_mut(i) {
-            Some(client) if !client.dead => (&client.sock).read(&mut buf),
-            _ => return,
-        };
-        match read {
-            Ok(0) => self.drop_client(i),
-            Ok(n) => self.feed(i, buf.get(..n).unwrap_or_default()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => self.drop_client(i),
+        for _ in 0..CLIENT_READS {
+            let read = match self.clients.get_mut(i) {
+                Some(client) if !client.dead && !client.closing => (&client.sock).read(&mut buf),
+                _ => return,
+            };
+            match read {
+                Ok(0) => return self.drop_client(i),
+                Ok(n) => self.feed(i, buf.get(..n).unwrap_or_default()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return self.drop_client(i),
+            }
         }
     }
 
@@ -774,9 +799,17 @@ impl Relay {
                 }
             }
         }
+        self.take_packets(i);
+    }
+
+    /// Acts on what client `i` has sent, in the order it was sent, up to its
+    /// first question: what comes after one waits until it is answered.
+    fn take_packets(&mut self, i: usize) {
         loop {
             let next = match self.clients.get_mut(i) {
-                Some(client) if !client.dead => client.decoder.next_packet(),
+                Some(client) if !client.dead && client.asked.is_none() => {
+                    client.decoder.next_packet()
+                }
                 _ => return,
             };
             match next {
@@ -826,17 +859,10 @@ impl Relay {
                 "no such session on this socket",
             );
         }
-        let session = Some(self.id.clone());
         match packet.message {
             Message::Ping(bytes) => self.queue(i, packet.session, Message::Pong(bytes)),
-            Message::List => {
-                let status = self.status();
-                self.queue(i, None, Message::ListReply(vec![status]));
-            }
-            Message::Status => {
-                let status = self.status();
-                self.queue(i, session, Message::StatusReply(status));
-            }
+            Message::List => self.ask(i, Question::List),
+            Message::Status => self.ask(i, Question::Status),
             Message::New(_) => self.error(
                 i,
                 ErrorCode::BAD_REQUEST,
@@ -976,6 +1002,48 @@ impl Relay {
         self.input.extend_from_slice(bytes);
         self.flush_input();
         true
+    }
+
+    fn ask(&mut self, i: usize, question: Question) {
+        if let Some(client) = self.clients.get_mut(i) {
+            client.asked = Some(question);
+        }
+    }
+
+    /// Answers the questions asked in this turn, now that everything every
+    /// client sent in it has been acted on: a client that left or detached
+    /// before somebody asked how the session stands is not counted, whichever
+    /// connection either of them came on. (Answered when it was read, a
+    /// question would miss what the connections looked at after its own
+    /// brought in the same turn.) Each asker's requests after its question
+    /// are then taken up, in order, and a question among them is answered in
+    /// the next round.
+    fn answer_questions(&mut self) {
+        loop {
+            let asked: Vec<(usize, Question)> = self
+                .clients
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, client)| client.asked.take().map(|question| (i, question)))
+                .collect();
+            if asked.is_empty() {
+                return;
+            }
+            let status = self.status();
+            for (i, question) in asked {
+                match question {
+                    Question::Status => self.queue(
+                        i,
+                        Some(self.id.clone()),
+                        Message::StatusReply(status.clone()),
+                    ),
+                    Question::List => {
+                        self.queue(i, None, Message::ListReply(vec![status.clone()]));
+                    }
+                }
+                self.take_packets(i);
+            }
+        }
     }
 
     fn status(&self) -> Status {
