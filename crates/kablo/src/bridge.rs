@@ -24,21 +24,38 @@
 //! client is not taking what it already has, so a slow connection holds up its
 //! own sessions only, and a relay that is not read from drops the bridge's
 //! connection and gets it back with the offset where it left off.
+//!
+//! It also connects to TCP ports for the client (see [`crate::streams`]), which
+//! is what `ssh -L` does without asking sshd for anything. Those connections
+//! last as long as the client's does, and what they carry shares the pipe with
+//! the sessions without starving either (see [`crate::outbound`]). A server's
+//! administrator can turn them off by putting a file in [`NO_FORWARDING`]; the
+//! file is looked at again for every `open`, so the decision reaches a bridge
+//! that is already running.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use kablo_proto::v1::stream::{self as wire, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, NewSession, Packet, PacketDecoder,
+    ErrorCode, Features, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, NewSession, Packet,
 };
 use kablo_proto::{SessionId, WIRE};
 
 use crate::handshake::{self, Step};
 use crate::launch::{self, Failure};
 use crate::link::Link;
+use crate::outbound::Outbound;
 use crate::scan::{self, Scan};
+use crate::streams::{self, Streams};
 use crate::{journal, sockdir, sys};
+
+/// The file whose presence turns streams off. Its contents are not looked at.
+pub const NO_FORWARDING: &str = "/etc/kablo/no-forwarding";
+
+/// What a client is told when [`NO_FORWARDING`] is there.
+pub const FORWARDING_OFF: &str = "turned off by the server's administrator";
 
 /// Unsent bytes for the client above which relays are not read.
 const OUT_SOFT: usize = 1 << 20;
@@ -55,6 +72,7 @@ enum Source {
     Out,
     Link(usize),
     Probe(usize, usize),
+    Stream(streams::Token),
 }
 
 /// Runs the bridge on standard input and output in socket directory `dir`.
@@ -79,14 +97,14 @@ struct Bridge {
     dir: PathBuf,
     input: BorrowedFd<'static>,
     output: BorrowedFd<'static>,
-    /// The most bytes written to the client at a time.
-    chunk: usize,
     /// Bytes received before the handshake is complete.
     hello: Vec<u8>,
     open: bool,
-    decoder: PacketDecoder,
-    out: Vec<u8>,
-    sent: usize,
+    decoder: IncomingDecoder,
+    out: Outbound,
+    streams: Streams,
+    /// What the streams said this turn that is not `data`.
+    stream_out: Vec<wire::Packet>,
     links: Vec<Link>,
     scans: Vec<Scan>,
     stop: Option<u8>,
@@ -104,12 +122,12 @@ impl Bridge {
             dir,
             input,
             output,
-            chunk,
             hello: Vec::new(),
             open: false,
-            decoder: PacketDecoder::new(),
-            out: Vec::new(),
-            sent: 0,
+            decoder: IncomingDecoder::new(),
+            out: Outbound::new(chunk),
+            streams: Streams::new(wire::Side::Server, streams::Config::default()),
+            stream_out: Vec::new(),
             links: Vec::new(),
             scans: Vec::new(),
             stop: None,
@@ -118,7 +136,7 @@ impl Bridge {
     }
 
     fn pending(&self) -> usize {
-        self.out.len().saturating_sub(self.sent)
+        self.out.pending()
     }
 
     fn serve(&mut self) -> u8 {
@@ -149,6 +167,10 @@ impl Bridge {
                     sources.push(Source::Probe(s, p));
                 }
             }
+            for (fd, token) in self.streams.interest() {
+                set.push(fd);
+                sources.push(Source::Stream(token));
+            }
             let wait = self
                 .next_deadline()
                 .map(|at| at.saturating_duration_since(Instant::now()));
@@ -174,6 +196,9 @@ impl Bridge {
                             scan.ready(*p, fd.revents);
                         }
                     }
+                    Source::Stream(token) => {
+                        self.streams.ready(*token, fd.revents, &mut self.stream_out);
+                    }
                 }
             }
             for link in &mut self.links {
@@ -184,9 +209,19 @@ impl Bridge {
             }
             self.finish_scans(&mut outgoing);
             self.links.retain(|link| !link.is_gone());
+            self.streams.settle(&mut self.stream_out);
+            self.streams.expire(now, &mut self.stream_out);
             for packet in &outgoing {
                 self.emit(packet);
             }
+            for packet in std::mem::take(&mut self.stream_out) {
+                let _ = packet.encode(wire::Side::Server, self.out.buffer());
+            }
+            // A stream's frame goes in behind the sessions' bytes every turn,
+            // unless the client is so far behind that nothing is read from it
+            // either.
+            let force = self.pending() < OUT_HARD;
+            self.out.admit(&mut self.streams, force);
             if !self.flush() && self.stop.is_none() {
                 // The client's end is gone; so is the reason to be here.
                 self.stop = Some(0);
@@ -199,32 +234,18 @@ impl Bridge {
             .iter()
             .filter_map(Link::deadline)
             .chain(self.scans.iter().filter_map(Scan::deadline))
+            .chain(self.streams.deadline())
             .min()
     }
 
     fn emit(&mut self, packet: &Packet) {
-        let _ = packet.encode(&mut self.out);
+        let _ = packet.encode(self.out.buffer());
     }
 
     fn flush(&mut self) -> bool {
-        while self.pending() > 0 {
-            let end = (self.sent + self.chunk).min(self.out.len());
-            let waiting = self.out.get(self.sent..end).unwrap_or_default();
-            match sys::write_fd(self.output, waiting) {
-                Ok(0) => break,
-                Ok(n) => self.sent += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => return false,
-            }
-        }
-        if self.sent >= self.out.len() {
-            self.out.clear();
-            self.sent = 0;
-        } else if self.sent >= 256 * 1024 {
-            self.out.drain(..self.sent);
-            self.sent = 0;
-        }
-        true
+        let output = self.output;
+        self.out
+            .flush(&mut self.streams, &mut |bytes| sys::write_fd(output, bytes))
     }
 
     fn finish_scans(&mut self, outgoing: &mut Vec<Packet>) {
@@ -262,14 +283,14 @@ impl Bridge {
                 Ok(Step::Done {
                     reply, consumed, ..
                 }) => {
-                    self.out.extend_from_slice(&reply);
+                    self.out.push(&reply);
                     let rest = self.hello.get(consumed..).unwrap_or_default().to_vec();
                     self.decoder.push(&rest);
                     self.hello = Vec::new();
                     self.open = true;
                 }
                 Ok(Step::Refused { reply }) => {
-                    self.out.extend_from_slice(&reply);
+                    self.out.push(&reply);
                     let _ = self.flush();
                     self.stop = Some(1);
                     return;
@@ -281,8 +302,9 @@ impl Bridge {
             }
         }
         loop {
-            match self.decoder.next_packet() {
-                Ok(Some(packet)) => self.handle(packet, now, outgoing),
+            match self.decoder.next_incoming() {
+                Ok(Some(Incoming::Session(packet))) => self.handle(packet, now, outgoing),
+                Ok(Some(Incoming::Stream { from, packet })) => self.handle_stream(from, packet),
                 Ok(None) => return,
                 Err(e) if e.is_recoverable() => {
                     outgoing.push(Packet::connection(Message::Error {
@@ -307,6 +329,9 @@ impl Bridge {
                 session,
                 message: Message::Pong(bytes),
             }),
+            (_, Message::Features) => outgoing.push(Packet::connection(Message::FeaturesReply(
+                features(Path::new(NO_FORWARDING)),
+            ))),
             (_, Message::List) => match Scan::start(&self.dir, scan::WAIT) {
                 Ok(scan) => self.scans.push(scan),
                 Err(e) => outgoing.push(failure(None, ErrorCode::UNAVAILABLE, &e.to_string())),
@@ -324,6 +349,17 @@ impl Bridge {
                 outgoing.push(failure(session, ErrorCode::BAD_REQUEST, "not a request"))
             }
         }
+    }
+
+    /// A message about a stream. Whether streams are on is asked again for
+    /// every `open`, so that an administrator's decision reaches streams
+    /// opened after it.
+    fn handle_stream(&mut self, from: wire::Side, packet: wire::Packet) {
+        if matches!(packet.message, wire::Message::Open { .. }) {
+            self.streams
+                .set_closed(forwarding_off(Path::new(NO_FORWARDING)).map(str::to_owned));
+        }
+        self.streams.handle(from, packet, &mut self.stream_out);
     }
 
     /// Sends a request for session `id` to its relay, connecting first if this
@@ -453,6 +489,20 @@ fn created(dir: &std::path::Path, id: SessionId) -> Packet {
     }
 }
 
+/// What the server can do beyond sessions: streams, unless the administrator
+/// has turned them off by the file at `switch`.
+fn features(switch: &Path) -> Features {
+    match forwarding_off(switch) {
+        Some(why) => Features::streams_off(why),
+        None => Features::with_streams(),
+    }
+}
+
+/// Why streams are off, if the file at `switch` says so by being there.
+pub fn forwarding_off(switch: &Path) -> Option<&'static str> {
+    switch.exists().then_some(FORWARDING_OFF)
+}
+
 /// Whether a client may send this message to a session.
 fn is_request(message: &Message) -> bool {
     matches!(
@@ -482,5 +532,45 @@ pub fn check_dir(dir: &std::path::Path) -> std::io::Result<()> {
     match sockdir::check_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path that is not there, in a directory of its own.
+    fn switch(label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kablo-bridge-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), dir.join("no-forwarding"))
+    }
+
+    #[test]
+    fn streams_are_on_until_the_file_is_there() {
+        let (dir, path) = switch("on");
+        assert_eq!(forwarding_off(&path), None);
+        assert!(features(&path).streams);
+        assert_eq!(features(&path).reason, None);
+
+        // Its contents do not matter, and it is looked at again each time.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(forwarding_off(&path), Some(FORWARDING_OFF));
+        let off = features(&path);
+        assert!(!off.streams);
+        assert_eq!(off.reason.as_deref(), Some(FORWARDING_OFF));
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(forwarding_off(&path), None);
+        assert!(features(&path).streams);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_there_leaves_streams_on() {
+        let (dir, path) = switch("none");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(forwarding_off(&path), None);
     }
 }

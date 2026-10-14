@@ -27,8 +27,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, Exit, Message, NewSession, Packet, PacketDecoder, Size, Status, View,
+    ErrorCode, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, Status, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -562,6 +563,37 @@ pub struct Seen {
     /// Every picture received, across attaches.
     pub pictures: Vec<Pic>,
     pub ended: Option<Exit>,
+    /// Whether the program's bytes are left out of `data` (a test that lets a
+    /// session run flat out has no use for them).
+    pub discard: bool,
+}
+
+/// What a client of a bridge has seen of one stream.
+#[derive(Default)]
+pub struct Flow {
+    /// The window the bridge offered in `opened`: what this end may send.
+    pub opened: Option<u32>,
+    /// Why the bridge could not open it.
+    pub failed: Option<(FailCode, String)>,
+    /// The bytes the target sent.
+    pub data: Vec<u8>,
+    /// How many bytes the target sent in all (kept when `data` is not).
+    pub total: u64,
+    /// The bridge said the target has no more to send.
+    pub eof: bool,
+    /// The bridge closed the stream.
+    pub closed: bool,
+    /// Bytes of credit received.
+    pub credit: u64,
+    /// Bytes sent to the target so far.
+    pub sent: u64,
+    /// Whether received bytes are held back from the target (no credit given
+    /// until [`Bridge::stream_release`]); by default they are credited at once.
+    pub hold: bool,
+    /// Bytes received and held.
+    pub owed: u64,
+    /// Whether the bytes are left out of `data`.
+    pub discard: bool,
 }
 
 /// A client of `kablo attach` (or of anything else that speaks the protocol
@@ -569,9 +601,18 @@ pub struct Seen {
 /// over one connection.
 pub struct Bridge {
     sock: UnixStream,
-    decoder: PacketDecoder,
+    decoder: IncomingDecoder,
     child: Child,
     pub sessions: HashMap<String, Seen>,
+    pub flows: HashMap<u32, Flow>,
+    pub features: Vec<Features>,
+    /// Every byte received after the handshake, once recording (see
+    /// [`Bridge::record`]).
+    pub raw: Option<Vec<u8>>,
+    next_stream: u32,
+    /// What the next stream opened is to do with the bytes it receives: held
+    /// back from the target, and left out of its `data` (see [`Flow`]).
+    pub next_flow: (bool, bool),
     pub listed: Vec<Vec<Status>>,
     pub created: Vec<Status>,
     pub statuses: Vec<Status>,
@@ -620,9 +661,14 @@ impl Bridge {
         (
             Bridge {
                 sock,
-                decoder: PacketDecoder::new(),
+                decoder: IncomingDecoder::new(),
                 child,
                 sessions: HashMap::new(),
+                flows: HashMap::new(),
+                features: Vec::new(),
+                raw: None,
+                next_stream: 0,
+                next_flow: (false, false),
                 listed: Vec::new(),
                 created: Vec::new(),
                 statuses: Vec::new(),
@@ -665,7 +711,12 @@ impl Bridge {
                     self.lost = Some("the stream ended".to_owned());
                     break;
                 }
-                Ok(n) => self.decoder.push(&buf[..n]),
+                Ok(n) => {
+                    if let Some(raw) = &mut self.raw {
+                        raw.extend_from_slice(&buf[..n]);
+                    }
+                    self.decoder.push(&buf[..n]);
+                }
                 Err(e) if nothing_yet(&e) => {}
                 Err(e) => {
                     self.closed = true;
@@ -682,7 +733,20 @@ impl Bridge {
     }
 
     fn file(&mut self) {
-        while let Some(packet) = self.decoder.next_packet().unwrap() {
+        let mut credits = Vec::new();
+        while let Some(incoming) = self.decoder.next_incoming().unwrap() {
+            let packet = match incoming {
+                Incoming::Session(packet) => packet,
+                Incoming::Stream { from, packet } => {
+                    assert_eq!(
+                        from,
+                        stream::Side::Server,
+                        "the bridge speaks as the server"
+                    );
+                    self.file_stream(packet, &mut credits);
+                    continue;
+                }
+            };
             let name = packet.session.as_ref().map(|s| s.as_str().to_owned());
             match packet.message {
                 Message::Attached { offset, truncated } => {
@@ -704,7 +768,9 @@ impl Bridge {
                     let seen = self.sessions.entry(name.unwrap()).or_default();
                     assert_eq!(offset, seen.next, "output is not contiguous");
                     seen.next += data.len() as u64;
-                    seen.data.extend_from_slice(&data);
+                    if !seen.discard {
+                        seen.data.extend_from_slice(&data);
+                    }
                 }
                 Message::Ended(exit) => {
                     self.sessions.entry(name.unwrap()).or_default().ended = Some(exit)
@@ -714,8 +780,38 @@ impl Bridge {
                 Message::Created(status) => self.created.push(status),
                 Message::StatusReply(status) => self.statuses.push(status),
                 Message::Pong(bytes) => self.pongs.push(bytes),
+                Message::FeaturesReply(features) => self.features.push(features),
                 other => panic!("the bridge sent {other:?}"),
             }
+        }
+        // Bytes taken are handed back after the whole read, the way a client
+        // that reads a buffer's worth and then credits it does.
+        for (id, bytes) in credits {
+            self.stream_message(id, stream::Message::Credit(bytes));
+        }
+    }
+
+    fn file_stream(&mut self, packet: stream::Packet, credits: &mut Vec<(u32, u32)>) {
+        let id = packet.stream;
+        let flow = self.flows.entry(id).or_default();
+        match packet.message {
+            stream::Message::Opened { window } => flow.opened = Some(window),
+            stream::Message::Failed { code, text } => flow.failed = Some((code, text)),
+            stream::Message::Data(bytes) => {
+                flow.total += bytes.len() as u64;
+                if !flow.discard {
+                    flow.data.extend_from_slice(&bytes);
+                }
+                if flow.hold {
+                    flow.owed += bytes.len() as u64;
+                } else {
+                    credits.push((id, bytes.len() as u32));
+                }
+            }
+            stream::Message::Credit(bytes) => flow.credit += u64::from(bytes),
+            stream::Message::Eof => flow.eof = true,
+            stream::Message::Close => flow.closed = true,
+            other @ stream::Message::Open { .. } => panic!("the bridge sent {other:?}"),
         }
     }
 
@@ -841,6 +937,126 @@ impl Bridge {
     /// Closes our end of the connection, as a client that goes away does.
     pub fn hang_up(&mut self) {
         let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Starts keeping every byte received from now on in `raw`.
+    pub fn record(&mut self) {
+        self.raw = Some(Vec::new());
+    }
+
+    /// Sends bytes as they are.
+    pub fn send_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.sock.write_all(bytes);
+    }
+
+    /// Sends a stream frame as it is written here, with a payload that is
+    /// `id` and then `rest`: for the frames a conforming client does not send.
+    pub fn stream_raw(&mut self, kind: u8, id: u32, rest: &[u8]) {
+        let mut payload = id.to_be_bytes().to_vec();
+        payload.extend_from_slice(rest);
+        let mut bytes = Vec::new();
+        kablo_proto::frame::encode_frame(
+            &mut bytes,
+            &kablo_proto::frame::RawFrame {
+                kind,
+                channel: kablo_proto::frame::CHANNEL_STREAM,
+                session: Vec::new(),
+                payload,
+            },
+        )
+        .unwrap();
+        let _ = self.sock.write_all(&bytes);
+    }
+
+    /// Sends one stream message as the client.
+    pub fn stream_message(&mut self, id: u32, message: stream::Message) {
+        let mut bytes = Vec::new();
+        stream::Packet::new(id, message)
+            .encode(stream::Side::Client, &mut bytes)
+            .unwrap();
+        let _ = self.sock.write_all(&bytes);
+    }
+
+    /// Sends an `open` for the next stream number and returns it. The answer
+    /// is in [`Bridge::flows`].
+    pub fn open_stream(&mut self, host: &str, port: u16, window: u32) -> u32 {
+        self.next_stream += 1;
+        let id = self.next_stream;
+        let (hold, discard) = std::mem::take(&mut self.next_flow);
+        let flow = self.flow(id);
+        flow.hold = hold;
+        flow.discard = discard;
+        self.stream_message(
+            id,
+            stream::Message::Open {
+                window,
+                port,
+                host: host.to_owned(),
+            },
+        );
+        id
+    }
+
+    /// Opens a stream and waits for the answer: the stream and the window the
+    /// bridge offered, or the stream, the code and the text of why it would
+    /// not.
+    pub fn connect_stream(
+        &mut self,
+        host: &str,
+        port: u16,
+        window: u32,
+    ) -> Result<(u32, u32), (u32, FailCode, String)> {
+        let id = self.open_stream(host, port, window);
+        self.until("the answer to an open", |b| {
+            b.flows
+                .get(&id)
+                .is_some_and(|f| f.opened.is_some() || f.failed.is_some())
+        });
+        let flow = self.flow(id);
+        match (flow.opened, flow.failed.clone()) {
+            (Some(window), _) => Ok((id, window)),
+            (None, Some((code, text))) => Err((id, code, text)),
+            (None, None) => unreachable!(),
+        }
+    }
+
+    /// Sends bytes on a stream, in `data` messages of at most `piece` bytes.
+    /// The caller keeps within the window.
+    pub fn stream_send(&mut self, id: u32, bytes: &[u8], piece: usize) {
+        let mut wire = Vec::new();
+        for chunk in bytes.chunks(piece) {
+            stream::Packet::new(id, stream::Message::Data(chunk.to_vec()))
+                .encode(stream::Side::Client, &mut wire)
+                .unwrap();
+        }
+        let _ = self.sock.write_all(&wire);
+        self.flow(id).sent += bytes.len() as u64;
+    }
+
+    /// The client has no more bytes for the target.
+    pub fn stream_eof(&mut self, id: u32) {
+        self.stream_message(id, stream::Message::Eof);
+    }
+
+    /// Ends a stream both ways.
+    pub fn stream_close(&mut self, id: u32) {
+        self.stream_message(id, stream::Message::Close);
+    }
+
+    /// What this client has seen of stream `id`.
+    pub fn flow(&mut self, id: u32) -> &mut Flow {
+        self.flows.entry(id).or_default()
+    }
+
+    /// Gives credit for what has been received and held.
+    pub fn stream_release(&mut self, id: u32) {
+        let owed = std::mem::take(&mut self.flow(id).owed);
+        let mut left = owed;
+        while left > 0 {
+            let part = left.min(u64::from(u32::MAX)) as u32;
+            self.stream_message(id, stream::Message::Credit(part));
+            left -= u64::from(part);
+        }
     }
 
     /// Waits for the process on the other end to exit.
