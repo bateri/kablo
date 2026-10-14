@@ -36,6 +36,22 @@ use kablo_screen::Screen;
 /// How long a test waits for anything before it calls it failed.
 pub const PATIENCE: Duration = Duration::from_secs(30);
 
+/// Whether a read of a socket with a read timeout that failed with `error`
+/// only means nothing has come yet, as opposed to the connection being over.
+///
+/// A signal is one of those: a read with a timeout is not restarted after one.
+/// Linux ends it with `EINTR` when a child of this process ends, even though
+/// nobody handles `SIGCHLD`, and the tests start and collect children all the
+/// time from threads running side by side.
+pub fn nothing_yet(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Env {
@@ -388,11 +404,7 @@ impl Conn {
                     break;
                 }
                 Ok(n) => self.decoder.push(&buf[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
+                Err(e) if nothing_yet(&e) => {}
                 Err(_) => {
                     self.closed = true;
                     break;
@@ -561,6 +573,8 @@ pub struct Bridge {
     /// `(session, code, text)` of every `error`.
     pub errors: Vec<(Option<String>, ErrorCode, String)>,
     pub closed: bool,
+    /// How the connection was found closed, for a failure message.
+    lost: Option<String>,
 }
 
 impl Bridge {
@@ -583,11 +597,13 @@ impl Bridge {
         let mut byte = [0u8; 1];
         let signature = WIRE.signature;
         while !seen.ends_with(signature) {
-            let got = sock
-                .read(&mut byte)
-                .expect("the bridge answers the handshake");
-            assert_eq!(got, 1, "the bridge closed before it answered");
-            seen.push(byte[0]);
+            match sock.read(&mut byte) {
+                Ok(0) => panic!("the bridge closed before it answered"),
+                Ok(_) => seen.push(byte[0]),
+                // Not an answer, and not the end of one (see `nothing_yet`).
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("the bridge answers the handshake: {e}"),
+            }
         }
         let mut rest = [0u8; 3];
         sock.read_exact(&mut rest).unwrap();
@@ -607,6 +623,7 @@ impl Bridge {
                 pongs: Vec::new(),
                 errors: Vec::new(),
                 closed: false,
+                lost: None,
             },
             noise,
         )
@@ -639,16 +656,14 @@ impl Bridge {
             match self.sock.read(&mut buf) {
                 Ok(0) => {
                     self.closed = true;
+                    self.lost = Some("the stream ended".to_owned());
                     break;
                 }
                 Ok(n) => self.decoder.push(&buf[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => {
+                Err(e) if nothing_yet(&e) => {}
+                Err(e) => {
                     self.closed = true;
+                    self.lost = Some(format!("a read failed: {e}"));
                     break;
                 }
             }
@@ -706,8 +721,30 @@ impl Bridge {
             if done(self) {
                 return;
             }
-            assert!(!self.closed, "the bridge closed while waiting for {what}");
+            if self.closed {
+                let lost = self.lost.clone().unwrap_or_default();
+                let end = self.ending();
+                panic!("the bridge closed while waiting for {what} ({lost}); {end}");
+            }
             assert!(start.elapsed() < PATIENCE, "timed out waiting for {what}");
+        }
+    }
+
+    /// How the process on the other end stands, for a failure message: it
+    /// tells a process that was killed, or that left on its own, from one that
+    /// is still there (the connection was lost on this side, then). A process
+    /// that closed its end is given a moment to finish exiting.
+    fn ending(&mut self) -> String {
+        let start = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return format!("its process ended with {status}"),
+                Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => return "its process is still running".to_owned(),
+                Err(e) => return format!("its process cannot be waited for: {e}"),
+            }
         }
     }
 

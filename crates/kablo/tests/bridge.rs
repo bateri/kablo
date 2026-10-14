@@ -977,11 +977,7 @@ impl Deaf {
                 match sock.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => decoder.push(&buf[..n]),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
+                    Err(e) if common::nothing_yet(&e) => {}
                     Err(_) => break,
                 }
                 while let Some(packet) = decoder.next_packet().unwrap() {
