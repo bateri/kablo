@@ -1,0 +1,12 @@
+# new session "build-1" with a command and 5000 rows of scrollback
+09                                                        # kind 0x09: new
+00                                                        # channel 0: terminal session
+07                                                        # session id length 7
+00 00 00 17                                               # payload length 23
+62 75 69 6c 64 2d 31                                      # session id "build-1"
+00 01                                                     # tlv key 1
+00 00 00 07                                               #   length 7
+2f 62 69 6e 2f 73 68                                      #   argument 0
+00 06                                                     # tlv key 6
+00 00 00 04                                               #   length 4
+00 00 13 88                                               #   5000 rows of scrollback

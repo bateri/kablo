@@ -101,7 +101,7 @@ Kinds below 0x80 go client to server, the others server to client.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64` |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture) |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -119,6 +119,7 @@ Kinds below 0x80 go client to server, the others server to client.
 | 0x86 | `status_reply` | yes | status TLV block, below |
 | 0x87 | `list_reply` | no | TLV block of `session` entries, below |
 | 0x88 | `created` | yes | status TLV block |
+| 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
 
 The first six client messages (`attach`, `detach`, `resize`, `terminate`,
 `upgrade`, `status`) are the core a relay must always understand.
@@ -135,11 +136,12 @@ at the server's default size.
 | 3 | bytes | `directory`: where to start |
 | 4 | 8 bytes | `size`: columns, rows, xpixel, ypixel as in `resize`; a size with a zero column or row count means the default (80 by 24) |
 | 5 | u64 | `journal`: the journal's capacity in bytes, from 16 KiB to 1 GiB; the default is 8 MiB |
+| 6 | u32 | `history`: how many rows of scrollback the session's screen keeps, from 0 to 100000; the default is 2000 |
 
 The command is an argument vector, **never a shell string**, and a server never
 builds a command line out of it. No argument, name, value or directory may
 contain a NUL; a name is not empty and has no `=`; a directory is not empty.
-A `new` that breaks this is malformed. A `journal` outside its range is
+A `new` that breaks this is malformed. A `journal` or a `history` outside its range is
 answered with `error` (`BAD_REQUEST`) and starts nothing.
 
 The session id in the header is the name asked for; a header with no id lets
@@ -189,8 +191,10 @@ client that shows it to a person removes control characters first.
 **Attach.** `attach(offset)` asks for the session's output starting at the
 byte `offset` (offsets count bytes the program has written since the session
 began; `u64::MAX` means "from now on"). The server answers `attached` with the
-offset the stream actually starts at, then sends `output` messages whose offsets
-are contiguous: each one's offset is the previous one's plus its length. The
+offset the stream actually starts at, then, if the offset asked for is gone
+or the client asked for one, a picture of the screen (below), then sends
+`output` messages whose offsets are contiguous: each one's offset is the
+previous one's plus its length. The
 `output` data is the program's bytes as written, and an `output` never carries
 more than 1 MiB minus 8 bytes. Several clients may attach to one session: all of
 them receive the output, input from any of them reaches the terminal, and the
@@ -199,18 +203,73 @@ attached are answered with `error` (`NOT_ATTACHED`) and do nothing; `detach`
 ends the stream and keeps the connection. An `attach` offset past the end of
 the stream is `BAD_REQUEST`.
 
+The `attach` of a client that knows its terminal carries a **view**: the
+terminal's size, and whether it wants a picture whatever the offset. The
+session's terminal takes that size before the answer, as if the client had sent
+a `resize`, so the picture is made for it; a size with a zero column or row
+count says nothing. A client without a view gets the picture for the size the
+terminal has. A relay that predates views reads the offset and ignores the
+rest, and answers as it always did (no picture).
+
 **Coming back.** A client that lost its connection attaches again with the
 offset after the last byte it received and gets exactly the bytes it missed, no
 more and no fewer. Output produced while nobody was attached is kept in a
 bounded journal.
 
-**Truncation.** When the journal no longer holds the offset asked for, the
-server answers `attached` with `truncated` set and an offset it can serve: the
-start of the first line in what remains (the byte after the first newline), so
-that the stream does not begin in the middle of an escape sequence. A
-truncated `attach` also makes the terminal one row smaller and back, so that a
-full-screen program, which gets `SIGWINCH` for each change, draws itself
-again.
+**Truncation and the picture.** The server keeps a screen of its own, built
+from every byte the program writes with the parser bateri uses. When the
+journal no longer holds the offset asked for, the server answers `attached`
+with `truncated` set and the offset the journal has reached, and follows it
+with a **picture**: the bytes that, written to a freshly reset terminal of the
+size the picture says, build the screen the program has now (both screens and
+which is active, the scrollback it was made to keep, every cell's text, colours
+and attributes, links, cursors, scrolling region, tab stops, character sets,
+modes, the title) and end with whatever escape sequence the stream stopped in.
+`output` goes on from the picture's `offset`, so the client has the screen and
+then the program's own bytes, with nothing missing and nothing twice. A client
+can ask for a picture whatever the offset (`attach` with the picture flag), as
+a device that has never seen the session does.
+
+A picture is one or more `picture` messages, in order, all with the same
+`offset`, `cols` and `rows`; every one but the last has `more` set. A client
+resets its terminal before the first piece and writes the bytes as they are.
+An `attached` that arrives before the last piece starts everything over: the
+connection the picture was coming over was replaced, and the picture is
+discarded. A reader that does not know `picture` skips it: it is told `truncated`
+and gets the program's bytes from the picture's offset on, none of what the
+journal still held and no screen.
+
+What a picture is not: kitty graphics images (the screen is text), the selection,
+a mode its terminal library keeps no bit for (SGR-pixel mouse). The screen is
+the server's, kept at the size of the last `resize` or `attach` view (a terminal
+that has ended keeps the size it ended at); a relay that is replaced or
+restarted rebuilds it from what the journal holds, from its start if nothing
+has been dropped and the journal is not very large, and from the first line
+break of the last 64 MiB of it otherwise, so a screen whose beginning was
+dropped (a full-screen program entered long ago) may lack state the dropped
+bytes set.
+
+A client that is slow to take a picture while the program writes faster than the
+journal holds is let go when the journal passes the picture's offset, and asks
+again with the picture still owed to it; the bridge does this for a client that
+did not notice, and a fast enough link never has the problem.
+
+**Questions nobody answers.** A program may ask its terminal a question (device
+attributes, the cursor position, a mode, the size in characters, whether the
+kitty keyboard protocol is there). The server's screen answers those that need
+nothing from the terminal's owner, as the parser would for any terminal, and its
+answer reaches the program **only while no client is attached**: with one
+attached the client's own terminal answers, and two answers to one question
+would be typed into the program. The server keeps in the journal how far the
+questions were answered, so what it reads while it serves, and what the keeper
+read while no server did (a program that asks at once, before the relay is up;
+the moment between one relay and the next), is answered once, by whichever relay
+comes to it first, and what an earlier relay answered is not answered again.
+Colour, clipboard and pixel-size questions are never answered by the server. A
+client that replays output it missed from the journal sees the questions that
+were asked meanwhile and answers them again. The kitty keyboard question is
+answered as a terminal that has the protocol would, which is what the client's
+own terminal does when it is attached.
 
 **Ending.** When the program exits, the server sends the rest of its output,
 then `ended` with how it exited. The session is kept until a client has been
@@ -291,7 +350,10 @@ every session for its status and replies with the sessions that answered) and
   bridge connects again, attaches again from the byte after the last one it
   gave the client and does not tell the client: the stream goes on with
   contiguous offsets and no second `attached`. If the journal has already
-  moved past that byte the new `attached` carries `truncated` and is passed on.
+  moved past that byte the new `attached` carries `truncated` and is passed
+  on, with the picture that follows it; so is the `attached` of a connection
+  lost in the middle of a picture, which the bridge asks to send the picture
+  again.
 - When the client's end of the connection closes, the bridge ends and nothing
   else does: no session is closed by it.
 
@@ -304,6 +366,9 @@ every session for its status and replies with the sessions that answered) and
 | frame payload | 1 MiB |
 | upgrade path | 4096 bytes |
 | journal capacity (`new`) | 16 KiB to 1 GiB, 8 MiB by default |
+| scrollback of the screen (`new`) | 0 to 100000 rows, 2000 by default |
+| terminal size (`new`, `resize`, an `attach` view) | at most 1000 columns by 1000 rows; more is `BAD_REQUEST` |
+| bytes in one `picture` | 1 MiB minus 13 bytes |
 | connections to one session | 64 |
 | input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |

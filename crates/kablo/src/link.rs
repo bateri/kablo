@@ -13,7 +13,11 @@
 //! `output` is handed to the owner, so the offset a new connection asks for
 //! is exactly the first byte the client has not been given. If the journal
 //! has moved past it by then, the new relay says so (`truncated`) and that
-//! `attached` goes to the client, who sees the gap for what it is.
+//! `attached` goes to the client, who sees the gap for what it is, and so does
+//! the picture of the screen the relay sends after it. A picture the client is
+//! owed (asked for, or announced by a `truncated` `attached`) and has not got
+//! whole is asked for again by the next connection, whose `attached` is then
+//! passed on too: the client starts the picture over.
 //!
 //! The link talks to its owner through packets: [`Link::send`] takes what the
 //! client sent, and everything that is to go back to the client is pushed to
@@ -26,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{ErrorCode, Message, Packet};
+use kablo_proto::v1::{ErrorCode, Message, Packet, Size, View};
 
 use crate::peer::{Gone, Peer};
 use crate::{sockdir, sys};
@@ -54,6 +58,11 @@ pub const BUSY: &str = "too many requests are waiting";
 struct Attach {
     /// The offset the client asked for.
     requested: u64,
+    /// What the client said of its terminal, kept as current as its resizes
+    /// make it: a relay that takes over does not know it.
+    view: Option<View>,
+    /// The client is owed a picture of the screen it has not got whole.
+    owed: bool,
     /// The offset after the last byte handed to the client; `None` until the
     /// first `attached` or `output`.
     delivered: Option<u64>,
@@ -157,12 +166,22 @@ impl Link {
             return Some(packet);
         }
         match &packet.message {
-            Message::Attach { offset } => {
+            Message::Attach { offset, view } => {
                 self.attach = Some(Attach {
                     requested: *offset,
+                    view: *view,
+                    owed: view.is_some_and(|view| view.picture),
                     delivered: None,
                     announced: false,
                 });
+            }
+            Message::Resize(size) => {
+                if let Some(attach) = self.attach.as_mut() {
+                    attach.view = Some(View {
+                        size: *size,
+                        picture: false,
+                    });
+                }
             }
             Message::Detach => self.attach = None,
             Message::Status => self.status_pending += 1,
@@ -247,11 +266,22 @@ impl Link {
                     if let Some(attach) = self.attach.as_mut() {
                         attach.announced = true;
                         attach.delivered = Some(*offset);
+                        // A cut stream is followed by a picture; so is a
+                        // stream that was asked to be.
+                        attach.owed |= *truncated;
+                    }
+                }
+                Message::Picture { more, .. } => {
+                    if let Some(attach) = self.attach.as_mut() {
+                        attach.owed = *more;
                     }
                 }
                 Message::Output { offset, data } => {
                     if let Some(attach) = self.attach.as_mut() {
                         attach.delivered = Some(offset + data.len() as u64);
+                        // The stream goes on: no picture is coming (a relay
+                        // that sends none, or one that has sent it).
+                        attach.owed = false;
                     }
                 }
                 Message::Ended(_) => self.finished = true,
@@ -304,8 +334,26 @@ impl Link {
                 self.swallow = 0;
                 if let Some(attach) = &self.attach {
                     let offset = attach.delivered.unwrap_or(attach.requested);
-                    peer.queue(&Packet::about(self.id.clone(), Message::Attach { offset }));
-                    if attach.announced {
+                    // The picture is asked for again only while it is owed; the
+                    // size is the client's latest.
+                    let view = match (attach.view, attach.owed) {
+                        (Some(view), owed) => Some(View {
+                            picture: owed,
+                            ..view
+                        }),
+                        (None, true) => Some(View {
+                            size: Size::default(),
+                            picture: true,
+                        }),
+                        (None, false) => None,
+                    };
+                    peer.queue(&Packet::about(
+                        self.id.clone(),
+                        Message::Attach { offset, view },
+                    ));
+                    // The `attached` that answers is the client's own again
+                    // unless the client is to see it: a picture starts over.
+                    if attach.announced && !attach.owed {
                         self.swallow = 1;
                     }
                 }

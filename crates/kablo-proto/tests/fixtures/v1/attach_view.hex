@@ -1,0 +1,9 @@
+# attach "work" from offset 0x1000 as a 120x40 terminal, picture asked for
+01                       # kind 0x01: attach
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 11              # payload length 17
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 10 00  # offset 4096
+00 78 00 28 03 c0 03 20  # view: 120 columns, 40 rows, 960 x 800 pixels
+01                       # view flags: picture

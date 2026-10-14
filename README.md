@@ -9,7 +9,11 @@ the last one left off.
 Unlike tmux or screen, kablo draws nothing. It does not put a terminal of its
 own between the program and you; while a client is attached, the bytes the
 program writes reach the client unchanged. Windows, tabs and splits belong to
-the terminal app, not to kablo.
+the terminal app, not to kablo. It does keep a screen of its own on the side,
+fed by the same bytes: a client that has been away longer than the journal
+reaches gets a picture of that screen first, then the program's output as it
+comes, and programs that ask their terminal something while nobody is attached
+are answered.
 
 kablo is built to be driven by a terminal app — locally over a unix socket,
 remotely over a plain `ssh host kablo attach` — and needs nothing from the
@@ -60,16 +64,19 @@ session that goes on without you. `--id NAME` names it (letters, digits, `.`,
 `_` and `-`; up to 64), `--cols` and `--rows` give it a size, `--cwd DIR` a
 directory, `--env NAME=VALUE` an addition to the environment, and
 `--journal-size 32M` how much output is kept for a client that comes back
-(16K to 1G; the default is 8M).
+(16K to 1G; the default is 8M). `--history 5000` is how many rows of scrollback
+the session's screen keeps for the picture (0 to 100000; the default is 2000).
 
 `kablo connect ID` puts the session on your terminal: what you type goes to
 the program, what it writes goes to your screen, and resizing the window
 resizes the program's terminal. **Ctrl-\ leaves the session running** and gives
 the terminal back; ending the program (`exit`) ends the session, and
 `connect` exits with the program's own status. Connecting again shows what the
-session printed while you were gone: kablo keeps the bytes the program wrote,
-so a full-screen program is drawn again from the start of what is kept, and
-the last frame wins. `--fresh` skips the past and shows only what comes next.
+session printed while you were gone: if the journal still reaches back to the
+start, you get the bytes the program wrote; if not, your terminal is reset and
+gets a picture of the session's screen (the screen, the scrollback it kept, the
+modes the program set), and the program's own output goes on from there.
+`--fresh` skips the past and shows only what comes next.
 When the session cannot take what you type for a moment, `connect` holds it
 and tries again (a few seconds at most, then it says why and exits); when the
 program is not reading its input at all, the terminal rings its bell for the
@@ -165,13 +172,34 @@ memory of where its relay comes from (see *Limits*).
 
 ## Limits
 
-- **No screen snapshot yet.** kablo keeps bytes, not a picture of the screen.
-  A client that comes back gets the bytes it missed. If the journal has
-  wrapped, it gets the rest from the start of the first line that is left and
-  is told the earlier part is gone, and a full-screen program is nudged to
-  redraw (the terminal is made one row smaller and back). A program that
-  changes the screen without drawing it all again can look wrong until it
-  redraws.
+- **The picture is of a text screen.** A client that comes back gets the bytes
+  it missed; if the journal has wrapped past them it gets a picture of the
+  screen instead, and the stream from where the picture ends. The picture
+  carries cells, colours and attributes, links, both screens, the scrollback
+  (up to `--history` rows), the cursor and the modes. It does not carry
+  images (kitty graphics) or the mouse mode that reports pixels, and the
+  title comes back only if the program set one. The screen keeps the size of the last client that said one (once the
+  program has ended it keeps the size it ended at).
+- **A replaced or restarted relay rebuilds the screen from the journal**: from
+  its start if nothing was dropped and the journal is not very large, else from
+  the first line break in the last 64 MiB of it.
+  A program that set modes or drew the screen long before that point (a
+  full-screen editor entered hours ago, with output since) can come back
+  without them until it draws again; the bytes a client gets are never wrong
+  for it.
+- **A picture is a screen, not the stream.** A client that takes it slower than
+  the program writes (a slow link, a program printing without end) can be let go
+  when the journal passes its picture, and is sent a newer one; one picture per
+  attached client is held in the session until it is sent.
+- **A terminal has at most 1000 columns and 1000 rows**: the session's screen
+  keeps every cell of it, so a size is memory.
+- **Questions to the terminal are answered by the session only while nobody is
+  attached**: device attributes, the cursor position, mode and size reports, and
+  whether the kitty keyboard protocol is there (answered as a terminal that has
+  it would, as the client's own terminal does).
+  With a client attached its own terminal answers, and a client that replays
+  output it missed answers the questions asked meanwhile again. Colours, the
+  clipboard and the size in pixels are never answered by the session.
 - **A program that does not read its input** gets only so much of it. The
   session holds 1 MiB of typed bytes for it; past that, an `input` is not
   written and its sender is told (`INPUT_FULL` in the protocol; through the

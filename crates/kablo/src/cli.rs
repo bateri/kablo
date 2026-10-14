@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{NewSession, Size};
+use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_ROWS, NewSession, Size};
 
 use crate::{
     bridge, connect, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade, warden,
@@ -29,7 +29,8 @@ commands:
   help      print this text
 
 kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
-          [--journal-size BYTES[K|M|G]] [-- PROGRAM [ARGUMENT]...]
+          [--journal-size BYTES[K|M|G]] [--history ROWS]
+          [-- PROGRAM [ARGUMENT]...]
 kablo list [--json]
 kablo connect [--fresh] ID
 kablo attach
@@ -149,8 +150,8 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
                     "an id is 1 to 64 characters of letters, digits, '.', '_' and '-'".to_owned()
                 })?);
             }
-            "--cols" => cols = Some(number(value()?, "--cols")?),
-            "--rows" => rows = Some(number(value()?, "--rows")?),
+            "--cols" => cols = Some(number(value()?, "--cols", MAX_COLS)?),
+            "--rows" => rows = Some(number(value()?, "--rows", MAX_ROWS)?),
             "--cwd" => {
                 let value = value()?;
                 let path = PathBuf::from(value);
@@ -175,6 +176,9 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
             "--journal-size" => {
                 parsed.request.journal_size = Some(size_with_unit(value()?)?);
             }
+            "--history" => {
+                parsed.request.history = Some(history(value()?)?);
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -190,12 +194,21 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
     Ok(parsed)
 }
 
-fn number(value: &OsStr, name: &str) -> Result<u16, String> {
+fn number(value: &OsStr, name: &str, most: u16) -> Result<u16, String> {
     value
         .to_str()
         .and_then(|v| v.parse::<u16>().ok())
-        .filter(|&n| n > 0)
-        .ok_or_else(|| format!("{name} takes a number from 1 to 65535"))
+        .filter(|&n| (1..=most).contains(&n))
+        .ok_or_else(|| format!("{name} takes a number from 1 to {most}"))
+}
+
+/// The rows of scrollback the screen keeps: 0 to the most a screen may.
+fn history(value: &OsStr) -> Result<u32, String> {
+    value
+        .to_str()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n <= MAX_HISTORY)
+        .ok_or_else(|| format!("--history takes a number of rows from 0 to {MAX_HISTORY}"))
 }
 
 /// `1048576`, `64K`, `8M` or `1G`.
@@ -466,6 +479,8 @@ mod tests {
             "E=",
             "--journal-size",
             "64K",
+            "--history",
+            "500",
             "--",
             "/bin/sh",
             "-c",
@@ -483,6 +498,7 @@ mod tests {
             ]
         );
         assert_eq!(parsed.request.journal_size, Some(64 * 1024));
+        assert_eq!(parsed.request.history, Some(500));
         assert_eq!(
             parsed.request.argv,
             vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"--id".to_vec()]
@@ -503,16 +519,23 @@ mod tests {
             &["--id"][..],
             &["--id", "a/b"],
             &["--cols", "0"],
+            &["--cols", "1001"],
+            &["--rows", "1001"],
             &["--rows", "x"],
             &["--env", "NOEQUALS"],
             &["--env", "=v"],
             &["--journal-size", "5"],
             &["--journal-size", "2T"],
             &["--journal-size", "1G1"],
+            &["--history", "-1"],
+            &["--history", "100001"],
+            &["--history", "lots"],
             &["--bogus"],
         ] {
             assert!(parse_new(&os(bad)).is_err(), "{bad:?}");
         }
+        assert_eq!(history(OsStr::new("0")), Ok(0));
+        assert_eq!(history(OsStr::new("100000")), Ok(MAX_HISTORY));
         assert_eq!(size_with_unit(OsStr::new("1G")), Ok(1 << 30));
         assert!(size_with_unit(OsStr::new("2G")).is_err());
     }

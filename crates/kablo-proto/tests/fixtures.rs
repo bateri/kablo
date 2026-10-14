@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use kablo_proto::frame::{self, RawFrame};
 use kablo_proto::hello::Reply;
 use kablo_proto::v1::{
-    self, Exit, Message, NewSession, Packet, PacketDecoder, Size, State, Status, kind, read_packet,
-    write_packet,
+    self, Exit, Message, NewSession, Packet, PacketDecoder, Size, State, Status, View, kind,
+    read_packet, write_packet,
 };
 use kablo_proto::{CHANNEL_SESSION, Error, SessionId, WIRE};
 
@@ -108,13 +108,24 @@ fn messages() -> Vec<(&'static str, Packet)> {
             ypixel: 0,
         }),
         journal_size: Some(1 << 20),
+        history: None,
     };
     vec![
-        ("attach", work(Message::Attach { offset: 0x1000 })),
+        ("attach", work(Message::attach(0x1000))),
+        ("attach_end", work(Message::attach(v1::OFFSET_END))),
         (
-            "attach_end",
+            "attach_view",
             work(Message::Attach {
-                offset: v1::OFFSET_END,
+                offset: 0x1000,
+                view: Some(View {
+                    size: Size {
+                        cols: 120,
+                        rows: 40,
+                        xpixel: 960,
+                        ypixel: 800,
+                    },
+                    picture: true,
+                }),
             }),
         ),
         ("detach", work(Message::Detach)),
@@ -147,6 +158,17 @@ fn messages() -> Vec<(&'static str, Packet)> {
             Packet::about(id("build-1"), Message::New(full_new)),
         ),
         (
+            "new_history",
+            Packet::about(
+                id("build-1"),
+                Message::New(NewSession {
+                    argv: vec![b"/bin/sh".to_vec()],
+                    history: Some(5000),
+                    ..NewSession::default()
+                }),
+            ),
+        ),
+        (
             "ping",
             Packet::connection(Message::Ping(b"pingdata".to_vec())),
         ),
@@ -169,6 +191,26 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Output {
                 offset: 0x1000,
                 data: b"hello\r\n".to_vec(),
+            }),
+        ),
+        (
+            "picture",
+            work(Message::Picture {
+                offset: 0x1000,
+                cols: 80,
+                rows: 24,
+                more: false,
+                data: b"\x1b[Hhi".to_vec(),
+            }),
+        ),
+        (
+            "picture_more",
+            work(Message::Picture {
+                offset: 0x1000,
+                cols: 80,
+                rows: 24,
+                more: true,
+                data: b"hi".to_vec(),
             }),
         ),
         ("ended_code", work(Message::Ended(Exit::Code(3)))),
@@ -325,6 +367,7 @@ fn every_message_kind_has_a_fixture() {
         STATUS_REPLY,
         LIST_REPLY,
         CREATED,
+        PICTURE,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -549,7 +592,7 @@ fn a_reader_ignores_what_a_later_version_adds() {
     let mut reader = stream.as_slice();
     assert_eq!(
         read_packet(&mut reader).unwrap(),
-        Some(work(Message::Attach { offset: 0x1000 }))
+        Some(work(Message::attach(0x1000)))
     );
     assert_eq!(
         read_packet(&mut reader).unwrap(),
@@ -576,6 +619,85 @@ fn a_reader_ignores_what_a_later_version_adds() {
     let mut block = running_work().to_block();
     block.extend_from_slice(&[0, 7, 0, 0, 0, 1, 9]); // state 9, the last entry wins
     assert_eq!(Status::from_block(&block).unwrap().state, State(9));
+}
+
+#[test]
+fn an_attach_is_the_one_it_always_was_unless_it_carries_a_whole_view() {
+    let view = View {
+        size: Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        },
+        picture: false,
+    };
+    let offset = [0, 0, 0, 0, 0, 0, 0x10, 0];
+    // The offset and nothing else, as the first clients sent it.
+    let plain = raw(kind::ATTACH, 0, "work", &offset);
+    assert_eq!(
+        read_packet(&mut plain.as_slice()).unwrap(),
+        Some(work(Message::attach(0x1000)))
+    );
+    // Less than a view after it is what a fixed layout's tail always was: ignored.
+    for cut in 1..9 {
+        let mut payload = offset.to_vec();
+        payload.extend(std::iter::repeat_n(7, cut));
+        let bytes = raw(kind::ATTACH, 0, "work", &payload);
+        assert_eq!(
+            read_packet(&mut bytes.as_slice()).unwrap(),
+            Some(work(Message::attach(0x1000))),
+            "{cut} bytes after the offset"
+        );
+    }
+    // A whole view, and whatever a later version appends after it.
+    let mut payload = offset.to_vec();
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0, 0xde, 0xad]);
+    let bytes = raw(kind::ATTACH, 0, "work", &payload);
+    assert_eq!(
+        read_packet(&mut bytes.as_slice()).unwrap(),
+        Some(work(Message::Attach {
+            offset: 0x1000,
+            view: Some(view)
+        }))
+    );
+}
+
+#[test]
+fn a_size_fits_up_to_the_most_a_screen_may_hold() {
+    let size = |cols, rows| Size {
+        cols,
+        rows,
+        xpixel: 0,
+        ypixel: 0,
+    };
+    assert!(size(0, 0).fits(), "the unsaid");
+    assert!(size(v1::MAX_COLS, v1::MAX_ROWS).fits());
+    assert!(!size(v1::MAX_COLS + 1, 24).fits());
+    assert!(!size(80, v1::MAX_ROWS + 1).fits());
+    assert!(!size(u16::MAX, u16::MAX).fits());
+}
+
+#[test]
+fn a_picture_piece_cannot_outgrow_a_frame() {
+    let biggest = work(Message::Picture {
+        offset: 7,
+        cols: 80,
+        rows: 24,
+        more: true,
+        data: vec![7; v1::MAX_PICTURE],
+    });
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &biggest).unwrap();
+    assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(biggest));
+    let too_big = work(Message::Picture {
+        offset: 7,
+        cols: 80,
+        rows: 24,
+        more: false,
+        data: vec![7; v1::MAX_PICTURE + 1],
+    });
+    assert!(write_packet(&mut Vec::new(), &too_big).is_err());
 }
 
 #[test]

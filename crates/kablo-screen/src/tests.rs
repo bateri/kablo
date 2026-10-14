@@ -1012,16 +1012,24 @@ fn the_tail_keeps_a_command_open_past_its_esc_until_the_next_byte() {
 
 #[test]
 fn a_command_that_never_ends_does_not_grow_the_tail_without_end() {
-    let (_, apc_keep) = KEEP_LIMITS;
-    let mut tail = Tail::default();
+    const SMALL: usize = 1 << 20;
+    let mut tail = Tail::with_apc_keep(SMALL);
     tail.feed(b"\x1b_Ga=t;");
     let chunk = vec![b'A'; 1 << 18];
-    for _ in 0..(apc_keep >> 18) + 2 {
+    for _ in 0..(SMALL >> 18) + 2 {
         tail.feed(&chunk);
     }
-    assert_eq!(tail.bytes().len(), apc_keep);
+    assert_eq!(tail.bytes().len(), SMALL);
     tail.feed(b"\x1b\\");
     assert!(tail.bytes().is_empty());
+}
+
+#[test]
+fn a_command_the_receiver_takes_reaches_it_whole() {
+    // The largest graphics command bateri accepts is 64 MiB of payload; the limit leaves
+    // that and a header, so a command that terminal takes is never cut short.
+    let (_, apc_keep) = KEEP_LIMITS;
+    assert!(apc_keep >= (64 << 20) + b"\x1b_Ga=T,f=100,m=0;".len());
 }
 
 #[test]

@@ -11,7 +11,10 @@
 //!  12   reserved
 //!  16   capacity u64: the ring's size in bytes
 //!  24   total    u64: bytes ever appended (an atomic; the commit point)
-//!  32   reserved up to 64
+//!  32   history  u32: scrollback rows the relay's screen keeps, plus one (0: not said)
+//!  40   answered u64: the offset up to which the terminal's questions were answered,
+//!                plus one (0: nobody keeps track)
+//!  48   reserved up to 64
 //!  64   the ring: byte `n` of the stream is at `64 + n % capacity`
 //! ```
 //!
@@ -26,7 +29,17 @@
 //! (release); a reader copies and re-reads `total` afterwards (acquire) to see
 //! that the bytes it copied have not been overwritten in the meantime. The
 //! layout is part of what a frozen warden hands to a newer relay, so it is
-//! versioned and a header that does not match is refused.
+//! versioned and a header that does not match is refused. A field that was
+//! reserved is read as zero by a journal an older warden made, and zero is what
+//! every such field says "not said" with.
+//!
+//! The header is also where a session's settings live that every relay of it
+//! needs and no relay can be told by anyone else (the offset the terminal's
+//! questions were answered up to is such a thing: what the warden reads while no
+//! relay does, the next relay answers): the warden is frozen and a
+//! relay may be replaced by a newer one, so what the person asked for at the
+//! start (the scrollback of the screen) is written once, here, by whoever makes
+//! the journal.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -41,6 +54,8 @@ const HEADER_LEN: usize = 64;
 const OFFSET_VERSION: usize = 8;
 const OFFSET_CAPACITY: usize = 16;
 const OFFSET_TOTAL: usize = 24;
+const OFFSET_HISTORY: usize = 32;
+const OFFSET_ANSWERED: usize = 40;
 
 /// The smallest ring a session may ask for.
 pub const MIN_CAPACITY: u64 = 16 * 1024;
@@ -98,6 +113,8 @@ impl Journal {
                 .write_unaligned(capacity);
         }
         journal.total_cell().store(0, Ordering::Release);
+        // Nobody has answered anything yet, and this journal says so.
+        journal.answered_cell().store(1, Ordering::Release);
         Ok(journal)
     }
 
@@ -161,6 +178,57 @@ impl Journal {
     /// The ring's size in bytes.
     pub fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    /// The rows of scrollback the session was started with, `None` when it
+    /// was not asked for any number (including a journal an older warden made).
+    pub fn history(&self) -> Option<u32> {
+        // SAFETY: the header is inside the mapping and the offset is 4-byte
+        // aligned within a page-aligned base; a value that nobody writes
+        // concurrently after `set_history`.
+        let stored = unsafe {
+            self.base
+                .as_ptr()
+                .add(OFFSET_HISTORY)
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        stored.checked_sub(1)
+    }
+
+    /// The offset up to which the terminal's questions have been answered (or
+    /// need no answer): what a relay that takes over must answer starts here.
+    /// `None` for a journal that does not keep track (one an older warden made),
+    /// of which nothing is answered late.
+    pub fn answered(&self) -> Option<u64> {
+        self.answered_cell().load(Ordering::Acquire).checked_sub(1)
+    }
+
+    /// Records that the questions up to `offset` are answered (the single writer
+    /// that reads the terminal).
+    pub fn set_answered(&mut self, offset: u64) {
+        self.answered_cell()
+            .store(offset.saturating_add(1), Ordering::Release);
+    }
+
+    /// Makes the journal one that keeps no track of answers, as one an older
+    /// warden made (for a test).
+    #[cfg(test)]
+    pub fn forget_answers(&mut self) {
+        self.answered_cell().store(0, Ordering::Release);
+    }
+
+    /// Records the scrollback rows the session was started with (the single
+    /// writer, before any relay reads it).
+    pub fn set_history(&mut self, rows: u32) {
+        // SAFETY: as in `history`; `&mut self` makes this the only writer.
+        unsafe {
+            self.base
+                .as_ptr()
+                .add(OFFSET_HISTORY)
+                .cast::<u32>()
+                .write_unaligned(rows.saturating_add(1));
+        }
     }
 
     /// How many bytes the program has written so far: the offset the next
@@ -268,7 +336,15 @@ impl Journal {
     /// start inside a line (an escape sequence is rarely longer than one).
     /// With no newline in the ring, the ring's start.
     pub fn line_start(&self) -> u64 {
-        let mut at = self.retained_from();
+        self.line_start_from(0)
+    }
+
+    /// Like [`Journal::line_start`], looking from `from` on (or from the
+    /// ring's start, if that is later). With no newline after it, the offset
+    /// looked from.
+    pub fn line_start_from(&self, from: u64) -> u64 {
+        let first = |journal: &Journal| from.max(journal.retained_from());
+        let mut at = first(self);
         let mut lapped = 0;
         let mut chunk = [0u8; 4096];
         while at < self.total() {
@@ -290,11 +366,16 @@ impl Journal {
                     if lapped > 8 {
                         break;
                     }
-                    at = self.retained_from();
+                    at = first(self);
                 }
             }
         }
-        self.retained_from()
+        first(self)
+    }
+
+    fn answered_cell(&self) -> &AtomicU64 {
+        // SAFETY: as in `total_cell`; `OFFSET_ANSWERED` is 8-byte aligned too.
+        unsafe { &*self.base.as_ptr().add(OFFSET_ANSWERED).cast::<AtomicU64>() }
     }
 
     fn total_cell(&self) -> &AtomicU64 {
@@ -513,5 +594,47 @@ mod tests {
         let mut out = [0u8; 12];
         assert_eq!(journal.copy_out(0, &mut out), Some(12));
         assert_eq!(&out, b"from the pty");
+    }
+
+    #[test]
+    fn what_was_answered_is_in_the_header() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        assert_eq!(journal.answered(), Some(0), "a new journal keeps track");
+        journal.set_answered(1234);
+        let again = Journal::open(dup_of(&journal)).unwrap();
+        assert_eq!(again.answered(), Some(1234));
+        // A journal an older warden made has a zero there: nobody keeps track.
+        // SAFETY: the header is inside the mapping; the single writer is this test.
+        unsafe {
+            journal
+                .base
+                .as_ptr()
+                .add(OFFSET_ANSWERED)
+                .cast::<u64>()
+                .write_unaligned(0);
+        }
+        assert_eq!(journal.answered(), None);
+    }
+
+    #[test]
+    fn the_scrollback_a_session_started_with_is_in_the_header() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        assert_eq!(journal.history(), None, "a journal nobody said it for");
+        journal.set_history(0);
+        assert_eq!(journal.history(), Some(0), "none is something to say");
+        journal.set_history(5000);
+        assert_eq!(journal.history(), Some(5000));
+        // Another process maps the same memory and reads the same number.
+        let again = Journal::open(dup_of(&journal)).unwrap();
+        assert_eq!(again.history(), Some(5000));
+        assert_eq!(again.total(), 0, "and the rest of the header is untouched");
+    }
+
+    fn dup_of(journal: &Journal) -> OwnedFd {
+        // SAFETY: `dup` of a descriptor that is open for the call.
+        let fd = unsafe { libc::dup(journal.as_raw_fd()) };
+        assert!(fd >= 0);
+        // SAFETY: a descriptor just made, owned from here.
+        unsafe { OwnedFd::from_raw_fd(fd) }
     }
 }

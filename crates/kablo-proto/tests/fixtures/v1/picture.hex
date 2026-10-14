@@ -1,0 +1,10 @@
+# the last piece of a picture of "work" at offset 0x1000, made for 80x24
+89                       # kind 0x89: picture
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 12              # payload length 18
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 10 00  # offset 4096
+00 50 00 18              # made for 80 columns, 24 rows
+00                       # flags: none (nothing follows)
+1b 5b 48 68 69          # bytes: ESC [ H h i

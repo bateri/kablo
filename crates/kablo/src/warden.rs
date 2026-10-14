@@ -261,7 +261,10 @@ impl Warden {
         control: &UnixStream,
     ) -> Result<Warden, String> {
         let capacity = request.journal_size.unwrap_or(journal::DEFAULT_CAPACITY);
-        let journal = Journal::create(capacity).map_err(|e| e.to_string())?;
+        let mut journal = Journal::create(capacity).map_err(|e| e.to_string())?;
+        if let Some(rows) = request.history {
+            journal.set_history(rows);
+        }
         let size = match request.size {
             Some(size) if size.cols != 0 && size.rows != 0 => size,
             _ => pty::DEFAULT_SIZE,

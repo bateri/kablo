@@ -7,10 +7,11 @@
 //! Resizing the window resizes the session's terminal.
 //!
 //! It attaches from the first byte the journal still holds, so a window that
-//! was closed and comes back is filled again with what it missed (kablo keeps
-//! the bytes, not a picture of the screen, so a full-screen program is drawn
-//! again from the start of the journal and the last frame wins); `--fresh`
-//! attaches at the end instead and shows only what comes next.
+//! was closed and comes back is filled again with what it missed. When the
+//! journal no longer reaches back to the start, the session sends a picture of
+//! the screen in its place: the terminal is reset and the picture is written to
+//! it, then the program's own output goes on from where the picture ends.
+//! `--fresh` attaches at the end instead and shows only what comes next.
 //!
 //! The connection is a [`Link`], so a relay that is replaced while a person is
 //! connected does not show. Neither does a moment of crowding: when the link
@@ -29,13 +30,16 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Packet};
+use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Packet, View};
 
 use crate::link::{self, Link};
 use crate::sys;
 
 /// The byte that leaves the session: Ctrl-\.
 pub const DETACH_KEY: u8 = 0x1c;
+
+/// Resets the terminal (`RIS`) before a picture of the screen is written to it.
+const RESET: &[u8] = b"\x1bc";
 
 /// The exit status of a command that is used the wrong way (`EX_USAGE`).
 const EXIT_USAGE: u8 = 64;
@@ -141,15 +145,25 @@ fn serve(
     let mut held = Held::default();
     let now = Instant::now();
     let offset = if fresh { OFFSET_END } else { 0 };
+    // The terminal's size goes with the attach, so that a picture of the screen
+    // is made for it; the resize after it is for a session that predates views.
+    let view = sys::window_size(input)
+        .ok()
+        .filter(|size| size.cols > 0 && size.rows > 0)
+        .map(|size| View {
+            size,
+            picture: false,
+        });
     link.send(
-        Packet::about(id.clone(), Message::Attach { offset }),
+        Packet::about(id.clone(), Message::Attach { offset, view }),
         now,
         &mut outgoing,
     );
     resize(&mut held, &mut link, &id, input, now, &mut outgoing);
     let mut buf = vec![0u8; 4096];
+    let mut picturing = false;
     loop {
-        if let Some(end) = show(&outgoing, output) {
+        if let Some(end) = show(&outgoing, output, &mut picturing) {
             return end;
         }
         outgoing.clear();
@@ -352,11 +366,27 @@ impl Held {
 
 /// Puts what the session sent on the screen. `Some` when it says the
 /// connection is over.
-fn show(packets: &[Packet], output: BorrowedFd<'_>) -> Option<End> {
+fn show(packets: &[Packet], output: BorrowedFd<'_>, picturing: &mut bool) -> Option<End> {
     for packet in packets {
         match &packet.message {
             Message::Output { data, .. } => {
                 if write_all(output, data).is_err() {
+                    return Some(End::Stopped);
+                }
+            }
+            // A new `attached` starts everything over, so a picture that was
+            // coming is not finished by the one that follows.
+            Message::Attached { .. } => *picturing = false,
+            Message::Picture { more, data, .. } => {
+                // The picture builds the screen on a terminal that has nothing
+                // on it: this one is reset first, once per picture.
+                let begun = if *picturing {
+                    Ok(())
+                } else {
+                    write_all(output, RESET)
+                };
+                *picturing = *more;
+                if begun.and_then(|()| write_all(output, data)).is_err() {
                     return Some(End::Stopped);
                 }
             }
@@ -582,5 +612,82 @@ mod tests {
         link.room = Some(0);
         let later = start + BUSY_PATIENCE + Duration::from_secs(1);
         assert_eq!(held.retry(later, |p| link.offer(p)), Retry::Waiting);
+    }
+
+    /// What `show` wrote to the terminal for these packets.
+    fn shown(packets: &[Packet], picturing: &mut bool) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(show(packets, ours.as_fd(), picturing).is_none());
+        drop(ours);
+        let mut out = Vec::new();
+        theirs.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    fn piece(more: bool, data: &str) -> Packet {
+        Packet::about(
+            id(),
+            Message::Picture {
+                offset: 100,
+                cols: 80,
+                rows: 24,
+                more,
+                data: data.as_bytes().to_vec(),
+            },
+        )
+    }
+
+    fn attached() -> Packet {
+        Packet::about(
+            id(),
+            Message::Attached {
+                offset: 100,
+                truncated: true,
+            },
+        )
+    }
+
+    #[test]
+    fn a_picture_resets_the_terminal_once_and_then_is_written_as_it_is() {
+        let mut picturing = false;
+        let out = shown(
+            &[attached(), piece(true, "one "), piece(false, "two")],
+            &mut picturing,
+        );
+        assert_eq!(out, b"\x1bcone two");
+        assert!(!picturing, "the last piece ends it");
+    }
+
+    #[test]
+    fn a_picture_cut_short_is_begun_again_by_the_next_attached() {
+        let mut picturing = false;
+        let first = shown(&[attached(), piece(true, "half")], &mut picturing);
+        assert_eq!(first, b"\x1bchalf");
+        assert!(picturing);
+        // The connection was replaced: the session starts the picture over.
+        let again = shown(&[attached(), piece(false, "whole")], &mut picturing);
+        assert_eq!(again, b"\x1bcwhole");
+    }
+
+    #[test]
+    fn output_after_a_picture_is_not_a_reset() {
+        let mut picturing = false;
+        let out = shown(
+            &[
+                piece(false, "screen"),
+                Packet::about(
+                    id(),
+                    Message::Output {
+                        offset: 100,
+                        data: b"live".to_vec(),
+                    },
+                ),
+                piece(false, "again"),
+            ],
+            &mut picturing,
+        );
+        assert_eq!(out, b"\x1bcscreenlive\x1bcagain");
     }
 }

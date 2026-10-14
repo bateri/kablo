@@ -29,7 +29,9 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use kablo_proto::v1::{ErrorCode, Message, NewSession, Packet, PacketDecoder};
+use kablo_proto::v1::{
+    ErrorCode, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, NewSession, Packet, PacketDecoder,
+};
 use kablo_proto::{SessionId, WIRE};
 
 use crate::handshake::{self, Step};
@@ -384,6 +386,20 @@ impl Bridge {
                     journal::MIN_CAPACITY,
                     journal::MAX_CAPACITY
                 ),
+            ));
+        }
+        if request.size.is_some_and(|size| !size.fits()) {
+            return outgoing.push(failure(
+                wanted,
+                ErrorCode::BAD_REQUEST,
+                &format!("a terminal has at most {MAX_COLS} columns and {MAX_ROWS} rows"),
+            ));
+        }
+        if request.history.is_some_and(|rows| rows > MAX_HISTORY) {
+            return outgoing.push(failure(
+                wanted,
+                ErrorCode::BAD_REQUEST,
+                &format!("the screen keeps 0 to {MAX_HISTORY} rows of scrollback"),
             ));
         }
         // A name the server makes can collide with a session that is there;

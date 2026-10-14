@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 kablo-proto = { path = "../kablo-proto" }
+kablo-screen = { path = "../kablo-screen" }
 libc = "0.2"
 
 [lints]

@@ -6,8 +6,11 @@
 //! Payloads that are one fixed layout are read as a prefix (a later version
 //! may append fields); payloads that may grow are [`tlv`] blocks.
 //!
-//! This module is frozen the moment v1 ships: a change is a new version with
-//! its own module and fixtures, and v1 stays readable.
+//! Version 1 grows only by addition: a new kind (a reader that does not know it
+//! skips the frame by its length), a field appended to a fixed layout, a new entry
+//! in a block. A message that exists is never changed, and its fixture never
+//! with it; a change that cannot be made that way is a new version with its own
+//! module and fixtures, and v1 stays readable.
 
 use std::io::{Read, Write};
 
@@ -53,6 +56,8 @@ pub mod kind {
     pub const LIST_REPLY: u8 = 0x87;
     /// `created`: the answer to `new`.
     pub const CREATED: u8 = 0x88;
+    /// `picture`: a piece of the screen as VT bytes.
+    pub const PICTURE: u8 = 0x89;
 }
 
 /// The name of a message kind, for diagnostics (`"unknown"` for a kind this
@@ -77,6 +82,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::STATUS_REPLY => "status_reply",
         kind::LIST_REPLY => "list_reply",
         kind::CREATED => "created",
+        kind::PICTURE => "picture",
         _ => "unknown",
     }
 }
@@ -86,6 +92,23 @@ pub const OFFSET_END: u64 = u64::MAX;
 
 /// The most program bytes one `output` message can carry.
 pub const MAX_OUTPUT: usize = MAX_PAYLOAD - 8;
+
+/// The most bytes of a screen's picture one `picture` message can carry.
+pub const MAX_PICTURE: usize = MAX_PAYLOAD - 13;
+
+/// The most columns and rows a session's terminal can be given. The relay's
+/// screen holds every cell of it twice (two screens), so a size is memory, and
+/// no terminal a person has comes near these.
+pub const MAX_COLS: u16 = 1000;
+
+/// See [`MAX_COLS`].
+pub const MAX_ROWS: u16 = 1000;
+
+/// The most rows of scrollback a session's screen can be asked to keep.
+pub const MAX_HISTORY: u32 = 100_000;
+
+/// The scrollback rows a session keeps when it is not asked for any number.
+pub const DEFAULT_HISTORY: u32 = 2_000;
 
 /// The longest binary path an `upgrade` can name.
 pub const MAX_PATH: usize = 4096;
@@ -107,6 +130,12 @@ impl Size {
     /// Bytes on the wire.
     pub const LEN: usize = 8;
 
+    /// Whether the size is one a session's terminal can have, the unsaid
+    /// (zero) included: no more than [`MAX_COLS`] by [`MAX_ROWS`].
+    pub fn fits(&self) -> bool {
+        self.cols <= MAX_COLS && self.rows <= MAX_ROWS
+    }
+
     fn write(&self, out: &mut Vec<u8>) {
         for v in [self.cols, self.rows, self.xpixel, self.ypixel] {
             out.extend_from_slice(&v.to_be_bytes());
@@ -119,6 +148,36 @@ impl Size {
             rows: fields.u16()?,
             xpixel: fields.u16()?,
             ypixel: fields.u16()?,
+        })
+    }
+}
+
+/// How a client looks at the session it attaches to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct View {
+    /// The client's terminal. The session's terminal takes this size before
+    /// anything is sent, so a picture of the screen is made for it. A size
+    /// with no columns or no rows says nothing.
+    pub size: Size,
+    /// Send a picture of the screen even if the offset asked for is still in
+    /// the journal.
+    pub picture: bool,
+}
+
+impl View {
+    /// Bytes on the wire.
+    const LEN: usize = Size::LEN + 1;
+
+    /// The wire form: a size and a flags byte (bit 0: picture).
+    fn write(&self, out: &mut Vec<u8>) {
+        self.size.write(out);
+        out.push(u8::from(self.picture));
+    }
+
+    fn read(fields: &mut Fields<'_>) -> Result<View> {
+        Ok(View {
+            size: Size::read(fields)?,
+            picture: fields.u8()? & 1 != 0,
         })
     }
 }
@@ -215,6 +274,9 @@ pub struct NewSession {
     pub size: Option<Size>,
     /// The journal's capacity in bytes.
     pub journal_size: Option<u64>,
+    /// How many rows of scrollback the session's screen keeps, up to
+    /// [`MAX_HISTORY`] ([`DEFAULT_HISTORY`] when not said).
+    pub history: Option<u32>,
 }
 
 mod new_key {
@@ -223,6 +285,7 @@ mod new_key {
     pub const CWD: u16 = 3;
     pub const SIZE: u16 = 4;
     pub const JOURNAL_SIZE: u16 = 5;
+    pub const HISTORY: u16 = 6;
 }
 
 impl NewSession {
@@ -270,6 +333,9 @@ impl NewSession {
         if let Some(bytes) = self.journal_size {
             w.put_u64(new_key::JOURNAL_SIZE, bytes);
         }
+        if let Some(rows) = self.history {
+            w.put_u32(new_key::HISTORY, rows);
+        }
         Ok(w.finish())
     }
 
@@ -288,6 +354,7 @@ impl NewSession {
                 new_key::JOURNAL_SIZE => {
                     new.journal_size = Some(tlv::read_u64(value, "journal size")?)
                 }
+                new_key::HISTORY => new.history = Some(tlv::read_u32(value, "history")?),
                 _ => {}
             }
         }
@@ -430,10 +497,15 @@ const LISTED: u16 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     /// Client to server: stream the session starting at `offset` (or
-    /// [`OFFSET_END`]). Answered by `Attached`, then `Output`s.
+    /// [`OFFSET_END`]). Answered by `Attached`, then a picture of the screen
+    /// when the bytes asked for are gone or the `view` asks for one, then
+    /// `Output`s.
     Attach {
         /// The first byte the client wants.
         offset: u64,
+        /// The client's terminal and what it wants shown first; `None` from
+        /// a client that says neither.
+        view: Option<View>,
     },
     /// Client to server: stop streaming the session; the session lives on.
     Detach,
@@ -464,7 +536,8 @@ pub enum Message {
     /// Server to client: the stream starts at `offset`; `truncated` says bytes
     /// the client asked for had already left the journal.
     Attached {
-        /// The offset of the first `Output` that follows.
+        /// The offset of the first `Output` that follows (and of the picture
+        /// before it, if one is sent).
         offset: u64,
         /// Whether the journal no longer held the offset asked for.
         truncated: bool,
@@ -495,6 +568,29 @@ pub enum Message {
     ListReply(Vec<Status>),
     /// Server to client: the answer to `New`.
     Created(Status),
+    /// Server to client: a piece of the screen as the bytes that build it. A
+    /// picture follows an `Attached` and is one or more pieces in order, the
+    /// last without `more`; the `Output` after it starts at `offset`.
+    Picture {
+        /// The offset of the program's output the picture is of: the stream
+        /// goes on from it.
+        offset: u64,
+        /// The columns of the terminal the picture was made for.
+        cols: u16,
+        /// The rows of the terminal the picture was made for.
+        rows: u16,
+        /// More pieces of this picture follow.
+        more: bool,
+        /// The bytes, to be written to a freshly reset terminal in order.
+        data: Vec<u8>,
+    },
+}
+
+impl Message {
+    /// An `attach` that says nothing of the client's terminal.
+    pub fn attach(offset: u64) -> Message {
+        Message::Attach { offset, view: None }
+    }
 }
 
 impl Message {
@@ -519,13 +615,20 @@ impl Message {
             Message::StatusReply(_) => kind::STATUS_REPLY,
             Message::ListReply(_) => kind::LIST_REPLY,
             Message::Created(_) => kind::CREATED,
+            Message::Picture { .. } => kind::PICTURE,
         }
     }
 
     fn payload(&self) -> Result<Vec<u8>> {
         Ok(match self {
             Message::Detach | Message::Status | Message::List => Vec::new(),
-            Message::Attach { offset } => offset.to_be_bytes().to_vec(),
+            Message::Attach { offset, view } => {
+                let mut out = offset.to_be_bytes().to_vec();
+                if let Some(view) = view {
+                    view.write(&mut out);
+                }
+                out
+            }
             Message::Resize(size) => {
                 let mut out = Vec::with_capacity(Size::LEN);
                 size.write(&mut out);
@@ -557,6 +660,24 @@ impl Message {
                 out.extend_from_slice(text.as_bytes());
                 out
             }
+            Message::Picture {
+                offset,
+                cols,
+                rows,
+                more,
+                data,
+            } => {
+                if data.len() > MAX_PICTURE {
+                    return Err(Error::Malformed("picture"));
+                }
+                let mut out = Vec::with_capacity(13 + data.len());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out.extend_from_slice(&cols.to_be_bytes());
+                out.extend_from_slice(&rows.to_be_bytes());
+                out.push(u8::from(*more));
+                out.extend_from_slice(data);
+                out
+            }
             Message::StatusReply(status) | Message::Created(status) => status.to_block(),
             Message::ListReply(all) => {
                 let mut w = tlv::Writer::new();
@@ -572,7 +693,19 @@ impl Message {
     fn parse(kind: u8, payload: &[u8]) -> Result<Option<Message>> {
         let mut f = Fields::new(payload, kind_name(kind));
         Ok(Some(match kind {
-            kind::ATTACH => Message::Attach { offset: f.u64()? },
+            kind::ATTACH => {
+                let offset = f.u64()?;
+                // Appended after the offset by a client that has more to say; an
+                // `attach` without it, or with less than a whole view after the
+                // offset, is the one that was always there (what follows a fixed
+                // layout is ignored).
+                let view = if f.len() < View::LEN {
+                    None
+                } else {
+                    Some(View::read(&mut f)?)
+                };
+                Message::Attach { offset, view }
+            }
             kind::DETACH => Message::Detach,
             kind::RESIZE => Message::Resize(Size::read(&mut f)?),
             kind::TERMINATE => Message::Terminate {
@@ -620,6 +753,13 @@ impl Message {
                 Message::ListReply(all)
             }
             kind::CREATED => Message::Created(Status::from_block(payload)?),
+            kind::PICTURE => Message::Picture {
+                offset: f.u64()?,
+                cols: f.u16()?,
+                rows: f.u16()?,
+                more: f.u8()? & 1 != 0,
+                data: f.rest().to_vec(),
+            },
             _ => return Ok(None),
         }))
     }
@@ -761,6 +901,10 @@ impl<'a> Fields<'a> {
 
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn len(&self) -> usize {
+        self.rest.len()
     }
 
     fn rest(self) -> &'a [u8] {

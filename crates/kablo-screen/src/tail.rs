@@ -33,11 +33,13 @@ enum Seq {
 /// not pin its size for the session's life.
 const TAIL_KEEP: usize = 4096;
 
-/// The most bytes of an application program command [`Tail`] keeps. A body that never
-/// ends must not grow the tail without end; past this the command is carried cut, and the
-/// terminal that completes it sees a body missing its end (graphics commands are sent in
-/// chunks of a few kilobytes, so this is generous).
-const APC_KEEP: usize = 1 << 20;
+/// The most bytes of an application program command [`Tail`] keeps: 64 MiB of payload and
+/// room for the command's header, the largest graphics command bateri takes (past it that
+/// terminal drops the command anyway, so nothing a receiver would use is cut). A command
+/// the receiver would take must reach it whole: cut short, its body would miss the middle
+/// and the picture it carries would come out broken. The memory is held only while such a
+/// command is open and goes back down to [`TAIL_KEEP`] when it ends.
+const APC_KEEP: usize = (64 << 20) + 4096;
 
 /// The bytes since the parser last stood in its **ground state**: a read that ended
 /// inside a CSI/OSC/DCS or inside one character's UTF-8 left them with no effect on
@@ -50,12 +52,26 @@ const APC_KEEP: usize = 1 << 20;
 /// **Known limit:** the cut is per code point, not per cluster: an emoji sequence cut
 /// **between** two code points comes back as two clusters in a terminal that clusters
 /// (the relay's own `Term` does not).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Tail {
     state: Seq,
     /// UTF-8 continuation bytes still missing in the ground state.
     utf8_need: u8,
     bytes: Vec<u8>,
+    /// How many bytes an application program command may hold ([`APC_KEEP`]; a test
+    /// makes it small).
+    apc_keep: usize,
+}
+
+impl Default for Tail {
+    fn default() -> Self {
+        Self {
+            state: Seq::default(),
+            utf8_need: 0,
+            bytes: Vec::new(),
+            apc_keep: APC_KEEP,
+        }
+    }
 }
 
 impl Tail {
@@ -187,7 +203,7 @@ impl Tail {
                 0x18 | 0x1a => self.ground(),
                 // The command stays open until the next byte says how it ends.
                 0x1b => self.enter(byte, Seq::ApcEscape),
-                _ if self.bytes.len() < APC_KEEP => self.bytes.push(byte),
+                _ if self.bytes.len() < self.apc_keep => self.bytes.push(byte),
                 _ => {}
             },
             Seq::ApcEscape => {
@@ -219,6 +235,14 @@ impl Tail {
 impl Tail {
     pub(crate) fn capacity(&self) -> usize {
         self.bytes.capacity()
+    }
+
+    /// A tail whose application program commands are cut at `apc_keep` bytes.
+    pub(crate) fn with_apc_keep(apc_keep: usize) -> Self {
+        Self {
+            apc_keep,
+            ..Self::default()
+        }
     }
 }
 

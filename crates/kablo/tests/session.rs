@@ -145,48 +145,6 @@ fn a_dead_relay_is_replaced_and_no_byte_is_lost() {
 }
 
 #[test]
-fn a_journal_that_overflows_says_so_and_the_stream_starts_at_a_line() {
-    let mut env = Env::new();
-    let id = env.start("ring", &["--journal-size", "16K", "--", "/bin/sh"]);
-    let mut witness = env.connect(&id);
-    witness.attach(0);
-    // 300 lines of 200 bytes: three times the ring, slowly enough that the
-    // witness keeps up.
-    let filler = "x".repeat(200);
-    witness.type_in(&format!(
-        "i=0; while [ $i -lt 300 ]; do echo L$i-{filler}; i=$((i+1)); sleep 0.01; done\n"
-    ));
-    witness.wait_for("L299-", 0);
-
-    let mut control = env.connect(&id);
-    let status = loop {
-        let status = control.status();
-        witness.pump(Duration::from_millis(20));
-        if status.offset == witness.next {
-            break status;
-        }
-    };
-    assert!(status.retained_from > 0, "the ring wrapped");
-
-    let mut late = env.connect(&id);
-    let (start, truncated) = late.attach(0);
-    assert!(truncated);
-    assert!(start >= status.retained_from);
-    let at = usize::try_from(start).unwrap();
-    assert_eq!(witness.data[at - 1], b'\n', "starts after a line break");
-    // A truncated attach makes the shell draw its prompt again, for both.
-    loop {
-        let status = control.status();
-        witness.pump(Duration::from_millis(20));
-        late.pump(Duration::from_millis(20));
-        if witness.next == status.offset && late.next == status.offset {
-            break;
-        }
-    }
-    assert_eq!(late.data, witness.data[at..]);
-}
-
-#[test]
 fn a_client_that_stops_reading_is_dropped_and_the_program_never_stalls() {
     let mut env = Env::new();
     let id = env.start("slow", &["--journal-size", "1M", "--", "/bin/sh"]);
@@ -395,7 +353,7 @@ fn the_socket_speaks_the_protocol_and_answers_what_it_cannot_do() {
             .iter()
             .any(|p| matches!(&p.message, Message::ListReply(all) if all.len() == 1))
     });
-    a.send(Message::Attach { offset: 1 << 40 });
+    a.send(Message::attach(1 << 40));
     a.until("an error", |c| !c.errors.is_empty());
     assert_eq!(a.errors[0].0, ErrorCode::BAD_REQUEST);
     a.send(Message::Upgrade {

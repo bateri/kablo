@@ -20,8 +20,8 @@ mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Bridge, PATIENCE};
-use kablo_proto::v1::{ErrorCode, Message, State};
+use common::{Bridge, PATIENCE, rebuilt, same, whole};
+use kablo_proto::v1::{ErrorCode, Message, NewSession, State};
 
 /// The sessions of the 15-at-once scenario: more than sshd's default
 /// `MaxSessions` of 10.
@@ -302,7 +302,7 @@ fn sessions_live_when_every_ssh_session_of_the_user_is_closed() {
 fn a_session_the_server_does_not_have_is_an_answer_not_a_hang() {
     let server = server();
     let (mut bridge, _) = server.bridge();
-    bridge.send(Some("nobody-home"), Message::Attach { offset: 0 });
+    bridge.send(Some("nobody-home"), Message::attach(0));
     let (session, code, _) = bridge.next_error();
     assert_eq!(session.as_deref(), Some("nobody-home"));
     assert_eq!(code, ErrorCode::UNKNOWN_SESSION);
@@ -393,4 +393,72 @@ fn the_server_side_is_upgraded_while_the_ssh_connection_carries_on() {
     }
     drop(bridge);
     server.clean_up(&prefix);
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn a_long_gap_over_ssh_comes_back_as_the_right_screen() {
+    let server = server();
+    let prefix = prefix("gap");
+    let id = format!("{prefix}-0");
+    let (mut first, _) = server.bridge();
+    // A ring small enough for a few hundred lines to wrap.
+    let new = NewSession {
+        argv: vec![b"/bin/sh".to_vec()],
+        journal_size: Some(16 * 1024),
+        ..NewSession::default()
+    };
+    first.try_new_with(Some(&id), new).expect("a session");
+    first.attach(&id, 0);
+    let filler = "x".repeat(200);
+    first.type_in(
+        &id,
+        &format!("i=0; while [ $i -lt 300 ]; do echo L$i-{filler}; i=$((i+1)); sleep 0.01; done\n"),
+    );
+    first.wait_for(&id, "L299-");
+    let settle = |bridge: &mut Bridge| loop {
+        let status = bridge.status(&id);
+        bridge.pump(Duration::from_millis(20));
+        if status.offset == bridge.seen(&id).next {
+            break;
+        }
+    };
+    settle(&mut first);
+    assert!(first.status(&id).retained_from > 0, "the ring wrapped");
+
+    // A device that was not there: it asks for everything and is told what is
+    // gone, then given the screen.
+    let (mut second, _) = server.bridge();
+    let (start, truncated) = second.attach(&id, 0);
+    assert!(truncated);
+    second.until("the picture", |b| {
+        b.sessions
+            .get(&id)
+            .is_some_and(|s| s.pictures.last().is_some_and(|p| p.complete))
+    });
+    first.type_in(&id, "echo after-$((1+2))\n");
+    first.wait_for(&id, "after-3\r\n");
+    second.wait_for(&id, "after-3\r\n");
+    settle(&mut first);
+    second.until("the same end", |b| {
+        b.sessions
+            .get(&id)
+            .is_some_and(|s| s.next == first_next(&first, &id))
+    });
+    let picture = second.seen(&id).pictures.last().unwrap().clone();
+    assert_eq!(picture.offset, start);
+    let at = usize::try_from(start).unwrap();
+    assert_eq!(second.seen(&id).data, first.seen(&id).data[at..]);
+    same(
+        rebuilt(&picture, &second.seen(&id).data),
+        whole(&first.seen(&id).data, 80, 24),
+    );
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    drop((first, second));
+    server.clean_up(&prefix);
+}
+
+/// Where the stream `id` has reached, as `bridge` has it.
+fn first_next(bridge: &Bridge, id: &str) -> u64 {
+    bridge.sessions.get(id).map_or(0, |seen| seen.next)
 }

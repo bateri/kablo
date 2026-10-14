@@ -27,8 +27,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kablo_proto::v1::{ErrorCode, Exit, Message, NewSession, Packet, PacketDecoder, Status};
+use kablo_proto::v1::{
+    ErrorCode, Exit, Message, NewSession, Packet, PacketDecoder, Size, Status, View,
+};
 use kablo_proto::{SessionId, WIRE};
+use kablo_screen::Screen;
 
 /// How long a test waits for anything before it calls it failed.
 pub const PATIENCE: Duration = Duration::from_secs(30);
@@ -252,6 +255,70 @@ impl Drop for Env {
 }
 
 /// A client of one session.
+/// A picture of a session's screen, as the pieces of it came.
+#[derive(Clone, Debug, Default)]
+pub struct Pic {
+    /// The offset of the program's output the picture is of.
+    pub offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub bytes: Vec<u8>,
+    pub pieces: usize,
+    /// The last piece came.
+    pub complete: bool,
+}
+
+impl Pic {
+    /// Files a `picture` message among the pictures seen: a piece goes to the
+    /// picture that is not yet complete, or begins another.
+    fn file(pictures: &mut Vec<Pic>, offset: u64, cols: u16, rows: u16, more: bool, data: &[u8]) {
+        if pictures.last().is_none_or(|last| last.complete) {
+            pictures.push(Pic {
+                offset,
+                cols,
+                rows,
+                ..Pic::default()
+            });
+        }
+        let last = pictures.last_mut().unwrap();
+        assert_eq!(
+            (last.offset, last.cols, last.rows),
+            (offset, cols, rows),
+            "the pieces of one picture agree"
+        );
+        last.bytes.extend_from_slice(data);
+        last.pieces += 1;
+        last.complete = !more;
+    }
+}
+
+/// What a terminal shows once it has the picture and the output after it. It
+/// keeps no scrollback, so what is compared is the screen and the state around
+/// it (modes, cursor, scrolling region, the other screen).
+pub fn rebuilt(picture: &Pic, after: &[u8]) -> Screen {
+    let mut screen = Screen::new(picture.cols, picture.rows, 0);
+    screen.feed(&picture.bytes);
+    screen.feed(after);
+    screen
+}
+
+/// What a terminal of the same kind shows that was given the whole stream.
+pub fn whole(stream: &[u8], cols: u16, rows: u16) -> Screen {
+    let mut screen = Screen::new(cols, rows, 0);
+    screen.feed(stream);
+    screen
+}
+
+/// Asserts that two screens are the same.
+pub fn same(mut got: Screen, mut wanted: Screen) {
+    let (got, wanted) = (got.image(), wanted.image());
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(&wanted),
+        "the screens differ"
+    );
+}
+
 pub struct Conn {
     sock: UnixStream,
     decoder: PacketDecoder,
@@ -262,6 +329,8 @@ pub struct Conn {
     pub next: u64,
     /// What `attached` said: where the stream starts, and whether it was cut.
     pub attached: Option<(u64, bool)>,
+    /// Every picture received, across attaches.
+    pub pictures: Vec<Pic>,
     pub ended: Option<Exit>,
     pub errors: Vec<(ErrorCode, String)>,
     pub replies: Vec<Packet>,
@@ -287,6 +356,7 @@ impl Conn {
             data: Vec::new(),
             next: 0,
             attached: None,
+            pictures: Vec::new(),
             ended: None,
             errors: Vec::new(),
             replies: Vec::new(),
@@ -344,6 +414,13 @@ impl Conn {
                     self.next = offset;
                     self.data.clear();
                 }
+                Message::Picture {
+                    offset,
+                    cols,
+                    rows,
+                    more,
+                    data,
+                } => Pic::file(&mut self.pictures, offset, cols, rows, more, &data),
                 Message::Output { offset, data } => {
                     assert_eq!(offset, self.next, "output is not contiguous");
                     self.next += data.len() as u64;
@@ -394,9 +471,38 @@ impl Conn {
     /// was cut.
     pub fn attach(&mut self, offset: u64) -> (u64, bool) {
         self.attached = None;
-        self.send(Message::Attach { offset });
+        self.send(Message::attach(offset));
         self.until("attached", |c| c.attached.is_some());
         self.attached.unwrap()
+    }
+
+    /// Attaches as a terminal of `cols` by `rows` that wants a picture of the
+    /// screen; returns where the stream starts and whether it was cut, once the
+    /// picture is whole.
+    pub fn attach_with_picture(&mut self, offset: u64, cols: u16, rows: u16) -> (u64, bool) {
+        self.attached = None;
+        self.pictures.clear();
+        self.send(Message::Attach {
+            offset,
+            view: Some(View {
+                size: Size {
+                    cols,
+                    rows,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                picture: true,
+            }),
+        });
+        self.until("attached and its picture", |c| {
+            c.attached.is_some() && c.pictures.last().is_some_and(|p| p.complete)
+        });
+        self.attached.unwrap()
+    }
+
+    /// The picture last received.
+    pub fn picture(&self) -> &Pic {
+        self.pictures.last().expect("a picture")
     }
 
     pub fn status(&mut self) -> Status {
@@ -435,6 +541,8 @@ pub struct Seen {
     /// Every `attached` received: where the stream started, and whether it
     /// was cut.
     pub attached: Vec<(u64, bool)>,
+    /// Every picture received, across attaches.
+    pub pictures: Vec<Pic>,
     pub ended: Option<Exit>,
 }
 
@@ -561,6 +669,16 @@ impl Bridge {
                     seen.attached.push((offset, truncated));
                     seen.next = offset;
                 }
+                Message::Picture {
+                    offset,
+                    cols,
+                    rows,
+                    more,
+                    data,
+                } => {
+                    let seen = self.sessions.entry(name.unwrap()).or_default();
+                    Pic::file(&mut seen.pictures, offset, cols, rows, more, &data);
+                }
                 Message::Output { offset, data } => {
                     let seen = self.sessions.entry(name.unwrap()).or_default();
                     assert_eq!(offset, seen.next, "output is not contiguous");
@@ -603,11 +721,20 @@ impl Bridge {
         id: Option<&str>,
         argv: &[&str],
     ) -> Result<Status, (ErrorCode, String)> {
-        let before = (self.created.len(), self.errors.len());
         let new = NewSession {
             argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
             ..NewSession::default()
         };
+        self.try_new_with(id, new)
+    }
+
+    /// Starts a session as `new` says, through the bridge.
+    pub fn try_new_with(
+        &mut self,
+        id: Option<&str>,
+        new: NewSession,
+    ) -> Result<Status, (ErrorCode, String)> {
+        let before = (self.created.len(), self.errors.len());
         self.send(id, Message::New(new));
         self.until("an answer to new", |b| {
             b.created.len() > before.0 || b.errors.len() > before.1
@@ -622,7 +749,7 @@ impl Bridge {
 
     pub fn attach(&mut self, id: &str, offset: u64) -> (u64, bool) {
         let before = self.seen(id).attached.len();
-        self.send(Some(id), Message::Attach { offset });
+        self.send(Some(id), Message::attach(offset));
         self.until("attached", |b| {
             b.sessions
                 .get(id)

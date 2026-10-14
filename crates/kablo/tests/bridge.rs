@@ -114,6 +114,7 @@ fn a_session_the_bridge_starts_takes_the_program_the_directory_and_the_size() {
             ypixel: 0,
         }),
         journal_size: Some(64 * 1024),
+        history: None,
     };
     bridge.send(Some(&id), Message::New(request));
     bridge.until("created", |b| !b.created.is_empty());
@@ -215,7 +216,7 @@ fn what_the_bridge_cannot_do_is_answered_not_dropped() {
     let mut bridge = Bridge::start(&env);
     for message in [
         Message::Status,
-        Message::Attach { offset: 0 },
+        Message::attach(0),
         Message::Terminate { force: false },
     ] {
         bridge.send(Some("no-such-session"), message);
@@ -430,7 +431,7 @@ fn a_session_whose_relay_is_gone_for_good_is_listed_as_broken_and_a_dead_one_is_
 
     // Attaching to it is told why not, after a while rather than never.
     let start = Instant::now();
-    bridge.send(Some(&broken), Message::Attach { offset: 0 });
+    bridge.send(Some(&broken), Message::attach(0));
     let (session, code, _) = bridge.next_error();
     assert_eq!(
         (session.as_deref(), code),
@@ -1039,11 +1040,7 @@ fn a_link_with_too_many_requests_waiting_hands_the_next_one_back_untouched() {
     let now = Instant::now();
     let mut link = Link::open(&env.dir, id.clone(), now).unwrap();
     let mut out = Vec::new();
-    link.send(
-        Packet::about(id.clone(), Message::Attach { offset: 0 }),
-        now,
-        &mut out,
-    );
+    link.send(Packet::about(id.clone(), Message::attach(0)), now, &mut out);
     deaf.wait_for_the_client();
     let mut taken = 0u8;
     let refused = loop {
