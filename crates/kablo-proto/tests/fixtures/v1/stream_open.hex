@@ -1,0 +1,13 @@
+# open stream 1 to localhost port 3000, ready to take 262144 bytes
+01           # kind 0x01: open
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 1f  # payload length 31
+00 00 00 01  # stream 1
+00 04 00 00  # window 262144
+00 01        # tlv key 1: port
+00 00 00 02  #   length 2
+0b b8        #   port 3000
+00 02        # tlv key 2: host
+00 00 00 09  #   length 9
+6c 6f 63 61 6c 68 6f 73 74  #   host "localhost"

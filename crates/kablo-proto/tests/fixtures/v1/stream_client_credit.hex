@@ -1,0 +1,7 @@
+# the client has taken 16384 bytes on stream 1
+03           # kind 0x03: credit, client to server
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 08  # payload length 8
+00 00 00 01  # stream 1
+00 00 40 00  # 16384 bytes more may be sent

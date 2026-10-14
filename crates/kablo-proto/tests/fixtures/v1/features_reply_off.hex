@@ -1,0 +1,11 @@
+# features reply: streams known and turned off, with the reason
+8a           # kind 0x8a: features_reply
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 35  # payload length 53
+00 01        # tlv key 1: streams
+00 00 00 01  #   length 1
+00           #   streams off
+00 02        # tlv key 2: reason
+00 00 00 28  #   length 40
+74 75 72 6e 65 64 20 6f 66 66 20 62 79 20 74 68 65 20 73 65 72 76 65 72 27 73 20 61 64 6d 69 6e 69 73 74 72 61 74 6f 72  #   text

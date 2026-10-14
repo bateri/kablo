@@ -1,0 +1,8 @@
+# stream 2 did not connect: streams are turned off
+86           # kind 0x86: failed
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 2e  # payload length 46
+00 00 00 02  # stream 2
+00 06        # code 6: streams are turned off on this server
+74 75 72 6e 65 64 20 6f 66 66 20 62 79 20 74 68 65 20 73 65 72 76 65 72 27 73 20 61 64 6d 69 6e 69 73 74 72 61 74 6f 72  # text

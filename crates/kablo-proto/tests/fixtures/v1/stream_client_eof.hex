@@ -1,0 +1,6 @@
+# the client sends no more bytes on stream 1
+04           # kind 0x04: eof, client to server
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 04  # payload length 4
+00 00 00 01  # stream 1

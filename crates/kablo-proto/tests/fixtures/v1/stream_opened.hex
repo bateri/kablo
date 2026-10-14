@@ -1,0 +1,7 @@
+# stream 1 is connected, the server takes 65536 bytes
+81           # kind 0x81: opened
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 08  # payload length 8
+00 00 00 01  # stream 1
+00 01 00 00  # window 65536

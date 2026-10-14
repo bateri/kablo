@@ -46,17 +46,19 @@ After the handshake the connection is a sequence of frames in both directions:
 ```text
 offset  size  field
 0       1     kind          what the payload is (section 4)
-1       1     channel       0 = terminal sessions; nothing else is defined
+1       1     channel       0 = terminal sessions, 1 = streams; nothing else is defined
 2       1     session_len   0 to 64
 3       4     payload_len   0 to 1 048 576 (1 MiB)
 7       n     session id    session_len bytes
 7+n     m     payload       payload_len bytes
 ```
 
-- A frame whose `channel` is not 0, or whose `kind` the reader does not know, is
-  **skipped** by its lengths: the reader discards `session_len + payload_len`
-  bytes and carries on. Senders of this version always write channel 0; the
-  other values are reserved (for forwarding other kinds of streams later).
+- A frame whose `channel` the reader does not know, or whose `kind` it does not
+  know on that channel, is **skipped** by its lengths: the reader discards
+  `session_len + payload_len` bytes and carries on. A reader that predates
+  streams skips every frame of channel 1 this way. The messages about sessions
+  are written on channel 0 and the messages about streams (section 4) on
+  channel 1; the other values are reserved.
 - `session_len` above 64 or `payload_len` above 1 MiB is a protocol violation:
   the reader rejects the header **without reading or reserving memory for the
   body** and closes the connection, since the stream can no longer be trusted.
@@ -69,7 +71,8 @@ A session is named by 1 to 64 bytes of `[A-Za-z0-9._-]`. The id in a frame
 header says which session the message concerns; it is empty for a message about
 the connection itself (`list`, `ping`, `pong`, `list_reply`, and a `new` that
 lets the server pick the name). A server's socket for a session is
-`<id>.sock`, which is why the alphabet has no separator.
+`<id>.sock`, which is why the alphabet has no separator. A frame on channel 1
+has none: it names its stream in the payload.
 
 ## 3. Payload shapes
 
@@ -97,7 +100,9 @@ key: u16 | length: u32 | value: length bytes
 
 ## 4. Messages
 
-Kinds below 0x80 go client to server, the others server to client.
+Kinds below 0x80 go client to server, the others server to client, on both
+channels. A kind means what it means on its channel: the table below is the
+messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
@@ -111,6 +116,7 @@ Kinds below 0x80 go client to server, the others server to client.
 | 0x08 | `list` | no | (empty) |
 | 0x09 | `new` | optional | TLV block, below |
 | 0x0a | `ping` | no | any bytes |
+| 0x0b | `features` | no | (empty) |
 | 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated) |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
@@ -120,6 +126,7 @@ Kinds below 0x80 go client to server, the others server to client.
 | 0x87 | `list_reply` | no | TLV block of `session` entries, below |
 | 0x88 | `created` | yes | status TLV block |
 | 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
+| 0x8a | `features_reply` | no | TLV block, below |
 
 The first six client messages (`attach`, `detach`, `resize`, `terminate`,
 `upgrade`, `status`) are the core a relay must always understand.
@@ -174,6 +181,22 @@ not counted in `clients`, whichever connection either of them was on.
 `list_reply` is a block of entries with key 1 (`session`), each holding one
 status block.
 
+### features
+
+The TLV block of `features_reply`: what the server can do beyond terminal
+sessions. Every key is optional and an absent one reads as zero (or nothing), so
+a reply with no `streams` says there are none.
+
+| key | value | meaning |
+|---|---|---|
+| 1 | u8 | `streams`: bit 0 is set when the server takes streams (channel 1) |
+| 2 | text | `reason`: when `streams` is clear and the server knows streams, why they are off; text for a person, who sees it with control characters removed |
+| 3 | u32 | `max_streams`: how many streams a connection may have open at once |
+| 4 | u32 | `max_window`: the largest window the server takes for a stream and offers for one |
+| 5 | u32 | `max_data`: the most bytes the server takes in one stream `data` |
+
+A limit that is absent or zero is the one in section 6.
+
 ### error codes
 
 | code | meaning |
@@ -188,6 +211,59 @@ status block.
 
 A code a reader has no name for is still a valid error. The text is for logs: a
 client that shows it to a person removes control characters first.
+
+### Stream messages
+
+The messages of channel 1. The frame's session id is empty (a reader ignores
+what is there) and the payload starts with `stream: u32`, the number of the
+stream. Payloads are fixed layouts, read as a prefix, except where a TLV block
+is said. `data`, `credit`, `eof` and `close` go both ways and have a kind for
+each.
+
+| kind | name | payload after `stream` |
+|---|---|---|
+| 0x01 | `open` | `window: u32`, then a TLV block, below |
+| 0x02 | `data` | the bytes |
+| 0x03 | `credit` | `bytes: u32` |
+| 0x04 | `eof` | (empty) |
+| 0x05 | `close` | (empty) |
+| 0x81 | `opened` | `window: u32` |
+| 0x82 | `data` | the bytes |
+| 0x83 | `credit` | `bytes: u32` |
+| 0x84 | `eof` | (empty) |
+| 0x85 | `close` | (empty) |
+| 0x86 | `failed` | `code: u16`, then UTF-8 text |
+
+The TLV block of `open`, the target to connect to:
+
+| key | value | meaning |
+|---|---|---|
+| 1 | u16 | `port` |
+| 2 | bytes | `host`: a name or an address (IPv4, or IPv6 without brackets), 1 to 253 bytes, no NUL |
+
+A reader checks the structure of a stream message and nothing else: an `open`
+without a `port` or a `host` reads as port 0 and an empty host, and the server
+answers it with `failed` like any other `open` it cannot use. Senders do not
+produce them (port 0, an empty host, a host over 253 bytes or with a NUL, a
+`data` over 32 KiB).
+
+### stream failure codes
+
+The `code` of `failed`.
+
+| code | meaning |
+|---|---|
+| 1 | the target refused the connection |
+| 2 | the target cannot be reached, or connecting failed in a way no other code names |
+| 3 | the host name could not be resolved |
+| 4 | the target did not answer in time |
+| 5 | too many streams on the connection, or a window over the largest |
+| 6 | the server has streams turned off |
+| 7 | the `open` makes no sense (port 0, an empty or too long host) |
+
+A code a reader has no name for is still a failure. The text is short English
+that reads after a colon ("connection refused"); a client that shows it to a
+person removes control characters first.
 
 ## 5. How a conversation goes
 
@@ -338,10 +414,11 @@ session's socket: it runs `ssh host kablo attach`, and the standard input and
 output of that command carry this protocol for every session on the server at
 once, each message naming its session in the frame header. The bridge
 (`kablo attach`) forwards a request for a session to that session's socket and
-what comes back to the client, and answers three things itself because they
+what comes back to the client, and answers four things itself because they
 are about the connection: `ping` (a `pong` with the same bytes), `list` (it asks
-every session for its status and replies with the sessions that answered) and
-`new` (it starts the session and replies `created` with its status).
+every session for its status and replies with the sessions that answered),
+`new` (it starts the session and replies `created` with its status) and
+`features` (a `features_reply`, at once).
 
 - A `list` leaves out a socket nobody listens on (a session that was killed
   leaves its file behind) and reports a socket that takes connections but never
@@ -361,6 +438,67 @@ every session for its status and replies with the sessions that answered) and
 - When the client's end of the connection closes, the bridge ends and nothing
   else does: no session is closed by it.
 
+**Streams.** The bridge can also connect to a TCP port the server user can
+reach and carry the bytes of that connection over the same standard input and
+output, on channel 1: what `ssh -L` does, without asking sshd for anything, so
+it works where sshd's forwarding is off. One TCP connection is one **stream**.
+
+- *Asking.* An old bridge knows nothing of streams and says nothing about it, so
+  a client asks before it relies on them: it sends `features` and, right after,
+  `ping`. A bridge with streams answers `features_reply` as it reads the
+  `features`, so before the `pong`. A client that reads the `pong` without
+  having read a `features_reply` (or reads something other than a
+  `features_reply` first, an `error` for instance) is talking to a bridge
+  without streams and sends nothing on channel 1. A `features_reply` whose
+  `streams` is clear says the same, with a `reason` when there is one. There is
+  no timeout in this and the handshake is the same as ever.
+- *Opening.* The client numbers its streams from 1 upward and never uses a
+  number twice on a connection, so that a frame of a stream that is over cannot
+  be taken for one of a later stream. It sends `open` with the target and a
+  window (below). The bridge resolves the name and connects without holding up
+  anything else on the connection, for at most 10 seconds, to any host and port
+  the user it runs as can reach, as `ssh -L` does, and answers `opened` with its
+  own window, or `failed` with a code and a text, after which the stream never
+  existed. The client does not send `data` before `opened`, and it does not read
+  the local socket it is carrying until then: what a program writes meanwhile
+  waits in that socket. A bridge ignores an `open` whose number is not above
+  every number it has seen on the connection.
+- *Windows.* Each end gives the other a window per stream: the bytes the other
+  may send before it has to wait. The client's is in `open` and is what the
+  server may send; the server's is in `opened` and is what the client may send.
+  An end that has taken bytes (the server by writing them to the target's
+  socket, the client by handing them to its own) sends `credit` with their
+  number, which adds to the other end's window. A window is at most 256 KiB,
+  and an end never has more than that left to send; a `data` is at most 32 KiB.
+  An end that breaks one of these (it sends past its window, or more than 32
+  KiB in a `data`, or sends credit that takes the other's window past the
+  largest) loses the stream: the one that sees it answers with `close`. What an end keeps for a stream is therefore at
+  most one window, and the bridge never has to stop reading its client to make
+  room for one stream's bytes. Everything else the bridge says (session output,
+  replies) goes in the same byte stream between the pieces of stream data, which
+  is why `data` comes in pieces.
+- *Half and whole closes.* `eof` says that the sender sends no more `data` on
+  the stream; the other direction goes on. At the target that is a shutdown of
+  the writing half of the socket, and the target's own shutdown or close comes
+  to the client as `eof` from the server. A stream is over when both ends have
+  sent `eof`, or when either sends `close`, which ends it in both directions at
+  once, with bytes still on their way dropped; the bridge sends `close` when
+  the target's socket fails. A `data` after the same end's `eof` is not valid:
+  the receiver ends the stream with `close`.
+- *Frames of a stream that is over.* A `data`, `credit`, `eof` or `close`
+  naming a stream the receiver does not have (it is over, or was never
+  opened) is **ignored**, not an error: an end that sent `close` has frames of
+  the stream still on their way to the other.
+- *With the connection.* Streams last as long as the connection to the bridge
+  does. When it ends, the bridge closes the sockets of all its streams; a client
+  that connects again has none, since a TCP connection cannot be picked up where
+  it was left, unlike a session.
+- *The administrator.* A server whose administrator has turned streams off says
+  so in `features_reply` (`streams` clear, with a `reason`) and answers an
+  `open` that comes anyway with `failed` (6). The bridge asks again at each
+  `open`, so a decision applies to the streams opened after it; open streams
+  go on.
+
 ## 6. Limits
 
 | what | limit |
@@ -376,15 +514,22 @@ every session for its status and replies with the sessions that answered) and
 | connections to one session | 64 |
 | input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |
+| streams open on one connection | 128, counting the ones still connecting; one more is `failed` (5) |
+| streams connecting at once on one connection | 16; one more is `failed` (5) |
+| window of a stream, and credit outstanding | 256 KiB; an `open` asking for more is `failed` (5) |
+| bytes in one stream `data` | 32 KiB |
+| time to connect a stream | 10 seconds, then `failed` (4) |
+| host in an `open` | 253 bytes |
 
 ## 7. Compatibility
 
 - Every end speaks a range of versions, and the server selects the highest
   both speak. A build reads **its current version and the one before it**.
 - Inside a version the format grows only in ways a reader already tolerates:
-  new message kinds and channels (skipped), new TLV keys (skipped), fields
-  appended to a fixed layout (ignored), new bits in a flag byte (ignored),
-  new error codes and states (carried as numbers).
+  new message kinds and channels (skipped: a reader without streams skips
+  channel 1, one without `features` skips that kind), new TLV keys (skipped),
+  fields appended to a fixed layout (ignored), new bits in a flag byte
+  (ignored), new error codes, failure codes and states (carried as numbers).
 - Anything else is a new version. The bytes of every message of every shipped
   version are kept as fixtures that a test reads and compares in both
   directions; a fixture is never edited.

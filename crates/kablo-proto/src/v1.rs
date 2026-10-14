@@ -2,7 +2,9 @@
 //!
 //! A message is a frame of a known kind on the session channel, plus the
 //! session it concerns (empty for the connection-level ones). The kinds with
-//! the high bit clear go client to server, the others server to client.
+//! the high bit clear go client to server, the others server to client. The
+//! frames of the other channel in use, the one that carries streams, are the
+//! messages of [`stream`].
 //! Payloads that are one fixed layout are read as a prefix (a later version
 //! may append fields); payloads that may grow are [`tlv`] blocks.
 //!
@@ -17,6 +19,8 @@ use std::io::{Read, Write};
 use crate::frame::{self, CHANNEL_SESSION, FrameDecoder, MAX_PAYLOAD, RawFrame};
 use crate::tlv;
 use crate::{Error, Result, SessionId};
+
+pub mod stream;
 
 /// The kind byte of each message.
 pub mod kind {
@@ -40,6 +44,8 @@ pub mod kind {
     pub const NEW: u8 = 0x09;
     /// `ping`: ask the server to answer.
     pub const PING: u8 = 0x0a;
+    /// `features`: ask what the server can do beyond sessions.
+    pub const FEATURES: u8 = 0x0b;
     /// `attached`: the answer to `attach`.
     pub const ATTACHED: u8 = 0x81;
     /// `output`: bytes from the program.
@@ -58,6 +64,8 @@ pub mod kind {
     pub const CREATED: u8 = 0x88;
     /// `picture`: a piece of the screen as VT bytes.
     pub const PICTURE: u8 = 0x89;
+    /// `features_reply`: the answer to `features`.
+    pub const FEATURES_REPLY: u8 = 0x8a;
 }
 
 /// The name of a message kind, for diagnostics (`"unknown"` for a kind this
@@ -74,6 +82,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::LIST => "list",
         kind::NEW => "new",
         kind::PING => "ping",
+        kind::FEATURES => "features",
         kind::ATTACHED => "attached",
         kind::OUTPUT => "output",
         kind::ENDED => "ended",
@@ -83,6 +92,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::LIST_REPLY => "list_reply",
         kind::CREATED => "created",
         kind::PICTURE => "picture",
+        kind::FEATURES_REPLY => "features_reply",
         _ => "unknown",
     }
 }
@@ -490,6 +500,104 @@ impl Status {
     }
 }
 
+/// What a server can do beyond terminal sessions: the answer to `features`.
+/// A key that is absent reads as its zero, so a server that knows nothing of
+/// streams answers (if at all) with the default, which has them off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Features {
+    /// Whether the server takes [`stream`]s.
+    pub streams: bool,
+    /// Why not, when it knows streams and has them off: text for a person, for
+    /// a log (the client removes control characters before showing it).
+    pub reason: Option<String>,
+    /// The most streams the server keeps open at once on a connection (0: not
+    /// said, so [`stream::MAX_STREAMS`]).
+    pub max_streams: u32,
+    /// The largest window the server accepts for a stream, and offers one (0:
+    /// not said, so [`stream::MAX_WINDOW`]).
+    pub max_window: u32,
+    /// The most bytes the server takes in one stream `data` message (0: not
+    /// said, so [`stream::MAX_DATA`]).
+    pub max_data: u32,
+}
+
+mod features_key {
+    pub const STREAMS: u16 = 1;
+    pub const REASON: u16 = 2;
+    pub const MAX_STREAMS: u16 = 3;
+    pub const MAX_WINDOW: u16 = 4;
+    pub const MAX_DATA: u16 = 5;
+}
+
+impl Features {
+    /// What a server with streams on and the limits of this version says.
+    pub fn with_streams() -> Features {
+        Features {
+            streams: true,
+            reason: None,
+            max_streams: stream::MAX_STREAMS,
+            max_window: stream::MAX_WINDOW,
+            max_data: u32::try_from(stream::MAX_DATA).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// What a server that knows streams and has them turned off says, and why.
+    pub fn streams_off(why: impl Into<String>) -> Features {
+        Features {
+            reason: Some(why.into()),
+            ..Features::default()
+        }
+    }
+
+    /// The wire form, a [`tlv`] block with the keys in ascending order. A limit
+    /// of zero is not written.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        w.put_u8(features_key::STREAMS, u8::from(self.streams));
+        if let Some(why) = &self.reason {
+            w.put(features_key::REASON, why.as_bytes());
+        }
+        for (key, limit) in [
+            (features_key::MAX_STREAMS, self.max_streams),
+            (features_key::MAX_WINDOW, self.max_window),
+            (features_key::MAX_DATA, self.max_data),
+        ] {
+            if limit != 0 {
+                w.put_u32(key, limit);
+            }
+        }
+        w.finish()
+    }
+
+    /// Reads the wire form. Every key is optional and reads as its zero when
+    /// absent; one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<Features> {
+        let mut features = Features::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                features_key::STREAMS => {
+                    features.streams = tlv::read_u8(value, "features streams")? & 1 != 0
+                }
+                features_key::REASON => {
+                    features.reason = Some(tlv::read_text(value, "features reason")?)
+                }
+                features_key::MAX_STREAMS => {
+                    features.max_streams = tlv::read_u32(value, "features max streams")?
+                }
+                features_key::MAX_WINDOW => {
+                    features.max_window = tlv::read_u32(value, "features max window")?
+                }
+                features_key::MAX_DATA => {
+                    features.max_data = tlv::read_u32(value, "features max data")?
+                }
+                _ => {}
+            }
+        }
+        Ok(features)
+    }
+}
+
 /// The key under which a `list_reply` block holds each session's status.
 const LISTED: u16 = 1;
 
@@ -533,6 +641,11 @@ pub enum Message {
     New(NewSession),
     /// Client to server: answer with a `Pong` carrying the same bytes.
     Ping(Vec<u8>),
+    /// Client to server: say what you can do beyond sessions. Answered by
+    /// `FeaturesReply`, which a server that has it sends before the `Pong` of a
+    /// `Ping` that follows (and one that has not skips this and sends only the
+    /// `Pong`).
+    Features,
     /// Server to client: the stream starts at `offset`; `truncated` says bytes
     /// the client asked for had already left the journal.
     Attached {
@@ -568,6 +681,8 @@ pub enum Message {
     ListReply(Vec<Status>),
     /// Server to client: the answer to `New`.
     Created(Status),
+    /// Server to client: the answer to `Features`.
+    FeaturesReply(Features),
     /// Server to client: a piece of the screen as the bytes that build it. A
     /// picture follows an `Attached` and is one or more pieces in order, the
     /// last without `more`; the `Output` after it starts at `offset`.
@@ -607,6 +722,7 @@ impl Message {
             Message::List => kind::LIST,
             Message::New(_) => kind::NEW,
             Message::Ping(_) => kind::PING,
+            Message::Features => kind::FEATURES,
             Message::Attached { .. } => kind::ATTACHED,
             Message::Output { .. } => kind::OUTPUT,
             Message::Ended(_) => kind::ENDED,
@@ -616,12 +732,13 @@ impl Message {
             Message::ListReply(_) => kind::LIST_REPLY,
             Message::Created(_) => kind::CREATED,
             Message::Picture { .. } => kind::PICTURE,
+            Message::FeaturesReply(_) => kind::FEATURES_REPLY,
         }
     }
 
     fn payload(&self) -> Result<Vec<u8>> {
         Ok(match self {
-            Message::Detach | Message::Status | Message::List => Vec::new(),
+            Message::Detach | Message::Status | Message::List | Message::Features => Vec::new(),
             Message::Attach { offset, view } => {
                 let mut out = offset.to_be_bytes().to_vec();
                 if let Some(view) = view {
@@ -679,6 +796,7 @@ impl Message {
                 out
             }
             Message::StatusReply(status) | Message::Created(status) => status.to_block(),
+            Message::FeaturesReply(features) => features.to_block(),
             Message::ListReply(all) => {
                 let mut w = tlv::Writer::new();
                 for status in all {
@@ -724,6 +842,7 @@ impl Message {
             kind::LIST => Message::List,
             kind::NEW => Message::New(NewSession::decode(payload)?),
             kind::PING => Message::Ping(payload.to_vec()),
+            kind::FEATURES => Message::Features,
             kind::ATTACHED => Message::Attached {
                 offset: f.u64()?,
                 truncated: f.u8()? & 1 != 0,
@@ -753,6 +872,7 @@ impl Message {
                 Message::ListReply(all)
             }
             kind::CREATED => Message::Created(Status::from_block(payload)?),
+            kind::FEATURES_REPLY => Message::FeaturesReply(Features::from_block(payload)?),
             kind::PICTURE => Message::Picture {
                 offset: f.u64()?,
                 cols: f.u16()?,
@@ -897,6 +1017,10 @@ impl<'a> Fields<'a> {
 
     fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     fn u64(&mut self) -> Result<u64> {

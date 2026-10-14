@@ -1,0 +1,6 @@
+# the server ends stream 1 in both directions
+85           # kind 0x85: close, server to client
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 04  # payload length 4
+00 00 00 01  # stream 1

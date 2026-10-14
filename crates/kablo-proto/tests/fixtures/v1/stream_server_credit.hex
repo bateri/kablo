@@ -1,0 +1,7 @@
+# the server has taken 32768 bytes on stream 1
+83           # kind 0x83: credit, server to client
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 08  # payload length 8
+00 00 00 01  # stream 1
+00 00 80 00  # 32768 bytes more may be sent

@@ -1,0 +1,7 @@
+# bytes from the client on stream 1
+02           # kind 0x02: data, client to server
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 16  # payload length 22
+00 00 00 01  # stream 1
+47 45 54 20 2f 20 48 54 54 50 2f 31 2e 30 0d 0a 0d 0a  # bytes

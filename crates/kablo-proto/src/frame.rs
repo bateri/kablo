@@ -23,9 +23,11 @@ pub const HEADER_LEN: usize = 7;
 pub const MAX_SESSION_LEN: usize = 64;
 /// The longest payload a frame may carry: 1 MiB.
 pub const MAX_PAYLOAD: usize = 1 << 20;
-/// The channel of terminal sessions, the only one v1 uses. A frame on any
-/// other channel is skipped (the field is reserved for port forwarding).
+/// The channel of terminal sessions. A frame on a channel a reader does not
+/// know is skipped by its lengths.
 pub const CHANNEL_SESSION: u8 = 0;
+/// The channel of streams (TCP connections the server makes for the client).
+pub const CHANNEL_STREAM: u8 = 1;
 
 /// How much a payload read reserves before bytes have actually arrived.
 const FIRST_CHUNK: usize = 16 * 1024;
@@ -35,7 +37,8 @@ const FIRST_CHUNK: usize = 16 * 1024;
 pub struct RawFrame {
     /// What the payload means. The high bit marks the server-to-client half.
     pub kind: u8,
-    /// [`CHANNEL_SESSION`], or a channel this version does not know.
+    /// [`CHANNEL_SESSION`], [`CHANNEL_STREAM`], or a channel this version does
+    /// not know.
     pub channel: u8,
     /// The session id bytes (empty for a connection-level frame).
     pub session: Vec<u8>,

@@ -39,6 +39,11 @@ impl Writer {
         self.put(key, &[value])
     }
 
+    /// Appends a two-byte entry.
+    pub fn put_u16(&mut self, key: u16, value: u16) -> &mut Writer {
+        self.put(key, &value.to_be_bytes())
+    }
+
     /// Appends a four-byte entry.
     pub fn put_u32(&mut self, key: u16, value: u32) -> &mut Writer {
         self.put(key, &value.to_be_bytes())
@@ -104,6 +109,11 @@ pub fn read_u8(value: &[u8], what: &'static str) -> Result<u8> {
     Ok(u8::from_be_bytes(exact(value, what)?))
 }
 
+/// Reads a two-byte value; any other length is malformed.
+pub fn read_u16(value: &[u8], what: &'static str) -> Result<u16> {
+    Ok(u16::from_be_bytes(exact(value, what)?))
+}
+
 /// Reads a four-byte value; any other length is malformed.
 pub fn read_u32(value: &[u8], what: &'static str) -> Result<u32> {
     Ok(u32::from_be_bytes(exact(value, what)?))
@@ -155,6 +165,9 @@ mod tests {
 
     #[test]
     fn scalars_must_have_their_exact_length() {
+        assert_eq!(read_u16(&[1, 0], "x").unwrap(), 256);
+        assert!(read_u16(&[1], "x").is_err());
+        assert!(read_u16(&[0, 0, 1], "x").is_err());
         assert_eq!(read_u32(&[0, 0, 1, 0], "x").unwrap(), 256);
         assert!(read_u32(&[0, 0, 1], "x").is_err());
         assert!(read_u32(&[0, 0, 0, 0, 1], "x").is_err());

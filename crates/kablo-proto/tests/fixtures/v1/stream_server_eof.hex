@@ -1,0 +1,6 @@
+# the target sends no more bytes on stream 1
+84           # kind 0x84: eof, server to client
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 04  # payload length 4
+00 00 00 01  # stream 1

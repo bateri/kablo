@@ -1,0 +1,5 @@
+# features (connection level): what can this server do?
+0b           # kind 0x0b: features
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

@@ -12,7 +12,9 @@
 //!
 //! A connection is a [`hello`] handshake, then [`frame`]s. A frame is a header
 //! (kind, channel, session id, payload length) and a payload; the payload of
-//! the frames in use is one of the [`v1`] messages. Nothing about the
+//! the frames in use is one of the [`v1`] messages: a [`v1::Packet`] on the
+//! session channel, a [`v1::stream::Packet`] on the channel of streams (TCP
+//! connections the server makes for the client). Nothing about the
 //! terminal's contents is in the protocol: the program's bytes travel inside
 //! `output` and `input` payloads untouched.
 //!
@@ -40,7 +42,7 @@ pub mod tlv;
 pub mod v1;
 
 pub use error::{Error, Result};
-pub use frame::{CHANNEL_SESSION, MAX_PAYLOAD, MAX_SESSION_LEN};
+pub use frame::{CHANNEL_SESSION, CHANNEL_STREAM, MAX_PAYLOAD, MAX_SESSION_LEN};
 pub use hello::{NOISE_LIMIT, Protocol, SIGNATURE};
 pub use session::SessionId;
 

@@ -20,11 +20,12 @@ use std::path::PathBuf;
 
 use kablo_proto::frame::{self, RawFrame};
 use kablo_proto::hello::Reply;
+use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder, Side, read_incoming};
 use kablo_proto::v1::{
-    self, Exit, Message, NewSession, Packet, PacketDecoder, Size, State, Status, View, kind,
-    read_packet, write_packet,
+    self, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, State, Status, View,
+    kind, read_packet, write_packet,
 };
-use kablo_proto::{CHANNEL_SESSION, Error, SessionId, WIRE};
+use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE};
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
@@ -236,6 +237,17 @@ fn messages() -> Vec<(&'static str, Packet)> {
             "pong",
             Packet::connection(Message::Pong(b"pingdata".to_vec())),
         ),
+        ("features", Packet::connection(Message::Features)),
+        (
+            "features_reply",
+            Packet::connection(Message::FeaturesReply(Features::with_streams())),
+        ),
+        (
+            "features_reply_off",
+            Packet::connection(Message::FeaturesReply(Features::streams_off(
+                "turned off by the server's administrator",
+            ))),
+        ),
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
             "status_reply_ended",
@@ -278,6 +290,77 @@ fn messages() -> Vec<(&'static str, Packet)> {
                 }),
             ),
         ),
+    ]
+}
+
+/// Every fixture of channel 1: the end that sends it, and what it says.
+fn streams() -> Vec<(&'static str, Side, stream::Packet)> {
+    use stream::Message as S;
+    let on = stream::Packet::new;
+    vec![
+        (
+            "stream_open",
+            Side::Client,
+            on(
+                1,
+                S::Open {
+                    window: 262_144,
+                    port: 3000,
+                    host: "localhost".into(),
+                },
+            ),
+        ),
+        (
+            "stream_opened",
+            Side::Server,
+            on(1, S::Opened { window: 65_536 }),
+        ),
+        (
+            "stream_failed",
+            Side::Server,
+            on(
+                1,
+                S::Failed {
+                    code: FailCode::REFUSED,
+                    text: "connection refused".into(),
+                },
+            ),
+        ),
+        (
+            "stream_failed_forbidden",
+            Side::Server,
+            on(
+                2,
+                S::Failed {
+                    code: FailCode::FORBIDDEN,
+                    text: "turned off by the server's administrator".into(),
+                },
+            ),
+        ),
+        (
+            "stream_client_data",
+            Side::Client,
+            on(1, S::Data(b"GET / HTTP/1.0\r\n\r\n".to_vec())),
+        ),
+        (
+            "stream_server_data",
+            Side::Server,
+            on(1, S::Data(b"HTTP/1.0 200 OK\r\n".to_vec())),
+        ),
+        (
+            "stream_client_credit",
+            Side::Client,
+            on(1, S::Credit(16_384)),
+        ),
+        (
+            "stream_server_credit",
+            Side::Server,
+            on(1, S::Credit(32_768)),
+        ),
+        ("stream_client_eof", Side::Client, on(1, S::Eof)),
+        ("stream_server_eof", Side::Server, on(1, S::Eof)),
+        ("stream_client_close", Side::Client, on(1, S::Close)),
+        ("stream_server_close", Side::Server, on(1, S::Close)),
     ]
 }
 
@@ -325,11 +408,12 @@ fn the_directory_holds_exactly_the_fixtures_the_tests_name() {
     let named: BTreeSet<String> = messages()
         .iter()
         .map(|(n, _)| (*n).to_owned())
+        .chain(streams().iter().map(|(n, ..)| (*n).to_owned()))
         .chain(HANDSHAKE.map(str::to_owned))
         .collect();
     assert_eq!(
         named.len(),
-        messages().len() + HANDSHAKE.len(),
+        messages().len() + streams().len() + HANDSHAKE.len(),
         "a name is listed twice"
     );
     let on_disk: BTreeSet<String> = std::fs::read_dir(dir())
@@ -359,6 +443,7 @@ fn every_message_kind_has_a_fixture() {
         LIST,
         NEW,
         PING,
+        FEATURES,
         ATTACHED,
         OUTPUT,
         ENDED,
@@ -368,6 +453,7 @@ fn every_message_kind_has_a_fixture() {
         LIST_REPLY,
         CREATED,
         PICTURE,
+        FEATURES_REPLY,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -470,7 +556,7 @@ fn frames_of_an_unknown_kind_or_channel_are_skipped_by_their_length() {
     let mut stream = Vec::new();
     stream.extend(raw(0x7e, CHANNEL_SESSION, "work", &[1; 5000])); // a kind from the future
     stream.extend(raw(0xfe, CHANNEL_SESSION, "", &[])); // another, from the server's half
-    stream.extend(raw(kind::DETACH, 1, "work", &[1, 2, 3])); // a known kind on a channel we do not have
+    stream.extend(raw(kind::DETACH, 1, "work", &[1, 2, 3])); // channel 1 is not this reader's: it reads sessions
     stream.extend(fixture("ping"));
     stream.extend(raw(0x7e, CHANNEL_SESSION, "", &[2; 10])); // and one trailing, to the end
     let ping = Packet::connection(Message::Ping(b"pingdata".to_vec()));
@@ -719,7 +805,11 @@ fn bytes_that_are_not_a_protocol_never_panic() {
         x ^= x << 17;
         x
     };
-    let seeds: Vec<Vec<u8>> = messages().iter().map(|(n, _)| fixture(n)).collect();
+    let seeds: Vec<Vec<u8>> = messages()
+        .iter()
+        .map(|(n, _)| fixture(n))
+        .chain(streams().iter().map(|(n, ..)| fixture(n)))
+        .collect();
     for round in 0..3000 {
         let mut bytes = if round % 2 == 0 {
             // A real frame with a few bytes flipped.
@@ -744,7 +834,510 @@ fn bytes_that_are_not_a_protocol_never_panic() {
         let mut decoder = PacketDecoder::new();
         decoder.push(&bytes);
         while let Ok(Some(_)) = decoder.next_packet() {}
+        let mut reader = bytes.as_slice();
+        while let Ok(Some(_)) = read_incoming(&mut reader) {}
+        let mut decoder = IncomingDecoder::new();
+        decoder.push(&bytes);
+        while let Ok(Some(_)) = decoder.next_incoming() {}
         let _ = Status::from_block(&bytes);
+        let _ = Features::from_block(&bytes);
         let _ = WIRE.read_hello(&mut bytes.as_slice());
     }
+}
+
+/// A channel 0 fixture by name.
+fn session_message(name: &str) -> Packet {
+    messages()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("no session fixture {name}"))
+        .1
+}
+
+/// A channel 1 fixture by name.
+fn stream_message(name: &str) -> (Side, stream::Packet) {
+    streams()
+        .into_iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(_, from, packet)| (from, packet))
+        .unwrap_or_else(|| panic!("no stream fixture {name}"))
+}
+
+#[test]
+fn every_stream_message_is_its_fixture_byte_for_byte() {
+    for (name, from, packet) in streams() {
+        let bytes = fixture(name);
+        let mut written = Vec::new();
+        stream::write_packet(&mut written, &packet, from).unwrap();
+        assert_eq!(written, bytes, "{name}: what is written");
+        let mut appended = vec![9];
+        packet.encode(from, &mut appended).unwrap();
+        assert_eq!(&appended[1..], bytes.as_slice(), "{name}: what is appended");
+
+        let expected = Incoming::Stream {
+            from,
+            packet: packet.clone(),
+        };
+        let mut reader = bytes.as_slice();
+        assert_eq!(
+            read_incoming(&mut reader).unwrap().as_ref(),
+            Some(&expected),
+            "{name}: what is read"
+        );
+        assert_eq!(
+            read_incoming(&mut reader).unwrap(),
+            None,
+            "{name}: left over"
+        );
+
+        let mut decoder = IncomingDecoder::new();
+        for byte in &bytes {
+            decoder.push(std::slice::from_ref(byte));
+        }
+        assert_eq!(
+            decoder.next_incoming().unwrap().as_ref(),
+            Some(&expected),
+            "{name}: what is decoded"
+        );
+        assert_eq!(decoder.pending(), 0, "{name}");
+
+        // The reader that reads sessions only (what a build without streams
+        // is) goes over the frame by its length and finds nothing.
+        assert_eq!(read_packet(&mut bytes.as_slice()).unwrap(), None, "{name}");
+        let mut old = PacketDecoder::new();
+        old.push(&bytes);
+        assert_eq!(old.next_packet().unwrap(), None, "{name}");
+        assert_eq!(old.pending(), 0, "{name}");
+        // Nor does the frame mean anything on the session channel.
+        let frame = frame::read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+        assert_eq!(frame.channel, CHANNEL_STREAM, "{name}");
+        assert!(frame.session.is_empty(), "{name}");
+        assert_eq!(Packet::from_frame(frame).unwrap(), None, "{name}");
+    }
+}
+
+#[test]
+fn every_stream_kind_has_a_fixture() {
+    let kinds: BTreeSet<u8> = streams()
+        .iter()
+        .map(|(_, from, p)| p.message.kind(*from).unwrap())
+        .collect();
+    use stream::kind::*;
+    for k in [
+        OPEN,
+        CLIENT_DATA,
+        CLIENT_CREDIT,
+        CLIENT_EOF,
+        CLIENT_CLOSE,
+        OPENED,
+        SERVER_DATA,
+        SERVER_CREDIT,
+        SERVER_EOF,
+        SERVER_CLOSE,
+        FAILED,
+    ] {
+        assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
+    }
+    // The kinds are the ones section 4 lists: the high bit marks the server.
+    assert!(
+        [OPEN, CLIENT_DATA, CLIENT_CREDIT, CLIENT_EOF, CLIENT_CLOSE]
+            .iter()
+            .all(|k| k & 0x80 == 0)
+    );
+    assert!(
+        [
+            OPENED,
+            SERVER_DATA,
+            SERVER_CREDIT,
+            SERVER_EOF,
+            SERVER_CLOSE,
+            FAILED
+        ]
+        .iter()
+        .all(|k| k & 0x80 != 0)
+    );
+    assert_eq!(kinds.len(), 11);
+}
+
+#[test]
+fn the_two_channels_interleave_and_a_reader_without_streams_sees_only_sessions() {
+    // (fixture, on channel 1)
+    let order = [
+        ("features", false),
+        ("ping", false),
+        ("features_reply", false),
+        ("stream_open", true),
+        ("pong", false),
+        ("stream_opened", true),
+        ("attach", false),
+        ("stream_client_data", true),
+        ("output", false),
+        ("stream_server_credit", true),
+        ("stream_server_data", true),
+        ("stream_client_eof", true),
+        ("stream_server_close", true),
+        ("detach", false),
+    ];
+    let mut wire = Vec::new();
+    let mut all = Vec::new();
+    let mut sessions = Vec::new();
+    for (name, on_stream) in order {
+        wire.extend(fixture(name));
+        if on_stream {
+            let (from, packet) = stream_message(name);
+            all.push(Incoming::Stream { from, packet });
+        } else {
+            let packet = session_message(name);
+            sessions.push(packet.clone());
+            all.push(Incoming::Session(packet));
+        }
+    }
+
+    let mut reader = wire.as_slice();
+    for expected in &all {
+        assert_eq!(read_incoming(&mut reader).unwrap().as_ref(), Some(expected));
+    }
+    assert_eq!(read_incoming(&mut reader).unwrap(), None);
+
+    let mut reader = wire.as_slice();
+    for expected in &sessions {
+        assert_eq!(read_packet(&mut reader).unwrap().as_ref(), Some(expected));
+    }
+    assert_eq!(read_packet(&mut reader).unwrap(), None);
+
+    for piece in [1, 3, 13, 4096] {
+        let mut incoming = IncomingDecoder::new();
+        let mut old = PacketDecoder::new();
+        let (mut got_all, mut got_sessions) = (Vec::new(), Vec::new());
+        for chunk in wire.chunks(piece) {
+            incoming.push(chunk);
+            while let Some(i) = incoming.next_incoming().unwrap() {
+                got_all.push(i);
+            }
+            old.push(chunk);
+            while let Some(p) = old.next_packet().unwrap() {
+                got_sessions.push(p);
+            }
+        }
+        assert_eq!(got_all, all, "pieces of {piece}");
+        assert_eq!(got_sessions, sessions, "pieces of {piece}");
+        assert_eq!(incoming.pending() + old.pending(), 0, "pieces of {piece}");
+    }
+}
+
+#[test]
+fn a_stream_message_that_does_not_parse_costs_that_message_and_nothing_after_it() {
+    use stream::kind as k;
+    let mut wire = Vec::new();
+    wire.extend(raw(k::CLIENT_DATA, CHANNEL_STREAM, "", &[0, 0, 1])); // not a whole stream number
+    wire.extend(raw(k::CLIENT_CLOSE, CHANNEL_STREAM, "", &[])); // no stream number at all
+    wire.extend(raw(k::OPEN, CHANNEL_STREAM, "", &[0, 0, 0, 1, 0, 0, 0])); // a window cut short
+    wire.extend(raw(
+        k::OPEN,
+        CHANNEL_STREAM,
+        "",
+        &[0, 0, 0, 1, 0, 0, 0, 9, 0, 1, 0, 0, 0, 9],
+    )); // an entry cut short
+    wire.extend(raw(
+        k::OPEN,
+        CHANNEL_STREAM,
+        "",
+        &[0, 0, 0, 1, 0, 0, 0, 9, 0, 1, 0, 0, 0, 3, 0, 0, 0],
+    )); // a port of three bytes
+    wire.extend(raw(k::OPENED, CHANNEL_STREAM, "", &[0, 0, 0, 1, 0, 0])); // a window cut short
+    wire.extend(raw(k::FAILED, CHANNEL_STREAM, "", &[0, 0, 0, 1, 0])); // a code cut short
+    wire.extend(raw(
+        k::CLIENT_CREDIT,
+        CHANNEL_STREAM,
+        "",
+        &[0, 0, 0, 1, 0, 0],
+    )); // a count cut short
+    wire.extend(raw(k::SERVER_CREDIT, CHANNEL_STREAM, "", &[0, 0, 0, 1])); // no count
+    wire.extend(fixture("stream_client_eof"));
+    let mut reader = wire.as_slice();
+    for n in 0..9 {
+        match read_incoming(&mut reader) {
+            Err(e) => assert!(e.is_recoverable(), "message {n}: {e}"),
+            Ok(i) => panic!("message {n} read as {i:?}"),
+        }
+    }
+    let (from, packet) = stream_message("stream_client_eof");
+    assert_eq!(
+        read_incoming(&mut reader).unwrap(),
+        Some(Incoming::Stream { from, packet })
+    );
+    assert_eq!(read_incoming(&mut reader).unwrap(), None);
+}
+
+#[test]
+fn frames_of_a_kind_or_channel_streams_do_not_have_are_skipped_by_their_length() {
+    use stream::kind as k;
+    let mut wire = Vec::new();
+    wire.extend(raw(0x06, CHANNEL_STREAM, "", &[0, 0, 0, 1, 7, 7])); // no client message has this kind
+    wire.extend(raw(0x87, CHANNEL_STREAM, "", &[0; 100])); // nor server message
+    wire.extend(raw(0x7e, CHANNEL_STREAM, "", &[1; 5000])); // a kind from the future
+    wire.extend(raw(0xfe, CHANNEL_STREAM, "", &[])); // another, from the server's half
+    wire.extend(raw(k::CLIENT_DATA, 2, "", &[0, 0, 0, 1, 7])); // a channel from the future
+    wire.extend(fixture("stream_server_eof"));
+    wire.extend(raw(0x06, CHANNEL_STREAM, "", &[2; 10])); // and one trailing, to the end
+    let (from, packet) = stream_message("stream_server_eof");
+    let eof = Incoming::Stream { from, packet };
+    let mut reader = wire.as_slice();
+    assert_eq!(read_incoming(&mut reader).unwrap(), Some(eof.clone()));
+    assert_eq!(read_incoming(&mut reader).unwrap(), None);
+    let mut decoder = IncomingDecoder::new();
+    decoder.push(&wire);
+    assert_eq!(decoder.next_incoming().unwrap(), Some(eof));
+    assert_eq!(decoder.next_incoming().unwrap(), None);
+    assert_eq!(decoder.pending(), 0);
+}
+
+#[test]
+fn a_reader_ignores_what_a_later_version_adds_to_a_stream_message() {
+    use stream::Message as S;
+    use stream::kind as k;
+    let read = |kind: u8, session: &str, payload: &[u8]| match read_incoming(
+        &mut raw(kind, CHANNEL_STREAM, session, payload).as_slice(),
+    ) {
+        Ok(Some(Incoming::Stream { packet, .. })) => packet,
+        other => panic!("read as {other:?}"),
+    };
+    // Fields appended to a fixed layout.
+    assert_eq!(
+        read(k::CLIENT_CREDIT, "", &[0, 0, 0, 5, 0, 0, 1, 0, 0xde, 0xad]),
+        stream::Packet::new(5, S::Credit(256))
+    );
+    assert_eq!(
+        read(k::OPENED, "", &[0, 0, 0, 5, 0, 0, 1, 0, 0xde]),
+        stream::Packet::new(5, S::Opened { window: 256 })
+    );
+    assert_eq!(
+        read(k::SERVER_EOF, "", &[0, 0, 0, 5, 1, 2, 3]),
+        stream::Packet::new(5, S::Eof)
+    );
+    assert_eq!(
+        read(k::CLIENT_CLOSE, "", &[0, 0, 0, 5, 1]),
+        stream::Packet::new(5, S::Close)
+    );
+    // A session id nobody asked for is not read.
+    assert_eq!(
+        read(k::SERVER_CLOSE, "work", &[0, 0, 0, 5]),
+        stream::Packet::new(5, S::Close)
+    );
+    // A key it does not know in an open, between the known ones; the last of a
+    // repeated key wins.
+    let mut payload = vec![0, 0, 0, 6, 0, 0, 0, 1];
+    payload.extend([0, 1, 0, 0, 0, 2, 0, 80]); // port 80
+    payload.extend([0x0f, 0xff, 0, 0, 0, 3, 9, 9, 9]); // a key from the future
+    payload.extend([0, 2, 0, 0, 0, 3, b'o', b'l', b'd']); // host "old"
+    payload.extend([0, 2, 0, 0, 0, 2, b'm', b'e']); // host "me"
+    assert_eq!(
+        read(k::OPEN, "", &payload),
+        stream::Packet::new(
+            6,
+            S::Open {
+                window: 1,
+                port: 80,
+                host: "me".into()
+            }
+        )
+    );
+    // A failure code this version has no name for is kept as it came.
+    assert_eq!(
+        read(k::FAILED, "", &[0, 0, 0, 6, 0x12, 0x34]),
+        stream::Packet::new(
+            6,
+            S::Failed {
+                code: FailCode(0x1234),
+                text: String::new()
+            }
+        )
+    );
+}
+
+#[test]
+fn what_an_open_asks_for_is_answered_by_the_server_not_refused_by_the_reader() {
+    use stream::Message as S;
+    use stream::kind as k;
+    // No keys at all: port 0 and no host, which a server answers `failed` with
+    // BAD_REQUEST on that stream.
+    let frame = raw(k::OPEN, CHANNEL_STREAM, "", &[0, 0, 0, 3, 0, 0, 0, 0]);
+    assert_eq!(
+        read_incoming(&mut frame.as_slice()).unwrap(),
+        Some(Incoming::Stream {
+            from: Side::Client,
+            packet: stream::Packet::new(
+                3,
+                S::Open {
+                    window: 0,
+                    port: 0,
+                    host: String::new()
+                }
+            )
+        })
+    );
+    // A data message over the sender's limit, and a window over the largest:
+    // a reader takes both so that the receiver can close that one stream.
+    let mut payload = vec![0, 0, 0, 3];
+    payload.extend(vec![7; stream::MAX_DATA + 1]);
+    let frame = raw(k::CLIENT_DATA, CHANNEL_STREAM, "", &payload);
+    let Some(Incoming::Stream { packet, .. }) = read_incoming(&mut frame.as_slice()).unwrap()
+    else {
+        panic!("not a stream message")
+    };
+    assert_eq!(
+        packet,
+        stream::Packet::new(3, S::Data(vec![7; stream::MAX_DATA + 1]))
+    );
+    let frame = raw(
+        k::OPENED,
+        CHANNEL_STREAM,
+        "",
+        &[0, 0, 0, 3, 0xff, 0xff, 0xff, 0xff],
+    );
+    assert_eq!(
+        read_incoming(&mut frame.as_slice()).unwrap(),
+        Some(Incoming::Stream {
+            from: Side::Server,
+            packet: stream::Packet::new(3, S::Opened { window: u32::MAX })
+        })
+    );
+}
+
+#[test]
+fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
+    use stream::Message as S;
+    let write = |from: Side, message: S| {
+        stream::write_packet(&mut Vec::new(), &stream::Packet::new(1, message), from)
+    };
+    let open = |port: u16, host: &str| S::Open {
+        window: 1,
+        port,
+        host: host.into(),
+    };
+    assert!(write(Side::Client, open(80, "example.org")).is_ok());
+    assert!(write(Side::Client, open(80, "::1")).is_ok());
+    assert!(write(Side::Client, open(80, &"a".repeat(stream::MAX_HOST))).is_ok());
+    assert!(
+        write(Side::Client, open(0, "example.org")).is_err(),
+        "port 0"
+    );
+    assert!(write(Side::Client, open(80, "")).is_err(), "no host");
+    assert!(write(Side::Client, open(80, "a\0b")).is_err(), "a NUL");
+    assert!(
+        write(Side::Client, open(80, &"a".repeat(stream::MAX_HOST + 1))).is_err(),
+        "a host over the longest name"
+    );
+
+    let data = |len: usize| S::Data(vec![1; len]);
+    assert!(write(Side::Client, data(stream::MAX_DATA)).is_ok());
+    assert!(write(Side::Server, data(stream::MAX_DATA)).is_ok());
+    assert!(write(Side::Client, data(stream::MAX_DATA + 1)).is_err());
+    assert!(write(Side::Server, data(stream::MAX_DATA + 1)).is_err());
+
+    // A message goes the way its name says.
+    assert!(write(Side::Server, open(80, "example.org")).is_err());
+    assert!(write(Side::Client, S::Opened { window: 1 }).is_err());
+    assert!(
+        write(
+            Side::Client,
+            S::Failed {
+                code: FailCode::REFUSED,
+                text: String::new()
+            }
+        )
+        .is_err()
+    );
+    for side in [Side::Client, Side::Server] {
+        for message in [S::Data(Vec::new()), S::Credit(1), S::Eof, S::Close] {
+            assert!(write(side, message).is_ok());
+        }
+    }
+}
+
+#[test]
+fn the_limits_of_streams_are_the_ones_the_features_say() {
+    let on = Features::with_streams();
+    assert!(on.streams);
+    assert_eq!(on.reason, None);
+    assert_eq!(on.max_streams, 128);
+    assert_eq!(on.max_window, 256 * 1024);
+    assert_eq!(on.max_data, 32 * 1024);
+    assert_eq!(usize::try_from(on.max_data).unwrap(), stream::MAX_DATA);
+    assert_eq!(stream::MAX_STREAMS, 128);
+    assert_eq!(stream::MAX_CONNECTING, 16);
+    assert_eq!(stream::CONNECT_TIMEOUT.as_secs(), 10);
+    assert_eq!(stream::MAX_HOST, 253);
+}
+
+#[test]
+fn features_read_as_zeros_unless_the_server_says_more() {
+    // Nothing said: no streams. A server that knows no streams says this or
+    // nothing at all.
+    assert_eq!(Features::from_block(&[]).unwrap(), Features::default());
+    assert!(!Features::default().streams);
+    let reply = raw(kind::FEATURES_REPLY, CHANNEL_SESSION, "", &[]);
+    assert_eq!(
+        read_packet(&mut reply.as_slice()).unwrap(),
+        Some(Packet::connection(Message::FeaturesReply(
+            Features::default()
+        )))
+    );
+
+    // Only the first bit of the flag byte is read; a key from the future is
+    // skipped, between the known ones; the last of a repeated key wins.
+    let mut block = Vec::new();
+    block.extend([0, 1, 0, 0, 0, 1, 0b1111_1110]); // streams: bit 0 clear
+    block.extend([0x0f, 0xff, 0, 0, 0, 2, 9, 9]);
+    block.extend([0, 3, 0, 0, 0, 4, 0, 0, 0, 5]);
+    assert_eq!(
+        Features::from_block(&block).unwrap(),
+        Features {
+            max_streams: 5,
+            ..Features::default()
+        }
+    );
+    block.extend([0, 1, 0, 0, 0, 1, 0b0000_0011]);
+    block.extend([0, 3, 0, 0, 0, 4, 0, 0, 0, 6]);
+    block.extend([0, 5, 0, 0, 0, 4, 0, 0, 1, 0]);
+    assert_eq!(
+        Features::from_block(&block).unwrap(),
+        Features {
+            streams: true,
+            max_streams: 6,
+            max_data: 256,
+            ..Features::default()
+        }
+    );
+
+    // A value of the wrong length, text that is not text, and an entry cut
+    // short make the message malformed, which costs that message alone.
+    for bad in [
+        &[0, 1, 0, 0, 0, 2, 1, 1][..],
+        &[0, 3, 0, 0, 0, 2, 0, 1],
+        &[0, 2, 0, 0, 0, 1, 0xff],
+        &[0, 4, 0, 0, 0, 9, 0],
+    ] {
+        let mut wire = raw(kind::FEATURES_REPLY, CHANNEL_SESSION, "", bad);
+        wire.extend(fixture("features"));
+        let err = read_packet(&mut wire.as_slice()).unwrap_err();
+        assert!(err.is_recoverable(), "{bad:?}: {err}");
+    }
+    // A request has no payload to be wrong about.
+    let request = raw(kind::FEATURES, CHANNEL_SESSION, "", &[1, 2, 3]);
+    assert_eq!(
+        read_packet(&mut request.as_slice()).unwrap(),
+        Some(Packet::connection(Message::Features))
+    );
+}
+
+#[test]
+fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
+    assert_eq!(v1::kind_name(kind::FEATURES), "features");
+    assert_eq!(v1::kind_name(kind::FEATURES_REPLY), "features_reply");
+    assert_eq!(v1::kind_name(0x0c), "unknown");
+    assert_eq!(v1::kind_name(0x8b), "unknown");
+    assert_eq!(stream::kind_name(stream::kind::OPEN), "stream open");
+    assert_eq!(stream::kind_name(stream::kind::FAILED), "stream failed");
+    assert_eq!(stream::kind_name(0x06), "unknown");
 }
