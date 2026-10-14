@@ -121,6 +121,58 @@ fn a_session_the_bridge_starts_takes_the_program_the_directory_and_the_size() {
 }
 
 #[test]
+fn a_journal_of_a_size_nobody_can_have_is_a_bad_request_and_starts_nothing() {
+    let env = Env::new();
+    let mut bridge = Bridge::start(&env);
+    let id = env.name("huge");
+    for size in [0, 16 * 1024 - 1, (1 << 30) + 1, u64::MAX] {
+        let request = NewSession {
+            argv: vec![b"/bin/sh".to_vec()],
+            journal_size: Some(size),
+            ..NewSession::default()
+        };
+        bridge.send(Some(&id), Message::New(request));
+        let (session, code, text) = bridge.next_error();
+        assert_eq!(session.as_deref(), Some(id.as_str()), "{size}");
+        assert_eq!(code, ErrorCode::BAD_REQUEST, "{size}: {text}");
+        assert!(
+            !env.socket(&id).exists() && bridge.list().is_empty(),
+            "{size}: nothing was started"
+        );
+    }
+}
+
+#[test]
+fn a_keeper_the_bridge_started_is_collected_when_its_session_ends() {
+    // The bridge is the keeper's parent and lives as long as the connection:
+    // a keeper nobody waits for stays a zombie that long.
+    let mut env = Env::new();
+    let mut bridge = Bridge::start(&env);
+    let id = env.name("brief");
+    env.track(&id);
+    bridge
+        .try_new(Some(&id), &["/bin/sh", "-c", "sleep 1; exit 0"])
+        .expect("a session");
+    bridge.attach(&id, 0);
+    bridge.until("the end", |b| {
+        b.sessions.get(&id).is_some_and(|s| s.ended.is_some())
+    });
+    env.wait_gone(&id);
+    let start = Instant::now();
+    loop {
+        let zombies = env.zombies_of(bridge.pid());
+        if zombies.is_empty() {
+            break;
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the bridge left {zombies:?} behind"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn the_bridge_names_a_session_when_asked_to_and_refuses_a_name_that_is_taken() {
     let mut env = Env::new();
     let mut bridge = Bridge::start(&env);

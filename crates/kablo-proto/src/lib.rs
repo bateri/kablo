@@ -6,6 +6,10 @@
 //! program, on any transport that carries bytes, can speak to a kablo server
 //! with it. `docs/PROTOCOL.md` in the repository describes the bytes.
 //!
+//! Beside the wire, [`install`] holds the rules a client shares for putting a
+//! kablo binary on a server: which target a server is, what the binary of a
+//! release is called and where it goes.
+//!
 //! A connection is a [`hello`] handshake, then [`frame`]s. A frame is a header
 //! (kind, channel, session id, payload length) and a payload; the payload of
 //! the frames in use is one of the [`v1`] messages. Nothing about the
@@ -30,6 +34,7 @@
 pub mod error;
 pub mod frame;
 pub mod hello;
+pub mod install;
 pub mod session;
 pub mod tlv;
 pub mod v1;

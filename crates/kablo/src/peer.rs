@@ -86,10 +86,13 @@ impl Peer {
     }
 
     /// What to ask `poll` about: writability while bytes wait, readability
-    /// when `reading`.
+    /// when `reading`, and always while the handshake is not answered: the
+    /// owner can take no more output, but the answer is not output, and a
+    /// connection that cannot hear it would give up on a session that is
+    /// there.
     pub fn interest(&self, reading: bool) -> libc::c_short {
         let mut events = 0;
-        if reading {
+        if reading || !self.open {
             events |= libc::POLLIN;
         }
         if self.pending() > 0 {
@@ -237,6 +240,8 @@ mod tests {
         let id = SessionId::new("s").unwrap();
         assert!(peer.queue(&Packet::about(id.clone(), Message::Status)));
         peer.flush().unwrap();
+        // The handshake is heard even by an owner that takes no output.
+        assert_ne!(peer.interest(false) & libc::POLLIN, 0);
 
         let (mut server, _) = listener.accept().unwrap();
         // The relay's side, by hand: the handshake and one frame behind it.
@@ -255,6 +260,7 @@ mod tests {
         let mut packets = Vec::new();
         pump(&mut peer, &mut packets, |_| false);
         assert!(peer.is_open());
+        assert_eq!(peer.interest(false) & libc::POLLIN, 0, "output waits");
         assert!(packets.is_empty(), "half the way through a frame");
         std::io::Write::write_all(&mut server, &reply[cut..]).unwrap();
         pump(&mut peer, &mut packets, |p| !p.is_empty());

@@ -122,6 +122,11 @@ struct Relay {
     clients: Vec<Client>,
     delivered_sent: bool,
     quit: bool,
+    /// The listening socket is left out of the poll set because accepting
+    /// failed (no descriptors left): it stays readable for as long as that
+    /// lasts, and waiting on it would spin. A client going frees a descriptor
+    /// and ends the pause.
+    accept_paused: bool,
     chunk: usize,
 }
 
@@ -201,6 +206,7 @@ impl Relay {
             clients: Vec::new(),
             delivered_sent: false,
             quit: false,
+            accept_paused: false,
             chunk,
         })
     }
@@ -218,7 +224,7 @@ impl Relay {
                 set.push(sys::want(self.chan.as_raw_fd(), libc::POLLIN | out));
                 sources.push(Source::Chan);
             }
-            if self.live && !self.quit && self.clients.len() < MAX_CLIENTS {
+            if self.live && !self.quit && !self.accept_paused && self.clients.len() < MAX_CLIENTS {
                 set.push(sys::want(self.listener.as_raw_fd(), libc::POLLIN));
                 sources.push(Source::Listener);
             }
@@ -274,7 +280,14 @@ impl Relay {
             for i in 0..self.clients.len() {
                 self.drive(i);
             }
+            let seated = self.clients.len();
             self.clients.retain(|client| !client.dead);
+            if self.clients.len() < seated {
+                self.accept_paused = false;
+            }
+            if self.is_orphaned() {
+                self.quit = true;
+            }
             if self.quit {
                 // The terminal is not read any more: what was typed and not
                 // yet taken is the last thing this relay does for it.
@@ -435,6 +448,17 @@ impl Relay {
         self.input_sent = 0;
     }
 
+    /// Nothing is left for this relay to do: the warden is gone (nobody can
+    /// tell it to quit, or keep the session for a client that comes later),
+    /// the program's side of the terminal is closed and every client has what
+    /// there is to give it. A warden that is gone while the program lives
+    /// leaves a session that still works, so that case goes on.
+    fn is_orphaned(&self) -> bool {
+        !self.chan_alive
+            && self.master_done
+            && self.clients.iter().all(|client| !self.wants_write(client))
+    }
+
     fn input_pending(&self) -> usize {
         self.input.len().saturating_sub(self.input_sent)
     }
@@ -481,7 +505,10 @@ impl Relay {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 // A connection that went away before it was accepted.
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => continue,
-                Err(_) => return,
+                Err(_) => {
+                    self.accept_paused = true;
+                    return;
+                }
             };
             let own = sys::effective_uid();
             let allowed = sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own));

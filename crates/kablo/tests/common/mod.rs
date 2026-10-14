@@ -130,6 +130,23 @@ impl Env {
             .collect()
     }
 
+    /// The children of `parent` that have ended and not been waited for.
+    pub fn zombies_of(&self, parent: u32) -> Vec<u32> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,stat="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let pid: u32 = it.next()?.parse().ok()?;
+                let ppid: u32 = it.next()?.parse().ok()?;
+                (ppid == parent && it.next()?.starts_with('Z')).then_some(pid)
+            })
+            .collect()
+    }
+
     /// The pid of the `role` (`warden` or `relay`) of session `id`.
     pub fn find(&self, role: &str, id: &str) -> Option<u32> {
         let wanted = format!("kablo {role} --id {id}");
@@ -492,6 +509,11 @@ impl Bridge {
         let mut command = env.kablo();
         command.arg("attach");
         Bridge::over(command).0
+    }
+
+    /// The pid of the `kablo attach` this is a client of.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn send(&mut self, session: Option<&str>, message: Message) {

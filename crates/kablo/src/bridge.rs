@@ -36,7 +36,7 @@ use crate::handshake::{self, Step};
 use crate::launch::{self, Failure};
 use crate::link::Link;
 use crate::scan::{self, Scan};
-use crate::{sockdir, sys};
+use crate::{journal, sockdir, sys};
 
 /// Unsent bytes for the client above which relays are not read.
 const OUT_SOFT: usize = 1 << 20;
@@ -369,6 +369,23 @@ impl Bridge {
         request: &NewSession,
         outgoing: &mut Vec<Packet>,
     ) {
+        // A size the journal cannot have is a bad request, not a server that
+        // is busy: asking again will not help, and starting a keeper to find
+        // that out would leave nothing but its refusal.
+        if request
+            .journal_size
+            .is_some_and(|size| !(journal::MIN_CAPACITY..=journal::MAX_CAPACITY).contains(&size))
+        {
+            return outgoing.push(failure(
+                wanted,
+                ErrorCode::BAD_REQUEST,
+                &format!(
+                    "the journal holds {} to {} bytes",
+                    journal::MIN_CAPACITY,
+                    journal::MAX_CAPACITY
+                ),
+            ));
+        }
         // A name the server makes can collide with a session that is there;
         // one the client chose is the client's to change.
         let tries = if wanted.is_some() { 1 } else { 3 };

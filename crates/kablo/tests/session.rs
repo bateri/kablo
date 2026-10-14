@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use common::{Conn, Env, PATIENCE};
@@ -491,4 +492,118 @@ fn a_session_whose_relay_keeps_dying_still_has_its_terminal_read() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn a_shell_starts_with_the_default_signals_whoever_started_the_keeper() {
+    // `nohup kablo new`, or a script that runs it in the background, hands the
+    // keeper signals that are ignored; a shell that kept them would shrug off
+    // the hang-up `terminate` sends.
+    let mut env = Env::new();
+    let id = env.name("ignored");
+    env.track(&id);
+    let mut command = env.kablo();
+    command.args([
+        "new",
+        "--id",
+        &id,
+        "--",
+        "/bin/sh",
+        "-c",
+        "kill -HUP $$; echo survived; sleep 3",
+    ]);
+    // SAFETY: the closure only calls `signal`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                libc::signal(signal, libc::SIG_IGN);
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let mut a = env.connect(&id);
+    a.attach(0);
+    a.until("the end", |c| c.ended.is_some());
+    assert_eq!(a.ended, Some(Exit::Signal(libc::SIGHUP)));
+    assert!(!String::from_utf8_lossy(&a.data).contains("survived"));
+}
+
+#[test]
+fn a_relay_whose_keeper_is_gone_and_whose_program_has_ended_goes_too() {
+    let mut env = Env::new();
+    let id = env.start("orphan", &["--", "/bin/sh", "-c", "sleep 1"]);
+    let warden = env.find("warden", &id).expect("a keeper");
+    // SAFETY: a signal to the keeper of this test's own session.
+    unsafe { libc::kill(warden as libc::pid_t, libc::SIGKILL) };
+
+    // Nothing can tell the relay to quit, or keep the session for a client
+    // that comes later: when the program is over it has nothing left to do.
+    let start = Instant::now();
+    while env.find("relay", &id).is_some() {
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the relay of a session nobody keeps is still there"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Seconds of processor time the process has used, as `ps` tells it (`M:SS.cc`
+/// on macOS, `HH:MM:SS` on Linux).
+fn cpu_seconds(pid: u32) -> Option<f64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .split(':')
+        .try_fold(0.0, |total, part| {
+            Some(total * 60.0 + part.parse::<f64>().ok()?)
+        })
+}
+
+#[test]
+fn a_relay_out_of_descriptors_waits_for_a_client_to_leave_instead_of_spinning() {
+    let mut env = Env::new();
+    let id = env.name("fds");
+    env.track(&id);
+    let mut command = env.kablo();
+    command.args(["new", "--id", &id, "--", "/bin/sh"]);
+    // SAFETY: the closure only calls `setrlimit`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 24,
+                rlim_max: 24,
+            };
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // More connections than the relay has descriptors for. Where a refused
+    // accept leaves the connection queued (Linux) the listening socket stays
+    // readable and a relay that waits on it spins; macOS drops the
+    // connection instead, so there the check passes either way.
+    let crowd: Vec<_> = (0..40)
+        .filter_map(|_| std::os::unix::net::UnixStream::connect(env.socket(&id)).ok())
+        .collect();
+    assert!(crowd.len() >= 30, "{} connections", crowd.len());
+    std::thread::sleep(Duration::from_millis(500));
+    let relay = env.find("relay", &id).expect("a relay");
+    let before = cpu_seconds(relay).expect("the processor time of the relay");
+    std::thread::sleep(Duration::from_secs(2));
+    let spent = cpu_seconds(relay).expect("the processor time of the relay") - before;
+    assert!(spent < 1.0, "the relay used {spent} s of processor in two");
+
+    // The ones that were there leave and the ones that waited are served.
+    drop(crowd);
+    let mut a = env.connect(&id);
+    assert_eq!(a.status().id.as_str(), id);
 }

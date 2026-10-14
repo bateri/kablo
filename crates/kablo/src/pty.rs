@@ -146,9 +146,15 @@ pub fn spawn(slave: &OwnedFd, request: &NewSession) -> io::Result<Child> {
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave.try_clone()?));
     // SAFETY: the closure runs between `fork` and `exec` and only calls
-    // async-signal-safe functions (`setsid`, `ioctl`).
+    // async-signal-safe functions (`signal`, `setsid`, `ioctl`).
     unsafe {
         command.pre_exec(|| {
+            // Signals the starter of the keeper left ignored (`nohup kablo
+            // new`, a background job of a script) stay ignored through every
+            // `exec`: a shell that shrugs off a hang-up cannot be terminated.
+            for signal in INHERITED_SIGNALS {
+                libc::signal(signal, libc::SIG_DFL);
+            }
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -162,6 +168,21 @@ pub fn spawn(slave: &OwnedFd, request: &NewSession) -> io::Result<Child> {
     }
     command.spawn()
 }
+
+/// The signals a shell starts with the default action for, whatever the
+/// keeper inherited.
+const INHERITED_SIGNALS: [libc::c_int; 10] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTERM,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGALRM,
+    libc::SIGCHLD,
+    libc::SIGPIPE,
+];
 
 /// The shell to run when the request names no program: its own `SHELL`, the
 /// keeper's, the user's passwd entry, `/bin/sh`.

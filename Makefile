@@ -80,6 +80,28 @@ e2e:
 		set -e; cargo build --release --locked -p kablo --target "$$(uname -m)-unknown-linux-musl"'
 	tests/e2e/run.sh "$(CURDIR)/target/linux/$$(docker run --rm $(LINUX_IMAGE) uname -m)-unknown-linux-musl/release/kablo"
 
-# Not built yet; it exits 1 so nothing mistakes it for a pass.
+# The binaries a release ships: dist/kablo-<version>-<target> for the four
+# targets, and SHA256SUMS next to them (tools/dist.sh is the how). The targets
+# and the names are the ones `kablo_proto::install` gives clients, and a test
+# reads these lines to prove it. The Linux ones are static musl builds made
+# and opened in a container of their own architecture (the one that is not the
+# machine's runs emulated); the macOS ones are cross-built by the rustup
+# toolchain, because Homebrew's rustc cannot add the standard library of the
+# Apple targets (`rustup target add <target> --toolchain $(DIST_TOOLCHAIN)`),
+# so both come from that one compiler, which is not the one `make check` uses.
+# Docker and the Apple targets are required, and a dist/ without SHA256SUMS is
+# a build that did not finish.
+DIST_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+DIST_LINUX_TARGETS = x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+DIST_MACOS_TARGETS = aarch64-apple-darwin x86_64-apple-darwin
+DIST_NAME = kablo-$(DIST_VERSION)-%
+DIST_SUMS = SHA256SUMS
+DIST_TOOLCHAIN ?= stable
+
 dist:
-	@echo "dist: not yet"; exit 1
+	@$(call match_rust,dist)
+	@$(call need_docker,dist)
+	DIST_VERSION="$(DIST_VERSION)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
+		DIST_IMAGE="$(LINUX_IMAGE)" DIST_DOCKERFILE="$(LINUX_DOCKERFILE)" \
+		DIST_TOOLCHAIN="$(DIST_TOOLCHAIN)" DIST_LINUX_TARGETS="$(DIST_LINUX_TARGETS)" \
+		DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" tools/dist.sh

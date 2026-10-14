@@ -191,14 +191,21 @@ fn attempt(
         )
     {
         end(&mut child);
-        return Try::Refused(Failure::Other(
-            "the session keeper did not answer in time".to_owned(),
-        ));
+        let why = "the session keeper did not answer in time".to_owned();
+        // A `systemd-run` that is stuck (a user manager that does not
+        // answer) is not a verdict on the keeper: try without it.
+        return if runner.is_some() {
+            Try::Silent(why)
+        } else {
+            Try::Refused(Failure::Other(why))
+        };
     }
     let line = line.trim_end();
     if line == "ok" {
-        // The warden is on its own now.
-        drop(child);
+        // The warden is on its own now, but its parent still has to wait for
+        // it: the bridge starts sessions for as long as its connection lives,
+        // and a keeper nobody waits for stays a zombie after it ends.
+        reap(child);
         return Try::Ready;
     }
     let status = child.wait();
@@ -210,6 +217,16 @@ fn attempt(
             Err(e) => format!("the session keeper ended before it was ready ({e})"),
         }),
     }
+}
+
+/// Waits for `child` on a thread of its own. A thread that cannot be made
+/// leaves the child as it was before this: a zombie until this process ends.
+fn reap(mut child: Child) {
+    let _ = std::thread::Builder::new()
+        .name("reap".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn end(child: &mut Child) {

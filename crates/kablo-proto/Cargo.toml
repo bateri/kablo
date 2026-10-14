@@ -1,6 +1,6 @@
 [package]
 name = "kablo-proto"
-description = "The kablo wire format: handshake, frames and messages. No I/O, no dependencies."
+description = "The kablo wire format (handshake, frames, messages) and the rules for installing a kablo binary on a server. No I/O, no dependencies."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

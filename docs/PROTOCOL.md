@@ -133,13 +133,14 @@ at the server's default size.
 | 1 | bytes | `argument`: one element of the command's argument vector (repeated, in order); none means the login shell |
 | 2 | bytes | `environment`: `NAME=value`, split at the first `=` (repeated); added to the defaults |
 | 3 | bytes | `directory`: where to start |
-| 4 | 8 bytes | `size`: columns, rows, xpixel, ypixel as in `resize` |
-| 5 | u64 | `journal`: the journal's capacity in bytes |
+| 4 | 8 bytes | `size`: columns, rows, xpixel, ypixel as in `resize`; a size with a zero column or row count means the default (80 by 24) |
+| 5 | u64 | `journal`: the journal's capacity in bytes, from 16 KiB to 1 GiB; the default is 8 MiB |
 
 The command is an argument vector, **never a shell string**, and a server never
 builds a command line out of it. No argument, name, value or directory may
 contain a NUL; a name is not empty and has no `=`; a directory is not empty.
-A `new` that breaks this is malformed.
+A `new` that breaks this is malformed. A `journal` outside its range is
+answered with `error` (`BAD_REQUEST`) and starts nothing.
 
 The session id in the header is the name asked for; a header with no id lets
 the server choose one. The answer is `created` with the id that was used, or
@@ -225,6 +226,11 @@ superuser and writable by nobody else. On success the server says nothing: the
 connection that asked, like every other connection to the session, is closed
 (the relay it was connected to is gone) and a client connects again, as it
 does after a relay dies, and attaches from the byte after the last it had.
+A client that goes through the bridge (below) never sees the closing, because
+the bridge connects again for it. What tells it the new relay serves is
+`status`: its `version` names the release of the relay that answers (an
+upgrade to a binary of the same release cannot be told apart that way).
+
 On failure the server answers `error` with `UPGRADE_FAILED` and a reason, the
 relay that was asked keeps serving and the connection stays open: the path is
 not one to run, the program has ended, or the new relay stopped before it took
@@ -234,13 +240,24 @@ new relay's, with none missing and none twice.
 
 **Pulse.** The client decides when to check that the other end is alive: it
 sends `ping` and the server answers `pong` with the same bytes. The server
-never speaks unprompted except to stream `output`, so an idle connection costs
-nothing.
+never speaks unprompted except to stream `output` and to say `ended` once, so an
+idle connection costs nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
-the program: the server stops buffering for it, drops it, and it comes back
-with the offset it had. A client is dropped when the journal has moved past
-the next byte it is owed; the only buffer a client costs is one frame.
+the program. Output is sent a frame at a time and only when the connection
+takes it, so the only buffer a client costs is one frame and its position in
+the journal. A client is dropped when the journal has moved past the next byte
+it is owed: its connection is closed, without a message, and it comes back
+with the offset it had. Replies to a client's requests are queued for it and a
+client that asks without ever reading is dropped the same way once 4 MiB of
+them are waiting.
+
+**Many clients.** A session serves 64 connections at once. A 65th is not
+refused: it waits, unaccepted, until a seat frees. Typed input is handed to the
+program as it takes it; while 1 MiB of it is waiting, the session reads none of
+its clients, so a program that does not read its input holds up the requests
+to its own session, and nothing else: its output goes on flowing and other
+sessions are untouched.
 
 **A session's socket.** Each session has a socket of its own and a connection
 to it speaks about that one session: a message naming another session is
@@ -281,6 +298,10 @@ every session for its status and replies with the sessions that answered) and
 | session id | 64 bytes |
 | frame payload | 1 MiB |
 | upgrade path | 4096 bytes |
+| journal capacity (`new`) | 16 KiB to 1 GiB, 8 MiB by default |
+| connections to one session | 64 |
+| input waiting for the program | 1 MiB, then clients are not read |
+| replies queued for one client | 4 MiB, then the client is dropped |
 
 ## 7. Compatibility
 
