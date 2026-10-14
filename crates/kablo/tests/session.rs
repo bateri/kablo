@@ -2,10 +2,13 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use common::{Conn, Env, PATIENCE};
+use kablo_proto::WIRE;
 use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Size, State};
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
@@ -594,7 +597,7 @@ fn cpu_seconds(pid: u32) -> Option<f64> {
 }
 
 #[test]
-fn a_relay_out_of_descriptors_waits_for_a_client_to_leave_instead_of_spinning() {
+fn a_relay_out_of_descriptors_neither_spins_nor_turns_away_those_who_wait() {
     let mut env = Env::new();
     let id = env.name("fds");
     env.track(&id);
@@ -614,14 +617,19 @@ fn a_relay_out_of_descriptors_waits_for_a_client_to_leave_instead_of_spinning() 
     let output = command.output().unwrap();
     assert!(output.status.success(), "{output:?}");
 
-    // More connections than the relay has descriptors for. Where a refused
-    // accept leaves the connection queued (Linux) the listening socket stays
-    // readable and a relay that waits on it spins; macOS drops the
-    // connection instead, so there the check passes either way.
-    let crowd: Vec<_> = (0..40)
-        .filter_map(|_| std::os::unix::net::UnixStream::connect(env.socket(&id)).ok())
+    // More connections than the relay has descriptors for, each saying hello.
+    // The ones it has no descriptor for wait in the listening socket's queue,
+    // which stays readable while they do: a relay that waits on it spins.
+    let mut hello = Vec::new();
+    WIRE.write_hello(&mut hello).unwrap();
+    let crowd: Vec<UnixStream> = (0..40)
+        .filter_map(|_| UnixStream::connect(env.socket(&id)).ok())
         .collect();
     assert!(crowd.len() >= 30, "{} connections", crowd.len());
+    for sock in &crowd {
+        assert!((&*sock).write_all(&hello).is_ok(), "{TURNED_AWAY}");
+        sock.set_nonblocking(true).unwrap();
+    }
     std::thread::sleep(Duration::from_millis(500));
     let relay = env.find("relay", &id).expect("a relay");
     let before = cpu_seconds(relay).expect("the processor time of the relay");
@@ -629,10 +637,49 @@ fn a_relay_out_of_descriptors_waits_for_a_client_to_leave_instead_of_spinning() 
     let spent = cpu_seconds(relay).expect("the processor time of the relay") - before;
     assert!(spent < 1.0, "the relay used {spent} s of processor in two");
 
-    // The ones that were there leave and the ones that waited are served.
-    drop(crowd);
+    // Seats free one at a time, and every connection that waited is served in
+    // its turn: none is turned away, the way an `accept` that finds no
+    // descriptor would turn it away on macOS.
+    let mut waiting = crowd;
+    let mut seated = std::collections::VecDeque::new();
+    let start = Instant::now();
+    while !waiting.is_empty() {
+        let mut still = Vec::new();
+        for sock in waiting {
+            match answered(&sock) {
+                Some(true) => seated.push_back(sock),
+                Some(false) => still.push(sock),
+                None => panic!("{TURNED_AWAY}"),
+            }
+        }
+        waiting = still;
+        assert!(
+            start.elapsed() < PATIENCE,
+            "{} never got a seat",
+            waiting.len()
+        );
+        drop(seated.pop_front());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // And whoever comes later is served too.
+    drop(seated);
     let mut a = env.connect(&id);
     assert_eq!(a.status().id.as_str(), id);
+}
+
+const TURNED_AWAY: &str = "a connection that waited for a seat was turned away";
+
+/// Whether the session has answered the hello on `sock`: `Some(false)` while
+/// it has not yet, `None` when it closed the connection instead.
+fn answered(sock: &UnixStream) -> Option<bool> {
+    let mut buf = [0u8; 64];
+    match (&*sock).read(&mut buf) {
+        Ok(0) => None,
+        Ok(_) => Some(true),
+        Err(e) if common::nothing_yet(&e) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// Types more than a session holds for its program at a connection, and

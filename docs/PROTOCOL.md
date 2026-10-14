@@ -316,7 +316,8 @@ client that asks without ever reading is dropped the same way once 4 MiB of
 them are waiting.
 
 **Many clients.** A session serves 64 connections at once. A 65th is not
-refused: it waits, unaccepted, until a seat frees. Typed input is handed to the
+refused: it waits, unaccepted, until a seat frees, and so does one that comes
+while the server has no descriptor left to give it. Typed input is handed to the
 program as it takes it, and up to 1 MiB of it waits for a program that is not
 reading. An `input` that would take what is waiting past that is not written,
 not even its first part, and its sender gets `error` (`INPUT_FULL`, code 7);

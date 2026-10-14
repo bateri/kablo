@@ -208,11 +208,17 @@ struct Relay {
     clients: Vec<Client>,
     delivered_sent: bool,
     quit: bool,
-    /// The listening socket is left out of the poll set because accepting
-    /// failed (no descriptors left): it stays readable for as long as that
-    /// lasts, and waiting on it would spin. A client going frees a descriptor
-    /// and ends the pause.
+    /// The listening socket is left out of the poll set because there is no
+    /// descriptor for another client (or accepting failed): it stays readable
+    /// while connections wait, and waiting on it would spin. A client going
+    /// frees a descriptor and ends the pause.
     accept_paused: bool,
+    /// A descriptor set aside for the next connection, let go just before
+    /// each `accept` so that one is free for it. An `accept` that finds none
+    /// does not leave the connection waiting everywhere: macOS drops it, and
+    /// a client that was waiting for a seat would be turned away. `None` when
+    /// there was none to set aside: the relay is full.
+    spare: Option<OwnedFd>,
     chunk: usize,
 }
 
@@ -287,7 +293,7 @@ impl Relay {
         inner::write(&mut &chan, &ToWarden::Ready)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
         chan.set_nonblocking(true)?;
-        Ok(Relay {
+        let mut relay = Relay {
             id: adopt.id,
             chan,
             chan_alive: true,
@@ -312,8 +318,11 @@ impl Relay {
             delivered_sent: false,
             quit: false,
             accept_paused: false,
+            spare: None,
             chunk,
-        })
+        };
+        relay.hold_spare();
+        Ok(relay)
     }
 
     fn serve(mut self) -> u8 {
@@ -389,6 +398,7 @@ impl Relay {
             let seated = self.clients.len();
             self.clients.retain(|client| !client.dead);
             if self.clients.len() < seated {
+                self.hold_spare();
                 self.accept_paused = false;
             }
             if self.is_orphaned() {
@@ -706,39 +716,73 @@ impl Relay {
         })
     }
 
+    /// Sets a descriptor aside for the next connection, if there is not one
+    /// already; whether there is one now.
+    fn hold_spare(&mut self) -> bool {
+        if self.spare.is_none() {
+            self.spare = self.listener.as_fd().try_clone_to_owned().ok();
+        }
+        self.spare.is_some()
+    }
+
     fn accept(&mut self) {
         while self.live && !self.quit && self.clients.len() < MAX_CLIENTS {
-            let sock = match self.listener.accept() {
-                Ok((sock, _)) => sock,
+            // The connection gets the spare's descriptor.
+            self.spare = None;
+            let accepted = self.listener.accept();
+            // And another is set aside for the next one. None left means the
+            // relay is full: it accepts nobody until a client goes.
+            let room = self.hold_spare();
+            let sock = match accepted {
+                Ok((sock, _)) => Some(sock),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                // A connection that went away before it was accepted.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => continue,
+                // A signal, or a connection that went away before it was
+                // accepted.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    None
+                }
+                // No descriptor after all (there was no spare to let go).
                 Err(_) => {
                     self.accept_paused = true;
                     return;
                 }
             };
-            let own = sys::effective_uid();
-            let allowed = sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own));
-            if !allowed || sock.set_nonblocking(true).is_err() {
-                continue;
+            if let Some(sock) = sock {
+                self.seat(sock);
             }
-            self.clients.push(Client {
-                sock,
-                open: false,
-                hello: Vec::new(),
-                decoder: PacketDecoder::new(),
-                out: Vec::new(),
-                sent: 0,
-                attach: None,
-                ended_queued: false,
-                closing: false,
-                dead: false,
-                upgrading: false,
-                asked: None,
-            });
+            if !room {
+                self.accept_paused = true;
+                return;
+            }
         }
+    }
+
+    /// Takes in a connection that was accepted, if it is one to serve.
+    fn seat(&mut self, sock: UnixStream) {
+        let own = sys::effective_uid();
+        let allowed = sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own));
+        if !allowed || sock.set_nonblocking(true).is_err() {
+            return;
+        }
+        self.clients.push(Client {
+            sock,
+            open: false,
+            hello: Vec::new(),
+            decoder: PacketDecoder::new(),
+            out: Vec::new(),
+            sent: 0,
+            attach: None,
+            ended_queued: false,
+            closing: false,
+            dead: false,
+            upgrading: false,
+            asked: None,
+        });
     }
 
     /// Reads what client `i` has sent, until its socket is empty or it has
@@ -1267,6 +1311,7 @@ mod tests {
             delivered_sent: false,
             quit: false,
             accept_paused: false,
+            spare: None,
             chunk: 4096,
         };
         relay.on_warden(ToRelay::Go);
