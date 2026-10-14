@@ -360,11 +360,17 @@ impl Conn {
 
     pub fn try_open(path: PathBuf, id: &str, patience: Duration) -> Result<Conn, String> {
         let mut sock = UnixStream::connect(path).map_err(|e| e.to_string())?;
-        sock.set_read_timeout(Some(patience)).unwrap();
+        // A session that is going away (its end was heard, its keeper is
+        // finishing) can take a connection and close it at once, and macOS
+        // then refuses to set an option on the socket (`EINVAL`). That is a
+        // connection that failed, for the caller to judge: the end of a test
+        // asks every session to go this way and passes over one that is gone.
+        sock.set_read_timeout(Some(patience))
+            .map_err(|e| e.to_string())?;
         WIRE.client(&mut sock.try_clone().unwrap(), &mut sock)
             .map_err(|e| e.to_string())?;
         sock.set_read_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
+            .map_err(|e| e.to_string())?;
         Ok(Conn {
             sock,
             decoder: PacketDecoder::new(),
