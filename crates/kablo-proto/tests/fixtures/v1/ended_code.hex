@@ -1,0 +1,8 @@
+# "work" ended with exit code 3
+83           # kind 0x83: ended
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 05  # payload length 5
+77 6f 72 6b  # session id "work"
+00           # exit kind: code
+00 00 00 03  # status 3

@@ -1,0 +1,30 @@
+# created "build-1"
+88                       # kind 0x88: created
+00                       # channel 0: terminal session
+07                       # session id length 7
+00 00 00 5d              # payload length 93
+62 75 69 6c 64 2d 31     # session id "build-1"
+00 01                    # tlv key 1
+00 00 00 07              #   length 7
+62 75 69 6c 64 2d 31     #   id "build-1"
+00 02                    # tlv key 2
+00 00 00 04              #   length 4
+00 00 10 cc              #   pid 4300
+00 05                    # tlv key 5
+00 00 00 08              #   length 8
+00 50 00 18 00 00 00 00  #   size (80, 24, 0, 0)
+00 06                    # tlv key 6
+00 00 00 04              #   length 4
+00 00 00 00              #   clients 0
+00 07                    # tlv key 7
+00 00 00 01              #   length 1
+00                       #   state 0
+00 08                    # tlv key 8
+00 00 00 08              #   length 8
+00 00 00 00 00 00 00 00  #   offset 0
+00 09                    # tlv key 9
+00 00 00 08              #   length 8
+00 00 00 00 00 00 00 00  #   retained from 0
+00 0b                    # tlv key 11
+00 00 00 05              #   length 5
+30 2e 31 2e 30           #   version "0.1.0"

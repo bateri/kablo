@@ -1,0 +1,8 @@
+# relay to warden: stopped reading, journal ends at 0x2a000
+82                       # kind 0x82: released
+00                       # channel 0: terminal session
+00                       # session id length 0
+00 00 00 0e              # payload length 14
+00 01                    # tlv key 1
+00 00 00 08              #   length 8
+00 00 00 00 00 02 a0 00  #   offset 172032

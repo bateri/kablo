@@ -1,0 +1,764 @@
+//! Version 1 of the messages.
+//!
+//! A message is a frame of a known kind on the session channel, plus the
+//! session it concerns (empty for the connection-level ones). The kinds with
+//! the high bit clear go client to server, the others server to client.
+//! Payloads that are one fixed layout are read as a prefix (a later version
+//! may append fields); payloads that may grow are [`tlv`] blocks.
+//!
+//! This module is frozen the moment v1 ships: a change is a new version with
+//! its own module and fixtures, and v1 stays readable.
+
+use std::io::{Read, Write};
+
+use crate::frame::{self, CHANNEL_SESSION, FrameDecoder, MAX_PAYLOAD, RawFrame};
+use crate::tlv;
+use crate::{Error, Result, SessionId};
+
+/// The kind byte of each message.
+pub mod kind {
+    /// `attach`: stream a session from an offset.
+    pub const ATTACH: u8 = 0x01;
+    /// `detach`: stop streaming a session.
+    pub const DETACH: u8 = 0x02;
+    /// `resize`: the terminal's size changed.
+    pub const RESIZE: u8 = 0x03;
+    /// `terminate`: end the session.
+    pub const TERMINATE: u8 = 0x04;
+    /// `upgrade`: replace the relay with another binary.
+    pub const UPGRADE: u8 = 0x05;
+    /// `status`: ask for a session's state.
+    pub const STATUS: u8 = 0x06;
+    /// `input`: bytes for the program.
+    pub const INPUT: u8 = 0x07;
+    /// `list`: ask for every session.
+    pub const LIST: u8 = 0x08;
+    /// `new`: start a session.
+    pub const NEW: u8 = 0x09;
+    /// `ping`: ask the server to answer.
+    pub const PING: u8 = 0x0a;
+    /// `attached`: the answer to `attach`.
+    pub const ATTACHED: u8 = 0x81;
+    /// `output`: bytes from the program.
+    pub const OUTPUT: u8 = 0x82;
+    /// `ended`: the program has exited.
+    pub const ENDED: u8 = 0x83;
+    /// `error`: a request failed.
+    pub const ERROR: u8 = 0x84;
+    /// `pong`: the answer to `ping`.
+    pub const PONG: u8 = 0x85;
+    /// `status_reply`: the answer to `status`.
+    pub const STATUS_REPLY: u8 = 0x86;
+    /// `list_reply`: the answer to `list`.
+    pub const LIST_REPLY: u8 = 0x87;
+    /// `created`: the answer to `new`.
+    pub const CREATED: u8 = 0x88;
+}
+
+/// The name of a message kind, for diagnostics (`"unknown"` for a kind this
+/// version does not have).
+pub fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        kind::ATTACH => "attach",
+        kind::DETACH => "detach",
+        kind::RESIZE => "resize",
+        kind::TERMINATE => "terminate",
+        kind::UPGRADE => "upgrade",
+        kind::STATUS => "status",
+        kind::INPUT => "input",
+        kind::LIST => "list",
+        kind::NEW => "new",
+        kind::PING => "ping",
+        kind::ATTACHED => "attached",
+        kind::OUTPUT => "output",
+        kind::ENDED => "ended",
+        kind::ERROR => "error",
+        kind::PONG => "pong",
+        kind::STATUS_REPLY => "status_reply",
+        kind::LIST_REPLY => "list_reply",
+        kind::CREATED => "created",
+        _ => "unknown",
+    }
+}
+
+/// The attach offset that means "the current end; replay nothing".
+pub const OFFSET_END: u64 = u64::MAX;
+
+/// The most program bytes one `output` message can carry.
+pub const MAX_OUTPUT: usize = MAX_PAYLOAD - 8;
+
+/// The longest binary path an `upgrade` can name.
+pub const MAX_PATH: usize = 4096;
+
+/// A terminal's size: cells and, for programs that ask, pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Size {
+    /// Columns.
+    pub cols: u16,
+    /// Rows.
+    pub rows: u16,
+    /// Width in pixels (0 when unknown).
+    pub xpixel: u16,
+    /// Height in pixels (0 when unknown).
+    pub ypixel: u16,
+}
+
+impl Size {
+    /// Bytes on the wire.
+    pub const LEN: usize = 8;
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for v in [self.cols, self.rows, self.xpixel, self.ypixel] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    fn read(fields: &mut Fields<'_>) -> Result<Size> {
+        Ok(Size {
+            cols: fields.u16()?,
+            rows: fields.u16()?,
+            xpixel: fields.u16()?,
+            ypixel: fields.u16()?,
+        })
+    }
+}
+
+/// How a program ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// It called `exit` with this status.
+    Code(i32),
+    /// A signal killed it.
+    Signal(i32),
+}
+
+impl Exit {
+    /// Bytes on the wire: a kind (0 code, 1 signal) and an `i32`.
+    pub const LEN: usize = 5;
+
+    /// The wire form.
+    pub fn to_bytes(self) -> [u8; Exit::LEN] {
+        let (kind, value) = match self {
+            Exit::Code(v) => (0, v),
+            Exit::Signal(v) => (1, v),
+        };
+        let [a, b, c, d] = value.to_be_bytes();
+        [kind, a, b, c, d]
+    }
+
+    /// Reads the wire form; bytes past it are ignored.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Exit> {
+        Exit::read(&mut Fields::new(bytes, "exit status"))
+    }
+
+    fn read(fields: &mut Fields<'_>) -> Result<Exit> {
+        let kind = fields.u8()?;
+        let value = i32::from_be_bytes(fields.array()?);
+        match kind {
+            0 => Ok(Exit::Code(value)),
+            1 => Ok(Exit::Signal(value)),
+            _ => Err(Error::Malformed("exit status")),
+        }
+    }
+}
+
+/// Where a session is in its life.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct State(pub u8);
+
+impl State {
+    /// The program is running.
+    pub const RUNNING: State = State(0);
+    /// The program has ended; the session waits for someone to hear of it.
+    pub const ENDED: State = State(1);
+    /// The relay keeps failing; the program is alive but nobody can attach.
+    pub const BROKEN: State = State(2);
+}
+
+/// Why a request failed. A code this version does not name still arrives
+/// as itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErrorCode(pub u16);
+
+impl ErrorCode {
+    /// No session has that id.
+    pub const UNKNOWN_SESSION: ErrorCode = ErrorCode(1);
+    /// A session with that id exists already.
+    pub const SESSION_EXISTS: ErrorCode = ErrorCode(2);
+    /// The request does not make sense (a missing session id, a bad value).
+    pub const BAD_REQUEST: ErrorCode = ErrorCode(3);
+    /// The connection is not attached to the session.
+    pub const NOT_ATTACHED: ErrorCode = ErrorCode(4);
+    /// The relay could not be replaced; the old one keeps serving.
+    pub const UPGRADE_FAILED: ErrorCode = ErrorCode(5);
+    /// The session cannot be served right now.
+    pub const UNAVAILABLE: ErrorCode = ErrorCode(6);
+}
+
+/// What a `new` asks for. Every field is optional: an empty request starts
+/// the user's login shell at the server's default size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewSession {
+    /// The command as an argument vector (never a shell string); empty means
+    /// the user's login shell.
+    pub argv: Vec<Vec<u8>>,
+    /// Extra environment, `(name, value)`, over the defaults.
+    pub env: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The starting directory.
+    pub cwd: Option<Vec<u8>>,
+    /// The starting size.
+    pub size: Option<Size>,
+    /// The journal's capacity in bytes.
+    pub journal_size: Option<u64>,
+}
+
+mod new_key {
+    pub const ARG: u16 = 1;
+    pub const ENV: u16 = 2;
+    pub const CWD: u16 = 3;
+    pub const SIZE: u16 = 4;
+    pub const JOURNAL_SIZE: u16 = 5;
+}
+
+impl NewSession {
+    /// Nothing that ends up in a `CString` may hold a NUL, a variable's name
+    /// is non-empty and has no `=`, and a directory is not empty. Checked on
+    /// both ends, so a sender cannot even produce what a receiver refuses.
+    fn check(&self) -> Result<()> {
+        let clean = |b: &[u8]| !b.contains(&0);
+        if !self.argv.iter().all(|a| clean(a)) {
+            return Err(Error::Malformed("argv"));
+        }
+        if !self
+            .env
+            .iter()
+            .all(|(k, v)| !k.is_empty() && !k.contains(&b'=') && clean(k) && clean(v))
+        {
+            return Err(Error::Malformed("env"));
+        }
+        if self.cwd.as_ref().is_some_and(|c| c.is_empty() || !clean(c)) {
+            return Err(Error::Malformed("cwd"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut w = tlv::Writer::new();
+        for arg in &self.argv {
+            w.put(new_key::ARG, arg);
+        }
+        for (name, value) in &self.env {
+            let mut entry = name.clone();
+            entry.push(b'=');
+            entry.extend_from_slice(value);
+            w.put(new_key::ENV, &entry);
+        }
+        if let Some(cwd) = &self.cwd {
+            w.put(new_key::CWD, cwd);
+        }
+        if let Some(size) = &self.size {
+            let mut bytes = Vec::with_capacity(Size::LEN);
+            size.write(&mut bytes);
+            w.put(new_key::SIZE, &bytes);
+        }
+        if let Some(bytes) = self.journal_size {
+            w.put_u64(new_key::JOURNAL_SIZE, bytes);
+        }
+        Ok(w.finish())
+    }
+
+    fn decode(block: &[u8]) -> Result<NewSession> {
+        let mut new = NewSession::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                new_key::ARG => new.argv.push(value.to_vec()),
+                new_key::ENV => {
+                    let (name, value) = split_env(value).ok_or(Error::Malformed("env"))?;
+                    new.env.push((name.to_vec(), value.to_vec()));
+                }
+                new_key::CWD => new.cwd = Some(value.to_vec()),
+                new_key::SIZE => new.size = Some(Size::read(&mut Fields::new(value, "size"))?),
+                new_key::JOURNAL_SIZE => {
+                    new.journal_size = Some(tlv::read_u64(value, "journal size")?)
+                }
+                _ => {}
+            }
+        }
+        new.check()?;
+        Ok(new)
+    }
+}
+
+fn split_env(entry: &[u8]) -> Option<(&[u8], &[u8])> {
+    let at = entry.iter().position(|&b| b == b'=')?;
+    let (name, rest) = entry.split_at_checked(at)?;
+    Some((name, rest.get(1..)?))
+}
+
+/// What the server knows of one session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// The session.
+    pub id: SessionId,
+    /// The shell's process id.
+    pub pid: u32,
+    /// The name of the program in the foreground of the terminal.
+    pub program: Option<Vec<u8>>,
+    /// The foreground program's working directory.
+    pub cwd: Option<Vec<u8>>,
+    /// The terminal's current size.
+    pub size: Size,
+    /// How many clients are attached.
+    pub clients: u32,
+    /// Where the session is in its life.
+    pub state: State,
+    /// Total bytes the program has written so far.
+    pub offset: u64,
+    /// The oldest offset the journal still holds.
+    pub retained_from: u64,
+    /// How the program ended, once it has.
+    pub exit: Option<Exit>,
+    /// The version of the relay serving the session (empty if unknown).
+    pub version: String,
+}
+
+mod status_key {
+    pub const ID: u16 = 1;
+    pub const PID: u16 = 2;
+    pub const PROGRAM: u16 = 3;
+    pub const CWD: u16 = 4;
+    pub const SIZE: u16 = 5;
+    pub const CLIENTS: u16 = 6;
+    pub const STATE: u16 = 7;
+    pub const OFFSET: u16 = 8;
+    pub const RETAINED_FROM: u16 = 9;
+    pub const EXIT: u16 = 10;
+    pub const VERSION: u16 = 11;
+}
+
+impl Status {
+    /// A status with everything but the id at its zero.
+    pub fn new(id: SessionId) -> Status {
+        Status {
+            id,
+            pid: 0,
+            program: None,
+            cwd: None,
+            size: Size::default(),
+            clients: 0,
+            state: State::RUNNING,
+            offset: 0,
+            retained_from: 0,
+            exit: None,
+            version: String::new(),
+        }
+    }
+
+    /// The wire form, a [`tlv`] block with the keys in ascending order.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        w.put(status_key::ID, self.id.as_str().as_bytes());
+        w.put_u32(status_key::PID, self.pid);
+        if let Some(program) = &self.program {
+            w.put(status_key::PROGRAM, program);
+        }
+        if let Some(cwd) = &self.cwd {
+            w.put(status_key::CWD, cwd);
+        }
+        let mut size = Vec::with_capacity(Size::LEN);
+        self.size.write(&mut size);
+        w.put(status_key::SIZE, &size);
+        w.put_u32(status_key::CLIENTS, self.clients);
+        w.put_u8(status_key::STATE, self.state.0);
+        w.put_u64(status_key::OFFSET, self.offset);
+        w.put_u64(status_key::RETAINED_FROM, self.retained_from);
+        if let Some(exit) = self.exit {
+            w.put(status_key::EXIT, &exit.to_bytes());
+        }
+        if !self.version.is_empty() {
+            w.put(status_key::VERSION, self.version.as_bytes());
+        }
+        w.finish()
+    }
+
+    /// Reads the wire form. Only the id is required; a key that is absent
+    /// reads as its zero, one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<Status> {
+        let mut id = None;
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            if key == status_key::ID {
+                id = Some(SessionId::from_bytes(value)?);
+            }
+        }
+        let mut status = Status::new(id.ok_or(Error::Malformed("status without an id"))?);
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                status_key::PID => status.pid = tlv::read_u32(value, "status pid")?,
+                status_key::PROGRAM => status.program = Some(value.to_vec()),
+                status_key::CWD => status.cwd = Some(value.to_vec()),
+                status_key::SIZE => {
+                    status.size = Size::read(&mut Fields::new(value, "status size"))?
+                }
+                status_key::CLIENTS => status.clients = tlv::read_u32(value, "status clients")?,
+                status_key::STATE => status.state = State(tlv::read_u8(value, "status state")?),
+                status_key::OFFSET => status.offset = tlv::read_u64(value, "status offset")?,
+                status_key::RETAINED_FROM => {
+                    status.retained_from = tlv::read_u64(value, "status retained")?
+                }
+                status_key::EXIT => status.exit = Some(Exit::from_bytes(value)?),
+                status_key::VERSION => status.version = tlv::read_text(value, "status version")?,
+                _ => {}
+            }
+        }
+        Ok(status)
+    }
+}
+
+/// The key under which a `list_reply` block holds each session's status.
+const LISTED: u16 = 1;
+
+/// A message, without the session it concerns (see [`Packet`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// Client to server: stream the session starting at `offset` (or
+    /// [`OFFSET_END`]). Answered by `Attached`, then `Output`s.
+    Attach {
+        /// The first byte the client wants.
+        offset: u64,
+    },
+    /// Client to server: stop streaming the session; the session lives on.
+    Detach,
+    /// Client to server: the terminal is now this size.
+    Resize(Size),
+    /// Client to server: end the session (`force`: SIGKILL rather than SIGHUP).
+    Terminate {
+        /// Kill rather than hang up.
+        force: bool,
+    },
+    /// Client to server: replace the session's relay with the binary at this
+    /// absolute path.
+    Upgrade {
+        /// The path, as bytes.
+        path: Vec<u8>,
+    },
+    /// Client to server: ask for the session's [`Status`].
+    Status,
+    /// Client to server: bytes for the program's terminal.
+    Input(Vec<u8>),
+    /// Client to server: ask for the [`Status`] of every session.
+    List,
+    /// Client to server: start a session. The session id in the packet is the
+    /// one asked for; without one the server makes a name.
+    New(NewSession),
+    /// Client to server: answer with a `Pong` carrying the same bytes.
+    Ping(Vec<u8>),
+    /// Server to client: the stream starts at `offset`; `truncated` says bytes
+    /// the client asked for had already left the journal.
+    Attached {
+        /// The offset of the first `Output` that follows.
+        offset: u64,
+        /// Whether the journal no longer held the offset asked for.
+        truncated: bool,
+    },
+    /// Server to client: program output starting at `offset`.
+    Output {
+        /// The offset of the first byte of `data` in the program's output.
+        offset: u64,
+        /// The bytes, exactly as the program wrote them.
+        data: Vec<u8>,
+    },
+    /// Server to client: the program has exited and everything it wrote has
+    /// been sent.
+    Ended(Exit),
+    /// Server to client: the request failed.
+    Error {
+        /// Why.
+        code: ErrorCode,
+        /// For a log, never a program: a client strips control characters
+        /// before showing it.
+        text: String,
+    },
+    /// Server to client: the answer to `Ping`.
+    Pong(Vec<u8>),
+    /// Server to client: the answer to `Status`.
+    StatusReply(Status),
+    /// Server to client: the answer to `List`.
+    ListReply(Vec<Status>),
+    /// Server to client: the answer to `New`.
+    Created(Status),
+}
+
+impl Message {
+    /// The kind byte of the message.
+    pub fn kind(&self) -> u8 {
+        match self {
+            Message::Attach { .. } => kind::ATTACH,
+            Message::Detach => kind::DETACH,
+            Message::Resize(_) => kind::RESIZE,
+            Message::Terminate { .. } => kind::TERMINATE,
+            Message::Upgrade { .. } => kind::UPGRADE,
+            Message::Status => kind::STATUS,
+            Message::Input(_) => kind::INPUT,
+            Message::List => kind::LIST,
+            Message::New(_) => kind::NEW,
+            Message::Ping(_) => kind::PING,
+            Message::Attached { .. } => kind::ATTACHED,
+            Message::Output { .. } => kind::OUTPUT,
+            Message::Ended(_) => kind::ENDED,
+            Message::Error { .. } => kind::ERROR,
+            Message::Pong(_) => kind::PONG,
+            Message::StatusReply(_) => kind::STATUS_REPLY,
+            Message::ListReply(_) => kind::LIST_REPLY,
+            Message::Created(_) => kind::CREATED,
+        }
+    }
+
+    fn payload(&self) -> Result<Vec<u8>> {
+        Ok(match self {
+            Message::Detach | Message::Status | Message::List => Vec::new(),
+            Message::Attach { offset } => offset.to_be_bytes().to_vec(),
+            Message::Resize(size) => {
+                let mut out = Vec::with_capacity(Size::LEN);
+                size.write(&mut out);
+                out
+            }
+            Message::Terminate { force } => vec![u8::from(*force)],
+            Message::Upgrade { path } => {
+                if path.is_empty() || path.len() > MAX_PATH || path.contains(&0) {
+                    return Err(Error::Malformed("upgrade path"));
+                }
+                path.clone()
+            }
+            Message::Input(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.clone(),
+            Message::New(new) => new.encode()?,
+            Message::Attached { offset, truncated } => {
+                let mut out = offset.to_be_bytes().to_vec();
+                out.push(u8::from(*truncated));
+                out
+            }
+            Message::Output { offset, data } => {
+                let mut out = Vec::with_capacity(8 + data.len());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out.extend_from_slice(data);
+                out
+            }
+            Message::Ended(exit) => exit.to_bytes().to_vec(),
+            Message::Error { code, text } => {
+                let mut out = code.0.to_be_bytes().to_vec();
+                out.extend_from_slice(text.as_bytes());
+                out
+            }
+            Message::StatusReply(status) | Message::Created(status) => status.to_block(),
+            Message::ListReply(all) => {
+                let mut w = tlv::Writer::new();
+                for status in all {
+                    w.put(LISTED, &status.to_block());
+                }
+                w.finish()
+            }
+        })
+    }
+
+    /// `Ok(None)` for a kind this version does not know.
+    fn parse(kind: u8, payload: &[u8]) -> Result<Option<Message>> {
+        let mut f = Fields::new(payload, kind_name(kind));
+        Ok(Some(match kind {
+            kind::ATTACH => Message::Attach { offset: f.u64()? },
+            kind::DETACH => Message::Detach,
+            kind::RESIZE => Message::Resize(Size::read(&mut f)?),
+            kind::TERMINATE => Message::Terminate {
+                force: f.u8()? & 1 != 0,
+            },
+            kind::UPGRADE => {
+                if payload.is_empty() || payload.len() > MAX_PATH || payload.contains(&0) {
+                    return Err(Error::Malformed("upgrade path"));
+                }
+                Message::Upgrade {
+                    path: payload.to_vec(),
+                }
+            }
+            kind::STATUS => Message::Status,
+            kind::INPUT => Message::Input(payload.to_vec()),
+            kind::LIST => Message::List,
+            kind::NEW => Message::New(NewSession::decode(payload)?),
+            kind::PING => Message::Ping(payload.to_vec()),
+            kind::ATTACHED => Message::Attached {
+                offset: f.u64()?,
+                truncated: f.u8()? & 1 != 0,
+            },
+            kind::OUTPUT => Message::Output {
+                offset: f.u64()?,
+                data: f.rest().to_vec(),
+            },
+            kind::ENDED => Message::Ended(Exit::read(&mut f)?),
+            kind::ERROR => {
+                let code = ErrorCode(f.u16()?);
+                Message::Error {
+                    code,
+                    text: String::from_utf8_lossy(f.rest()).into_owned(),
+                }
+            }
+            kind::PONG => Message::Pong(payload.to_vec()),
+            kind::STATUS_REPLY => Message::StatusReply(Status::from_block(payload)?),
+            kind::LIST_REPLY => {
+                let mut all = Vec::new();
+                for entry in tlv::entries(payload) {
+                    let (key, value) = entry?;
+                    if key == LISTED {
+                        all.push(Status::from_block(value)?);
+                    }
+                }
+                Message::ListReply(all)
+            }
+            kind::CREATED => Message::Created(Status::from_block(payload)?),
+            _ => return Ok(None),
+        }))
+    }
+}
+
+/// A message and the session it concerns: what one frame carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Packet {
+    /// The session, or `None` for a connection-level message (`list`, `ping`,
+    /// a `new` that lets the server choose the name).
+    pub session: Option<SessionId>,
+    /// The message.
+    pub message: Message,
+}
+
+impl Packet {
+    /// A message about a session.
+    pub fn about(session: SessionId, message: Message) -> Packet {
+        Packet {
+            session: Some(session),
+            message,
+        }
+    }
+
+    /// A message about the connection.
+    pub fn connection(message: Message) -> Packet {
+        Packet {
+            session: None,
+            message,
+        }
+    }
+
+    /// The frame this packet is.
+    pub fn to_frame(&self) -> Result<RawFrame> {
+        Ok(RawFrame {
+            kind: self.message.kind(),
+            channel: CHANNEL_SESSION,
+            session: self
+                .session
+                .as_ref()
+                .map(|s| s.as_str().as_bytes().to_vec())
+                .unwrap_or_default(),
+            payload: self.message.payload()?,
+        })
+    }
+
+    /// Reads a packet out of a frame. `Ok(None)` for a frame this version
+    /// skips: a channel other than the session channel, or a kind it does not
+    /// know.
+    pub fn from_frame(frame: RawFrame) -> Result<Option<Packet>> {
+        if frame.channel != CHANNEL_SESSION {
+            return Ok(None);
+        }
+        let Some(message) = Message::parse(frame.kind, &frame.payload)? else {
+            return Ok(None);
+        };
+        let session = if frame.session.is_empty() {
+            None
+        } else {
+            Some(SessionId::from_bytes(&frame.session)?)
+        };
+        Ok(Some(Packet { session, message }))
+    }
+
+    /// Appends the packet's bytes to `out` (for a writer that buffers).
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        frame::encode_frame(out, &self.to_frame()?)
+    }
+}
+
+/// Reads the next packet, skipping frames this version does not know.
+/// `Ok(None)` is the stream ending between frames. After an
+/// [`Error::is_recoverable`] error the next call reads the next frame.
+pub fn read_packet<R: Read>(reader: &mut R) -> Result<Option<Packet>> {
+    frame::read_with(reader, Packet::from_frame)
+}
+
+/// Writes one packet.
+pub fn write_packet<W: Write>(writer: &mut W, packet: &Packet) -> Result<()> {
+    frame::write_frame(writer, &packet.to_frame()?)
+}
+
+/// Turns bytes pushed in arbitrary pieces into packets: [`read_packet`] for a
+/// reader that cannot block.
+#[derive(Debug, Default)]
+pub struct PacketDecoder {
+    frames: FrameDecoder,
+}
+
+impl PacketDecoder {
+    /// An empty decoder.
+    pub fn new() -> PacketDecoder {
+        PacketDecoder::default()
+    }
+
+    /// Adds bytes that arrived.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.frames.push(bytes);
+    }
+
+    /// How many pushed bytes are not yet part of a returned packet.
+    pub fn pending(&self) -> usize {
+        self.frames.pending()
+    }
+
+    /// The next packet, or `None` when more bytes are needed.
+    pub fn next_packet(&mut self) -> Result<Option<Packet>> {
+        self.frames.next_with(Packet::from_frame)
+    }
+}
+
+/// Reads a fixed layout field by field.
+struct Fields<'a> {
+    rest: &'a [u8],
+    what: &'static str,
+}
+
+impl<'a> Fields<'a> {
+    fn new(rest: &'a [u8], what: &'static str) -> Fields<'a> {
+        Fields { rest, what }
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let (head, tail) = self
+            .rest
+            .split_first_chunk::<N>()
+            .ok_or(Error::Malformed(self.what))?;
+        self.rest = tail;
+        Ok(*head)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(u8::from_be_bytes(self.array()?))
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn rest(self) -> &'a [u8] {
+        self.rest
+    }
+}

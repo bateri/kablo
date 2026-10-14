@@ -1,0 +1,7 @@
+# input for "work"
+07           # kind 0x07: input
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 03  # payload length 3
+77 6f 72 6b  # session id "work"
+6c 73 0d     # bytes: ls and a carriage return

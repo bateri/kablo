@@ -1,0 +1,7 @@
+# attach "work" from offset 0x1000
+01                       # kind 0x01: attach
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 08              # payload length 8
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 10 00  # offset 4096

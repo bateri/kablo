@@ -1,0 +1,10 @@
+[package]
+name = "kablo-proto"
+description = "The kablo wire format: handshake, frames and messages. No I/O, no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

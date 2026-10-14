@@ -1,0 +1,14 @@
+# warden to relay: adopt "work" whose shell already ended with signal 15
+01              # kind 0x01: adopt
+00              # channel 0: terminal session
+00              # session id length 0
+00 00 00 1f     # payload length 31
+00 01           # tlv key 1
+00 00 00 04     #   length 4
+77 6f 72 6b     #   id "work"
+00 02           # tlv key 2
+00 00 00 04     #   length 4
+00 00 10 92     #   shell pid 4242
+00 03           # tlv key 3
+00 00 00 05     #   length 5
+01 00 00 00 0f  #   exit signal 15

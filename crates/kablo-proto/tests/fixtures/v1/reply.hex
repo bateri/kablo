@@ -1,0 +1,5 @@
+# server reply: version 1 selected, the server speaks 1 to 1
+4b 41 42 4c 4f 00  # signature
+01                 # selected version
+01                 # lowest version
+01                 # highest version

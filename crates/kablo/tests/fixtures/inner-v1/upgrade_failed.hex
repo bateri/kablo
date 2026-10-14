@@ -1,0 +1,8 @@
+# warden to relay: the upgrade did not happen
+05                                               # kind 0x05: upgrade failed
+00                                               # channel 0: terminal session
+00                                               # session id length 0
+00 00 00 16                                      # payload length 22
+00 01                                            # tlv key 1
+00 00 00 10                                      #   length 16
+6e 65 77 20 72 65 6c 61 79 20 65 78 69 74 65 64  #   text

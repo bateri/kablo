@@ -1,0 +1,13 @@
+[package]
+name = "kablo"
+description = "A transparent terminal session keeper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kablo-proto = { path = "../kablo-proto" }
+
+[lints]
+workspace = true

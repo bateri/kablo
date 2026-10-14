@@ -1,0 +1,8 @@
+# output of "work" starting at offset 0x1000
+82                       # kind 0x82: output
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 0f              # payload length 15
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 10 00  # offset 4096
+68 65 6c 6c 6f 0d 0a     # bytes

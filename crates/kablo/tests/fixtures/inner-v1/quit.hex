@@ -1,0 +1,5 @@
+# warden to relay: stop reading, release, exit
+03           # kind 0x03: quit
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

@@ -1,0 +1,8 @@
+# relay to warden: end the session with a hang-up
+84           # kind 0x84: terminate
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 07  # payload length 7
+00 01        # tlv key 1
+00 00 00 01  #   length 1
+00           #   flag: none

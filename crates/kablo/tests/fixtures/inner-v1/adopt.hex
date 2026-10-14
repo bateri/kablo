@@ -1,0 +1,11 @@
+# warden to relay: adopt "work" (the 3 descriptors travel beside this frame)
+01           # kind 0x01: adopt
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 14  # payload length 20
+00 01        # tlv key 1
+00 00 00 04  #   length 4
+77 6f 72 6b  #   id "work"
+00 02        # tlv key 2
+00 00 00 04  #   length 4
+00 00 10 92  #   shell pid 4242

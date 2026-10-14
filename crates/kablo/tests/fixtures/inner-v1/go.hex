@@ -1,0 +1,5 @@
+# warden to relay: start reading the terminal
+02           # kind 0x02: go
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

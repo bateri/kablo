@@ -1,0 +1,5 @@
+# relay to warden: the shell's end reached a client
+85           # kind 0x85: delivered
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

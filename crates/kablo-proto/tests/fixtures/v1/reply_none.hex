@@ -1,0 +1,5 @@
+# server reply: no common version (selected 0), the server speaks 1 to 1
+4b 41 42 4c 4f 00  # signature
+00                 # selected version: none
+01                 # lowest version
+01                 # highest version

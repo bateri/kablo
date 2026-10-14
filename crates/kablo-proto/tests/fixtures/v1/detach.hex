@@ -1,0 +1,6 @@
+# detach "work"
+02           # kind 0x02: detach
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 00  # payload length 0
+77 6f 72 6b  # session id "work"

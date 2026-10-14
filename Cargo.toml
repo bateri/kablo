@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/kablo-proto", "crates/kablo"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+
+# The parsers read bytes from a peer: a panic there is a remote crash, so the
+# panicking shortcuts are errors outside tests (clippy.toml lets tests use them).
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

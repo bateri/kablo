@@ -1,0 +1,36 @@
+# status of "work", running
+86                                # kind 0x86: status_reply
+00                                # channel 0: terminal session
+04                                # session id length 4
+00 00 00 74                       # payload length 116
+77 6f 72 6b                       # session id "work"
+00 01                             # tlv key 1
+00 00 00 04                       #   length 4
+77 6f 72 6b                       #   id "work"
+00 02                             # tlv key 2
+00 00 00 04                       #   length 4
+00 00 10 92                       #   pid 4242
+00 03                             # tlv key 3
+00 00 00 03                       #   length 3
+76 69 6d                          #   foreground program "vim"
+00 04                             # tlv key 4
+00 00 00 0b                       #   length 11
+2f 68 6f 6d 65 2f 75 2f 73 72 63  #   foreground directory "/home/u/src"
+00 05                             # tlv key 5
+00 00 00 08                       #   length 8
+00 78 00 28 03 c0 03 20           #   size (120, 40, 960, 800)
+00 06                             # tlv key 6
+00 00 00 04                       #   length 4
+00 00 00 02                       #   clients 2
+00 07                             # tlv key 7
+00 00 00 01                       #   length 1
+00                                #   state 0
+00 08                             # tlv key 8
+00 00 00 08                       #   length 8
+00 00 00 00 00 01 e2 40           #   offset 123456
+00 09                             # tlv key 9
+00 00 00 08                       #   length 8
+00 00 00 00 00 00 00 64           #   retained from 100
+00 0b                             # tlv key 11
+00 00 00 05                       #   length 5
+30 2e 31 2e 30                    #   version "0.1.0"

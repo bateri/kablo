@@ -1,0 +1,5 @@
+# list reply with no sessions
+87           # kind 0x87: list_reply
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

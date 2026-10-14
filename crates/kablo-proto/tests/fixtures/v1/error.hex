@@ -1,0 +1,8 @@
+# error about "nope"
+84                                            # kind 0x84: error
+00                                            # channel 0: terminal session
+04                                            # session id length 4
+00 00 00 11                                   # payload length 17
+6e 6f 70 65                                   # session id "nope"
+00 01                                         # code 1: unknown session
+6e 6f 20 73 75 63 68 20 73 65 73 73 69 6f 6e  # text

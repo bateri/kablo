@@ -1,0 +1,7 @@
+# upgrade "work" to a binary
+05                                                           # kind 0x05: upgrade
+00                                                           # channel 0: terminal session
+04                                                           # session id length 4
+00 00 00 14                                                  # payload length 20
+77 6f 72 6b                                                  # session id "work"
+2f 75 73 72 2f 6c 6f 63 61 6c 2f 62 69 6e 2f 6b 61 62 6c 6f  # path

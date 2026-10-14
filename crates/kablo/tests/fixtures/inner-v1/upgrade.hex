@@ -1,0 +1,8 @@
+# relay to warden: replace me with this binary
+83                                                           # kind 0x83: upgrade
+00                                                           # channel 0: terminal session
+00                                                           # session id length 0
+00 00 00 1a                                                  # payload length 26
+00 01                                                        # tlv key 1
+00 00 00 14                                                  #   length 20
+2f 6f 70 74 2f 6b 61 62 6c 6f 2f 62 69 6e 2f 6b 61 62 6c 6f  #   path

@@ -1,0 +1,5 @@
+# new session with all defaults (no session id: the server names it)
+09           # kind 0x09: new
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

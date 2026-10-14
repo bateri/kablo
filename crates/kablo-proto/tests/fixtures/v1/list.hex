@@ -1,0 +1,5 @@
+# list every session (connection level: no session id)
+08           # kind 0x08: list
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

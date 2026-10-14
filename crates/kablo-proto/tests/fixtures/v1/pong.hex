@@ -1,0 +1,6 @@
+# pong (connection level)
+85                       # kind 0x85: pong
+00                       # channel 0: terminal session
+00                       # session id length 0
+00 00 00 08              # payload length 8
+70 69 6e 67 64 61 74 61  # the ping's bytes

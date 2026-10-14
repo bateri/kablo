@@ -1,0 +1,7 @@
+# resize "work"
+03                       # kind 0x03: resize
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 08              # payload length 8
+77 6f 72 6b              # session id "work"
+00 78 00 28 03 c0 03 20  # size: 120 columns, 40 rows, 960x800 pixels

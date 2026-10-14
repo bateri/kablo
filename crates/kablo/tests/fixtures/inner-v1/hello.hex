@@ -1,0 +1,4 @@
+# relay hello: the range of inner versions it speaks, 1 to 1
+4b 41 42 4c 4f 57 00  # signature
+01                    # lowest version
+01                    # highest version

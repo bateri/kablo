@@ -1,0 +1,8 @@
+# "work" ended by signal 9
+83           # kind 0x83: ended
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 05  # payload length 5
+77 6f 72 6b  # session id "work"
+01           # exit kind: signal
+00 00 00 09  # signal 9

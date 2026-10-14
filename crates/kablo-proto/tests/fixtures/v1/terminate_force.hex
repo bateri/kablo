@@ -1,0 +1,7 @@
+# terminate "work" by force
+04           # kind 0x04: terminate
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 01  # payload length 1
+77 6f 72 6b  # session id "work"
+01           # flags: force

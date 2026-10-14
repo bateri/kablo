@@ -1,0 +1,30 @@
+# new session "build-1" with every field
+09                                                        # kind 0x09: new
+00                                                        # channel 0: terminal session
+07                                                        # session id length 7
+00 00 00 6e                                               # payload length 110
+62 75 69 6c 64 2d 31                                      # session id "build-1"
+00 01                                                     # tlv key 1
+00 00 00 07                                               #   length 7
+2f 62 69 6e 2f 73 68                                      #   argument 0
+00 01                                                     # tlv key 1
+00 00 00 02                                               #   length 2
+2d 63                                                     #   argument 1
+00 01                                                     # tlv key 1
+00 00 00 07                                               #   length 7
+65 63 68 6f 20 68 69                                      #   argument 2
+00 02                                                     # tlv key 2
+00 00 00 13                                               #   length 19
+54 45 52 4d 3d 78 74 65 72 6d 2d 32 35 36 63 6f 6c 6f 72  #   environment TERM
+00 02                                                     # tlv key 2
+00 00 00 07                                               #   length 7
+46 4f 4f 3d 61 3d 62                                      #   environment FOO (value contains =)
+00 03                                                     # tlv key 3
+00 00 00 04                                               #   length 4
+2f 74 6d 70                                               #   working directory
+00 04                                                     # tlv key 4
+00 00 00 08                                               #   length 8
+00 50 00 18 00 00 00 00                                   #   size 80x24, no pixels
+00 05                                                     # tlv key 5
+00 00 00 08                                               #   length 8
+00 00 00 00 00 10 00 00                                   #   journal capacity 1 MiB
