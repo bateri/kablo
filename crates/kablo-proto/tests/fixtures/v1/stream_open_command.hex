@@ -1,0 +1,28 @@
+# run tar -cf - src in /home/u with two variables as stream 3, ready to take 262144 bytes
+01           # kind 0x01: open
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 52  # payload length 82
+00 00 00 03  # stream 3
+00 04 00 00  # window 262144
+00 03        # tlv key 3: argv
+00 00 00 03  #   length 3
+74 61 72     #   argument 0, the program "tar"
+00 03        # tlv key 3: argv
+00 00 00 03  #   length 3
+2d 63 66     #   argument 1 "-cf"
+00 03        # tlv key 3: argv
+00 00 00 01  #   length 1
+2d           #   argument 2 "-"
+00 03        # tlv key 3: argv
+00 00 00 03  #   length 3
+73 72 63     #   argument 3 "src"
+00 04        # tlv key 4: env
+00 00 00 08  #   length 8
+4c 43 5f 41 4c 4c 3d 43  #   environment LC_ALL=C
+00 04        # tlv key 4: env
+00 00 00 07  #   length 7
+46 4f 4f 3d 61 3d 62  #   environment FOO (the value contains =)
+00 05        # tlv key 5: cwd
+00 00 00 07  #   length 7
+2f 68 6f 6d 65 2f 75  #   working directory "/home/u"

@@ -566,6 +566,12 @@ impl Streams {
             (Side::Server, Message::Open { window, port, host }) => {
                 self.open_requested(id, window, port, host, out);
             }
+            // This server does not run programs yet: it answers an `open` for
+            // one as a server from before them does, which reads it as a
+            // target with no port and no host.
+            (Side::Server, Message::OpenCommand { window, .. }) => {
+                self.open_requested(id, window, 0, String::new(), out);
+            }
             (Side::Client, Message::Opened { window }) => self.opened(id, window, out),
             (Side::Client, Message::Failed { code, text }) => self.failed(id, code, text),
             (_, Message::Data(bytes)) => self.data_in(id, bytes, out),

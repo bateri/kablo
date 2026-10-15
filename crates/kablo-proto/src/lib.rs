@@ -14,9 +14,9 @@
 //! (kind, channel, session id, payload length) and a payload; the payload of
 //! the frames in use is one of the [`v1`] messages: a [`v1::Packet`] on the
 //! session channel, a [`v1::stream::Packet`] on the channel of streams (TCP
-//! connections the server makes for the client). Nothing about the
-//! terminal's contents is in the protocol: the program's bytes travel inside
-//! `output` and `input` payloads untouched.
+//! connections the server makes for the client, and programs it runs). Nothing
+//! about the terminal's contents is in the protocol: the program's bytes travel
+//! inside `output` and `input` payloads untouched.
 //!
 //! # Compatibility
 //!

@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 use kablo_proto::frame::{self, RawFrame};
 use kablo_proto::hello::Reply;
-use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder, Side, read_incoming};
+use kablo_proto::v1::stream::{
+    self, Command, FailCode, Incoming, IncomingDecoder, Side, read_incoming,
+};
 use kablo_proto::v1::{
     self, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, State, Status, View,
     kind, read_packet, write_packet,
@@ -249,6 +251,18 @@ fn messages() -> Vec<(&'static str, Packet)> {
                 "turned off by the server's administrator",
             ))),
         ),
+        (
+            "features_reply_commands",
+            Packet::connection(Message::FeaturesReply(
+                Features::with_streams().with_commands(),
+            )),
+        ),
+        (
+            "features_reply_off_commands",
+            Packet::connection(Message::FeaturesReply(
+                Features::streams_off("turned off by the server's administrator").with_commands(),
+            )),
+        ),
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
             "status_reply_warden",
@@ -378,7 +392,72 @@ fn streams() -> Vec<(&'static str, Side, stream::Packet)> {
         ("stream_server_eof", Side::Server, on(1, S::Eof)),
         ("stream_client_close", Side::Client, on(1, S::Close)),
         ("stream_server_close", Side::Server, on(1, S::Close)),
+        (
+            "stream_open_command",
+            Side::Client,
+            on(
+                3,
+                S::OpenCommand {
+                    window: 262_144,
+                    command: tar_command(),
+                },
+            ),
+        ),
+        (
+            "stream_open_command_argv",
+            Side::Client,
+            on(
+                4,
+                S::OpenCommand {
+                    window: 65_536,
+                    command: Command {
+                        argv: vec![b"true".to_vec()],
+                        ..Command::default()
+                    },
+                },
+            ),
+        ),
+        (
+            "stream_server_stderr",
+            Side::Server,
+            on(
+                3,
+                S::Stderr(b"tar: src: No such file or directory\n".to_vec()),
+            ),
+        ),
+        (
+            "stream_exited_code",
+            Side::Server,
+            on(3, S::Exited(Exit::Code(2))),
+        ),
+        (
+            "stream_exited_signal",
+            Side::Server,
+            on(3, S::Exited(Exit::Signal(9))),
+        ),
+        (
+            "stream_failed_not_started",
+            Side::Server,
+            on(
+                4,
+                S::Failed {
+                    code: FailCode::START_FAILED,
+                    text: "No such file or directory".into(),
+                },
+            ),
+        ),
     ]
+}
+
+/// The command of the `stream_open_command` fixture.
+fn tar_command() -> Command {
+    Command {
+        argv: ["tar", "-cf", "-", "src"]
+            .map(|a| a.as_bytes().to_vec())
+            .to_vec(),
+        env: vec![b"LC_ALL=C".to_vec(), b"FOO=a=b".to_vec()],
+        cwd: Some(b"/home/u".to_vec()),
+    }
 }
 
 /// The fixtures that are not messages.
@@ -978,6 +1057,8 @@ fn every_stream_kind_has_a_fixture() {
         SERVER_EOF,
         SERVER_CLOSE,
         FAILED,
+        STDERR,
+        EXITED,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -994,12 +1075,14 @@ fn every_stream_kind_has_a_fixture() {
             SERVER_CREDIT,
             SERVER_EOF,
             SERVER_CLOSE,
-            FAILED
+            FAILED,
+            STDERR,
+            EXITED
         ]
         .iter()
         .all(|k| k & 0x80 != 0)
     );
-    assert_eq!(kinds.len(), 11);
+    assert_eq!(kinds.len(), 13);
 }
 
 #[test]
@@ -1117,7 +1200,7 @@ fn frames_of_a_kind_or_channel_streams_do_not_have_are_skipped_by_their_length()
     use stream::kind as k;
     let mut wire = Vec::new();
     wire.extend(raw(0x06, CHANNEL_STREAM, "", &[0, 0, 0, 1, 7, 7])); // no client message has this kind
-    wire.extend(raw(0x87, CHANNEL_STREAM, "", &[0; 100])); // nor server message
+    wire.extend(raw(0x89, CHANNEL_STREAM, "", &[0; 100])); // nor server message
     wire.extend(raw(0x7e, CHANNEL_STREAM, "", &[1; 5000])); // a kind from the future
     wire.extend(raw(0xfe, CHANNEL_STREAM, "", &[])); // another, from the server's half
     wire.extend(raw(k::CLIENT_DATA, 2, "", &[0, 0, 0, 1, 7])); // a channel from the future
@@ -1185,6 +1268,54 @@ fn a_reader_ignores_what_a_later_version_adds_to_a_stream_message() {
             }
         )
     );
+    // A command's open: the keys it has, in any order, with one it does not
+    // know between them; the last directory wins, the port and host are not
+    // read, and the arguments and variables come in the order they were sent.
+    let mut payload = vec![0, 0, 0, 7, 0, 0, 0, 2];
+    payload.extend([0, 5, 0, 0, 0, 2, b'/', b'a']); // directory "/a"
+    payload.extend([0, 3, 0, 0, 0, 2, b's', b'h']); // program "sh"
+    payload.extend([0, 1, 0, 0, 0, 2, 0, 80]); // a port, which a command has no use for
+    payload.extend([0, 2, 0, 0, 0, 1, b'h']); // nor a host
+    payload.extend([0x0f, 0xff, 0, 0, 0, 1, 9]); // a key from the future
+    payload.extend([0, 3, 0, 0, 0, 0]); // an empty argument
+    payload.extend([0, 4, 0, 0, 0, 3, b'A', b'=', b'1']);
+    payload.extend([0, 5, 0, 0, 0, 2, b'/', b'b']); // directory "/b"
+    payload.extend([0, 4, 0, 0, 0, 3, b'B', b'=', b'2']);
+    assert_eq!(
+        read(k::OPEN, "", &payload),
+        stream::Packet::new(
+            7,
+            S::OpenCommand {
+                window: 2,
+                command: Command {
+                    argv: vec![b"sh".to_vec(), Vec::new()],
+                    env: vec![b"A=1".to_vec(), b"B=2".to_vec()],
+                    cwd: Some(b"/b".to_vec()),
+                }
+            }
+        )
+    );
+    // Variables and a directory without an argument are not a command: the
+    // server reads a target, and has no port to connect to.
+    let mut payload = vec![0, 0, 0, 7, 0, 0, 0, 2];
+    payload.extend([0, 4, 0, 0, 0, 3, b'A', b'=', b'1']);
+    payload.extend([0, 5, 0, 0, 0, 2, b'/', b'a']);
+    assert_eq!(
+        read(k::OPEN, "", &payload),
+        stream::Packet::new(
+            7,
+            S::Open {
+                window: 2,
+                port: 0,
+                host: String::new()
+            }
+        )
+    );
+    // The exit status of an `exited` is read as a prefix, as in `ended`.
+    assert_eq!(
+        read(0x88, "", &[0, 0, 0, 7, 1, 0, 0, 0, 15, 0xde, 0xad]),
+        stream::Packet::new(7, S::Exited(Exit::Signal(15)))
+    );
     // A failure code this version has no name for is kept as it came.
     assert_eq!(
         read(k::FAILED, "", &[0, 0, 0, 6, 0x12, 0x34]),
@@ -1219,6 +1350,32 @@ fn what_an_open_asks_for_is_answered_by_the_server_not_refused_by_the_reader() {
             )
         })
     );
+    // A command the server will not run is read all the same, so that it can
+    // answer `failed` with BAD_REQUEST on that stream: a NUL in an argument, a
+    // variable with no name or no `=`, more arguments than the limit.
+    let mut payload = vec![0, 0, 0, 3, 0, 0, 0, 0];
+    payload.extend([0, 3, 0, 0, 0, 3, b'a', 0, b'b']);
+    payload.extend([0, 4, 0, 0, 0, 2, b'=', b'x']);
+    payload.extend([0, 4, 0, 0, 0, 1, b'Z']);
+    for _ in 0..=stream::MAX_ARGV {
+        payload.extend([0, 3, 0, 0, 0, 1, b'x']);
+    }
+    let frame = raw(k::OPEN, CHANNEL_STREAM, "", &payload);
+    let Some(Incoming::Stream {
+        packet:
+            stream::Packet {
+                message: S::OpenCommand { command, .. },
+                ..
+            },
+        ..
+    }) = read_incoming(&mut frame.as_slice()).unwrap()
+    else {
+        panic!("not a command")
+    };
+    assert_eq!(command.argv.len(), stream::MAX_ARGV + 2);
+    assert_eq!(command.argv.first().unwrap(), b"a\0b");
+    assert_eq!(command.env, [b"=x".to_vec(), b"Z".to_vec()]);
+    assert!(command.check().is_err());
     // A data message over the sender's limit, and a window over the largest:
     // a reader takes both so that the receiver can close that one stream.
     let mut payload = vec![0, 0, 0, 3];
@@ -1272,6 +1429,80 @@ fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
         "a host over the longest name"
     );
 
+    let run = |command: Command| S::OpenCommand { window: 1, command };
+    let args = |argv: &[&str]| Command {
+        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        ..Command::default()
+    };
+    assert!(write(Side::Client, run(tar_command())).is_ok());
+    assert!(write(Side::Client, run(args(&["sh", "-c", ""]))).is_ok());
+    assert!(write(Side::Client, run(args(&[]))).is_err(), "no program");
+    assert!(
+        write(Side::Client, run(args(&[""]))).is_err(),
+        "an empty program"
+    );
+    assert!(write(Side::Client, run(args(&["a\0b"]))).is_err(), "a NUL");
+    assert!(write(Side::Client, run(args(&["sh", "a\0"]))).is_err());
+    assert!(
+        write(Side::Server, run(tar_command())).is_err(),
+        "from the server"
+    );
+    let with_env = |entries: &[&str]| Command {
+        env: entries.iter().map(|e| e.as_bytes().to_vec()).collect(),
+        ..args(&["env"])
+    };
+    assert!(write(Side::Client, run(with_env(&["A=", "B=c=d"]))).is_ok());
+    assert!(write(Side::Client, run(with_env(&["A"]))).is_err(), "no =");
+    assert!(
+        write(Side::Client, run(with_env(&["=a"]))).is_err(),
+        "no name"
+    );
+    assert!(
+        write(Side::Client, run(with_env(&["A=\0"]))).is_err(),
+        "a NUL"
+    );
+    let with_cwd = |cwd: &str| Command {
+        cwd: Some(cwd.as_bytes().to_vec()),
+        ..args(&["pwd"])
+    };
+    assert!(write(Side::Client, run(with_cwd("/tmp"))).is_ok());
+    assert!(
+        write(Side::Client, run(with_cwd(""))).is_err(),
+        "an empty directory"
+    );
+    assert!(write(Side::Client, run(with_cwd("/a\0"))).is_err(), "a NUL");
+    let many = |n: usize| args(&vec!["x"; n]);
+    assert!(write(Side::Client, run(many(stream::MAX_ARGV))).is_ok());
+    assert!(write(Side::Client, run(many(stream::MAX_ARGV + 1))).is_err());
+    let vars = |n: usize| Command {
+        env: vec![b"A=1".to_vec(); n],
+        ..args(&["env"])
+    };
+    assert!(write(Side::Client, run(vars(stream::MAX_ENV))).is_ok());
+    assert!(write(Side::Client, run(vars(stream::MAX_ENV + 1))).is_err());
+    let big = |len: usize| Command {
+        argv: vec![b"cat".to_vec(), vec![b'x'; len]],
+        ..Command::default()
+    };
+    assert!(write(Side::Client, run(big(stream::MAX_COMMAND_BYTES - 3))).is_ok());
+    assert!(write(Side::Client, run(big(stream::MAX_COMMAND_BYTES - 2))).is_err());
+    // Counted over everything a command carries, not each part alone: the
+    // limit is over by two bytes here, though no part is near it.
+    let half = stream::MAX_COMMAND_BYTES / 2;
+    let spread = Command {
+        argv: vec![b"cat".to_vec(), vec![b'x'; half]],
+        env: vec![[b"A=".to_vec(), vec![b'y'; half - 4]].concat()],
+        cwd: Some(b"/".to_vec()),
+    };
+    assert!(write(Side::Client, run(spread)).is_err());
+
+    // The two kinds only the server sends.
+    assert!(write(Side::Server, S::Stderr(vec![1; stream::MAX_DATA])).is_ok());
+    assert!(write(Side::Server, S::Stderr(vec![1; stream::MAX_DATA + 1])).is_err());
+    assert!(write(Side::Client, S::Stderr(Vec::new())).is_err());
+    assert!(write(Side::Server, S::Exited(Exit::Code(0))).is_ok());
+    assert!(write(Side::Client, S::Exited(Exit::Code(0))).is_err());
+
     let data = |len: usize| S::Data(vec![1; len]);
     assert!(write(Side::Client, data(stream::MAX_DATA)).is_ok());
     assert!(write(Side::Server, data(stream::MAX_DATA)).is_ok());
@@ -1311,6 +1542,21 @@ fn the_limits_of_streams_are_the_ones_the_features_say() {
     assert_eq!(stream::MAX_CONNECTING, 16);
     assert_eq!(stream::CONNECT_TIMEOUT.as_secs(), 10);
     assert_eq!(stream::MAX_HOST, 253);
+    assert_eq!(stream::MAX_ARGV, 1024);
+    assert_eq!(stream::MAX_ENV, 256);
+    assert_eq!(stream::MAX_COMMAND_BYTES, 256 * 1024);
+    // Commands are a feature of their own, off until a server says it has them,
+    // and the limits of streams do not change with them.
+    assert!(!on.commands);
+    let both = on.clone().with_commands();
+    assert!(both.commands);
+    assert_eq!(
+        Features {
+            commands: false,
+            ..both
+        },
+        on
+    );
 }
 
 #[test]
@@ -1353,9 +1599,27 @@ fn features_read_as_zeros_unless_the_server_says_more() {
         }
     );
 
+    // Commands: bit 0 of its byte, absent when clear, last wins.
+    assert!(!Features::default().commands);
+    block.extend([0, 6, 0, 0, 0, 1, 0b1111_1111]);
+    assert!(Features::from_block(&block).unwrap().commands);
+    block.extend([0, 6, 0, 0, 0, 1, 0b0000_0010]);
+    assert!(!Features::from_block(&block).unwrap().commands);
+    // Written only when set, so that a server without commands is the bytes it
+    // was before there were any.
+    assert_eq!(
+        Features::with_streams().to_block(),
+        fixture("features_reply")[7..]
+    );
+    assert_eq!(Features::with_streams().with_commands().to_block().len(), {
+        Features::with_streams().to_block().len() + 7
+    });
+    assert!(!Features::streams_off("x").commands);
+
     // A value of the wrong length, text that is not text, and an entry cut
     // short make the message malformed, which costs that message alone.
     for bad in [
+        &[0, 6, 0, 0, 0, 2, 1, 1][..],
         &[0, 1, 0, 0, 0, 2, 1, 1][..],
         &[0, 3, 0, 0, 0, 2, 0, 1],
         &[0, 2, 0, 0, 0, 1, 0xff],
@@ -1383,4 +1647,107 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(stream::kind_name(stream::kind::OPEN), "stream open");
     assert_eq!(stream::kind_name(stream::kind::FAILED), "stream failed");
     assert_eq!(stream::kind_name(0x06), "unknown");
+    assert_eq!(stream::kind_name(stream::kind::STDERR), "stream stderr");
+    assert_eq!(stream::kind_name(stream::kind::EXITED), "stream exited");
+    assert_eq!(stream::kind_name(0x89), "unknown");
+    assert_eq!(FailCode::START_FAILED, FailCode(8));
+}
+
+/// What a reader from before commands made of a frame of channel 1: it had the
+/// client kinds 0x01-0x05 and the server kinds 0x81-0x86, and the keys 1 and 2
+/// of an `open`, and skipped the rest. `None` for a frame it skipped.
+fn read_before_commands(bytes: &[u8]) -> Option<(&'static str, u16, String)> {
+    let frame = frame::read_frame(&mut &bytes[..]).unwrap().unwrap();
+    assert_eq!(frame.channel, CHANNEL_STREAM);
+    let name = match frame.kind {
+        0x01 => "open",
+        0x02 | 0x82 => "data",
+        0x03 | 0x83 => "credit",
+        0x04 | 0x84 => "eof",
+        0x05 | 0x85 => "close",
+        0x81 => "opened",
+        0x86 => "failed",
+        _ => return None,
+    };
+    let (mut port, mut host) = (0, String::new());
+    if name == "open" {
+        for entry in kablo_proto::tlv::entries(&frame.payload[8..]) {
+            let (key, value) = entry.unwrap();
+            match key {
+                1 => port = u16::from_be_bytes([value[0], value[1]]),
+                2 => host = String::from_utf8_lossy(value).into_owned(),
+                _ => {}
+            }
+        }
+    }
+    Some((name, port, host))
+}
+
+#[test]
+fn a_reader_from_before_commands_skips_the_new_kinds_and_reads_a_command_open_as_a_target_with_none()
+ {
+    use stream::Message as S;
+    for (name, _, packet) in streams() {
+        let old = read_before_commands(&fixture(name));
+        match &packet.message {
+            // The server's answer to a stream it never heard of is nothing to
+            // act on: the kind was skipped.
+            S::Stderr(_) | S::Exited(_) => assert_eq!(old, None, "{name}"),
+            // Port 0 and no host: what a server from before commands answers
+            // with `failed` (7), and a client sees that and nothing worse.
+            S::OpenCommand { .. } => {
+                assert_eq!(old, Some(("open", 0, String::new())), "{name}")
+            }
+            S::Open { port, host, .. } => {
+                assert_eq!(old, Some(("open", *port, host.clone())), "{name}")
+            }
+            // A code it has no name for is a failure all the same.
+            S::Failed { .. } => assert_eq!(old.map(|o| o.0), Some("failed"), "{name}"),
+            _ => assert!(old.is_some(), "{name}"),
+        }
+    }
+}
+
+#[test]
+fn a_command_conversation_reads_in_order_however_it_arrives() {
+    let order = [
+        "stream_open_command",
+        "stream_client_data",
+        "stream_server_stderr",
+        "stream_server_data",
+        "stream_server_credit",
+        "stream_client_eof",
+        "stream_server_eof",
+        "stream_exited_code",
+        "stream_server_close",
+        "stream_failed_not_started",
+    ];
+    let mut wire = Vec::new();
+    let mut expected = Vec::new();
+    for name in order {
+        wire.extend(fixture(name));
+        let (from, packet) = stream_message(name);
+        expected.push(Incoming::Stream { from, packet });
+    }
+    for piece in [1, 5, 4096] {
+        let mut decoder = IncomingDecoder::new();
+        let mut got = Vec::new();
+        for chunk in wire.chunks(piece) {
+            decoder.push(chunk);
+            while let Some(i) = decoder.next_incoming().unwrap() {
+                got.push(i);
+            }
+        }
+        assert_eq!(got, expected, "pieces of {piece}");
+        assert_eq!(decoder.pending(), 0);
+    }
+    // And the command is the one the fixture says: its variables are read as
+    // names and values.
+    let command = tar_command();
+    command.check().unwrap();
+    let vars: Vec<_> = command.vars().collect();
+    assert_eq!(
+        vars,
+        [(&b"LC_ALL"[..], &b"C"[..]), (&b"FOO"[..], &b"a=b"[..])]
+    );
 }

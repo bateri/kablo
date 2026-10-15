@@ -1,0 +1,10 @@
+# run true as stream 4, with nothing else said
+01           # kind 0x01: open
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 12  # payload length 18
+00 00 00 04  # stream 4
+00 01 00 00  # window 65536
+00 03        # tlv key 3: argv
+00 00 00 04  #   length 4
+74 72 75 65  #   argument 0, the program "true"

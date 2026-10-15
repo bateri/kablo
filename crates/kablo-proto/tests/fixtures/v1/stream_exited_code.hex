@@ -1,0 +1,8 @@
+# the command on stream 3 ended with exit code 2
+88           # kind 0x88: exited
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 09  # payload length 9
+00 00 00 03  # stream 3
+00           # exit kind: code
+00 00 00 02  # status 2

@@ -1,0 +1,8 @@
+# the command on stream 3 was ended by signal 9
+88           # kind 0x88: exited
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 09  # payload length 9
+00 00 00 03  # stream 3
+01           # exit kind: signal
+00 00 00 09  # signal 9

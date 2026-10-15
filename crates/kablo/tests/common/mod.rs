@@ -869,7 +869,10 @@ impl Bridge {
             stream::Message::Credit(bytes) => flow.credit += u64::from(bytes),
             stream::Message::Eof => flow.eof = true,
             stream::Message::Close => flow.closed = true,
-            other @ stream::Message::Open { .. } => panic!("the bridge sent {other:?}"),
+            other @ (stream::Message::Open { .. }
+            | stream::Message::OpenCommand { .. }
+            | stream::Message::Stderr(_)
+            | stream::Message::Exited(_)) => panic!("the bridge sent {other:?}"),
         }
     }
 

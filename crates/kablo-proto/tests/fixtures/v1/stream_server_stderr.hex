@@ -1,0 +1,7 @@
+# bytes the command on stream 3 wrote to its standard error
+87           # kind 0x87: stderr, server to client
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 28  # payload length 40
+00 00 00 03  # stream 3
+74 61 72 3a 20 73 72 63 3a 20 4e 6f 20 73 75 63 68 20 66 69 6c 65 20 6f 72 20 64 69 72 65 63 74 6f 72 79 0a  # bytes

@@ -500,6 +500,29 @@ fn what_cannot_be_opened_is_failed_without_connecting() {
 }
 
 #[test]
+fn an_open_for_a_command_is_answered_as_a_server_from_before_commands_would() {
+    let mut server = server_with(Config::default());
+    let mut out = Vec::new();
+    let command = kablo_proto::v1::stream::Command {
+        argv: vec![b"true".to_vec()],
+        ..Default::default()
+    };
+    server.handle(
+        Side::Client,
+        Packet::new(
+            1,
+            Message::OpenCommand {
+                window: 1000,
+                command,
+            },
+        ),
+        &mut out,
+    );
+    assert_eq!(failed(&out), [(1, FailCode::BAD_REQUEST)]);
+    assert!(server.is_empty());
+}
+
+#[test]
 fn too_many_streams_and_too_many_connecting_are_the_limit() {
     let (config, gate) = gated();
     let mut server = server_with(Config {

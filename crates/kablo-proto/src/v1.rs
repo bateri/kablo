@@ -530,6 +530,10 @@ pub struct Features {
     /// The most bytes the server takes in one stream `data` message (0: not
     /// said, so [`stream::MAX_DATA`]).
     pub max_data: u32,
+    /// Whether the server runs programs for the client: a stream whose `open`
+    /// is a [`stream::Command`]. Independent of `streams`: an administrator
+    /// who turns streams off has not turned commands off.
+    pub commands: bool,
 }
 
 mod features_key {
@@ -538,6 +542,7 @@ mod features_key {
     pub const MAX_STREAMS: u16 = 3;
     pub const MAX_WINDOW: u16 = 4;
     pub const MAX_DATA: u16 = 5;
+    pub const COMMANDS: u16 = 6;
 }
 
 impl Features {
@@ -549,6 +554,15 @@ impl Features {
             max_streams: stream::MAX_STREAMS,
             max_window: stream::MAX_WINDOW,
             max_data: u32::try_from(stream::MAX_DATA).unwrap_or(u32::MAX),
+            commands: false,
+        }
+    }
+
+    /// The same features, and the server runs programs too.
+    pub fn with_commands(self) -> Features {
+        Features {
+            commands: true,
+            ..self
         }
     }
 
@@ -561,7 +575,9 @@ impl Features {
     }
 
     /// The wire form, a [`tlv`] block with the keys in ascending order. A limit
-    /// of zero is not written.
+    /// of zero is not written, nor is `commands` when it is clear: a reply
+    /// from before commands existed, and one from a server without them, are
+    /// the same bytes.
     pub fn to_block(&self) -> Vec<u8> {
         let mut w = tlv::Writer::new();
         w.put_u8(features_key::STREAMS, u8::from(self.streams));
@@ -576,6 +592,9 @@ impl Features {
             if limit != 0 {
                 w.put_u32(key, limit);
             }
+        }
+        if self.commands {
+            w.put_u8(features_key::COMMANDS, 1);
         }
         w.finish()
     }
@@ -601,6 +620,9 @@ impl Features {
                 }
                 features_key::MAX_DATA => {
                     features.max_data = tlv::read_u32(value, "features max data")?
+                }
+                features_key::COMMANDS => {
+                    features.commands = tlv::read_u8(value, "features commands")? & 1 != 0
                 }
                 _ => {}
             }

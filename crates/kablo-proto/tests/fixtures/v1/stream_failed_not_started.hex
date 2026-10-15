@@ -1,0 +1,8 @@
+# stream 4 did not start: the program is not there
+86           # kind 0x86: failed
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 1f  # payload length 31
+00 00 00 04  # stream 4
+00 08        # code 8: the command could not be started
+4e 6f 20 73 75 63 68 20 66 69 6c 65 20 6f 72 20 64 69 72 65 63 74 6f 72 79  # text

@@ -195,8 +195,11 @@ a reply with no `streams` says there are none.
 | 3 | u32 | `max_streams`: how many streams a connection may have open at once |
 | 4 | u32 | `max_window`: the largest window the server takes for a stream and offers for one |
 | 5 | u32 | `max_data`: the most bytes the server takes in one stream `data` |
+| 6 | u8 | `commands`: bit 0 is set when the server runs programs for the client (an `open` with an `argv`, below); written only when set |
 
-A limit that is absent or zero is the one in section 6.
+A limit that is absent or zero is the one in section 6. `commands` is
+independent of `streams`: a server whose administrator has turned streams off
+(section 5) still runs commands, and says so.
 
 ### error codes
 
@@ -234,19 +237,33 @@ each.
 | 0x84 | `eof` | (empty) |
 | 0x85 | `close` | (empty) |
 | 0x86 | `failed` | `code: u16`, then UTF-8 text |
+| 0x87 | `stderr` | the bytes (a command's standard error) |
+| 0x88 | `exited` | the exit status, 5 bytes laid out as in `ended`: a kind (0 exit code, 1 signal) and an `i32` (a command's end) |
 
-The TLV block of `open`, the target to connect to:
+The TLV block of `open` holds either a target to connect to or a command to
+run. A block with an `argv` entry is a command, and its `port` and `host` are
+not read; any other is a target.
 
 | key | value | meaning |
 |---|---|---|
 | 1 | u16 | `port` |
 | 2 | bytes | `host`: a name or an address (IPv4, or IPv6 without brackets), 1 to 253 bytes, no NUL |
+| 3 | bytes | `argv`: one argument of the command; repeats, in order, and the first is the program |
+| 4 | bytes | `env`: one variable to add to the server's environment, `NAME=VALUE` (the name is what comes before the first `=`); repeats |
+| 5 | bytes | `cwd`: the directory to start in; the user's home when absent |
 
 A reader checks the structure of a stream message and nothing else: an `open`
 without a `port` or a `host` reads as port 0 and an empty host, and the server
-answers it with `failed` like any other `open` it cannot use. Senders do not
-produce them (port 0, an empty host, a host over 253 bytes or with a NUL, a
-`data` over 32 KiB).
+answers it with `failed` like any other `open` it cannot use; so does one with
+a command it will not run (below). Senders do not produce them (port 0, an
+empty host, a host over 253 bytes or with a NUL, a `data` or `stderr` over
+32 KiB, a command that is not valid).
+
+A command is valid when it has a program that is not empty, no NUL appears in
+any argument, variable or the directory, every variable has a name, the
+directory is not empty, and the limits in section 6 hold. It is an argument
+vector and never a shell string: the server starts the program as given and
+builds no command line from it.
 
 ### stream failure codes
 
@@ -260,7 +277,8 @@ The `code` of `failed`.
 | 4 | the target did not answer in time |
 | 5 | too many streams on the connection, or a window over the largest |
 | 6 | the server has streams turned off |
-| 7 | the `open` makes no sense (port 0, an empty or too long host) |
+| 7 | the `open` makes no sense (port 0, an empty or too long host; for a command, one that is not valid) |
+| 8 | the command could not be started; the text says why, as the system does |
 
 A code a reader has no name for is still a failure. The text is short English
 that reads after a colon ("connection refused"); a client that shows it to a
@@ -515,6 +533,47 @@ it works where sshd's forwarding is off. One TCP connection is one **stream**.
   place where the decision is kept cannot be looked at by the bridge's user)
   counts as one that has, and says so in the `reason`.
 
+**Commands.** The same channel runs a program on the server for the client, with
+no terminal: the equivalent of `ssh host command` for the one connection that
+is already there. The stream is the program's standard input, output and error;
+it lasts as long as the program does and no longer than the connection.
+
+- *Asking.* A server that runs commands sets `commands` in its `features_reply`
+  (key 6), whether it takes streams or not. A client sends an `open` with an
+  `argv` only to a server that has said so: one from before commands reads it
+  as a target with no port and no host and answers `failed` (7), and one that
+  never heard of streams says nothing.
+- *Opening.* As for any stream: the client numbers it, gives a window, and the
+  server answers `opened` with its own window, or `failed`. A command that is
+  not valid is `failed` (7) and the program is not started; one that does not
+  start (no such program, a directory that is not there, no permission, the
+  system's refusal) is `failed` (8) with the system's words as the text. The
+  program starts in its own process group, with no controlling terminal, in the
+  server's environment plus the `env` entries and in `cwd` or the user's home.
+  The client does not send `data` before `opened`.
+- *The program's streams.* `data` from the client is written to the program's
+  standard input, under the window the server gave; `eof` from the client
+  closes it. `data` from the server is the program's standard output and
+  `stderr` its standard error, kept apart; they are two pipes, so the order
+  between them is the order the server happened to read them in. Both are paid
+  for out of the one window the client gave: `credit` from the client adds to
+  it whichever the bytes were.
+- *The end.* When the program's standard output and standard error have both
+  ended the server sends `eof`, then `exited` with how the program ended (a code
+  or the signal that killed it, as the server's system numbers them), then
+  `close`. Standard output and error end when the program and everything it
+  started have closed them: a program that leaves a process holding them keeps
+  the stream open until that process lets go, or the client sends `close`. A
+  `data` or `stderr` after the server's `eof`, or an `exited` before it, is not
+  valid.
+- *Ending it early.* `close` from the client ends the stream and the program
+  with it: the server signals the program's process group to end and, if it is
+  still there after a short wait, to be killed. The same happens to every
+  command when the connection to the bridge ends. A command lives as long as
+  the connection and not longer; work that has to outlive it is a session.
+- *The administrator.* The switch that turns streams off (section 5, Streams)
+  does not touch commands: a person who can log in can run a program.
+
 ## 6. Limits
 
 | what | limit |
@@ -533,9 +592,12 @@ it works where sshd's forwarding is off. One TCP connection is one **stream**.
 | streams open on one connection | 128, counting the ones still connecting; one more is `failed` (5) |
 | streams connecting at once on one connection | 16; one more is `failed` (5) |
 | window of a stream, and credit outstanding | 256 KiB; an `open` asking for more is `failed` (5) |
-| bytes in one stream `data` | 32 KiB |
+| bytes in one stream `data` or `stderr` | 32 KiB |
 | time to connect a stream | 10 seconds, then `failed` (4) |
 | host in an `open` | 253 bytes |
+| arguments of a command, the program included | 1024; more is `failed` (7) |
+| environment entries of a command | 256; more is `failed` (7) |
+| bytes in a command's arguments, variables and directory together | 256 KiB; more is `failed` (7) |
 
 ## 7. Compatibility
 
