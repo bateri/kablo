@@ -20,13 +20,16 @@ remotely over a plain `ssh host kablo attach` — and needs nothing from the
 server beyond a login and the ability to run one command. It also works on
 its own, the way `dtach` does (below).
 
-Status: early; [0.1.0](CHANGELOG.md) is the first release. Linux (x86_64,
+Status: early. Versions and what each one changed are in
+[CHANGELOG.md](CHANGELOG.md); the binaries are on the
+[releases page](https://github.com/bateri/kablo/releases). Linux (x86_64,
 aarch64) and macOS (Apple silicon, Intel).
 
 ## Install
 
 Download the binary for your machine from the
-[latest release](https://github.com/bateri/kablo/releases/latest). Its name
+[latest release](https://github.com/bateri/kablo/releases/latest) (until the
+first one is published, the page is empty: build from source, below). Its name
 ends in the target: `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`
 (static, for any Linux distribution), `aarch64-apple-darwin` (Apple silicon)
 or `x86_64-apple-darwin` (Intel).
