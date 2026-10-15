@@ -49,7 +49,8 @@ terminal app puts the windows on top.
   asking for a password, and where an interactive `ssh` or `mosh` in front
   connects to (the target and nothing else of its command line). It is told
   when that changes, and the session looks only after output or typing, never
-  on a timer while nothing happens. The protocol's `status` carries the same.
+  on a timer while nothing happens. The protocol's `status` carries the same,
+  and so does `kablo list --json` (`secret`, `remote`, `remote_port`).
 - **A program is not answered twice when you come back.** A question that was
   answered already (where the cursor is, what the terminal is) used to be
   answered again by your terminal when the output was shown again, and the
