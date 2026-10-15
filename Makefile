@@ -3,7 +3,7 @@ CARGO ?= cargo
 # Prerequisite order is only guaranteed under serial make; under -j the promise
 # "cheapest gate first" breaks.
 .NOTPARALLEL:
-.PHONY: check fmt clippy test linux e2e dist notices notices-check release-gate release publish ship
+.PHONY: check fmt clippy test linux e2e dist dist-signed notices notices-check release-gate release publish ship
 
 # Definition of done. Homebrew rustc is not pinned (there is deliberately no
 # rust-toolchain.toml): the version is printed first so a clippy failure that
@@ -128,13 +128,33 @@ DIST_SUMS = SHA256SUMS
 DIST_LICENSES = LICENSE $(NOTICES)
 DIST_TOOLCHAIN ?= stable
 
+DIST_ENV = DIST_VERSION="$(DIST_VERSION)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
+	DIST_IMAGE="$(LINUX_IMAGE)" DIST_DOCKERFILE="$(LINUX_DOCKERFILE)" \
+	DIST_TOOLCHAIN="$(DIST_TOOLCHAIN)" DIST_LINUX_TARGETS="$(DIST_LINUX_TARGETS)" \
+	DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" DIST_LICENSES="$(DIST_LICENSES)"
+
 dist: notices-check
 	@$(call match_rust,dist)
 	@$(call need_docker,dist)
-	DIST_VERSION="$(DIST_VERSION)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
-		DIST_IMAGE="$(LINUX_IMAGE)" DIST_DOCKERFILE="$(LINUX_DOCKERFILE)" \
-		DIST_TOOLCHAIN="$(DIST_TOOLCHAIN)" DIST_LINUX_TARGETS="$(DIST_LINUX_TARGETS)" \
-		DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" DIST_LICENSES="$(DIST_LICENSES)" tools/dist.sh
+	$(DIST_ENV) tools/dist.sh
+
+# The same files, with the macOS binaries signed and notarized: what a release
+# ships, so that a Mac opens them without a prompt. Signing is with a
+# Developer ID Application identity from the keychain, found by that name
+# (`SIGN_ID="..."` names another), with the hardened runtime and a secure
+# timestamp; notarization is by `xcrun notarytool` with the keychain profile
+# NOTARY_PROFILE, set up once with `xcrun notarytool store-credentials` (the
+# password does not enter the repo; bateri's releases use the same Apple
+# account and the same profile). It needs the network and takes minutes, which
+# is why `dist` alone does neither: it is what development builds.
+SIGN_ID ?= $(shell security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)
+NOTARY_PROFILE ?= bateri-notary
+
+dist-signed: notices-check
+	@test -n '$(SIGN_ID)' || { echo "dist-signed: there is no Developer ID Application identity in the keychain (security find-identity -v -p codesigning), and the macOS binaries of a release are signed"; exit 1; }
+	@$(call match_rust,dist-signed)
+	@$(call need_docker,dist-signed)
+	$(DIST_ENV) DIST_SIGN_ID='$(SIGN_ID)' DIST_NOTARY_PROFILE='$(NOTARY_PROFILE)' tools/dist.sh
 
 # Publishing a version is one command, on this Mac:
 #
@@ -159,7 +179,8 @@ dist: notices-check
 # `VERSION=`.
 #
 # Then every gate the project has, none skipped: the notice is current
-# (cheap), `check`, `linux`, `e2e`, `dist`. Without Docker `linux` and `e2e` print SKIPPED and exit 2, which in
+# (cheap), `check`, `linux`, `e2e`, `dist-signed` (the build, with the macOS
+# binaries signed and notarized). Without Docker `linux` and `e2e` print SKIPPED and exit 2, which in
 # a release is a stop, not an allowed gap. The tree must be as clean at the
 # end as at the start (a gate that rewrites Cargo.lock means the binaries are
 # not the commit's) and HEAD the same commit; only then `release` writes that
@@ -206,7 +227,7 @@ release-gate:
 	grep -q '[^[:space:]]' $(RELEASE_NOTES) || { rm -rf $(RELEASE_DIR); echo "release: CHANGELOG.md has no '## [$(DIST_VERSION)]' section or it is empty (turn Unreleased into the version)"; exit 1; }
 	git rev-parse HEAD >$(RELEASE_DIR)/.gate
 
-release: release-gate notices-check check linux e2e dist
+release: release-gate notices-check check linux e2e dist-signed
 	@test -z "$$(git status --porcelain)" && test "$$(git rev-parse HEAD)" = "$$(cat $(RELEASE_DIR)/.gate)" || { echo "release: the tree or HEAD changed while the gates ran, so the binaries are not of one known commit"; exit 1; }
 	cp $(addprefix dist/,$(RELEASE_FILES)) $(RELEASE_DIR)/
 	@$(call check_release_sums,release)

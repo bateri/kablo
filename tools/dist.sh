@@ -8,11 +8,23 @@
 # finish, and a stale binary can never pass for a new one. The licenses go in
 # next to the binaries and are summed with them, so what a release carries
 # is exactly what SHA256SUMS lists.
+#
+# With DIST_SIGN_ID (a release) the macOS binaries are signed with that
+# identity, with the hardened runtime and a secure timestamp, before they are
+# run; with DIST_NOTARY_PROFILE too they are then notarized by Apple
+# (`notarytool`, that keychain profile), and Apple's ticket has to cover each
+# binary as it is in dist/.
+# A bare executable cannot have its ticket stapled, so a Mac that opens one a
+# browser saved asks Apple about it once, online; one fetched with curl or
+# copied over ssh carries no quarantine and is not asked about. The sums come
+# after all of it: signing changes the files.
 set -eu
 
 : "${DIST_VERSION:?}" "${DIST_NAME:?}" "${DIST_SUMS:?}" "${DIST_IMAGE:?}" \
     "${DIST_DOCKERFILE:?}" "${DIST_TOOLCHAIN:?}" \
     "${DIST_LINUX_TARGETS:?}" "${DIST_MACOS_TARGETS:?}" "${DIST_LICENSES:?}"
+sign_id=${DIST_SIGN_ID:-}
+notary_profile=${DIST_NOTARY_PROFILE:-}
 
 fail() {
     echo "dist: $*" >&2
@@ -31,6 +43,12 @@ check_version() {
         *) fail "$2 says '$1', not version $DIST_VERSION" ;;
     esac
 }
+
+[ -z "$notary_profile" ] || [ -n "$sign_id" ] || fail "notarizing needs signed binaries (DIST_SIGN_ID)"
+if [ -n "$sign_id" ]; then
+    security find-identity -v -p codesigning | grep -qF "\"$sign_id\"" ||
+        fail "there is no valid code-signing identity named '$sign_id' in the keychain (security find-identity -v -p codesigning)"
+fi
 
 # The macOS binaries come from the rustup toolchain: Homebrew's rustc cannot
 # add the standard library of a target. Look before building anything.
@@ -108,6 +126,19 @@ for target in $DIST_MACOS_TARGETS; do
     CARGO_TARGET_DIR=target/dist RUSTC="$rustc" \
         "$cargo" build --release --locked -p kablo --target "$target"
     cp "target/dist/$target/release/kablo" "dist/$name"
+    if [ -n "$sign_id" ]; then
+        # Over the linker's ad-hoc signature. What notarization asks for: a
+        # Developer ID, the hardened runtime and a timestamp from Apple.
+        codesign --force --options runtime --timestamp --sign "$sign_id" "dist/$name"
+        codesign --verify --strict "dist/$name" || fail "dist/$name does not verify after signing"
+        signed=$(codesign -dv "dist/$name" 2>&1)
+        case $signed in
+            *"flags="*"(runtime)"*) ;;
+            *) fail "dist/$name is not signed with the hardened runtime" ;;
+        esac
+        printf '%s\n' "$signed" | grep -q '^Timestamp=' || fail "dist/$name has no secure timestamp"
+        echo "signed: dist/$name ($sign_id)"
+    fi
 
     described=$(file "dist/$name")
     echo "$described"
@@ -123,6 +154,46 @@ for target in $DIST_MACOS_TARGETS; do
         echo "dist: dist/$name was not run: this Mac cannot run $arch binaries"
     fi
 done
+
+# Notarization: both binaries in one submission, waited for. A refusal stops
+# the build with Apple's own account of why.
+if [ -n "$notary_profile" ]; then
+    work=target/dist/notarize
+    rm -rf "$work"
+    mkdir -p "$work/kablo"
+    for target in $DIST_MACOS_TARGETS; do
+        cp "dist/$(name_of "$target")" "$work/kablo/"
+    done
+    ditto -c -k --keepParent "$work/kablo" "$work/kablo.zip"
+    echo "==> notarizing the macOS binaries (notarytool, profile $notary_profile)"
+    answer=$(xcrun notarytool submit "$work/kablo.zip" --keychain-profile "$notary_profile" \
+        --wait --output-format json) || fail "notarytool could not submit or wait: $answer"
+    status=$(printf '%s' "$answer" | plutil -extract status raw -o - -) || fail "notarytool said: $answer"
+    id=$(printf '%s' "$answer" | plutil -extract id raw -o - -) || id=
+    if [ "$status" != Accepted ]; then
+        [ -z "$id" ] || xcrun notarytool log "$id" --keychain-profile "$notary_profile" >&2 || true
+        fail "Apple did not accept the macOS binaries: $status (submission $id)"
+    fi
+    echo "notarized: submission $id"
+    # What Apple's ticket covers: the code-directory hash of each binary as it
+    # is in dist/ must be in the submission's log, or what ships is not what
+    # was notarized. That is the check, not Gatekeeper's verdict on this Mac:
+    # with no ticket stapled to it, Gatekeeper answers from what it has looked
+    # up before, and right after a submission that is "unnotarized" for a
+    # while. Its verdict is printed, and is no reason to stop.
+    xcrun notarytool log "$id" --keychain-profile "$notary_profile" "$work/log.json" >/dev/null ||
+        fail "notarytool could not fetch the log of submission $id"
+    for target in $DIST_MACOS_TARGETS; do
+        name=$(name_of "$target")
+        cdhash=$(codesign -dvvv "dist/$name" 2>&1 | sed -n 's/^CDHash=//p')
+        [ -n "$cdhash" ] || fail "dist/$name has no code-directory hash"
+        grep -qF "\"$cdhash\"" "$work/log.json" ||
+            fail "Apple's ticket for submission $id does not cover dist/$name ($cdhash)"
+        echo "notarized: dist/$name ($cdhash)"
+        echo "gatekeeper on this Mac, for now: $(spctl --assess --type execute --verbose=2 "dist/$name" 2>&1 | tr '\n' ' ')"
+    done
+    rm -rf "$work"
+fi
 
 # The sums, from inside dist/ so the names in the file are the names there.
 if command -v sha256sum >/dev/null 2>&1; then

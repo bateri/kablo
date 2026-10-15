@@ -49,13 +49,11 @@ the one you downloaded. The release also carries this project's `LICENSE`
 and `THIRD-PARTY-LICENSES.txt`, the notice for the code inside the binary that
 asks to travel with copies of it.
 
-**The macOS binaries are not signed or notarized.** A file `curl` fetched runs
-as it is. One a browser saved carries macOS's quarantine mark, and Gatekeeper
-refuses to run it until you remove the mark:
-
-```sh
-xattr -d com.apple.quarantine kablo-0.1.0-aarch64-apple-darwin
-```
+The macOS binaries are signed with a Developer ID and notarized by Apple. One
+a browser saved opens without a prompt (the Mac asks Apple about it once, so
+the first run wants the network: a bare executable cannot carry its ticket);
+one fetched with `curl` or copied over ssh carries no quarantine mark and is
+not asked about at all, so a Mac you reach only over ssh takes it as it is.
 
 To build it from source instead, with Rust 1.88 or newer:
 
@@ -73,7 +71,10 @@ targets installed in its `stable` toolchain (`rustup target add
 aarch64-apple-darwin x86_64-apple-darwin --toolchain stable`; Homebrew's Rust
 cannot add them). The macOS binaries are built by that toolchain, the Linux
 ones by the compiler in the image. `make release` runs every gate and then
-`make dist` into `target/release-<version>/`, and `make ship` publishes the
+builds the same files with the macOS binaries signed and notarized
+(`make dist-signed`: a Developer ID Application identity in the keychain and
+a `notarytool` profile, `NOTARY_PROFILE`) into `target/release-<version>/`,
+and `make ship` publishes the
 result as a GitHub release; a version is released only if `CHANGELOG.md` has
 a section for it.
 

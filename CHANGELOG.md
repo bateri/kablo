@@ -86,16 +86,18 @@ terminal app puts the windows on top.
   client is reconnected without noticing. Fixes to the warden reach sessions
   that are already running, not only new ones.
 - **Binaries for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel).**
-  The Linux ones are static, so they run on any distribution. Every release
+  The Linux ones are static, so they run on any distribution; the macOS ones
+  are signed with a Developer ID and notarized by Apple, so a Mac opens them
+  without a prompt, and over ssh they need no desktop session. Every release
   lists the binaries' checksums in `SHA256SUMS` and carries the license
   notice for the third-party code inside them.
 
 ### Known limits
 
-- The macOS binaries are not signed or notarized. A file a browser saved
-  carries macOS's quarantine mark and Gatekeeper refuses to run it until you
-  remove the mark (`xattr -d com.apple.quarantine <file>`); a file fetched
-  with `curl` carries none.
+- A macOS binary a browser saved asks Apple about itself the first time it
+  runs, so that first run needs the network (a bare executable cannot carry
+  its notarization ticket). One fetched with `curl` or copied over ssh is not
+  asked about.
 - The screen picture is of a text screen: it does not carry images, and the
   rest of what a returning client does not get back is in the README, under
   [Limits](https://github.com/bateri/kablo#limits).
