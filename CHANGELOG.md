@@ -51,6 +51,15 @@ terminal app puts the windows on top.
   holds up typing and replies. An administrator who does not want connections
   carried creates `/etc/kablo/no-forwarding`; kablo then refuses them, on
   running bridges too.
+- **Programs run on the server over the same connection.** `kablo exec
+  -- ssh devbox kablo attach -- tar -cf - project` does what `ssh devbox tar
+  -cf - project` does, without asking ssh for another channel: the program has
+  no terminal, its input comes from here, its output and errors come back
+  apart, and `kablo exec` ends with its exit status (255 when kablo itself
+  could not run it). The program ends with the connection, or when `kablo
+  exec` is interrupted. Apps that speak the protocol get the same through an
+  `open` that names a program, and learn whether a server can from `features`.
+  An administrator's `/etc/kablo/no-forwarding` does not touch programs.
 - **Upgrades under running sessions.** `kablo upgrade ID /path/to/new/kablo`
   (or `--all`) replaces a session's relay and then its warden, the process
   that keeps the shell, in place: the shell keeps running and an attached

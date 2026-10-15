@@ -8,9 +8,11 @@
 //! ones that are not for clients.
 
 pub mod bridge;
+pub mod carrier;
 pub mod cli;
 pub mod connect;
 pub mod dial;
+pub mod exec;
 pub mod forward;
 pub mod handshake;
 pub mod inner;

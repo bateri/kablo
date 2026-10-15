@@ -4,10 +4,11 @@
 //! This is the one engine of both ends. The bridge (the [`Side::Server`]) makes
 //! the connection to the target an `open` names, or starts the program it
 //! names; a client (the [`Side::Client`]) hands it a socket it has accepted and
-//! has the bridge open the other half. Once a stream is open the two ends are
-//! alike, and so is the code: bytes move between a socket and the wire under a
-//! **window** each way. (A program is the other end of a stream the bridge
-//! makes, and for now only the bridge: see **Programs**.)
+//! has the bridge open the other half, or asks it to run a program and hands it
+//! the descriptors that are the program's input, output and errors. Once a
+//! stream is open the two ends are alike, and so is the code: bytes move
+//! between a socket (or a program's pipes, or the client's own) and the wire
+//! under a **window** each way: see **Programs**.
 //! Nothing here reads or writes the wire itself. The owner feeds it what
 //! arrived ([`Streams::handle`]), asks which descriptors to wait for
 //! ([`Streams::interest`]), tells it which are ready ([`Streams::ready`]) and
@@ -38,6 +39,9 @@
 //! control packet pair that is queued with the data: its `exited` and the
 //! `close` after it say what happened *after* the last byte, so they wait
 //! behind the `eof`, and the stream is let go without taking the frames with it.
+//! (The client end of a command takes the same pair the other way: bytes of the
+//! program's output that have been received and not yet written here are not
+//! lost to the `close` that follows `exited`.)
 //!
 //! **A stream that is not valid** (data past its window, past its end or
 //! before it was opened, a credit past the largest window) is ended with a
@@ -68,6 +72,24 @@
 //! for its `eof`. A program that leaves another holding its pipes keeps the
 //! stream open until that one lets go or the client closes it.
 //!
+//! **A command, at the client** ([`Streams::open_command`]). The program is on
+//! the other side; here its standard input is read from a descriptor the owner
+//! gives ([`Local`]) and its standard output and errors are written to two
+//! more, which the owner may share with the whole system (a terminal, a pipe in
+//! a pipeline) and so are never made non-blocking: each is written only when a
+//! look says it takes bytes, and in pieces a pipe takes whole, so that nothing
+//! here waits on a reader that is slow. Standard output and errors are two
+//! queues paid for out of the one window, like the server's two pipes. The
+//! stream is over for the owner ([`Event::Exited`]) when the server has said how
+//! the program ended and everything it wrote has been written; the server's
+//! `close` that follows is not an abort. A stream that is closed before that
+//! (the server closed it, or it broke the rules, or what the program wrote
+//! cannot be written here) is [`Event::Closed`], and is told to the server. What
+//! the program wrote as errors and cannot be written is dropped, with credit
+//! for it, and the program goes on: a reader of errors that went away is not a
+//! reason to end it; one of its output is, since a program nobody hears is not
+//! worth running.
+//!
 //! A program lasts as long as its stream. A `close` (and a stream that breaks
 //! the rules) tells the program's whole process group to end and keeps the
 //! program for [`Config::kill_wait`]: it is collected the moment the group is
@@ -92,7 +114,7 @@ use kablo_proto::v1::stream::{
     CONNECT_TIMEOUT, Command, FailCode, MAX_CONNECTING, MAX_DATA, MAX_HOST, MAX_STREAMS,
     MAX_WINDOW, Message, Packet, Side,
 };
-use kablo_proto::v1::{Features, Message as SessionMessage};
+use kablo_proto::v1::{Exit, Features, Message as SessionMessage};
 
 use crate::dial::{self, Refusal, Target};
 use crate::outbound::Frames;
@@ -102,6 +124,13 @@ use crate::sys;
 /// Bytes of `data` frames that may wait for the wire before sockets are not
 /// read.
 pub const QUEUED_SOFT: usize = 4 * MAX_DATA;
+
+/// The most a pipe is sure to take in one write once it has said it takes
+/// bytes (POSIX's `PIPE_BUF`, which `libc` has for Linux only).
+#[cfg(target_os = "linux")]
+const PIPE_BUF: usize = libc::PIPE_BUF;
+#[cfg(not(target_os = "linux"))]
+const PIPE_BUF: usize = 512;
 
 /// How a target is reached: its address and the time by which it must be.
 /// Tests put their own here.
@@ -149,6 +178,15 @@ pub enum Token {
     Stdout(u32),
     /// The errors of the program of this stream.
     Stderr(u32),
+    /// Client end of a command: the descriptor the program's input is read
+    /// from has bytes.
+    LocalInput(u32),
+    /// Client end of a command: the descriptor its output is written to takes
+    /// bytes.
+    LocalOutput(u32),
+    /// Client end of a command: the descriptor its errors are written to takes
+    /// bytes.
+    LocalErrors(u32),
     /// The end of the program of this stream.
     Exit(u32),
     /// The end of a program (this process number) whose stream is over.
@@ -172,12 +210,90 @@ pub enum Event {
         /// In a few words.
         text: String,
     },
+    /// A command's program ended as `exit` says, and everything it wrote has
+    /// been written to the descriptors of [`Local`] (or has nowhere to go: the
+    /// program had ended all the same). The stream is gone.
+    Exited {
+        /// The stream.
+        stream: u32,
+        /// How the program ended.
+        exit: Exit,
+    },
+    /// A command's stream was ended before its program's end was told. The
+    /// stream is gone.
+    Closed {
+        /// The stream.
+        stream: u32,
+        /// Who ended it.
+        cause: Cause,
+    },
+}
+
+/// Who ended a command's stream before its program's end was told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// The server closed it, or broke the rules of the protocol.
+    Server,
+    /// This end did: the program's output could not be written here, for this
+    /// reason (`BrokenPipe` is a reader that went away).
+    Local(io::ErrorKind),
+}
+
+/// The descriptors of a command that is run for this end (client): where its
+/// standard input comes from and where its standard output and errors go. They
+/// are the owner's to give, and none is made non-blocking; the same descriptor
+/// may be given for the output and the errors.
+#[derive(Debug)]
+pub struct Local {
+    /// Read to give the program input; at its end the program's input ends.
+    pub input: OwnedFd,
+    /// Written with what the program writes.
+    pub output: OwnedFd,
+    /// Written with what the program writes as errors.
+    pub errors: OwnedFd,
 }
 
 /// What the other end of a stream is.
 enum End {
     Socket(TcpStream),
     Program(Run),
+    /// This end's own descriptors, for a command run on the server.
+    Local(Held),
+}
+
+/// [`Local`], with the input gone once it is over.
+struct Held {
+    input: Option<OwnedFd>,
+    output: OwnedFd,
+    errors: OwnedFd,
+    /// Whether the output and the errors are regular files, which take what
+    /// they are given without being asked.
+    files: [bool; 2],
+}
+
+impl Held {
+    /// Writes to the output or the errors, if it takes bytes now (and
+    /// `WouldBlock` if not): the descriptor may be shared, so it is asked
+    /// rather than made non-blocking, and no more is given than a pipe takes
+    /// whole. (A regular file is never asked: it takes what it is given, and a
+    /// transfer into one is not made of pieces of a pipe's size.)
+    fn write(&self, channel: Channel, bytes: &[u8]) -> io::Result<usize> {
+        let (fd, file) = match channel {
+            Channel::Out => (&self.output, self.files[0]),
+            Channel::Err => (&self.errors, self.files[1]),
+        };
+        if file {
+            return sys::write_fd(fd.as_fd(), bytes);
+        }
+        let mut asked = [sys::want(fd.as_raw_fd(), libc::POLLOUT)];
+        if sys::poll(&mut asked, Some(Duration::ZERO))? == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        sys::write_fd(
+            fd.as_fd(),
+            bytes.get(..bytes.len().min(PIPE_BUF)).unwrap_or(bytes),
+        )
+    }
 }
 
 /// A program, and the pipes this end holds to it. A pipe is gone once it is
@@ -198,15 +314,18 @@ enum Channel {
 }
 
 impl End {
-    /// Writes toward the other end: the socket, the program's input. A program
-    /// that has closed its input is a broken pipe, as a socket that is reset.
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    /// Writes toward the other end: the socket, the program's input (`channel`
+    /// says which of the two outputs a client's own descriptors are written
+    /// for). A program that has closed its input is a broken pipe, as a socket
+    /// that is reset.
+    fn write(&mut self, channel: Channel, bytes: &[u8]) -> io::Result<usize> {
         match self {
             End::Socket(socket) => socket.write(bytes),
             End::Program(run) => match &run.stdin {
                 Some(pipe) => sys::write_fd(pipe.as_fd(), bytes),
                 None => Err(io::ErrorKind::BrokenPipe.into()),
             },
+            End::Local(local) => local.write(channel, bytes),
         }
     }
 
@@ -224,6 +343,10 @@ impl End {
                     None => Err(io::ErrorKind::WouldBlock.into()),
                 }
             }
+            End::Local(local) => match &local.input {
+                Some(input) => sys::read_fd(input.as_fd(), buf),
+                None => Err(io::ErrorKind::WouldBlock.into()),
+            },
         }
     }
 
@@ -235,6 +358,8 @@ impl End {
                 let _ = socket.shutdown(Shutdown::Write);
             }
             End::Program(run) => run.stdin = None,
+            // Nothing to shut: the descriptors are the owner's.
+            End::Local(_) => {}
         }
     }
 
@@ -248,6 +373,10 @@ impl End {
                     Channel::Err => run.stderr = None,
                 }
                 run.stdout.is_none() && run.stderr.is_none()
+            }
+            End::Local(local) => {
+                local.input = None;
+                true
             }
         }
     }
@@ -264,6 +393,16 @@ struct Stream {
     recv_window: u32,
     /// Bytes received and not yet written to the socket.
     inbox: VecDeque<u8>,
+    /// Client end of a command: the program's errors received and not yet
+    /// written. They are paid for out of the same window as the output.
+    errors: VecDeque<u8>,
+    /// Client end of a command: how the server said the program ended. After
+    /// that nothing more arrives but the `close`.
+    exited: Option<Exit>,
+    /// Client end of a command: the errors cannot be written any more. What
+    /// arrives for them is dropped, with credit for it, and the program goes
+    /// on.
+    errors_dead: bool,
     /// Bytes written to the socket that the other end has not been told of.
     uncredited: u32,
     /// This end has sent `eof`: the socket said it had nothing more.
@@ -287,6 +426,9 @@ impl Stream {
             send_window,
             recv_window,
             inbox: VecDeque::new(),
+            errors: VecDeque::new(),
+            exited: None,
+            errors_dead: false,
             uncredited: 0,
             sent_eof: false,
             got_eof: false,
@@ -298,7 +440,8 @@ impl Stream {
     /// Whether the socket may be read: the stream is open, has window to send
     /// into, and its socket has not said it has nothing more.
     fn can_send(&self) -> bool {
-        !self.opening && !self.sent_eof && self.send_window > 0
+        // (A command's program that has ended reads no more.)
+        !self.opening && !self.sent_eof && self.send_window > 0 && self.exited.is_none()
     }
 }
 
@@ -401,6 +544,19 @@ pub fn judge(first: &SessionMessage) -> Verdict {
         }
         SessionMessage::FeaturesReply(features) => Verdict::Without(features.reason.clone()),
         _ => Verdict::Without(None),
+    }
+}
+
+/// Judges, for a client that wants a program run, the first message that came
+/// back after `features` and `ping` were sent: the bridge's features if it runs
+/// commands. A bridge that does not (one from before commands, or one that
+/// answered something else) gives `None`; the client waits for nothing and
+/// never guesses. Commands do not depend on streams: a bridge whose
+/// administrator turned those off still runs them, and says so here.
+pub fn judge_commands(first: &SessionMessage) -> Option<Features> {
+    match first {
+        SessionMessage::FeaturesReply(features) if features.commands => Some(features.clone()),
+        _ => None,
     }
 }
 
@@ -517,6 +673,14 @@ impl Streams {
         self.closed = why;
     }
 
+    /// Client end of a command: whether the server has said how the program
+    /// ended. The stream is then over but for what the program wrote and is
+    /// still to be written here ([`Event::Exited`] tells when it is all
+    /// written).
+    pub fn ended(&self, id: u32) -> bool {
+        self.streams.get(&id).is_some_and(|s| s.exited.is_some())
+    }
+
     /// What has happened to opened streams since this was last asked.
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -562,6 +726,67 @@ impl Streams {
         );
         out.push(packet);
         Ok(id)
+    }
+
+    /// Client end: opens a stream that runs `command` on the server, with the
+    /// descriptors of `local` for its input, output and errors. The input is not
+    /// read until the server has said `opened`. Returns the stream's number;
+    /// the `open` is in `out`.
+    pub fn open_command(
+        &mut self,
+        local: Local,
+        command: Command,
+        out: &mut Vec<Packet>,
+    ) -> io::Result<u32> {
+        if self.streams.len() >= self.config.max_streams {
+            return Err(io::Error::other("too many streams"));
+        }
+        let id = self
+            .last_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("out of stream numbers"))?;
+        let packet = Packet::new(
+            id,
+            Message::OpenCommand {
+                window: self.config.window,
+                command,
+            },
+        );
+        // The writer refuses a command no server could run.
+        packet
+            .encode(self.side, &mut Vec::new())
+            .map_err(io::Error::other)?;
+        self.last_id = id;
+        let Local {
+            input,
+            output,
+            errors,
+        } = local;
+        let files = [
+            sys::is_regular_file(output.as_fd()),
+            sys::is_regular_file(errors.as_fd()),
+        ];
+        let held = Held {
+            input: Some(input),
+            output,
+            errors,
+            files,
+        };
+        self.streams.insert(
+            id,
+            Stream::new(End::Local(held), 0, self.config.window, true),
+        );
+        out.push(packet);
+        Ok(id)
+    }
+
+    /// Client end: ends a stream from here. The server is told with a `close`,
+    /// which ends a command's program; what has not been written yet is
+    /// dropped. Nothing happens for a stream that is not there.
+    pub fn close(&mut self, id: u32, out: &mut Vec<Packet>) {
+        if self.streams.contains_key(&id) {
+            self.reset(id, out);
+        }
     }
 
     /// Server end: an `open`.
@@ -769,13 +994,16 @@ impl Streams {
             }
             (Side::Client, Message::Opened { window }) => self.opened(id, window, out),
             (Side::Client, Message::Failed { code, text }) => self.failed(id, code, text),
-            (_, Message::Data(bytes)) => self.data_in(id, bytes, out),
+            (Side::Client, Message::Stderr(bytes)) => {
+                self.data_in(id, bytes, Channel::Err, out);
+            }
+            (Side::Client, Message::Exited(exit)) => self.exited_in(id, exit, out),
+            (_, Message::Data(bytes)) => self.data_in(id, bytes, Channel::Out, out),
             (_, Message::Credit(bytes)) => self.credit_in(id, bytes, out),
             (_, Message::Eof) => self.eof_in(id, out),
             (_, Message::Close) => self.close_in(id),
-            // `open` going to a client, `opened` or `failed` to a server. (A
-            // client end has nothing to do with the `stderr` and `exited` of a
-            // program yet: no client end opens one through here.)
+            // `open` going to a client, `opened` or `failed` to a server. (`stderr`
+            // and `exited` go to a client only.)
             _ => {}
         }
     }
@@ -811,12 +1039,17 @@ impl Streams {
         }
     }
 
-    fn data_in(&mut self, id: u32, bytes: Vec<u8>, out: &mut Vec<Packet>) {
+    /// `data` or (`Channel::Err`) `stderr` arrived.
+    fn data_in(&mut self, id: u32, bytes: Vec<u8>, channel: Channel, out: &mut Vec<Packet>) {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
         let size = bytes.len();
+        // A connection has no errors of its own to speak of.
+        let errors_without_a_program =
+            channel == Channel::Err && !matches!(stream.end, End::Local(_));
         if stream.opening
+            || errors_without_a_program
             || stream.got_eof
             || size > MAX_DATA
             || u64::try_from(size).unwrap_or(u64::MAX) > u64::from(stream.recv_window)
@@ -826,12 +1059,32 @@ impl Streams {
         }
         let size = u32::try_from(size).unwrap_or(0);
         stream.recv_window -= size;
-        if stream.write_dead {
+        if stream.write_dead || (channel == Channel::Err && stream.errors_dead) {
             // Nowhere to write it: it counts as taken.
             stream.uncredited = stream.uncredited.saturating_add(size);
+        } else if channel == Channel::Err {
+            stream.errors.extend(bytes);
         } else {
             stream.inbox.extend(bytes);
         }
+        self.dirty.insert(id);
+    }
+
+    /// `exited` arrived: how a command's program ended. It comes once, after
+    /// the server's `eof`, and only on a command's stream.
+    fn exited_in(&mut self, id: u32, exit: Exit, out: &mut Vec<Packet>) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if !matches!(stream.end, End::Local(_))
+            || stream.opening
+            || !stream.got_eof
+            || stream.exited.is_some()
+        {
+            self.reset(id, out);
+            return;
+        }
+        stream.exited = Some(exit);
         self.dirty.insert(id);
     }
 
@@ -862,7 +1115,17 @@ impl Streams {
             entry.phase = Phase::Cancelled;
             return;
         }
-        self.forget(id);
+        // The `close` that follows `exited` ends nothing that is not over: what
+        // the program wrote is still being written here.
+        if self.streams.get(&id).is_some_and(|s| s.exited.is_some()) {
+            return;
+        }
+        if self.forget(id) {
+            self.events.push(Event::Closed {
+                stream: id,
+                cause: Cause::Server,
+            });
+        }
     }
 
     // --- sockets ------------------------------------------------------------
@@ -898,6 +1161,26 @@ impl Streams {
                     }
                     if let Some(watch) = run.program.watch_fd() {
                         found.push((sys::want(watch, libc::POLLIN), Token::Exit(id)));
+                    }
+                }
+                End::Local(local) => {
+                    if let Some(pipe) = local.input.as_ref().filter(|_| reading) {
+                        found.push((
+                            sys::want(pipe.as_raw_fd(), libc::POLLIN),
+                            Token::LocalInput(id),
+                        ));
+                    }
+                    if writing {
+                        found.push((
+                            sys::want(local.output.as_raw_fd(), libc::POLLOUT),
+                            Token::LocalOutput(id),
+                        ));
+                    }
+                    if !stream.errors.is_empty() {
+                        found.push((
+                            sys::want(local.errors.as_raw_fd(), libc::POLLOUT),
+                            Token::LocalErrors(id),
+                        ));
                     }
                 }
             }
@@ -955,6 +1238,8 @@ impl Streams {
             Token::Stdin(id) => self.drain(id, out),
             Token::Stdout(id) => self.fill(id, Channel::Out, out),
             Token::Stderr(id) => self.fill(id, Channel::Err, out),
+            Token::LocalInput(id) => self.fill(id, Channel::Out, out),
+            Token::LocalOutput(id) | Token::LocalErrors(id) => self.drain(id, out),
             Token::Exit(id) => self.program_ended(id),
             Token::Dying(pid) => self.collect(pid),
         }
@@ -970,44 +1255,84 @@ impl Streams {
 
     /// Writes a stream's inbox to its socket as far as it goes, gives credit
     /// for what went, and shuts the socket's writing half once the other end
-    /// has said it is done and everything is written.
+    /// has said it is done and everything is written. (A command's output and
+    /// errors are two inboxes, written to two descriptors.)
     fn drain(&mut self, id: u32, out: &mut Vec<Packet>) {
         let step = credit_step(self.config.window);
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        while !stream.inbox.is_empty() {
-            let (front, _) = stream.inbox.as_slices();
-            match stream.end.write(front) {
-                Ok(0) => break,
-                Ok(n) => {
-                    stream.inbox.drain(..n);
-                    stream.uncredited = stream
-                        .uncredited
-                        .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                // The socket will take no more. That is the end of what can
-                // be written to it, not of what it says: the stream goes on
-                // as far as its reading half does (a target that answered and
-                // hung up has its answer carried; a reset socket fails the
-                // read too, and that ends the stream).
-                Err(_) => {
-                    let dropped = u32::try_from(stream.inbox.len()).unwrap_or(u32::MAX);
-                    stream.uncredited = stream.uncredited.saturating_add(dropped);
-                    stream.inbox.clear();
-                    stream.write_dead = true;
+        let command = matches!(stream.end, End::Local(_));
+        let mut gave_up = None;
+        for channel in [Channel::Out, Channel::Err] {
+            loop {
+                let inbox = match channel {
+                    Channel::Out => &mut stream.inbox,
+                    Channel::Err => &mut stream.errors,
+                };
+                let (front, _) = inbox.as_slices();
+                if front.is_empty() {
                     break;
                 }
+                match stream.end.write(channel, front) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        inbox.drain(..n);
+                        stream.uncredited = stream
+                            .uncredited
+                            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // What a command wrote has nowhere to go. Its errors are
+                    // dropped and it goes on; if it is the output the reader of
+                    // went away, it is over, since a program that cannot be
+                    // heard is not worth running.
+                    Err(e) if command => {
+                        if channel == Channel::Err {
+                            let dropped = u32::try_from(inbox.len()).unwrap_or(u32::MAX);
+                            stream.uncredited = stream.uncredited.saturating_add(dropped);
+                            inbox.clear();
+                            stream.errors_dead = true;
+                        } else {
+                            gave_up = Some(e.kind());
+                        }
+                        break;
+                    }
+                    // The socket will take no more. That is the end of what can
+                    // be written to it, not of what it says: the stream goes on
+                    // as far as its reading half does (a target that answered and
+                    // hung up has its answer carried; a reset socket fails the
+                    // read too, and that ends the stream).
+                    Err(_) => {
+                        let dropped = u32::try_from(inbox.len()).unwrap_or(u32::MAX);
+                        stream.uncredited = stream.uncredited.saturating_add(dropped);
+                        inbox.clear();
+                        stream.write_dead = true;
+                        break;
+                    }
+                }
             }
+        }
+        if let Some(kind) = gave_up {
+            if stream.exited.is_some() {
+                // The program is gone and has been heard of: what it wrote has
+                // nowhere to go, and how it ended is the result all the same.
+                stream.inbox.clear();
+                stream.errors.clear();
+                self.finish(id);
+            } else {
+                self.reset_by(id, Cause::Local(kind), out);
+            }
+            return;
         }
         if stream.uncredited >= step {
             let bytes = std::mem::take(&mut stream.uncredited);
             stream.recv_window = stream.recv_window.saturating_add(bytes);
             out.push(Packet::new(id, Message::Credit(bytes)));
         }
-        if ((stream.got_eof && stream.inbox.is_empty()) || stream.write_dead) && !stream.shut {
+        let written = stream.inbox.is_empty() && stream.errors.is_empty();
+        if ((stream.got_eof && written) || stream.write_dead) && !stream.shut {
             stream.end.shut();
             stream.shut = true;
         }
@@ -1091,6 +1416,10 @@ impl Streams {
         let over = self.streams.get(&id).is_some_and(|s| match &s.end {
             End::Socket(_) => s.sent_eof && s.got_eof && s.shut,
             End::Program(run) => s.sent_eof && run.program.exit().is_some(),
+            // Over once the server has said how the program ended and all it
+            // wrote has been written; this end's own `eof` does not matter,
+            // the program is gone.
+            End::Local(_) => s.exited.is_some() && s.inbox.is_empty() && s.errors.is_empty(),
         });
         if !over {
             return;
@@ -1101,32 +1430,52 @@ impl Streams {
             return;
         };
         self.dirty.remove(&id);
-        if let End::Program(run) = stream.end {
-            // How it ended, and the end of the stream, go behind the `eof`.
-            if let Some(exit) = run.program.exit() {
-                self.queue(id, Message::Exited(exit));
-                self.queue(id, Message::Close);
+        match stream.end {
+            End::Program(run) => {
+                // How it ended, and the end of the stream, go behind the `eof`.
+                if let Some(exit) = run.program.exit() {
+                    self.queue(id, Message::Exited(exit));
+                    self.queue(id, Message::Close);
+                }
             }
+            End::Local(_) => {
+                if let Some(exit) = stream.exited {
+                    self.events.push(Event::Exited { stream: id, exit });
+                }
+            }
+            End::Socket(_) => {}
         }
     }
 
     /// Ends a stream that cannot go on, and says so.
     fn reset(&mut self, id: u32, out: &mut Vec<Packet>) {
-        self.forget(id);
+        self.reset_by(id, Cause::Server, out);
+    }
+
+    /// [`Streams::reset`], for a stream that the other end broke or that this
+    /// end gave up.
+    fn reset_by(&mut self, id: u32, cause: Cause, out: &mut Vec<Packet>) {
+        if self.forget(id) {
+            self.events.push(Event::Closed { stream: id, cause });
+        }
         out.push(Packet::new(id, Message::Close));
     }
 
     /// Drops a stream and everything queued for it. The program of a stream, if
-    /// it has one, is told to end.
-    fn forget(&mut self, id: u32) {
+    /// it has one, is told to end. Whether it was a command run for this end.
+    fn forget(&mut self, id: u32) -> bool {
+        let mut command = false;
         if let Some(stream) = self.streams.remove(&id) {
-            if let End::Program(Run { program, .. }) = stream.end {
-                self.dismiss(program);
+            match stream.end {
+                End::Program(Run { program, .. }) => self.dismiss(program),
+                End::Local(_) => command = true,
+                End::Socket(_) => {}
             }
         }
         self.dirty.remove(&id);
         self.data.retain(|queued| queued.stream != id);
         self.data_bytes = self.data.iter().map(|queued| queued.frame.len()).sum();
+        command
     }
 
     /// Tells a program whose stream is over to end: its group is signalled and

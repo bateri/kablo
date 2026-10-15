@@ -225,6 +225,65 @@ Connections that are already open are not closed. If the bridge cannot tell
 whether the file is there (its directory is not one the user may look in), it
 counts as if it were, and says that it could not check.
 
+## Running a command
+
+```sh
+kablo exec -- ssh devbox kablo attach -- tar -cf - project | tar -tf -
+```
+
+`kablo exec` does what `ssh devbox tar -cf - project` does: it runs a program
+on the server and joins it to this terminal. What you type (or pipe in) goes
+to the program's standard input, its standard output and its standard error
+come out as this command's own, kept apart, and `kablo exec` ends with the
+program's exit status. The difference is the road: the program is started by
+the `kablo attach` of the carrier, over the one connection that is already
+there, so nothing else is asked of ssh and sessions, forwarded ports and
+programs share a single login.
+
+```sh
+kablo exec [--cwd DIR] [--env NAME=VALUE]... -- COMMAND [ARGUMENT]... -- PROGRAM [ARGUMENT]...
+```
+
+- The first `--` starts the carrier, as for `kablo forward` (anything that
+  ends in `kablo attach` on the server will do), and the second starts the
+  program. The program's own arguments may hold `--`; the carrier's may not.
+- **The program is an argument vector, never a shell string**: nothing in it is
+  read as a shell would read it (`$HOME`, `*` and `;` reach the program as they
+  are). Run a shell on purpose with `-- sh -c 'script'`.
+- `--cwd DIR` is a directory on the server (the user's home by default; a
+  relative one counts from there) and `--env NAME=VALUE` adds to the server's
+  environment; give as many as you like.
+  kablo does not write either to a log. As with `ssh host command`, the
+  arguments of a running program are in the server's process list, which its
+  other users can read: a secret goes in the input or the environment, not
+  in an argument.
+- There is **no terminal**: the program's input, output and errors are pipes,
+  the program is in a process group of its own, and what it reads from a
+  terminal is not there. Ending the input here (Ctrl-D on a terminal, or the
+  end of a pipe) ends the program's input.
+- `kablo exec` ends with the program's exit status, or 128 plus the number of
+  the signal that killed it (the server's numbering). **255 is `kablo exec`'s
+  own**: the program could not be started or its directory not entered (the
+  words are on standard error), the server is too old to run programs, the
+  connection was lost, or what the program wrote could not be written here. (A
+  program may end with 255 as well, as with `ssh`.)
+- **A program lives as long as the connection and no longer.** Ctrl-C or a
+  `SIGTERM` here ends the program (the server signals its whole process group
+  to end and, if anything is left after two seconds, to be killed), and so does
+  losing the connection or killing the carrier. Work that has to outlive the
+  connection is a [session](#use), not a command. A program that leaves a
+  process holding its output keeps `kablo exec` waiting until that process lets
+  go.
+- If whatever reads standard output goes away (`| head`), the program is ended
+  and `kablo exec` ends quietly with 141 (128 and the number of `SIGPIPE`), as
+  any program that writes to a closed pipe does. If standard error cannot be
+  written to, what the program writes there is dropped and it goes on.
+- The program shares the pipe with the sessions that travel over the same
+  `kablo attach`, and neither waits behind the other, as with forwarded ports.
+- **The administrator's switch is not about programs.** `/etc/kablo/no-forwarding`
+  (above) turns off carrying connections; whoever can log in as the user can
+  run a program, so commands are not touched by it.
+
 ## Replacing kablo under running sessions
 
 Each session is two processes: a *warden*, which is the shell's parent, and a
@@ -360,6 +419,12 @@ memory of where its relay comes from (see *Limits*).
   of `kablo attach` carries at most 128 connections open at once and connects
   16 at a time (one more is told "too many"); a target has 10 seconds to
   answer. `kablo forward` does not reconnect when its command ends.
+- **A command is a program, not a session.** It has no terminal, it is not
+  kept when the connection ends, and nothing of what it wrote is kept for a
+  client that comes back. It counts among the 128 streams of a connection and
+  its output and errors share one window of 256 KiB.
+- **The carrier of `kablo exec` and `kablo forward` is a command line,** so it
+  cannot hold a `--` of its own (`kablo exec`); put such a command in a script.
 - Windows and the BSDs are not supported, and a server with SELinux enforcing
   has not been tried (the ssh route asks sshd for no socket or port
   forwarding).
@@ -368,9 +433,10 @@ memory of where its relay comes from (see *Limits*).
 
 - **The protocol** is in [docs/PROTOCOL.md](docs/PROTOCOL.md) and implemented
   by the `kablo-proto` crate, which does no I/O and has no dependencies. It
-  also carries TCP connections (streams, on their own channel): an app asks
-  `features` and, right behind it, `ping`, and relies on streams only if the
-  answer to `features` comes first and says they are on. A
+  also carries TCP connections and programs (streams, on their own channel):
+  an app asks `features` and, right behind it, `ping`, and relies on streams
+  only if the answer to `features` comes first and says they are on, and on
+  commands only if it says so too (`commands`, independent of the streams). A
   build reads its own wire version and the one before it, and the bytes of
   every message of every shipped version are kept as test fixtures.
   `kablo version` prints one line of `key=value` tokens

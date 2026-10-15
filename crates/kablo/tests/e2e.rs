@@ -22,7 +22,9 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Bridge, Env, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, whole};
+use common::{
+    Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, whole,
+};
 use kablo_proto::v1::{ErrorCode, Message, NewSession, State};
 
 /// The port of the TCP echo server inside the container (tests/e2e/Dockerfile),
@@ -668,4 +670,137 @@ fn kablo_forward_ends_when_its_ssh_is_killed() {
     assert_eq!(forward.wait_exit().code(), Some(1));
     forward.said("ssh was killed by signal 9");
     assert!(is_over(&mut socket), "the connection outlived its carrier");
+}
+
+// --- kablo exec ------------------------------------------------------------------
+
+/// A `kablo exec` of this test's directory with the server's ssh as the
+/// carrier, and the program the arguments name.
+fn start_exec(env: &Env, server: &Server, options: &[&str], program: &[&str]) -> Exec {
+    let carrier = server.ssh("kablo attach");
+    let mut words = vec![carrier.get_program().to_str().unwrap().to_owned()];
+    words.extend(carrier.get_args().map(|a| a.to_str().unwrap().to_owned()));
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    Exec::start_over(env, options, &words, program)
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn kablo_exec_runs_a_program_where_sshs_own_forwarding_is_off_and_its_output_pipes_on() {
+    let server = server();
+    let env = Env::new();
+
+    // The server's directory, as a stream of an archive made there and listed
+    // here: the work `ssh host tar -cf - …` does, over the one connection.
+    let mut archive = env.kablo();
+    let carrier = server.ssh("kablo attach");
+    archive
+        .arg("exec")
+        .arg("--")
+        .arg(carrier.get_program())
+        .args(carrier.get_args())
+        .args(["--", "tar", "-cf", "-", "-C", "/etc/ssh", "sshd_config.d"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut archive = archive.spawn().unwrap();
+    let listing = Command::new("tar")
+        .args(["-tf", "-"])
+        .stdin(Stdio::from(archive.stdout.take().unwrap()))
+        .output()
+        .unwrap();
+    let ended = archive.wait_with_output().unwrap();
+    assert_eq!(ended.status.code(), Some(0), "{ended:?}");
+    let names = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.status.success(), "{listing:?}");
+    assert!(
+        names.lines().any(|l| l == "sshd_config.d/kablo-e2e.conf"),
+        "{names}"
+    );
+    assert!(
+        ended.stderr.is_empty(),
+        "tar's own words are the only ones that could be here: {:?}",
+        String::from_utf8_lossy(&ended.stderr)
+    );
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn kablo_exec_over_ssh_keeps_the_streams_apart_and_ends_with_the_programs_status() {
+    let server = server();
+    let env = Env::new();
+
+    let mut running = start_exec(
+        &env,
+        &server,
+        &["--env", "E2E_WORD=over ssh"],
+        &[
+            "/bin/sh",
+            "-c",
+            "echo \"out: $E2E_WORD\"; echo err >&2; cat; exit 7",
+        ],
+    );
+    running.type_in(b"typed\n");
+    running.end_input();
+    let ran = running.finish();
+    assert_eq!(ran.status.code(), Some(7), "{ran:?}");
+    // What the startup file prints is the ssh login's and not the program's: it
+    // is noise before the signature.
+    assert_eq!(ran.out(), "out: over ssh\ntyped\n");
+    assert_eq!(ran.err(), "err\n");
+
+    // Not a program the server has.
+    let ran = start_exec(&env, &server, &[], &["/no/such/program"]).finish();
+    assert_eq!(ran.status.code(), Some(255));
+    assert_eq!(
+        ran.err(),
+        "kablo: cannot run /no/such/program: No such file or directory\n"
+    );
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn kablo_exec_ends_with_its_ssh_and_the_servers_program_goes_with_the_connection() {
+    let server = server();
+    let env = Env::new();
+    // A sleep for a number of seconds of its own, so that it is found by its
+    // command line and no other program of the server is taken for it.
+    let tag = (1_000_000 + std::process::id()).to_string();
+    let running = start_exec(&env, &server, &[], &["/bin/sleep", &tag]);
+    let start = Instant::now();
+    while server.count(&tag) == 0 {
+        assert!(start.elapsed() < PATIENCE, "the program never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The ssh that carries it is the one child `kablo exec` has.
+    let children = Command::new("pgrep")
+        .args(["-P", &running.child.id().to_string()])
+        .output()
+        .unwrap();
+    let ssh: libc::pid_t = String::from_utf8_lossy(&children.stdout)
+        .lines()
+        .next()
+        .expect("kablo exec has a child")
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: the pid of the ssh this test's `kablo exec` started.
+    unsafe { libc::kill(ssh, libc::SIGKILL) };
+    let ran = running.finish();
+    assert_eq!(ran.status.code(), Some(255), "{ran:?}");
+    assert!(
+        ran.err().contains("ssh was killed by signal 9"),
+        "{}",
+        ran.err()
+    );
+    // The bridge ends with its connection and takes the program with it.
+    let start = Instant::now();
+    while server.count(&tag) > 0 {
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the program outlived the connection"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

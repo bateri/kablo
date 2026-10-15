@@ -191,9 +191,14 @@ fn a_command_that_cannot_start_is_failed_in_the_systems_words() {
     let mut elsewhere = command(&["/bin/true"]);
     elsewhere.cwd = Some(b"/no/such/directory".to_vec());
     let (_, code, text) = bridge.run_command(elsewhere, MAX_WINDOW).unwrap_err();
+    // The directory is named: the system's answer to the `exec` that follows
+    // would have named the program.
     assert_eq!(
         (code, text.as_str()),
-        (FailCode::START_FAILED, "No such file or directory")
+        (
+            FailCode::START_FAILED,
+            "cannot enter /no/such/directory: No such file or directory"
+        )
     );
     // Nothing else is affected: the next command runs.
     let (id, _) = bridge

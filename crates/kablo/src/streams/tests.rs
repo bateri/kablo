@@ -1092,7 +1092,7 @@ impl Programs {
     fn pid(&self, id: u32) -> u32 {
         match &self.server.streams.get(&id).unwrap().end {
             End::Program(run) => run.program.id(),
-            End::Socket(_) => panic!("a socket"),
+            End::Socket(_) | End::Local(_) => panic!("not a program"),
         }
     }
 
@@ -1319,7 +1319,15 @@ fn a_command_that_is_not_valid_or_does_not_start_or_is_over_a_limit_is_failed() 
             _ => None,
         })
         .collect();
-    assert_eq!(words, ["No such file or directory"; 2]);
+    // The program that is not there is said by the system; the directory that
+    // is not there is named, since the system's answer would name the program.
+    assert_eq!(
+        words,
+        [
+            "No such file or directory",
+            "cannot enter /no/such/directory: No such file or directory"
+        ]
+    );
     assert!(p.server.is_empty(), "nothing was started");
 
     // The streams limit counts programs.
@@ -1433,4 +1441,648 @@ fn a_program_that_is_dropped_with_the_engine_is_collected_too() {
     let pid = p.pid(1);
     drop(p);
     assert!(gone(pid));
+}
+
+// --- commands, at the client ---------------------------------------------------
+
+/// The test's ends of the descriptors a command is joined to.
+struct Terminal {
+    /// Written to give the program input; dropping it ends the input.
+    typed: Option<OwnedFd>,
+    /// Read for what the program wrote as output.
+    shown: OwnedFd,
+    /// Read for what it wrote as errors.
+    warned: OwnedFd,
+}
+
+/// The descriptors a client gives a command, and the test's ends of them.
+fn terminal() -> (Local, Terminal) {
+    let (input, typed) = sys::pipe().unwrap();
+    let (shown, output) = sys::pipe().unwrap();
+    let (warned, errors) = sys::pipe().unwrap();
+    for fd in [&shown, &warned] {
+        sys::set_nonblocking(fd.as_raw_fd()).unwrap();
+    }
+    (
+        Local {
+            input,
+            output,
+            errors,
+        },
+        Terminal {
+            typed: Some(typed),
+            shown,
+            warned,
+        },
+    )
+}
+
+/// What a pipe has now.
+fn available(fd: &OwnedFd) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match sys::read_fd(fd.as_fd(), &mut buf) {
+            Ok(0) => return all,
+            Ok(n) => all.extend_from_slice(buf.get(..n).unwrap()),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return all,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// The ends of a command, turned by hand against a server whose answers the
+/// test makes up.
+struct Alone {
+    client: Streams,
+    out: Vec<Packet>,
+    events: Vec<Event>,
+}
+
+impl Alone {
+    /// A client with a command open and answered with `window`.
+    fn opened(window: u32, local: Local) -> Alone {
+        let mut client = Streams::new(
+            Side::Client,
+            Config {
+                window,
+                ..Config::default()
+            },
+        );
+        let mut out = Vec::new();
+        client
+            .open_command(local, command(&["/bin/cat"]), &mut out)
+            .unwrap();
+        assert!(matches!(
+            out.first().map(|p| &p.message),
+            Some(Message::OpenCommand { .. })
+        ));
+        out.clear();
+        let mut alone = Alone {
+            client,
+            out,
+            events: Vec::new(),
+        };
+        alone.hears(Message::Opened { window });
+        assert_eq!(alone.events, [Event::Opened(1)]);
+        alone
+    }
+
+    fn hears(&mut self, message: Message) {
+        self.client
+            .handle(Side::Server, Packet::new(1, message), &mut self.out);
+        self.client.settle(&mut self.out);
+        self.events.extend(self.client.take_events());
+    }
+
+    /// One look at the descriptors, as a loop would.
+    fn turn(&mut self) {
+        let found = self.client.interest();
+        let mut set: Vec<libc::pollfd> = found.iter().map(|(fd, _)| *fd).collect();
+        sys::poll(&mut set, Some(Duration::from_millis(5))).unwrap();
+        for ((_, token), fd) in found.into_iter().zip(&set) {
+            if fd.revents != 0 {
+                self.client.ready(token, fd.revents, &mut self.out);
+            }
+        }
+        self.client.settle(&mut self.out);
+        self.events.extend(self.client.take_events());
+    }
+
+    fn closed(&self) -> bool {
+        self.out.iter().any(|p| p.message == Message::Close)
+    }
+}
+
+#[test]
+fn a_command_run_for_a_client_keeps_output_and_errors_apart_and_ends_with_the_programs_status() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, term) = terminal();
+    // The input is never ended, and the command ends all the same.
+    let id = rig
+        .client
+        .open_command(local, sh("echo out; echo err >&2; exit 3"), &mut rig.c_out)
+        .unwrap();
+    assert_eq!(id, 1);
+    let mut events = Vec::new();
+    rig.until("the end", |r| {
+        events.extend(r.client.take_events());
+        events.iter().any(|e| matches!(e, Event::Exited { .. }))
+    });
+    assert_eq!(
+        events,
+        [
+            Event::Opened(1),
+            Event::Exited {
+                stream: 1,
+                exit: Exit::Code(3)
+            }
+        ]
+    );
+    assert_eq!(available(&term.shown), b"out\n");
+    assert_eq!(available(&term.warned), b"err\n");
+    assert!(rig.client.is_empty(), "the stream is over");
+    rig.until("the server to let the program go", |r| {
+        r.server.is_empty() && r.server.dying.is_empty()
+    });
+}
+
+#[test]
+fn a_signal_that_ended_the_program_is_told_as_one() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, _term) = terminal();
+    rig.client
+        .open_command(local, sh("kill -9 $$"), &mut rig.c_out)
+        .unwrap();
+    let mut events = Vec::new();
+    rig.until("the end", |r| {
+        events.extend(r.client.take_events());
+        events.iter().any(|e| matches!(e, Event::Exited { .. }))
+    });
+    assert_eq!(
+        events.last(),
+        Some(&Event::Exited {
+            stream: 1,
+            exit: Exit::Signal(libc::SIGKILL)
+        })
+    );
+}
+
+#[test]
+fn what_is_typed_goes_to_the_program_and_comes_back_though_it_is_more_than_a_window() {
+    let window = 4000;
+    let mut rig = Rig::new(window);
+    let (local, mut term) = terminal();
+    rig.client
+        .open_command(local, command(&["/bin/cat"]), &mut rig.c_out)
+        .unwrap();
+    let sent = pattern(300_000, 5);
+    let typed = term.typed.take().unwrap();
+    let writer = {
+        let sent = sent.clone();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::from(typed);
+            file.write_all(&sent).unwrap();
+            // Dropped: the end of the input.
+        })
+    };
+    // The test's own end of the pipe, read by a thread that waits for it.
+    // SAFETY: plain flag changes on a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(term.shown.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(
+            term.shown.as_raw_fd(),
+            libc::F_SETFL,
+            flags & !libc::O_NONBLOCK,
+        );
+    }
+    let shown = std::fs::File::from(term.shown);
+    let reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut shown = shown;
+        // (The pipe is the test's end only: it ends when the engine lets go of
+        // the other end.)
+        shown.read_to_end(&mut all).unwrap();
+        all
+    });
+    let mut events = Vec::new();
+    rig.until("the end", |r| {
+        events.extend(r.client.take_events());
+        events.iter().any(|e| matches!(e, Event::Exited { .. }))
+    });
+    // The engine's side of the pipes goes with it.
+    drop(rig.client);
+    writer.join().unwrap();
+    let back = reader.join().unwrap();
+    assert_eq!(back.len(), sent.len());
+    assert!(back == sent, "what came back is not what was typed");
+}
+
+#[test]
+fn an_input_that_is_at_its_end_ends_the_programs_input_at_once() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (mut local, term) = terminal();
+    local.input = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+    rig.client
+        .open_command(local, sh("cat; echo done"), &mut rig.c_out)
+        .unwrap();
+    let mut events = Vec::new();
+    rig.until("the end", |r| {
+        events.extend(r.client.take_events());
+        events.iter().any(|e| matches!(e, Event::Exited { .. }))
+    });
+    assert_eq!(available(&term.shown), b"done\n");
+}
+
+#[test]
+fn a_program_that_does_not_start_is_a_failed_event_and_leaves_nothing() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, _term) = terminal();
+    rig.client
+        .open_command(local, command(&["/no/such/program"]), &mut rig.c_out)
+        .unwrap();
+    let mut events = Vec::new();
+    rig.until("the answer", |r| {
+        events.extend(r.client.take_events());
+        !events.is_empty()
+    });
+    assert!(
+        matches!(&events[..], [Event::Failed { code, text, .. }]
+            if *code == FailCode::START_FAILED && text == "No such file or directory"),
+        "{events:?}"
+    );
+    assert!(rig.client.is_empty());
+}
+
+#[test]
+fn a_command_that_is_not_valid_is_not_sent() {
+    let mut client = Streams::new(Side::Client, Config::default());
+    let (local, _term) = terminal();
+    let mut out = Vec::new();
+    assert!(
+        client
+            .open_command(local, Command::default(), &mut out)
+            .is_err()
+    );
+    assert!(out.is_empty());
+    assert!(client.is_empty());
+}
+
+#[test]
+fn a_server_that_closes_a_command_early_closes_it_here_and_the_program_goes() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, _term) = terminal();
+    rig.client
+        .open_command(local, command(&["/bin/cat"]), &mut rig.c_out)
+        .unwrap();
+    rig.until("the program to be running", |r| {
+        r.server.streams.contains_key(&1)
+    });
+    let pid = {
+        let End::Program(run) = &rig.server.streams.get(&1).unwrap().end else {
+            panic!("not a program");
+        };
+        run.program.id()
+    };
+    let mut events = rig.client.take_events();
+    rig.client
+        .handle(Side::Server, Packet::new(1, Message::Close), &mut rig.c_out);
+    events.extend(rig.client.take_events());
+    assert_eq!(
+        events,
+        [
+            Event::Opened(1),
+            Event::Closed {
+                stream: 1,
+                cause: Cause::Server
+            }
+        ]
+    );
+    assert!(rig.client.is_empty());
+    // (The server end of this test did not close it; the client does.)
+    rig.server
+        .handle(Side::Client, Packet::new(1, Message::Close), &mut rig.s_out);
+    rig.until("the program to be collected", |r| r.server.dying.is_empty());
+    wait_gone("the program of a stream the server closed", &[pid]);
+}
+
+#[test]
+fn a_command_is_closed_from_here_with_a_close() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, _term) = terminal();
+    rig.client
+        .open_command(local, command(&["/bin/cat"]), &mut rig.c_out)
+        .unwrap();
+    rig.until("the program to be running", |r| {
+        r.server.streams.contains_key(&1)
+    });
+    let pid = {
+        let End::Program(run) = &rig.server.streams.get(&1).unwrap().end else {
+            panic!("not a program");
+        };
+        run.program.id()
+    };
+    rig.client.close(1, &mut rig.c_out);
+    assert!(rig.client.is_empty());
+    rig.until("the program to be collected", |r| {
+        r.server.is_empty() && r.server.dying.is_empty()
+    });
+    wait_gone("the program of a stream closed here", &[pid]);
+    // A stream that is not there is nothing to close.
+    let mut none = Vec::new();
+    rig.client.close(1, &mut none);
+    assert!(none.is_empty());
+}
+
+#[test]
+fn a_reader_that_has_gone_away_ends_the_command() {
+    let mut rig = Rig::new(MAX_WINDOW);
+    let (local, term) = terminal();
+    drop(term.shown);
+    rig.client
+        .open_command(local, command(&["/usr/bin/yes"]), &mut rig.c_out)
+        .unwrap();
+    let mut events = Vec::new();
+    rig.until("the command to give up", |r| {
+        events.extend(r.client.take_events());
+        events.iter().any(|e| matches!(e, Event::Closed { .. }))
+    });
+    assert!(
+        events.contains(&Event::Closed {
+            stream: 1,
+            cause: Cause::Local(ErrorKind::BrokenPipe)
+        }),
+        "{events:?}"
+    );
+    assert!(rig.client.is_empty());
+    // The close reaches the server and the program is let go.
+    rig.until("the program to go", |r| {
+        r.server.is_empty() && r.server.dying.is_empty()
+    });
+}
+
+#[test]
+fn what_the_program_wrote_is_not_lost_to_the_close_that_follows_its_end() {
+    // A window far larger than a pipe holds, and a reader that takes its time.
+    let (local, term) = terminal();
+    let mut alone = Alone::opened(MAX_WINDOW, local);
+    let sent = pattern(200_000, 9);
+    for piece in sent.chunks(MAX_DATA) {
+        alone.hears(Message::Data(piece.to_vec()));
+    }
+    alone.hears(Message::Eof);
+    alone.hears(Message::Exited(Exit::Code(0)));
+    alone.hears(Message::Close);
+    assert!(
+        !alone
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Exited { .. })),
+        "all of it has not been written yet: {:?}",
+        alone.events
+    );
+    assert!(!alone.client.is_empty());
+    let mut got = Vec::new();
+    let start = Instant::now();
+    while !alone
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Exited { .. }))
+    {
+        got.extend(available(&term.shown));
+        alone.turn();
+        assert!(start.elapsed() < PATIENCE, "the end never came");
+    }
+    got.extend(available(&term.shown));
+    assert_eq!(got.len(), sent.len());
+    assert!(got == sent);
+    assert!(
+        !alone
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Closed { .. }))
+    );
+    assert!(alone.client.is_empty());
+}
+
+#[test]
+fn errors_are_paid_for_out_of_the_window_and_given_back_as_they_are_written() {
+    let (local, term) = terminal();
+    let mut alone = Alone::opened(1000, local);
+    alone.hears(Message::Stderr(vec![b'e'; 400]));
+    alone.hears(Message::Data(vec![b'o'; 300]));
+    // Written at once (the pipes are empty), and credit given for both once a
+    // quarter of the window is.
+    assert_eq!(available(&term.warned), vec![b'e'; 400]);
+    assert_eq!(available(&term.shown), vec![b'o'; 300]);
+    let credited: u32 = alone
+        .out
+        .iter()
+        .filter_map(|p| match p.message {
+            Message::Credit(n) => Some(n),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(credited, 700);
+    // More than the window it gave is not allowed, the errors included.
+    alone.hears(Message::Stderr(vec![b'e'; 1001]));
+    assert!(alone.closed());
+    assert_eq!(
+        alone.events.last(),
+        Some(&Event::Closed {
+            stream: 1,
+            cause: Cause::Server
+        })
+    );
+}
+
+#[test]
+fn an_end_that_is_told_out_of_turn_closes_the_stream() {
+    // `exited` before the `eof`.
+    let (local, _term) = terminal();
+    let mut alone = Alone::opened(1000, local);
+    alone.hears(Message::Exited(Exit::Code(0)));
+    assert!(alone.closed());
+    assert!(matches!(
+        alone.events.last(),
+        Some(Event::Closed {
+            cause: Cause::Server,
+            ..
+        })
+    ));
+
+    // `stderr` after the `eof`.
+    let (local, _term) = terminal();
+    let mut alone = Alone::opened(1000, local);
+    alone.hears(Message::Eof);
+    alone.hears(Message::Stderr(b"late".to_vec()));
+    assert!(alone.closed());
+
+    // `data` before `opened`.
+    let (local, _term) = terminal();
+    let mut client = Streams::new(Side::Client, Config::default());
+    let mut out = Vec::new();
+    client
+        .open_command(local, command(&["/bin/cat"]), &mut out)
+        .unwrap();
+    out.clear();
+    client.handle(
+        Side::Server,
+        Packet::new(1, Message::Data(b"early".to_vec())),
+        &mut out,
+    );
+    assert_eq!(out, [Packet::new(1, Message::Close)]);
+}
+
+#[test]
+fn errors_and_ends_belong_to_commands_and_not_to_connections() {
+    for message in [
+        Message::Stderr(b"no".to_vec()),
+        Message::Exited(Exit::Code(0)),
+    ] {
+        let (ours, _theirs) = pair();
+        let mut client = Streams::new(Side::Client, Config::default());
+        let mut out = Vec::new();
+        client.open(ours, "x", 80, &mut out).unwrap();
+        out.clear();
+        client.handle(
+            Side::Server,
+            Packet::new(1, Message::Opened { window: 1000 }),
+            &mut out,
+        );
+        client.handle(Side::Server, Packet::new(1, Message::Eof), &mut out);
+        client.handle(Side::Server, Packet::new(1, message), &mut out);
+        assert_eq!(out, [Packet::new(1, Message::Close)]);
+        assert!(client.is_empty());
+        assert!(
+            !client
+                .take_events()
+                .iter()
+                .any(|e| matches!(e, Event::Closed { .. })),
+            "a connection is not a command"
+        );
+    }
+}
+
+#[test]
+fn only_a_bridge_that_says_it_runs_commands_is_asked_to() {
+    let with = Features::default().with_commands();
+    assert_eq!(
+        judge_commands(&SessionMessage::FeaturesReply(with.clone())),
+        Some(with)
+    );
+    // Streams off, commands on: the administrator's switch is not theirs.
+    let off = Features::streams_off("no".to_owned()).with_commands();
+    assert!(judge_commands(&SessionMessage::FeaturesReply(off)).is_some());
+    assert_eq!(
+        judge_commands(&SessionMessage::FeaturesReply(Features::default())),
+        None
+    );
+    assert_eq!(judge_commands(&SessionMessage::Pong(Vec::new())), None);
+}
+
+#[test]
+fn errors_that_cannot_be_written_are_dropped_with_credit_and_the_program_goes_on() {
+    let (local, term) = terminal();
+    // Nobody reads the errors.
+    drop(term.warned);
+    let mut alone = Alone::opened(1000, local);
+    alone.hears(Message::Stderr(vec![b'e'; 400]));
+    alone.hears(Message::Data(vec![b'o'; 100]));
+    alone.hears(Message::Stderr(vec![b'e'; 300]));
+    assert_eq!(available(&term.shown), vec![b'o'; 100]);
+    let credited: u32 = alone
+        .out
+        .iter()
+        .filter_map(|p| match p.message {
+            Message::Credit(n) => Some(n),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(credited, 800, "dropped bytes count as taken");
+    assert!(!alone.closed(), "the program was not ended");
+    alone.hears(Message::Eof);
+    alone.hears(Message::Exited(Exit::Code(4)));
+    assert_eq!(
+        alone.events.last(),
+        Some(&Event::Exited {
+            stream: 1,
+            exit: Exit::Code(4)
+        })
+    );
+}
+
+#[test]
+fn an_output_with_no_reader_ends_the_program_unless_it_has_ended_already() {
+    // The reader goes away while the program runs: it is ended.
+    let (local, term) = terminal();
+    drop(term.shown);
+    let mut alone = Alone::opened(1000, local);
+    alone.hears(Message::Data(vec![b'o'; 10]));
+    assert!(alone.closed());
+    assert_eq!(
+        alone.events.last(),
+        Some(&Event::Closed {
+            stream: 1,
+            cause: Cause::Local(ErrorKind::BrokenPipe)
+        })
+    );
+
+    // The program has ended and said how, and its last words have nowhere to
+    // go: how it ended is the result. (`data`, `eof` and `exited` come in one
+    // breath, as a server says them.)
+    let (local, term) = terminal();
+    drop(term.shown);
+    let mut alone = Alone::opened(1000, local);
+    for message in [
+        Message::Data(b"x".to_vec()),
+        Message::Eof,
+        Message::Exited(Exit::Code(7)),
+    ] {
+        alone
+            .client
+            .handle(Side::Server, Packet::new(1, message), &mut alone.out);
+    }
+    alone.client.settle(&mut alone.out);
+    alone.events.extend(alone.client.take_events());
+    assert_eq!(
+        alone.events.last(),
+        Some(&Event::Exited {
+            stream: 1,
+            exit: Exit::Code(7)
+        })
+    );
+    assert!(!alone.closed());
+    assert!(alone.client.is_empty());
+}
+
+#[test]
+fn a_program_that_has_ended_reads_no_more_input() {
+    // The output is full, so what the program wrote waits and the stream is
+    // not over; the input is not read meanwhile.
+    let (input, _typed) = sys::pipe().unwrap();
+    let (_shown, output) = sys::pipe().unwrap();
+    let (_warned, errors) = sys::pipe().unwrap();
+    let mut alone = Alone::opened(
+        MAX_WINDOW,
+        Local {
+            input,
+            output,
+            errors,
+        },
+    );
+    for piece in pattern(200_000, 1).chunks(MAX_DATA) {
+        alone.hears(Message::Data(piece.to_vec()));
+    }
+    alone.hears(Message::Eof);
+    alone.hears(Message::Exited(Exit::Code(0)));
+    assert!(alone.client.ended(1));
+    let reads = |alone: &Alone| {
+        alone
+            .client
+            .interest()
+            .iter()
+            .any(|(_, token)| matches!(token, Token::LocalInput(_)))
+    };
+    assert!(!reads(&alone), "the input is still being read");
+}
+
+#[test]
+fn a_regular_file_takes_what_it_is_given_in_one_write() {
+    let (local, _term) = terminal();
+    let dir = std::env::temp_dir().join(format!("kablo-streams-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("out");
+    let file = std::fs::File::create(&path).unwrap();
+    let local = Local {
+        output: OwnedFd::from(file),
+        ..local
+    };
+    let mut alone = Alone::opened(MAX_WINDOW, local);
+    let sent = pattern(MAX_DATA, 2);
+    alone.hears(Message::Data(sent.clone()));
+    // Written at once, all of it, though a pipe is given 512 bytes at a time.
+    assert_eq!(std::fs::read(&path).unwrap(), sent);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
 }

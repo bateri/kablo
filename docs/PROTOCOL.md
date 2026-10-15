@@ -547,7 +547,9 @@ it lasts as long as the program does and no longer than the connection.
   server answers `opened` with its own window, or `failed`. A command that is
   not valid is `failed` (7) and the program is not started; one that does not
   start (no such program, a directory that is not there, no permission, the
-  system's refusal) is `failed` (8) with the system's words as the text. The
+  system's refusal) is `failed` (8) with the system's words as the text (for a
+  directory that cannot be entered, `cannot enter DIRECTORY: ` comes before
+  them, since the system's words alone would name the program). The
   program starts in its own process group, with no controlling terminal, in the
   server's environment plus the `env` entries and in `cwd` or the user's home
   (a `cwd` that is not absolute counts from there; a home that is not there is

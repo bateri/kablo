@@ -1407,3 +1407,162 @@ impl Drop for Forward {
         let _ = self.child.wait();
     }
 }
+
+// --- kablo exec ------------------------------------------------------------------
+
+/// A `kablo exec` of this test's directory that is running, with its standard
+/// input, output and error as the test's ends of pipes. The carrier is this
+/// build's own `kablo attach`.
+pub struct Exec {
+    pub child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    /// None where the test holds the pipe itself.
+    stdout: Option<mpsc::Receiver<Vec<u8>>>,
+    stderr: mpsc::Receiver<Vec<u8>>,
+}
+
+/// What a `kablo exec` did: how it ended, and what it wrote.
+#[derive(Debug)]
+pub struct Ran {
+    pub status: ExitStatus,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+}
+
+impl Ran {
+    pub fn out(&self) -> String {
+        String::from_utf8_lossy(&self.out).into_owned()
+    }
+
+    pub fn err(&self) -> String {
+        String::from_utf8_lossy(&self.err).into_owned()
+    }
+}
+
+impl Exec {
+    /// Starts `kablo exec <options> -- <carrier> -- <program>`.
+    pub fn start_over(env: &Env, options: &[&str], carrier: &[&str], program: &[&str]) -> Exec {
+        Exec::spawn(env, options, carrier, program, true).0
+    }
+
+    /// Starts `kablo exec <options> -- kablo attach -- <program>` and leaves its
+    /// standard output to the test: the pipe is the one returned.
+    pub fn start_holding_output(
+        env: &Env,
+        options: &[&str],
+        program: &[&str],
+    ) -> (Exec, std::process::ChildStdout) {
+        let carrier = [env!("CARGO_BIN_EXE_kablo"), "attach"];
+        let (exec, held) = Exec::spawn(env, options, &carrier, program, false);
+        (exec, held.unwrap())
+    }
+
+    fn spawn(
+        env: &Env,
+        options: &[&str],
+        carrier: &[&str],
+        program: &[&str],
+        capture_output: bool,
+    ) -> (Exec, Option<std::process::ChildStdout>) {
+        let mut command = env.kablo();
+        command
+            .arg("exec")
+            .args(options)
+            .arg("--")
+            .args(carrier)
+            .arg("--")
+            .args(program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let everything = |mut source: Box<dyn Read + Send>| {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let _ = source.read_to_end(&mut all);
+                let _ = sender.send(all);
+            });
+            receiver
+        };
+        let (stdout, held) = if capture_output {
+            (
+                Some(everything(Box::new(child.stdout.take().unwrap()))),
+                None,
+            )
+        } else {
+            (None, child.stdout.take())
+        };
+        let exec = Exec {
+            stdin: child.stdin.take(),
+            stdout,
+            stderr: everything(Box::new(child.stderr.take().unwrap())),
+            child,
+        };
+        (exec, held)
+    }
+
+    /// Starts `kablo exec <options> -- kablo attach -- <program>`.
+    pub fn start(env: &Env, options: &[&str], program: &[&str]) -> Exec {
+        Exec::start_over(
+            env,
+            options,
+            &[env!("CARGO_BIN_EXE_kablo"), "attach"],
+            program,
+        )
+    }
+
+    /// Writes to the program's input.
+    pub fn type_in(&mut self, bytes: &[u8]) {
+        self.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+    }
+
+    /// Ends the program's input.
+    pub fn end_input(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Waits for the end, and for what was written to the end of it.
+    pub fn finish(mut self) -> Ran {
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(start.elapsed() < PATIENCE, "`kablo exec` never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        self.stdin = None;
+        let out = match &self.stdout {
+            Some(stdout) => stdout.recv_timeout(PATIENCE).unwrap(),
+            None => Vec::new(),
+        };
+        let err = self.stderr.recv_timeout(PATIENCE).unwrap();
+        Ran { status, out, err }
+    }
+}
+
+impl Drop for Exec {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Runs `kablo exec <options> -- kablo attach -- <program>` with `input` on
+/// its standard input (then its end) and waits for it.
+pub fn exec(env: &Env, options: &[&str], program: &[&str], input: &[u8]) -> Ran {
+    let mut running = Exec::start(env, options, program);
+    // A program that takes none of it must not hold the test up: the input is
+    // written from a thread of its own.
+    let stdin = running.stdin.take();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input);
+        }
+    });
+    let ran = running.finish();
+    let _ = writer.join();
+    ran
+}

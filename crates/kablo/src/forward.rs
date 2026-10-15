@@ -30,32 +30,18 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
 
-use kablo_proto::WIRE;
 use kablo_proto::v1::stream::{self as wire, Incoming, IncomingDecoder, MAX_HOST};
-use kablo_proto::v1::{Features, Message, Packet};
+use kablo_proto::v1::{Features, Message};
 
-use crate::handshake::{self, ClientStep};
-use crate::outbound::{self, Outbound};
+use crate::carrier::{self, READ_CHUNK, clean, describe, signal_in};
+pub use crate::carrier::{End, Wire};
+use crate::outbound::Outbound;
 use crate::streams::{self, Event, Streams, Verdict};
 use crate::sys;
 
-/// Bytes read from the carrier at a time.
-const READ_CHUNK: usize = outbound::CHUNK;
-
 /// What the `ping` that follows the `features` carries.
 const PING: &[u8] = b"kablo forward";
-
-/// How long a command gets to end once this has finished with it, before it is
-/// killed. Only the way out waits; nothing else here does.
-const REAP_GRACE: Duration = Duration::from_secs(2);
-
-/// How many characters of a text from the server are shown.
-const SHOWN: usize = 200;
 
 // --- the command line ----------------------------------------------------------
 
@@ -296,47 +282,6 @@ pub fn listen(bind: Bind, specs: &[Spec]) -> Result<Vec<Listening>, String> {
 
 // --- the carrier -----------------------------------------------------------------
 
-/// The two ends of the command that reaches the bridge, as seen from here.
-#[derive(Debug)]
-pub struct Wire {
-    /// What the command writes: the bridge's bytes.
-    pub input: OwnedFd,
-    /// What the command reads: ours.
-    pub output: OwnedFd,
-}
-
-/// Why forwarding ended. It has no good ending: it goes on until something
-/// stops it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum End {
-    /// The command ended or stopped taking bytes.
-    Carrier,
-    /// A signal asked to stop.
-    Signal(i32),
-    /// The server will not carry connections, in words for a person.
-    Declined(String),
-    /// Something went wrong, in words for a person.
-    Failed(String),
-}
-
-/// A text from the server as a person may be shown it: no control characters
-/// (it could move the cursor or set the title) and not too long.
-fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|&c| !c.is_control() && !changes_direction(c))
-        .take(SHOWN)
-        .collect()
-}
-
-/// Characters that are not control characters and still change how a line
-/// reads: the marks and overrides that reverse the direction of text, and the
-/// zero-width ones.
-fn changes_direction(c: char) -> bool {
-    matches!(c,
-        '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
-        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
-}
-
 /// What a descriptor in the poll set stands for.
 enum Source {
     Signal,
@@ -344,117 +289,6 @@ enum Source {
     Out,
     Listener(usize),
     Stream(streams::Token),
-}
-
-/// A signal waiting in the signal pipe, if one is.
-fn signal_in(signals: BorrowedFd<'_>) -> Option<i32> {
-    let mut byte = [0u8; 1];
-    match sys::read_fd(signals, &mut byte) {
-        Ok(1) => byte.first().map(|&signal| i32::from(signal)),
-        _ => None,
-    }
-}
-
-/// Waits until the carrier has something to say (or a signal comes), reads
-/// it, and appends it to `into`.
-fn read_more(
-    input: BorrowedFd<'_>,
-    signals: Option<BorrowedFd<'_>>,
-    buf: &mut [u8],
-    into: &mut Vec<u8>,
-) -> Result<(), End> {
-    let mut set = vec![sys::want(input.as_raw_fd(), libc::POLLIN)];
-    if let Some(signals) = signals {
-        set.push(sys::want(signals.as_raw_fd(), libc::POLLIN));
-    }
-    sys::poll(&mut set, None)
-        .map_err(|e| End::Failed(format!("cannot wait for the server: {e}")))?;
-    if set.get(1).is_some_and(|fd| fd.revents != 0)
-        && let Some(signal) = signals.and_then(signal_in)
-    {
-        return Err(End::Signal(signal));
-    }
-    if set.first().is_some_and(|fd| fd.revents != 0) {
-        match sys::read_fd(input, buf) {
-            Ok(0) | Err(_) => return Err(End::Carrier),
-            Ok(n) => into.extend_from_slice(buf.get(..n).unwrap_or_default()),
-        }
-    }
-    Ok(())
-}
-
-fn write_all(output: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), End> {
-    while !bytes.is_empty() {
-        match sys::write_fd(output, bytes) {
-            Ok(0) | Err(_) => return Err(End::Carrier),
-            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
-        }
-    }
-    Ok(())
-}
-
-/// The handshake, then `features` and, right behind it, `ping`: the first
-/// thing the bridge says after that tells what it is (see
-/// [`streams::judge`]). Nothing here has a time limit: the command may be
-/// waiting for a password.
-fn negotiate(
-    carrier: &Wire,
-    signals: Option<BorrowedFd<'_>>,
-    decoder: &mut IncomingDecoder,
-) -> Result<Features, End> {
-    let mut hello = Vec::new();
-    WIRE.write_hello(&mut hello)
-        .map_err(|e| End::Failed(e.to_string()))?;
-    write_all(carrier.output.as_fd(), &hello)?;
-
-    let mut buf = vec![0u8; READ_CHUNK];
-    let mut seen = Vec::new();
-    let consumed = loop {
-        read_more(carrier.input.as_fd(), signals, &mut buf, &mut seen)?;
-        match handshake::reply(&WIRE, &seen) {
-            Ok(ClientStep::Need) => {}
-            Ok(ClientStep::Done { consumed, .. }) => break consumed,
-            Ok(ClientStep::Refused) => {
-                return Err(End::Declined(
-                    "the kablo on the server speaks no version of the protocol this one does"
-                        .to_owned(),
-                ));
-            }
-            Err(e) => {
-                return Err(End::Failed(format!(
-                    "what the command printed is not a kablo bridge: {e}"
-                )));
-            }
-        }
-    };
-    decoder.push(seen.get(consumed..).unwrap_or_default());
-
-    let mut asks = Vec::new();
-    for message in [Message::Features, Message::Ping(PING.to_vec())] {
-        Packet::connection(message)
-            .encode(&mut asks)
-            .map_err(|e| End::Failed(e.to_string()))?;
-    }
-    write_all(carrier.output.as_fd(), &asks)?;
-
-    loop {
-        match decoder.next_incoming() {
-            Ok(Some(Incoming::Session(packet))) => return verdict(&packet.message),
-            // Nothing has been opened: a stream message answers nothing.
-            Ok(Some(Incoming::Stream { .. })) => {}
-            Ok(None) => {
-                let mut more = Vec::new();
-                read_more(carrier.input.as_fd(), signals, &mut buf, &mut more)?;
-                decoder.push(&more);
-            }
-            Err(e) if e.is_recoverable() => {}
-            Err(e) => {
-                return Err(End::Failed(format!(
-                    "the server's answer is not the protocol: {e}"
-                )));
-            }
-        }
-    }
 }
 
 fn verdict(first: &Message) -> Result<Features, End> {
@@ -486,7 +320,7 @@ pub fn serve(
     err: &mut dyn Write,
 ) -> End {
     let mut decoder = IncomingDecoder::new();
-    let features = match negotiate(&carrier, signals, &mut decoder) {
+    let features = match carrier::negotiate(&carrier, signals, &mut decoder, PING, verdict) {
         Ok(features) => features,
         Err(end) => return end,
     };
@@ -718,6 +552,8 @@ impl Forwarding<'_> {
                 Event::Opened(id) => {
                     self.labels.remove(&id);
                 }
+                // Connections have neither: they are a command's.
+                Event::Exited { .. } | Event::Closed { .. } => {}
                 Event::Failed { stream, text, .. } => {
                     let label = self
                         .labels
@@ -753,46 +589,24 @@ pub fn run(options: Options, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             return 1;
         }
     };
-    let Some((program, arguments)) = options.carrier.split_first() else {
-        return 1;
-    };
-    let name = Path::new(program)
-        .file_name()
-        .unwrap_or(program)
-        .to_string_lossy()
-        .into_owned();
-    let mut child = match Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = writeln!(err, "kablo: cannot run {name}: {e}");
+    let (mut command, wire) = match carrier::start(&options.carrier) {
+        Ok(started) => started,
+        Err(why) => {
+            let _ = writeln!(err, "kablo: {why}");
             return 1;
         }
     };
-    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = writeln!(err, "kablo: cannot reach {name}'s input and output");
-        return 1;
-    };
-    let carrier = Wire {
-        input: OwnedFd::from(stdout),
-        output: OwnedFd::from(stdin),
-    };
     // The carrier's pipes are gone when this returns, and with them the
     // command's input: the end of it is how a bridge is told to finish.
-    let end = serve(carrier, listeners, Some(signals.as_fd()), out, err);
-    let status = reap(&mut child, end != End::Carrier);
+    let end = serve(wire, listeners, Some(signals.as_fd()), out, err);
+    let status = command.reap(end != End::Carrier);
     match end {
         End::Signal(signal) => u8::try_from(128 + signal).unwrap_or(1),
         End::Carrier => {
             let _ = writeln!(
                 err,
-                "kablo: {name} {}; the connections it carried are closed",
+                "kablo: {} {}; the connections it carried are closed",
+                command.name(),
                 describe(status)
             );
             1
@@ -802,40 +616,6 @@ pub fn run(options: Options, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             1
         }
     }
-}
-
-fn describe(status: Option<ExitStatus>) -> String {
-    match status {
-        Some(status) => match (status.code(), status.signal()) {
-            (Some(code), _) => format!("ended (exit status {code})"),
-            (None, Some(signal)) => format!("was killed by signal {signal}"),
-            (None, None) => "ended".to_owned(),
-        },
-        None => "ended".to_owned(),
-    }
-}
-
-/// Collects the command. With `stop` it is asked to end first; one that has
-/// not within [`REAP_GRACE`] is killed. This is the only wait in the module and
-/// it is on the way out.
-fn reap(child: &mut Child, stop: bool) -> Option<ExitStatus> {
-    if stop && let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        let _ = sys::kill(pid, libc::SIGTERM);
-    }
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-        if start.elapsed() >= REAP_GRACE {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let _ = child.kill();
-    child.wait().ok()
 }
 
 #[cfg(test)]
@@ -1011,16 +791,5 @@ mod tests {
         .unwrap_err();
         assert!(why.contains("already in use"), "{why}");
         assert!(why.contains(&port.to_string()), "{why}");
-    }
-
-    #[test]
-    fn what_the_server_says_is_shown_without_control_characters() {
-        assert_eq!(clean("a\u{1b}[31mb\nc\u{7}"), "a[31mbc");
-        assert_eq!(
-            clean("name\u{202e}gnp.exe\u{2066}\u{200b}"),
-            "namegnp.exe",
-            "no text that reads backwards"
-        );
-        assert_eq!(clean(&"x".repeat(1000)).len(), SHOWN);
     }
 }

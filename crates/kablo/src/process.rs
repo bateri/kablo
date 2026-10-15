@@ -69,6 +69,11 @@ pub fn start(command: &Command) -> io::Result<(Program, Pipes)> {
     let mut spawn = std::process::Command::new(OsStr::from_bytes(program));
     spawn.args(args.iter().map(|a| OsStr::from_bytes(a)));
     if let Some(dir) = start_dir(command.cwd.as_deref()) {
+        // A directory that was asked for and is not there is said as that: the
+        // system's answer to the `exec` that follows would name the program.
+        if command.cwd.is_some() {
+            check_dir(&dir)?;
+        }
         spawn.current_dir(&dir);
         // A shell takes `PWD` only if it names the directory it is in.
         spawn.env("PWD", &dir);
@@ -130,6 +135,24 @@ pub fn start(command: &Command) -> io::Result<(Program, Pipes)> {
         },
     }
     Ok((program, pipes))
+}
+
+/// Whether the directory a command asked to start in can be entered as far as
+/// can be told before trying; the error says which directory.
+fn check_dir(dir: &Path) -> io::Result<()> {
+    let found = std::fs::metadata(dir).and_then(|meta| {
+        if meta.is_dir() {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTDIR))
+        }
+    });
+    found.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot enter {}: {}", dir.display(), system_words(&e)),
+        )
+    })
 }
 
 /// Where a command starts: the directory it asked for, which counts from home
@@ -334,7 +357,19 @@ mod tests {
         let mut asked = command(&["/bin/true"]);
         asked.cwd = Some(b"/no/such/directory".to_vec());
         let error = start(&asked).err().unwrap();
-        assert_eq!(system_words(&error), "No such file or directory");
+        // The directory is named: the system's answer to the `exec` that
+        // follows would have named the program.
+        assert_eq!(
+            system_words(&error),
+            "cannot enter /no/such/directory: No such file or directory"
+        );
+        // A file is not a directory either.
+        asked.cwd = Some(b"/bin/sh".to_vec());
+        let error = start(&asked).err().unwrap();
+        assert_eq!(
+            system_words(&error),
+            "cannot enter /bin/sh: Not a directory"
+        );
     }
 
     #[test]

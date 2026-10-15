@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
 
-use common::{Bridge, Env, Forward, client, read_exactly};
+use common::{Bridge, Env, Forward, client, exec, read_exactly};
 use kablo::bridge::{FORWARDING_OFF, NO_FORWARDING};
 use kablo_proto::v1::Message;
 use kablo_proto::v1::stream::{Command, FailCode, MAX_WINDOW};
@@ -163,6 +163,10 @@ fn the_administrator_turns_streams_off_and_on_for_a_bridge_that_is_running() {
     assert_eq!(refused.wait_exit().code(), Some(1));
     refused.said(FORWARDING_OFF);
     refused.announced_nothing();
+    // A program is not a connection, to `kablo exec` as to the bridge.
+    let ran = exec(&env, &[], &["/bin/echo", "runs"], b"");
+    assert_eq!(ran.status.code(), Some(0), "{}", ran.err());
+    assert_eq!(ran.out(), "runs\n");
     switch.off();
     let mut carried = Forward::start(&env, &args);
     let address = carried.announced(1)[0];

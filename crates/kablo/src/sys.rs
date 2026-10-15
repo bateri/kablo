@@ -611,6 +611,15 @@ pub fn read_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Whether `fd` is a regular file (and not a pipe, a socket or a terminal).
+pub fn is_regular_file(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: an all-zero `stat` is a valid value; the kernel fills it.
+    let mut found: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open for the call and `found` is a valid out-pointer.
+    let ok = unsafe { libc::fstat(fd.as_raw_fd(), &raw mut found) } == 0;
+    ok && found.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
 /// Whether `fd` is a terminal.
 pub fn is_tty(fd: BorrowedFd<'_>) -> bool {
     // SAFETY: `fd` is open for the call.
