@@ -198,8 +198,8 @@ Every key is optional and an absent one reads as nothing.
 | 1 | bytes | `program`: the name of the program in the terminal's foreground, as in `status` |
 | 2 | bytes | `directory`: the foreground program's working directory, as in `status` |
 | 3 | u8 | `secret`: bit 0 is set when the terminal does not show what is typed and takes it a line at a time, which is what `sudo`, `read -s` and ssh set to ask for a password (a program that wants single keys, an editor, turns the display of what is typed off but not the line mode, and is not a secret); written only when set |
-| 4 | bytes | `remote`: the target of the interactive ssh or mosh session in the foreground, as the user typed it (`user@host`, `host`, a name from ssh's configuration); a client that shows it to a person removes control characters first |
-| 5 | u16 | `remote_port`: the port the user asked ssh for (`-p`, `-o Port=`, an `ssh://` target); absent when they asked for none, which does not say what port ssh will use |
+| 4 | bytes | `remote`: the target of the interactive ssh or mosh session in the foreground, as the user typed it (`user@host`, `host`, a name from ssh's configuration); an `ssh://user@host:2222` target is told as `user@host`, without its scheme and port (the port is `remote_port`); a client that shows it to a person removes control characters first |
+| 5 | u16 | `remote_port`: the port the user asked ssh for (`-p`, `-o Port=`, an `ssh://` target); absent when they asked for none, which does not say what port ssh will use, and for mosh, whose `-p` is a UDP port |
 
 A `state` is **the whole of it**: a key that is absent is nothing now, not "as
 before", so a client keeps the last one it was given and replaces it. The server

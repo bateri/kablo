@@ -393,6 +393,24 @@ pub fn foreground_group(master: BorrowedFd<'_>) -> Option<libc::pid_t> {
     (group > 0).then_some(group)
 }
 
+/// Whether the terminal `master` belongs to is set the way a program sets it
+/// to ask for a password: what is typed is not shown (`ECHO` off) and is taken
+/// a line at a time (`ICANON` on). A program that wants single keys, an
+/// editor, turns the display off too but not the line mode, and does not
+/// count. `tcgetattr` on the master answers with the program's side's flags
+/// (measured on macOS; Linux reads the linked terminal), and a failure counts
+/// as not asking.
+pub fn hides_typing(master: BorrowedFd<'_>) -> bool {
+    // SAFETY: an all-zero `termios` is a valid value of a plain C struct; the
+    // call only writes it.
+    let mut modes: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `master` is open for the call and `modes` is a valid out-pointer.
+    if unsafe { libc::tcgetattr(master.as_raw_fd(), &raw mut modes) } != 0 {
+        return false;
+    }
+    modes.c_lflag & libc::ICANON != 0 && modes.c_lflag & libc::ECHO == 0
+}
+
 /// Sends `signal` to the process `pid`. A process that is already gone is
 /// not an error.
 pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
@@ -853,5 +871,44 @@ mod tests {
             0
         );
         assert!(start.elapsed() >= Duration::from_millis(2));
+    }
+
+    #[test]
+    fn a_terminal_asks_for_a_secret_only_when_it_hides_typing_and_reads_lines() {
+        let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
+        let set = |icanon: bool, echo: bool| {
+            // SAFETY: an all-zero `termios` is valid; the call only writes it.
+            let mut modes: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: the slave is open and `modes` is a valid out-pointer.
+            assert_eq!(
+                unsafe { libc::tcgetattr(pty.slave.as_raw_fd(), &raw mut modes) },
+                0
+            );
+            for (flag, on) in [(libc::ICANON, icanon), (libc::ECHO, echo)] {
+                if on {
+                    modes.c_lflag |= flag;
+                } else {
+                    modes.c_lflag &= !flag;
+                }
+            }
+            // SAFETY: the slave is open and `modes` is a valid in-pointer.
+            assert_eq!(
+                unsafe { libc::tcsetattr(pty.slave.as_raw_fd(), libc::TCSANOW, &raw const modes) },
+                0
+            );
+        };
+        // A fresh terminal shows what is typed and reads lines.
+        assert!(!hides_typing(pty.master.as_fd()));
+        // `sudo`, `read -s`, ssh's password prompt: no echo, lines.
+        set(true, false);
+        assert!(hides_typing(pty.master.as_fd()));
+        // An editor at a prompt: single keys, nothing shown.
+        set(false, false);
+        assert!(!hides_typing(pty.master.as_fd()));
+        // Single keys shown (`stty cbreak`-like).
+        set(false, true);
+        assert!(!hides_typing(pty.master.as_fd()));
+        set(true, true);
+        assert!(!hides_typing(pty.master.as_fd()));
     }
 }

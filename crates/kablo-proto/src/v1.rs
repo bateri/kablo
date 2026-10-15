@@ -575,13 +575,14 @@ pub struct TerminalState {
     /// what a program sets to ask for a password. Written only when set.
     pub secret: bool,
     /// The target of the interactive ssh or mosh session in the foreground, as
-    /// the user typed it (`user@host`, `host`, a name from ssh's configuration);
-    /// a person is shown it with control characters removed. Nothing else of
-    /// the command line is in it.
+    /// the user typed it (`user@host`, `host`, a name from ssh's configuration;
+    /// an `ssh://` target without its scheme and port); a person is shown it
+    /// with control characters removed. Nothing else of the command line is
+    /// in it.
     pub remote: Option<Vec<u8>>,
     /// The port the user asked ssh for (`-p`, `-o Port=` or an `ssh://`
     /// target). Absent when they asked for none, which says nothing of the port
-    /// ssh will use: its configuration decides.
+    /// ssh will use: its configuration decides. Absent for mosh.
     pub remote_port: Option<u16>,
 }
 

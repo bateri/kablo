@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, Status, View,
+    ErrorCode, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, Status,
+    TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -410,6 +411,11 @@ pub struct Conn {
     pub errors: Vec<(ErrorCode, String)>,
     pub replies: Vec<Packet>,
     pub closed: bool,
+    /// Every `state` received, across attaches, the last one last.
+    pub states: Vec<TerminalState>,
+    /// The kinds of message received in the order they came (`attached`,
+    /// `state`, `picture`, `output`), a run of one kind written once.
+    pub trace: Vec<&'static str>,
 }
 
 impl Conn {
@@ -442,7 +448,15 @@ impl Conn {
             errors: Vec::new(),
             replies: Vec::new(),
             closed: false,
+            states: Vec::new(),
+            trace: Vec::new(),
         })
+    }
+
+    fn note(&mut self, kind: &'static str) {
+        if self.trace.last() != Some(&kind) {
+            self.trace.push(kind);
+        }
     }
 
     pub fn send(&mut self, message: Message) {
@@ -489,9 +503,14 @@ impl Conn {
                 Message::Attached {
                     offset, truncated, ..
                 } => {
+                    self.note("attached");
                     self.attached = Some((offset, truncated));
                     self.next = offset;
                     self.data.clear();
+                }
+                Message::TerminalState(state) => {
+                    self.note("state");
+                    self.states.push(state);
                 }
                 Message::Picture {
                     offset,
@@ -499,8 +518,12 @@ impl Conn {
                     rows,
                     more,
                     data,
-                } => Pic::file(&mut self.pictures, offset, cols, rows, more, &data),
+                } => {
+                    self.note("picture");
+                    Pic::file(&mut self.pictures, offset, cols, rows, more, &data);
+                }
                 Message::Output { offset, data } => {
+                    self.note("output");
                     assert_eq!(offset, self.next, "output is not contiguous");
                     self.next += data.len() as u64;
                     self.data.extend_from_slice(&data);
@@ -624,6 +647,8 @@ pub struct Seen {
     /// Every picture received, across attaches.
     pub pictures: Vec<Pic>,
     pub ended: Option<Exit>,
+    /// Every `state` received, across attaches.
+    pub states: Vec<TerminalState>,
     /// Whether the program's bytes are left out of `data` (a test that lets a
     /// session run flat out has no use for them).
     pub discard: bool,
@@ -844,6 +869,12 @@ impl Bridge {
                 Message::Ended(exit) => {
                     self.sessions.entry(name.unwrap()).or_default().ended = Some(exit)
                 }
+                Message::TerminalState(state) => self
+                    .sessions
+                    .entry(name.unwrap())
+                    .or_default()
+                    .states
+                    .push(state),
                 Message::Error { code, text } => self.errors.push((name, code, text)),
                 Message::ListReply(statuses) => self.listed.push(statuses),
                 Message::Created(status) => self.created.push(status),

@@ -28,6 +28,15 @@
 //! client's. A relay that starts (a replacement, or a restart after a crash) has
 //! no screen to carry over and builds it again from what the journal holds.
 //!
+//! **The terminal's state is told, not polled.** What only the server can see
+//! of the terminal (the program in the foreground, whether a password is being
+//! asked for, where an ssh session goes) is told to every attached client as a
+//! `state` when it differs from what was last told: right after `attached`,
+//! at the end of a turn that read output, and once more [`STATE_SETTLE`] after
+//! the last output or typed input (a program that says nothing). Nobody
+//! attached, nothing looked at, and no timer: an idle session waits in `poll`
+//! for ever.
+//!
 //! **Nothing is closed by silence.** A client that goes away takes only its
 //! own state with it; the session ends only on an explicit `terminate`
 //! (forwarded to the warden, which owns the shell) or when the shell exits.
@@ -45,10 +54,11 @@
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::{Duration, Instant};
 
 use kablo_proto::v1::{
     DEFAULT_HISTORY, ErrorCode, Exit, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, OFFSET_END, Packet,
-    PacketDecoder, Size, State, Status, View,
+    PacketDecoder, Size, State, Status, TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -76,6 +86,55 @@ const OUT_LIMIT: usize = 4 << 20;
 /// program is owed must never keep a person from asking about the session or
 /// ending it.
 const INPUT_LIMIT: usize = 1 << 20;
+
+/// How long after the last output, or the last input a client typed, the
+/// terminal is looked at once more. The look at the end of a turn that read
+/// output cannot see a program that starts and says nothing (`sleep 100`), nor
+/// one the shell has not yet made the foreground when its echo of the line
+/// arrives (the shell forks after the newline is read, and the program is the
+/// foreground a moment later); this one does, a moment after the line was
+/// typed. The wait is short enough to feel like part of the keystroke and long
+/// enough for the shell's fork and `exec` to be done.
+const STATE_SETTLE: Duration = Duration::from_millis(200);
+
+/// The one look at the terminal that follows output or input by
+/// [`STATE_SETTLE`].
+///
+/// This is the only timer the relay has, and it has a stop condition: it is
+/// armed by output the relay read or input a client typed, it fires **once**,
+/// and then it is not armed again until there is more of either. A session
+/// nobody is attached to never has it armed, and neither does one that has
+/// ended, so an idle session is a `poll` with no timeout.
+#[derive(Default)]
+struct Settle {
+    due: Option<Instant>,
+}
+
+impl Settle {
+    /// Output or input arrived at `now`: look once more when it has been quiet
+    /// for [`STATE_SETTLE`].
+    fn arm(&mut self, now: Instant) {
+        self.due = Some(now + STATE_SETTLE);
+    }
+
+    fn cancel(&mut self) {
+        self.due = None;
+    }
+
+    /// How long a `poll` may wait at `now`: for ever unless armed.
+    fn timeout(&self, now: Instant) -> Option<Duration> {
+        self.due.map(|due| due.saturating_duration_since(now))
+    }
+
+    /// Whether it is time to look; a look that is due is due once.
+    fn fire(&mut self, now: Instant) -> bool {
+        if self.due.is_some_and(|due| due <= now) {
+            self.due = None;
+            return true;
+        }
+        false
+    }
+}
 
 /// Whose questions the bytes given to the screen may hold.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +275,17 @@ struct Relay {
     /// while connections wait, and waiting on it would spin. A client going
     /// frees a descriptor and ends the pause.
     accept_paused: bool,
+    /// What the terminal was last found to be, and told to the clients that
+    /// were attached then (`None` before the first look). A client that
+    /// attaches later is told on its own, whatever this says.
+    told: Option<TerminalState>,
+    /// Looks at the terminal, and remembers the command line it read.
+    watch: procinfo::Watch,
+    /// The look that follows output or input by a moment.
+    settle: Settle,
+    /// Output was read in this turn of the loop: the terminal is looked at
+    /// once at its end.
+    output_read: bool,
     /// A descriptor set aside for the next connection, let go just before
     /// each `accept` so that one is free for it. An `accept` that finds none
     /// does not leave the connection waiting everywhere: macOS drops it, and
@@ -332,6 +402,10 @@ impl Relay {
             delivered_sent: false,
             quit: false,
             accept_paused: false,
+            told: None,
+            watch: procinfo::Watch::default(),
+            settle: Settle::default(),
+            output_read: false,
             spare: None,
             chunk,
         };
@@ -380,7 +454,12 @@ impl Relay {
                     sources.push(Source::Client(i));
                 }
             }
-            if sys::poll(&mut set, None).is_err() {
+            // The look after output or input waits on the clock, and only while
+            // there is someone to tell.
+            if self.exit.is_some() || self.attached() == 0 {
+                self.settle.cancel();
+            }
+            if sys::poll(&mut set, self.settle.timeout(Instant::now())).is_err() {
                 return 1;
             }
             for (fd, source) in set.iter().zip(&sources) {
@@ -406,6 +485,7 @@ impl Relay {
                 }
             }
             self.answer_questions();
+            self.look_at_the_terminal();
             for i in 0..self.clients.len() {
                 self.drive(i);
             }
@@ -553,7 +633,11 @@ impl Relay {
                     return;
                 }
                 // Before the next read: a read may lap a small ring.
-                Ok(_) => self.feed_screen(Feed::Live),
+                Ok(_) => {
+                    self.feed_screen(Feed::Live);
+                    self.output_read = true;
+                    self.settle.arm(Instant::now());
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 // `EIO` is how Linux says the program's side is closed.
                 Err(_) => {
@@ -579,6 +663,47 @@ impl Relay {
         self.final_drained = true;
         self.input.clear();
         self.input_sent = 0;
+    }
+
+    // --- the terminal's state -----------------------------------------------
+
+    /// The terminal as it is now; nothing once the program has ended.
+    fn terminal_now(&mut self) -> TerminalState {
+        if self.exit.is_some() {
+            return TerminalState::default();
+        }
+        self.watch.look(self.master.as_fd(), self.child_pid)
+    }
+
+    /// At the end of a turn in which output was read, or when the look after
+    /// output or input is due: looks at the terminal once, and tells the
+    /// attached clients if it is not what they were told. At most one look in
+    /// a turn, whichever of the two brought it, and none when nobody is
+    /// attached (`status` looks when it is asked).
+    fn look_at_the_terminal(&mut self) {
+        let output = std::mem::take(&mut self.output_read);
+        let due = self.settle.fire(Instant::now());
+        if !(output || due) || self.exit.is_some() || self.attached() == 0 {
+            return;
+        }
+        let now = self.terminal_now();
+        self.tell_the_others(&now, usize::MAX);
+    }
+
+    /// Tells every attached client but `except` that the terminal is `now`,
+    /// if that is not what it was last found to be. (The client that has just
+    /// attached is told on its own: it has been told nothing before.)
+    fn tell_the_others(&mut self, now: &TerminalState, except: usize) {
+        if self.told.as_ref() == Some(now) {
+            return;
+        }
+        self.told = Some(now.clone());
+        for i in 0..self.clients.len() {
+            if i != except && self.is_attached(i) {
+                let session = Some(self.id.clone());
+                self.queue(i, session, Message::TerminalState(now.clone()));
+            }
+        }
     }
 
     // --- the screen ---------------------------------------------------------
@@ -1006,6 +1131,11 @@ impl Relay {
                 answered: 0,
             },
         );
+        // Then what the terminal is doing: before the picture and the
+        // output, which `drive` queues after it.
+        let now = self.terminal_now();
+        self.tell_the_others(&now, i);
+        self.queue(i, Some(self.id.clone()), Message::TerminalState(now));
     }
 
     fn resize(&mut self, i: usize, size: Size) {
@@ -1040,7 +1170,10 @@ impl Relay {
         }
         if !self.queue_input(bytes) {
             self.error(i, ErrorCode::INPUT_FULL, "the program is not taking input");
+            return;
         }
+        // What is typed may start a program that says nothing.
+        self.settle.arm(Instant::now());
     }
 
     /// Holds `bytes` for the program, which takes them when it reads. `false`
@@ -1110,9 +1243,12 @@ impl Relay {
         let mut status = Status::new(self.id.clone());
         status.pid = self.child_pid;
         if self.exit.is_none() {
-            let foreground = procinfo::foreground(self.master.as_fd(), self.child_pid);
-            status.program = foreground.program;
-            status.cwd = foreground.cwd;
+            let terminal = procinfo::look(self.master.as_fd(), self.child_pid);
+            status.program = terminal.program;
+            status.cwd = terminal.cwd;
+            status.secret = terminal.secret;
+            status.remote = terminal.remote;
+            status.remote_port = terminal.remote_port;
         }
         status.size = sys::window_size(self.master.as_fd()).unwrap_or_default();
         status.clients = self
@@ -1329,6 +1465,10 @@ mod tests {
             delivered_sent: false,
             quit: false,
             accept_paused: false,
+            told: None,
+            watch: procinfo::Watch::default(),
+            settle: Settle::default(),
+            output_read: false,
             spare: None,
             chunk: 4096,
         };
@@ -1409,5 +1549,37 @@ mod tests {
         journal.append(&data);
         assert_eq!(journal.retained_from(), 100);
         assert_eq!(replay_start(&journal, 1 << 30), (cap / 2) as u64 + 1);
+    }
+
+    #[test]
+    fn the_look_after_output_is_a_timer_that_fires_once_and_rests() {
+        let start = Instant::now();
+        let mut settle = Settle::default();
+        // Not armed: the relay's `poll` waits for ever.
+        assert_eq!(settle.timeout(start), None);
+        assert!(!settle.fire(start + STATE_SETTLE * 10));
+
+        settle.arm(start);
+        assert_eq!(settle.timeout(start), Some(STATE_SETTLE));
+        let half = STATE_SETTLE / 2;
+        assert_eq!(settle.timeout(start + half), Some(STATE_SETTLE - half));
+        assert!(!settle.fire(start + half));
+        // Once it is due the poll does not wait, and the look happens once.
+        assert_eq!(
+            settle.timeout(start + STATE_SETTLE * 2),
+            Some(Duration::ZERO)
+        );
+        assert!(settle.fire(start + STATE_SETTLE));
+        assert!(!settle.fire(start + STATE_SETTLE * 2));
+        assert_eq!(settle.timeout(start + STATE_SETTLE * 2), None);
+
+        // More output pushes it back; nobody to tell cancels it.
+        settle.arm(start);
+        settle.arm(start + half);
+        assert!(!settle.fire(start + STATE_SETTLE));
+        assert!(settle.fire(start + half + STATE_SETTLE));
+        settle.arm(start);
+        settle.cancel();
+        assert_eq!(settle.timeout(start), None);
     }
 }
