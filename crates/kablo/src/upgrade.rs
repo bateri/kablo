@@ -1,5 +1,7 @@
 //! `kablo upgrade`: replace the relay of a session, or of every session on
-//! this machine, with the one in another binary, without ending anything.
+//! this machine, with the one in another binary, without ending anything. The
+//! warden of the session renews itself into the same binary right after, when
+//! it can.
 //!
 //! The command asks a session's relay (`upgrade` with the binary's absolute
 //! path) and then listens. There are two ways it ends. The relay may answer
@@ -9,6 +11,14 @@
 //! relay had been replaced says nothing more. The command then asks the
 //! session for its status, which only the relay that took over can answer, so
 //! "replaced" is printed only for a session that is there to be asked.
+//!
+//! The warden renews itself a moment after the relay took over, when the
+//! session is at rest, and tells the relay which build it now is. The command
+//! waits a little for that to show in the status ([`RENEWAL_WAIT`]) and says
+//! so when the warden stays: a warden from before renewals existed (it never
+//! said its version) is not waited for. Two builds of one release cannot be
+//! told apart by their version, so for those the command cannot see whether
+//! the warden has renewed.
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -23,6 +33,10 @@ use crate::{sockdir, sys};
 
 /// How long one session has to be replaced and to answer afterwards.
 pub const WAIT: Duration = Duration::from_secs(20);
+
+/// How long the warden of a session whose relay was replaced has to show,
+/// in the session's status, that it is the new build too.
+pub const RENEWAL_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a relay has to answer the handshake of the request: a socket
 /// that takes the connection and says nothing has nobody serving it.
@@ -61,7 +75,7 @@ pub fn run(
     for id in ids {
         match replace(dir, &id, binary) {
             Ok(now) => {
-                let _ = writeln!(out, "{id}: relay replaced (now {})", now.version);
+                let _ = writeln!(out, "{}", report(&id, &now));
             }
             Err(why) => {
                 let _ = writeln!(err, "kablo: {id}: {why}");
@@ -109,7 +123,41 @@ fn replace(dir: &Path, id: &SessionId, binary: &Path) -> Result<Status, String> 
             End::Late => return Err("the relay did not answer in time".to_owned()),
         }
     }
-    asked(&path, id, by)
+    let now = asked(&path, id, by)?;
+    Ok(warden_followed(&path, id, now))
+}
+
+/// What is said of a session whose relay was replaced, given the status the
+/// new relay gave.
+fn report(id: &SessionId, now: &Status) -> String {
+    let version = plain(&now.version);
+    if now.warden_version == now.version {
+        format!("{id}: replaced (now {version})")
+    } else if now.warden_version.is_empty() {
+        format!(
+            "{id}: relay replaced (now {version}); its warden is of an earlier kind and stays until the session ends"
+        )
+    } else {
+        format!(
+            "{id}: relay replaced (now {version}); its warden stays at {} until the session ends",
+            plain(&now.warden_version)
+        )
+    }
+}
+
+/// The status of `id` once its warden has had time to renew itself: `now`
+/// when it already is the build the relay is, or never said what it is.
+fn warden_followed(path: &Path, id: &SessionId, mut now: Status) -> Status {
+    let by = Instant::now() + RENEWAL_WAIT;
+    while !now.warden_version.is_empty() && now.warden_version != now.version && Instant::now() < by
+    {
+        std::thread::sleep(Duration::from_millis(50));
+        match asked(path, id, by) {
+            Ok(again) => now = again,
+            Err(_) => break,
+        }
+    }
+    now
 }
 
 /// The status of `id`, asked of whatever relay is serving once the one that
@@ -218,6 +266,37 @@ fn plain(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_of(version: &str, warden: &str) -> Status {
+        let mut status = Status::new(SessionId::new("work").unwrap());
+        status.version = version.to_owned();
+        status.warden_version = warden.to_owned();
+        status
+    }
+
+    #[test]
+    fn the_line_says_whether_the_warden_followed() {
+        let id = SessionId::new("work").unwrap();
+        assert_eq!(
+            report(&id, &status_of("0.2.0", "0.2.0")),
+            "work: replaced (now 0.2.0)"
+        );
+        let stays = report(&id, &status_of("0.2.0", "0.1.0"));
+        assert!(
+            stays.starts_with("work: relay replaced (now 0.2.0); "),
+            "{stays}"
+        );
+        assert!(
+            stays.contains("its warden stays at 0.1.0 until the session ends"),
+            "{stays}"
+        );
+        let old = report(&id, &status_of("0.2.0", ""));
+        assert!(
+            old.starts_with("work: relay replaced (now 0.2.0); "),
+            "{old}"
+        );
+        assert!(old.contains("earlier kind"), "{old}");
+    }
 
     #[test]
     fn a_relays_words_lose_their_control_characters() {

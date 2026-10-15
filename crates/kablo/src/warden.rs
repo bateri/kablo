@@ -7,13 +7,17 @@
 //! dies, passes a client's `terminate` on to the shell, and cleans up when
 //! the shell's end has reached a client.
 //!
-//! **It is frozen.** While the shell lives the warden's code does not change:
-//! a new release's relay is started by the old release's warden, and an
-//! update never touches the shell's parent. So this file is std and `libc`
-//! only (through `sys`), panics nowhere (`unwrap`, `expect` and indexing are
-//! denied in the workspace), speaks only the inner wire, and holds no logic
-//! that could be wrong in a way a relay could not work around. Behaviour
-//! belongs in the relay.
+//! **Its code reaches a running session only by renewal.** Nothing starts a
+//! new warden for a session that has a shell: a new release's relay is
+//! started by the old release's warden, and an update never touches the
+//! shell's parent. So this file is std and `libc` only (through `sys`), panics
+//! nowhere (`unwrap`, `expect` and indexing are denied in the workspace),
+//! speaks only the inner wire, and holds no logic that could be wrong in a way
+//! a relay could not work around. Behaviour belongs in the relay. What cannot
+//! change is the way out: a warden of any release must be able to renew into
+//! a later one and a later one must be able to take over from it (see
+//! *Renewing*), because a build that lost either would leave every warden
+//! started from the builds before it where it is.
 //!
 //! **Replacing the relay.** A relay that was asked to (`upgrade`) hands the
 //! request on; the warden checks the binary named, starts it as a *second*
@@ -26,6 +30,21 @@
 //! is told so (`UpgradeFailed`). After the change the warden starts relays
 //! from the new binary.
 //!
+//! **Renewing.** The relay an upgrade brought in also says which warden
+//! records its binary reads ([`ToWarden::CanRenew`]). Once it serves and the
+//! warden is at rest (the shell lives, nothing is being handed over, nothing
+//! is half-sent or half-read on the relay's channel) the warden writes what it
+//! knows as a [`Renewal`] into a pipe and replaces its own program with that
+//! binary (`execve`): the same process, so the shell's parent and the pid
+//! stay, and the descriptors it keeps (terminal, journal, listening socket,
+//! the relay's channel) stay open under the same numbers. The new image
+//! ([`resume`]) reads the record, takes the processes up again by number and
+//! tells the relay it was renewed. If the `execve` fails the old image goes
+//! on, and no second try is made for that upgrade. If the new image cannot
+//! take the session up it ends, and the relay serves on without a warden: the
+//! shell lives, but nobody restarts a relay, collects its exit code or hangs
+//! it up on `terminate`.
+//!
 //! It waits on file descriptors only: the shell's exit watch, the terminal
 //! while it reads it, the channels of its relays. Its timers are named and
 //! end: [`ENDED_HOLD`] after the shell exits and no client has heard of it,
@@ -34,8 +53,8 @@
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -45,7 +64,7 @@ use std::time::{Duration, Instant};
 use kablo_proto::SessionId;
 use kablo_proto::v1::{Exit, Message, NewSession};
 
-use crate::inner::{self, Adopt, Decoder, INNER, ToRelay, ToWarden};
+use crate::inner::{self, Adopt, Decoder, INNER, Renewal, ToRelay, ToWarden};
 use crate::journal::{self, Journal};
 use crate::pty;
 use crate::sockdir;
@@ -66,9 +85,6 @@ pub const RELAY_YOUTH: Duration = Duration::from_secs(10);
 /// terminal, before it is killed: neither an upgrade nor the end of a session
 /// waits for one that is stuck.
 pub const QUIT_WAIT: Duration = Duration::from_secs(5);
-
-/// The version of this build, which the relays are told.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The most program bytes one read of the terminal takes.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -108,7 +124,7 @@ pub fn run(id: SessionId, dir: &Path) -> u8 {
         }
         Err(e) => return refuse(&mut control, &e.to_string()),
     };
-    let warden = match Warden::start(id, &request, listener, &control) {
+    let warden = match Warden::start(id, dir, &request, listener, &control) {
         Ok(warden) => warden,
         Err(why) => {
             let _ = std::fs::remove_file(&path);
@@ -120,6 +136,37 @@ pub fn run(id: SessionId, dir: &Path) -> u8 {
     drop(control);
     let code = warden.serve();
     // The socket is ours from the bind on: whatever ended the warden, it goes.
+    let _ = std::fs::remove_file(&path);
+    code
+}
+
+/// Carries on as the warden of a session that an earlier image of this very
+/// process was the warden of: it replaced its program with this one
+/// ([`Warden::renew`]) and left what it knew in the pipe whose read end is
+/// descriptor `record`. Nothing of a first start is done again (no new
+/// session, no `setsid`, descriptors are not closed), and a record that
+/// cannot be used ends the process with the socket left alone: the relay
+/// keeps serving the session without a warden.
+pub fn resume(id: SessionId, record: RawFd) -> u8 {
+    if record <= 2 || !sys::is_open(record) {
+        return 1;
+    }
+    // SAFETY: the earlier image passed this descriptor, the read end of a
+    // pipe, by number; it was just seen to be open and is owned from here.
+    let pipe = unsafe { OwnedFd::from_raw_fd(record) };
+    let mut file = std::fs::File::from(pipe);
+    let renewal = match inner::read::<Renewal, _>(&mut file) {
+        Ok(Some(renewal)) if renewal.id == id => renewal,
+        _ => return 1,
+    };
+    drop(file);
+    let warden = match Warden::resume(renewal) {
+        Ok(warden) => warden,
+        Err(_) => return 1,
+    };
+    let path = sockdir::socket_path(&warden.dir, &warden.id);
+    let code = warden.serve();
+    // As after a first start: the socket is this warden's to remove.
     let _ = std::fs::remove_file(&path);
     code
 }
@@ -200,6 +247,11 @@ struct RelayLink {
     started: Instant,
     /// The binary it was started from.
     exe: PathBuf,
+    /// The renewal record versions its binary says it reads, once it has said.
+    renews: Option<(u8, u8)>,
+    /// An upgrade asked for this relay: the warden renews into its binary once
+    /// it serves.
+    for_upgrade: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -227,6 +279,8 @@ enum Role {
 
 struct Warden {
     id: SessionId,
+    /// The directory of the session's socket.
+    dir: PathBuf,
     master: OwnedFd,
     journal: Journal,
     listener: UnixListener,
@@ -249,6 +303,9 @@ struct Warden {
     strikes: u32,
     ever_ready: bool,
     quitting: bool,
+    /// An upgrade has brought in a relay whose binary this warden is to renew
+    /// into, as soon as the session is at rest.
+    renew_pending: bool,
     /// The channel to `kablo new` until the first relay is ready.
     control: Option<UnixStream>,
     chunk: usize,
@@ -259,6 +316,7 @@ impl Warden {
     /// what `kablo new` is told.
     fn start(
         id: SessionId,
+        dir: &Path,
         request: &NewSession,
         listener: UnixListener,
         control: &UnixStream,
@@ -302,6 +360,7 @@ impl Warden {
         let chunk = usize::try_from(READ_CHUNK.min(journal.capacity() / 4)).unwrap_or(4096);
         Ok(Warden {
             id,
+            dir: dir.to_path_buf(),
             master,
             journal,
             listener,
@@ -319,9 +378,114 @@ impl Warden {
             strikes: 0,
             ever_ready: false,
             quitting: false,
+            renew_pending: false,
             control: Some(control),
             chunk,
         })
+    }
+
+    /// Takes the session up from the record an earlier image left. The
+    /// processes are known by number, the descriptors by the numbers they had,
+    /// and the relay is the one that served, `Active`.
+    fn resume(renewal: Renewal) -> Result<Warden, String> {
+        let Renewal {
+            id,
+            dir,
+            shell_pid,
+            master,
+            journal,
+            listener,
+            relay_chan,
+            relay_pid,
+            relay_serial,
+            relay_binary,
+            relay_exe,
+            serials,
+            strikes,
+            ever_ready,
+            chunk,
+            delivered,
+        } = renewal;
+        let numbers = [master, journal, listener, relay_chan];
+        let mut sorted = numbers;
+        sorted.sort_unstable();
+        if numbers.iter().any(|&fd| fd <= 2 || !sys::is_open(fd))
+            || sorted.windows(2).any(|pair| pair.first() == pair.get(1))
+        {
+            return Err("the record names descriptors that are not open".to_owned());
+        }
+        // SAFETY: each number is a descriptor the earlier image left open for
+        // this one; checked open and distinct above, owned from here.
+        let [master, journal, listener, chan] =
+            numbers.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        for fd in [&master, &journal, &listener, &chan] {
+            sys::set_cloexec(fd.as_raw_fd()).map_err(|e| e.to_string())?;
+        }
+        let journal =
+            Journal::open(journal).map_err(|e| format!("cannot open the journal: {e}"))?;
+        let listener = UnixListener::from(listener);
+        let chan = UnixStream::from(chan);
+        chan.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let mut child = sys::Proc::from_pid(shell_pid).map_err(|e| e.to_string())?;
+        let relay_child = sys::Proc::from_pid(relay_pid).map_err(|e| e.to_string())?;
+        // The watch first and the look after it: a shell that ended while
+        // nobody was watching waits as a zombie, and its exit is not lost.
+        let watch = sys::exit_watch(child.id()).ok();
+        let ended = child
+            .try_wait()
+            .map_err(|e| format!("cannot look at the program: {e}"))?
+            .is_some();
+        if watch.is_none() && !ended {
+            return Err("cannot watch the program".to_owned());
+        }
+        let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        // A relay that has been serving is not a young one: if it dies soon
+        // after the renewal, that is not a strike.
+        let started = Instant::now()
+            .checked_sub(RELAY_YOUTH)
+            .unwrap_or_else(Instant::now);
+        let relay = RelayLink {
+            serial: relay_serial,
+            child: relay_child,
+            chan,
+            stage: Stage::Active,
+            hello: Vec::new(),
+            decoder: Decoder::new(),
+            out: Vec::new(),
+            started,
+            exe: path(relay_binary),
+            renews: None,
+            for_upgrade: false,
+        };
+        let mut warden = Warden {
+            id,
+            dir: path(dir),
+            master,
+            journal,
+            listener,
+            child,
+            watch,
+            exit: None,
+            ended_at: None,
+            delivered,
+            master_open: true,
+            relay: Some(relay),
+            next: None,
+            retire_by: None,
+            relay_exe: path(relay_exe),
+            serials,
+            strikes,
+            ever_ready,
+            quitting: false,
+            renew_pending: false,
+            control: None,
+            chunk: usize::try_from(chunk).unwrap_or(4096),
+        };
+        warden.send(relay_serial, &ToRelay::Renewed(crate::release()));
+        if ended {
+            warden.on_child_exit();
+        }
+        Ok(warden)
     }
 
     /// The loop. Ends when the session is over and cleaned up (status 0) or
@@ -351,6 +515,9 @@ impl Warden {
                 self.promote();
                 continue;
             }
+            // Every change to what this looks at comes with an event that
+            // ends a turn, so the look comes before each wait.
+            self.renew_if_at_rest();
             let deadline = match (ended_by, self.retire_by) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -443,6 +610,8 @@ impl Warden {
     /// The shell exited: collect it and tell the relays that have the session.
     fn on_child_exit(&mut self) {
         self.watch = None;
+        // A session whose shell has ended is left as it is.
+        self.renew_pending = false;
         let exit = match self.child.wait() {
             Ok(status) => pty::exit_of(status),
             Err(_) => Exit::Code(-1),
@@ -562,6 +731,8 @@ impl Warden {
             out: Vec::new(),
             started: Instant::now(),
             exe: exe.to_path_buf(),
+            renews: None,
+            for_upgrade: false,
         })
     }
 
@@ -653,7 +824,7 @@ impl Warden {
             id: self.id.clone(),
             child_pid: self.child.id(),
             exit: self.exit,
-            warden_version: Some(VERSION.to_owned()),
+            warden_version: Some(crate::release()),
         });
         let fds = [
             self.master.as_raw_fd(),
@@ -712,9 +883,11 @@ impl Warden {
                     self.upgrade(&path);
                 }
             }
-            // What a relay's binary reads is for a warden that renews itself;
-            // this one does not act on it yet.
-            ToWarden::CanRenew { .. } => {}
+            ToWarden::CanRenew { min, max } => {
+                if let Some(link) = self.link(serial) {
+                    link.renews = Some((min, max));
+                }
+            }
         }
     }
 
@@ -758,6 +931,9 @@ impl Warden {
         next.stage = Stage::Active;
         self.relay_exe.clone_from(&next.exe);
         self.ever_ready = true;
+        // Whether the binary can be renewed into is looked at when the
+        // warden is at rest: what it says about itself is a frame of its own.
+        self.renew_pending |= next.for_upgrade;
         let serial = next.serial;
         self.relay = Some(next);
         self.send(serial, &ToRelay::Go);
@@ -788,7 +964,10 @@ impl Warden {
             reap(waiting);
         }
         match self.spawn_relay(&exe) {
-            Ok(link) => self.next = Some(link),
+            Ok(mut link) => {
+                link.for_upgrade = true;
+                self.next = Some(link);
+            }
             Err(e) => self.upgrade_failed(&format!("cannot start {}: {e}", exe.display())),
         }
     }
@@ -802,6 +981,130 @@ impl Warden {
             .map(|link| link.serial);
         if let Some(serial) = serving {
             self.send(serial, &ToRelay::UpgradeFailed(why.to_owned()));
+        }
+    }
+
+    /// Renews this warden if an upgrade asked for it and the session is at
+    /// rest: the shell lives, no relay is being brought in or let go of, and
+    /// the relay's channel holds nothing half-sent or half-read, which a new
+    /// image could not take up. Called before every wait, so it runs again
+    /// whenever something it looks at has changed.
+    fn renew_if_at_rest(&mut self) {
+        if !self.renew_pending {
+            return;
+        }
+        if self.exit.is_some() || self.quitting {
+            self.renew_pending = false;
+            return;
+        }
+        if self.control.is_some() || self.next.is_some() || self.retire_by.is_some() {
+            return;
+        }
+        let Some(link) = self.relay.as_ref() else {
+            return;
+        };
+        if link.stage != Stage::Active || !link.out.is_empty() || link.decoder.pending() != 0 {
+            return;
+        }
+        match link.renews {
+            // It has not said yet; it does, right after it is set up.
+            None => return,
+            Some(range) if !reads_renewal(range) => {
+                self.renew_pending = false;
+                return;
+            }
+            Some(_) => {}
+        }
+        // One try for an upgrade: whatever comes of it, not again.
+        self.renew_pending = false;
+        self.renew();
+    }
+
+    /// Replaces this program with the binary of the relay that serves, and
+    /// hands the new image what this one knows. Returns only if that did not
+    /// happen, with everything as it was.
+    fn renew(&mut self) {
+        let Some(link) = self.relay.as_ref() else {
+            return;
+        };
+        let Ok(chunk) = u32::try_from(self.chunk) else {
+            return;
+        };
+        // What made the binary fit to run was looked at when the relay was
+        // started from it; the file may have been changed since.
+        if check_binary(link.exe.as_os_str().as_bytes()).is_err() {
+            return;
+        }
+        let kept = [
+            self.master.as_raw_fd(),
+            self.journal.as_raw_fd(),
+            self.listener.as_raw_fd(),
+            link.chan.as_raw_fd(),
+        ];
+        let exe = link.exe.clone();
+        let renewal = Renewal {
+            id: self.id.clone(),
+            dir: self.dir.as_os_str().as_bytes().to_vec(),
+            shell_pid: self.child.id(),
+            master: self.master.as_raw_fd(),
+            journal: self.journal.as_raw_fd(),
+            listener: self.listener.as_raw_fd(),
+            relay_chan: link.chan.as_raw_fd(),
+            relay_pid: link.child.id(),
+            relay_serial: link.serial,
+            relay_binary: exe.as_os_str().as_bytes().to_vec(),
+            relay_exe: self.relay_exe.as_os_str().as_bytes().to_vec(),
+            serials: self.serials,
+            strikes: self.strikes,
+            ever_ready: self.ever_ready,
+            chunk,
+            delivered: self.delivered,
+        };
+        let mut record = Vec::new();
+        if inner::write(&mut record, &renewal).is_err() {
+            return;
+        }
+        let Ok((read, write)) = sys::pipe() else {
+            return;
+        };
+        // A record the pipe cannot take whole is not sent: this warden never
+        // waits on a pipe of its own.
+        if sys::set_nonblocking(write.as_raw_fd()).is_err() {
+            return;
+        }
+        match sys::write_fd(write.as_fd(), &record) {
+            Ok(n) if n == record.len() => {}
+            _ => return,
+        }
+        drop(write);
+        let carried: Vec<RawFd> = kept.iter().copied().chain([read.as_raw_fd()]).collect();
+        if carried.iter().any(|&fd| sys::clear_cloexec(fd).is_err()) {
+            for fd in kept {
+                let _ = sys::set_cloexec(fd);
+            }
+            return;
+        }
+        // A watch on the shell is made anew by the new image; this one must
+        // not leak into it (a kqueue is not closed by an exec on its own).
+        if let Some(watch) = &self.watch {
+            let _ = sys::set_cloexec(watch.as_raw_fd());
+        }
+        // `--id` and `--dir` stay on the command line as they were: they are
+        // how this process is found among others.
+        let args = [
+            exe.as_os_str().to_owned(),
+            "warden".into(),
+            "--id".into(),
+            self.id.as_str().into(),
+            "--dir".into(),
+            self.dir.as_os_str().to_owned(),
+            "--resume".into(),
+            read.as_raw_fd().to_string().into(),
+        ];
+        // It returns only to say it did not happen.
+        let _ = sys::exec(&exe, &args);
+        for fd in kept {
+            let _ = sys::set_cloexec(fd);
         }
     }
 
@@ -963,6 +1266,12 @@ fn check_binary(path: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Whether a relay's binary, which says it reads the renewal records from
+/// `range.0` to `range.1`, reads the one this build writes.
+fn reads_renewal(range: (u8, u8)) -> bool {
+    (range.0..=range.1).contains(&inner::RENEWAL_VERSION)
+}
+
 /// What a descriptor in the poll set stands for.
 enum Source {
     Child,
@@ -1005,6 +1314,20 @@ mod tests {
         assert!(refused(&file(&dir, "group", 0o775)).contains("written by others"));
         assert!(refused(&file(&dir, "world", 0o757)).contains("written by others"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_warden_renews_only_into_a_binary_that_reads_what_it_writes() {
+        let version = inner::RENEWAL_VERSION;
+        assert!(reads_renewal((inner::RENEWAL_MIN_VERSION, version)));
+        assert!(reads_renewal((version, version.saturating_add(1))));
+        assert!(!reads_renewal((
+            version.saturating_add(1),
+            version.saturating_add(2)
+        )));
+        assert!(!reads_renewal((0, version.saturating_sub(1))));
+        // A range written the wrong way round reads nothing.
+        assert!(!reads_renewal((version.saturating_add(1), version)));
     }
 
     #[test]

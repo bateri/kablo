@@ -193,24 +193,43 @@ counts as if it were, and says that it could not check.
 
 ## Replacing kablo under running sessions
 
-Each session is two processes: a *warden*, which is the shell's parent and
-never changes while the shell lives, and a *relay*, which listens for clients,
-reads the terminal and keeps the journal. The relay can be swapped for the one
-in another binary without ending the shell and without dropping a client:
+Each session is two processes: a *warden*, which is the shell's parent, and a
+*relay*, which listens for clients, reads the terminal and keeps the journal.
+An upgrade replaces both, without ending the shell and without dropping a
+client:
 
 ```sh
 kablo upgrade ID /path/to/new/kablo
 kablo upgrade --all /path/to/new/kablo
 ```
 
+The relay is swapped for the one in the new binary first. Then the warden
+replaces its own program with the same binary, in the same process: its pid
+stays, the shell stays its child (so its exit code is still collected), and the
+terminal, the journal and the listening socket stay open. It does that at a
+quiet moment (the shell lives and nothing is being handed over), which comes
+right after the relay took over unless something is in the middle of a change.
+
 The path must be absolute (a relative one is made absolute from where you run
 the command), a regular file you can run, owned by you or by root, and
-writable by nobody else. On success `upgrade` prints `ID: relay replaced (now
+writable by nobody else. On success `upgrade` prints `ID: replaced (now
 VERSION)` for each session and exits 0; a client attached to the session is
 reconnected by its `attach` without noticing. On failure it says why and
 exits 1 (the file is not one to run, the program has ended, the new relay
-stopped before it took over), and the old relay keeps serving. The warden is
-never replaced: a new warden only comes with a new session.
+stopped before it took over), and the old relay keeps serving.
+
+The warden stays as it was when it cannot follow: the new relay does not say it
+reads what a renewing warden leaves for it, the program ended before the
+quiet moment came, the new binary could not be run again from where it is, or
+the warden is from a release before wardens could be renewed. `upgrade` then
+still exits 0, because the relay was replaced, and says so: `ID: relay
+replaced (now VERSION); its warden stays at VERSION until the session ends`
+(for a warden from before renewals, which never said its version, the line
+says it is of an earlier kind). Starting a new session is the way to get a new
+warden. (Two builds of one
+release say the same version, so for those `upgrade` cannot tell whether the
+warden followed; `ps` shows `--resume` on the command line of a warden that
+has renewed.)
 
 Put each version in a directory of its own and leave the old one where it is.
 Overwriting the binary of a running session in place costs the warden its
@@ -291,8 +310,14 @@ memory of where its relay comes from (see *Limits*).
 - **`upgrade` can fall back without saying so.** If the new relay dies between
   announcing itself and taking over, or the old one dies during the hand-over,
   the warden starts a relay from the binary it had before, and `kablo upgrade`
-  still prints `relay replaced`. The version in that line is the only hint:
-  compare it with the one you installed.
+  still prints `replaced`. The version in that line is the only hint: compare
+  it with the one you installed.
+- **A warden that cannot take the session up after it renewed** (a damaged
+  binary, say) ends, and the session carries on with its relay alone: the shell
+  and its programs live and the relay serves, but nothing restarts a relay that
+  dies, nobody collects the shell's exit code, and `terminate` is refused.
+  `kablo upgrade` cannot see this when the old and the new release are the
+  same, and otherwise says that the warden stays.
 - **The systemd scope** is tested against a stand-in `systemd-run`, not yet on
   a machine with a real systemd. The `setsid` route is what the end-to-end
   tests (a real sshd in a container) run.

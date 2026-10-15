@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,6 +54,31 @@ pub fn nothing_yet(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::Interrupted
     )
+}
+
+/// The file the process `pid` is running, as the system says it (a command
+/// line says what the process was told, not what it is).
+pub fn binary_of(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `buf` is a writable buffer of the length passed.
+        let len = unsafe {
+            libc::proc_pidpath(
+                libc::c_int::try_from(pid).ok()?,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+            )
+        };
+        let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
+        buf.truncate(len);
+        Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+    }
 }
 
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
@@ -186,6 +211,36 @@ impl Env {
             .into_iter()
             .map(|(_, _, command)| command)
             .find(|command| command.contains(&wanted))
+    }
+
+    /// Waits until the warden of `id` runs `binary` and returns its pid: a
+    /// warden that renews itself keeps its pid and changes the program it is.
+    pub fn warden_running(&self, id: &str, binary: &Path) -> u32 {
+        let wanted = std::fs::canonicalize(binary).unwrap();
+        let start = Instant::now();
+        loop {
+            if let Some(pid) = self.find("warden", id) {
+                let runs = binary_of(pid).and_then(|path| std::fs::canonicalize(path).ok());
+                if runs.as_ref() == Some(&wanted) {
+                    return pid;
+                }
+            }
+            assert!(
+                start.elapsed() < PATIENCE,
+                "the warden of {id} never ran {}: {:?}",
+                binary.display(),
+                self.find("warden", id).and_then(binary_of)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The parent of process `pid`.
+    pub fn parent_of(&self, pid: u32) -> Option<u32> {
+        self.processes()
+            .into_iter()
+            .find(|(this, _, _)| *this == pid)
+            .map(|(_, parent, _)| parent)
     }
 
     /// A copy of the `kablo` under test in a directory of its own, to upgrade

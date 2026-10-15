@@ -371,6 +371,19 @@ the bridge connects again for it. What tells it the new relay serves is
 `status`: its `version` names the release of the relay that answers (an
 upgrade to a binary of the same release cannot be told apart that way).
 
+**Replacing the warden.** The same request renews the warden of the session
+too, in the same stroke and without a message of its own: once the new relay
+serves and the session is at rest, the warden replaces its program with that
+binary (`execve`; same process, shell and descriptors) if the new relay said
+it can take over from it. Nothing of this reaches a client except `status`:
+`warden_version` names the release of the warden that keeps the session, and is
+the release of the new relay a moment after the upgrade when the warden
+followed. A warden that cannot follow (the new binary does not read what the
+old one hands over, the program ended first, the file could not be run again)
+stays as it was, the relay is replaced all the same, and `warden_version`
+keeps the old release; a warden from before renewals existed does not report
+one at all.
+
 On failure the server answers `error` with `UPGRADE_FAILED` and a reason, the
 relay that was asked keeps serving and the connection stays open: the path is
 not one to run, the program has ended, or the new relay stopped before it took

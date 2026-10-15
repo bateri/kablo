@@ -1127,7 +1127,7 @@ impl Relay {
         status.offset = self.journal.total();
         status.retained_from = self.journal.retained_from();
         status.exit = self.exit;
-        status.version = env!("CARGO_PKG_VERSION").to_owned();
+        status.version = crate::release();
         status.warden_version.clone_from(&self.warden_version);
         status
     }

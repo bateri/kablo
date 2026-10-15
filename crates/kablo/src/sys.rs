@@ -6,9 +6,12 @@
 //! keep to what a loop needs: descriptor flags, `poll`, passing descriptors
 //! over a Unix socket, the terminal's size, signals.
 
+use std::ffi::{CString, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
@@ -28,6 +31,59 @@ pub fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {
 pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `F_SETFD` changes only the descriptor's flags.
     cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }).map(drop)
+}
+
+/// Takes close-on-exec off `fd`, so that a process this one replaces itself
+/// with (`execve`) keeps it open under the same number.
+pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `F_SETFD` changes only the descriptor's flags.
+    cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }).map(drop)
+}
+
+/// Whether `fd` is an open descriptor of this process.
+pub fn is_open(fd: RawFd) -> bool {
+    // SAFETY: `F_GETFD` only reads the descriptor's flags.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+}
+
+/// A pipe, as (read end, write end), both close-on-exec.
+pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` holds the two descriptors `pipe` writes.
+    cvt(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
+    // SAFETY: both are fresh descriptors nobody else owns.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    set_cloexec(read.as_raw_fd())?;
+    set_cloexec(write.as_raw_fd())?;
+    Ok((read, write))
+}
+
+/// Replaces this process with the program at `path`, run with `args` (the
+/// first is the name it is told) and the environment this process has. Returns
+/// only to say why it could not, with nothing of this process changed.
+///
+/// `std`'s own `exec` is not used because it sets `SIGPIPE` back to its
+/// default before it tries and leaves it so when it fails: the next write to a
+/// peer that has gone would then end the process that was meant to carry on.
+pub fn exec(path: &Path, args: &[OsString]) -> io::Error {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a name to run");
+    let Ok(program) = CString::new(path.as_os_str().as_bytes()) else {
+        return invalid();
+    };
+    let mut owned = Vec::with_capacity(args.len());
+    for arg in args {
+        match CString::new(arg.as_bytes()) {
+            Ok(arg) => owned.push(arg),
+            Err(_) => return invalid(),
+        }
+    }
+    let mut argv: Vec<*const libc::c_char> = owned.iter().map(|arg| arg.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    // SAFETY: `program` and the strings `argv` points into are NUL-terminated
+    // and outlive the call, and `argv` ends with a null pointer. `execv`
+    // returns only when it failed.
+    unsafe { libc::execv(program.as_ptr(), argv.as_ptr()) };
+    io::Error::last_os_error()
 }
 
 /// Puts `fd` in non-blocking mode.
@@ -601,13 +657,8 @@ extern "C" fn on_signal(signal: libc::c_int) {
 /// descriptor, so a `poll` loop can wait on them with everything else. At
 /// most one such pipe exists per process: a second call replaces the first.
 pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
-    let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` holds the two descriptors `pipe` writes.
-    cvt(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
-    // SAFETY: both are fresh descriptors nobody else owns.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    let (read, write) = pipe()?;
     for end in [&read, &write] {
-        set_cloexec(end.as_raw_fd())?;
         set_nonblocking(end.as_raw_fd())?;
     }
     // The handler lives as long as the process, and so does its pipe.
@@ -730,6 +781,43 @@ mod tests {
         let ready = poll(&mut set, Some(Duration::from_secs(10))).unwrap();
         assert_eq!(ready, 1);
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_descriptor_can_be_made_to_survive_an_exec_and_made_not_to() {
+        let (read, write) = pipe().unwrap();
+        let flags = |fd: &OwnedFd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags(&read) & libc::FD_CLOEXEC != 0);
+        assert!(flags(&write) & libc::FD_CLOEXEC != 0);
+        clear_cloexec(read.as_raw_fd()).unwrap();
+        assert_eq!(flags(&read) & libc::FD_CLOEXEC, 0);
+        set_cloexec(read.as_raw_fd()).unwrap();
+        assert!(flags(&read) & libc::FD_CLOEXEC != 0);
+        assert!(is_open(read.as_raw_fd()));
+        let number = write.as_raw_fd();
+        drop(write);
+        assert!(!is_open(number));
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_run_leaves_the_process_as_it_was() {
+        let disposition = || {
+            // SAFETY: an all-zero `sigaction` is valid; the call only reads
+            // the current one into it.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null new action asks only for the old one.
+            unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut action) };
+            action.sa_sigaction
+        };
+        let before = disposition();
+        let why = exec(
+            Path::new("/nonexistent/kablo"),
+            &[OsString::from("kablo"), OsString::from("warden")],
+        );
+        assert_eq!(why.kind(), io::ErrorKind::NotFound);
+        assert_eq!(disposition(), before, "SIGPIPE is as it was");
+        let nul = exec(Path::new("/bin/sh"), &[OsString::from("a\0b")]);
+        assert_eq!(nul.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

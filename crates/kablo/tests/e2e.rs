@@ -94,6 +94,25 @@ impl Server {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// The process of the container whose command line has `needle`, if one.
+    fn pid_of(&self, needle: &str) -> Option<u32> {
+        self.exec("pgrep", &["-f", needle])
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// The parent of a process of the container.
+    fn parent_of(&self, pid: u32) -> Option<u32> {
+        let stat = self.exec("cat", &[&format!("/proc/{pid}/stat")]);
+        // After the name, which is in parentheses and may hold anything: the
+        // state, then the parent.
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().nth(1)?.parse().ok()
+    }
+
     /// How many processes of the container have a command line with `needle`.
     fn count(&self, needle: &str) -> usize {
         self.exec("pgrep", &["-f", needle]).lines().count()
@@ -344,6 +363,14 @@ fn the_server_side_is_upgraded_while_the_ssh_connection_carries_on() {
     for id in &ids {
         bridge.wait_for(id, "line10\r\n");
     }
+    let wardens: Vec<u32> = ids
+        .iter()
+        .map(|id| {
+            server
+                .pid_of(&format!("kablo warden --id {id}"))
+                .expect("a warden")
+        })
+        .collect();
 
     // A newer kablo is put on the server (a copy of the installed one, which
     // is what matters: another file, run by another path) and the sessions are
@@ -365,9 +392,31 @@ fn the_server_side_is_upgraded_while_the_ssh_connection_carries_on() {
         String::from_utf8_lossy(&said.stderr)
     );
     for id in &ids {
+        assert!(stdout.contains(&format!("{id}: replaced (now")), "{stdout}");
+    }
+
+    // Each warden renews itself while the lines are still coming, as the same
+    // process: its pid stays, the shell is still its child, and the program it
+    // runs is the new binary.
+    for (n, id) in ids.iter().enumerate() {
+        let wanted = format!("{home}/kablo warden --id {id}");
+        let start = Instant::now();
+        while server.count(&wanted) != 1 {
+            assert!(
+                start.elapsed() < PATIENCE,
+                "{id}: its warden never ran the new binary"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(server.pid_of(&wanted), wardens.get(n).copied(), "{id}");
+        assert_eq!(server.parent_of(shells[n]), wardens.get(n).copied(), "{id}");
+    }
+    bridge.pump(Duration::from_millis(50));
+    for id in &ids {
+        let text = String::from_utf8_lossy(&bridge.seen(id).data).into_owned();
         assert!(
-            stdout.contains(&format!("{id}: relay replaced")),
-            "{stdout}"
+            !text.contains("line299"),
+            "{id}: the lines were over before the warden renewed"
         );
     }
 

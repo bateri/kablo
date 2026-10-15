@@ -1,16 +1,17 @@
 //! The wire between a session's warden and its relay.
 //!
-//! The warden is the shell's parent and never changes while the shell lives;
-//! the relay is replaced by upgrades. They talk over a socket pair the warden
+//! The warden is the shell's parent and stays the same process while the shell
+//! lives, its program changing only when an upgrade renews it; the relay is
+//! replaced by upgrades. They talk over a socket pair the warden
 //! makes, in frames of the same shape as the public wire ([`kablo_proto::frame`])
 //! but with a signature, version range and message set of their own. A relay
 //! that is newer than its warden must still make itself understood, so this
 //! wire follows the same rule as the public one: a build reads the current
 //! version and the one before it, and the fixtures of every version stay.
 //!
-//! The relay opens the handshake and the warden, the frozen end, selects the
-//! version. Messages travel in frames on the session channel with no session
-//! id; every payload is empty or a [`kablo_proto::tlv`] block. One message
+//! The relay opens the handshake and the warden, the end that may be the older
+//! one, selects the version. Messages travel in frames on the session channel
+//! with no session id; every payload is empty or a [`kablo_proto::tlv`] block. One message
 //! carries file descriptors: [`ToRelay::Adopt`] is sent with exactly
 //! [`ADOPT_DESCRIPTORS`] descriptors in the ancillary data of the frame's
 //! first byte, in this order: the terminal's master side, the journal's
@@ -146,6 +147,12 @@ impl<M: Wire> Decoder<M> {
     /// The next message, or `None` when more bytes are needed.
     pub fn next_message(&mut self) -> Result<Option<M>> {
         self.frames.next_with(M::from_frame)
+    }
+
+    /// How many bytes have arrived that are not a message yet: a part of a
+    /// frame, which is lost with the decoder.
+    pub fn pending(&self) -> usize {
+        self.frames.pending()
     }
 }
 

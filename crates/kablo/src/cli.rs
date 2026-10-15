@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -46,7 +47,7 @@ kablo upgrade (--all | ID) PATH
 pub fn version_line() -> String {
     format!(
         "version={} wire_min={} wire_max={} inner_min={} inner_max={}",
-        env!("CARGO_PKG_VERSION"),
+        crate::release(),
         kablo_proto::MIN_VERSION,
         kablo_proto::MAX_VERSION,
         inner::MIN_VERSION,
@@ -72,14 +73,22 @@ where
             // first starts the second. Not for people.
             Some("warden") => {
                 return match internal(rest) {
-                    Ok((id, Some(dir))) => warden::run(id, &dir),
-                    Ok((_, None)) => usage_error(err, "warden needs --dir"),
+                    // A warden that renewed itself: the session is already up.
+                    Ok(Internal {
+                        id,
+                        resume: Some(record),
+                        ..
+                    }) => warden::resume(id, record),
+                    Ok(Internal {
+                        id, dir: Some(dir), ..
+                    }) => warden::run(id, &dir),
+                    Ok(_) => usage_error(err, "warden needs --dir"),
                     Err(why) => usage_error(err, why),
                 };
             }
             Some("relay") => {
                 return match internal(rest) {
-                    Ok((id, _)) => relay::run(id),
+                    Ok(Internal { id, .. }) => relay::run(id),
                     Err(why) => usage_error(err, why),
                 };
             }
@@ -110,11 +119,21 @@ fn usage_error(err: &mut dyn Write, why: &str) -> u8 {
     EXIT_USAGE
 }
 
-/// The arguments of `kablo warden` and `kablo relay`: `--id ID` and, for the
-/// warden, `--dir DIR`.
-fn internal(args: &[OsString]) -> Result<(SessionId, Option<PathBuf>), &'static str> {
+/// The arguments of `kablo warden` and `kablo relay`.
+#[derive(Debug, PartialEq, Eq)]
+struct Internal {
+    id: SessionId,
+    /// The socket directory, for the warden.
+    dir: Option<PathBuf>,
+    /// The descriptor a renewed warden finds its record on.
+    resume: Option<RawFd>,
+}
+
+/// Reads `--id ID` and, for the warden, `--dir DIR` and `--resume FD`.
+fn internal(args: &[OsString]) -> Result<Internal, &'static str> {
     let mut id = None;
     let mut dir = None;
+    let mut resume = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match (flag.to_str(), it.next()) {
@@ -122,10 +141,18 @@ fn internal(args: &[OsString]) -> Result<(SessionId, Option<PathBuf>), &'static 
                 id = value.to_str().and_then(|v| SessionId::new(v).ok());
             }
             (Some("--dir"), Some(value)) => dir = Some(PathBuf::from(value)),
+            (Some("--resume"), Some(value)) => {
+                resume = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--resume needs a descriptor number")?,
+                );
+            }
             _ => return Err("unknown argument"),
         }
     }
-    id.map(|id| (id, dir))
+    id.map(|id| Internal { id, dir, resume })
         .ok_or("--id is missing or not a session id")
 }
 
@@ -418,6 +445,27 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_renewed_wardens_command_line_names_the_descriptor_of_its_record() {
+        let words = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let renewed = internal(&words(&[
+            "--id", "work", "--dir", "/tmp/d", "--resume", "9",
+        ]))
+        .unwrap();
+        assert_eq!(renewed.id.as_str(), "work");
+        assert_eq!(renewed.dir, Some(PathBuf::from("/tmp/d")));
+        assert_eq!(renewed.resume, Some(9));
+        let first = internal(&words(&["--id", "work", "--dir", "/tmp/d"])).unwrap();
+        assert_eq!(first.resume, None);
+        for wrong in [
+            &["--id", "work", "--resume", "nine"][..],
+            &["--id", "work", "--resume"],
+            &["--resume", "9"],
+        ] {
+            assert!(internal(&words(wrong)).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]
