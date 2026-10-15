@@ -27,8 +27,8 @@ commands:
             programs (`ssh host kablo attach`), not for people
   forward   carry connections to local ports to ports the server reaches, as
             `ssh -L` does, over a command that runs `kablo attach` there
-  upgrade   run a session's relay from another kablo binary, without ending
-            the session or dropping the clients
+  upgrade   run a session's relay and warden from another kablo binary,
+            without ending the session or dropping the clients
   version   print the version and the protocol versions this build speaks
   help      print this text
 

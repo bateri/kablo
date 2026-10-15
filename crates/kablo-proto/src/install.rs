@@ -34,7 +34,8 @@ use crate::{Error, Result};
 pub const UNAME_COMMAND: &str = "uname -s -m";
 
 /// The file name of the checksums of a release: one `<sha256>  <name>` line per
-/// binary, as `sha256sum` writes and checks it.
+/// file of the release (the binaries and the license files), as `sha256sum`
+/// writes and checks it.
 pub const CHECKSUMS: &str = "SHA256SUMS";
 
 /// The directory, relative to the user's home, that holds one directory per

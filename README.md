@@ -20,28 +20,59 @@ remotely over a plain `ssh host kablo attach` — and needs nothing from the
 server beyond a login and the ability to run one command. It also works on
 its own, the way `dtach` does (below).
 
-Status: early development, not yet released. Linux (x86_64, aarch64) and macOS
-(Apple silicon, Intel).
+Status: early; [0.1.0](CHANGELOG.md) is the first release. Linux (x86_64,
+aarch64) and macOS (Apple silicon, Intel).
 
 ## Install
 
-There is no release yet. Build it from source, with Rust 1.88 or newer:
+Download the binary for your machine from the
+[latest release](https://github.com/bateri/kablo/releases/latest). Its name
+ends in the target: `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`
+(static, for any Linux distribution), `aarch64-apple-darwin` (Apple silicon)
+or `x86_64-apple-darwin` (Intel).
+
+```sh
+v=0.1.0                        # the version of the release you download
+t=x86_64-unknown-linux-musl    # your machine's target, from the list above
+curl -fLO https://github.com/bateri/kablo/releases/download/v$v/kablo-$v-$t
+curl -fLO https://github.com/bateri/kablo/releases/download/v$v/SHA256SUMS
+grep -F " kablo-$v-$t" SHA256SUMS | sha256sum -c -    # on a Mac: ... | shasum -a 256 -c -
+chmod +x kablo-$v-$t
+mkdir -p ~/.local/bin && mv kablo-$v-$t ~/.local/bin/kablo
+```
+
+`SHA256SUMS` lists every file of the release, and the `grep` picks the line of
+the one you downloaded. The release also carries this project's `LICENSE`
+and `THIRD-PARTY-LICENSES.txt`, the notice for the code inside the binary that
+asks to travel with copies of it.
+
+**The macOS binaries are not signed or notarized.** A file `curl` fetched runs
+as it is. One a browser saved carries macOS's quarantine mark, and Gatekeeper
+refuses to run it until you remove the mark:
+
+```sh
+xattr -d com.apple.quarantine kablo-0.1.0-aarch64-apple-darwin
+```
+
+To build it from source instead, with Rust 1.88 or newer:
 
 ```sh
 cargo build --release          # target/release/kablo
 ```
 
-`make dist` builds what a release will ship: `dist/kablo-<version>-<target>`
-for the four targets, and a `SHA256SUMS` next to them. It needs a Mac with
-Docker (the Linux binaries are static musl builds, made and tried in a
-container of their own architecture), a local `rustc` of the version named in
+`make dist` builds the files a release ships: `dist/kablo-<version>-<target>`
+for the four targets, with `LICENSE`, `THIRD-PARTY-LICENSES.txt` and the
+`SHA256SUMS` over all of them. It needs a Mac with Docker (the Linux binaries
+are static musl builds, made and tried in a container of their own
+architecture), a local `rustc` of the version named in
 `tools/linux/Dockerfile` (as for `make linux`), and rustup with both Apple
 targets installed in its `stable` toolchain (`rustup target add
 aarch64-apple-darwin x86_64-apple-darwin --toolchain stable`; Homebrew's Rust
 cannot add them). The macOS binaries are built by that toolchain, the Linux
-ones by the compiler in the image. Check what you downloaded with
-`shasum -a 256 --ignore-missing -c SHA256SUMS` (`sha256sum --ignore-missing -c`
-on Linux), which skips the binaries you did not download.
+ones by the compiler in the image. `make release` runs every gate and then
+`make dist` into `target/release-<version>/`, and `make ship` publishes the
+result as a GitHub release; a version is released only if `CHANGELOG.md` has
+a section for it.
 
 The binary is one file. Put it where your shell finds it, on a server too. The
 program a terminal app runs over ssh is `kablo attach`, and ssh runs it in a

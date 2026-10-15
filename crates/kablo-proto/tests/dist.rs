@@ -88,3 +88,62 @@ fn dist_ships_the_licenses_and_the_notice_is_whole() {
         assert!(notice.contains(needed), "the notice lacks '{needed}'");
     }
 }
+
+/// The script that writes the notice asks cargo about each target's graph, so
+/// it names the targets itself (a script cannot read a Makefile variable
+/// without a second way of passing it). The two lists are one list.
+#[test]
+fn the_notice_is_made_for_the_targets_dist_builds() {
+    let makefile = std::fs::read_to_string(MAKEFILE).unwrap();
+    let root = std::path::Path::new(MAKEFILE).parent().unwrap();
+    let mut built: Vec<String> = Vec::new();
+    for name in ["DIST_LINUX_TARGETS", "DIST_MACOS_TARGETS"] {
+        built.extend(
+            variable(&makefile, name)
+                .split_whitespace()
+                .map(str::to_owned),
+        );
+    }
+
+    let script = std::fs::read_to_string(root.join("tools/third_party_notices.py")).unwrap();
+    let list = script
+        .split("TARGETS = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the script has no TARGETS list");
+    let named: Vec<String> = list
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(named, built);
+}
+
+/// The notice carries musl's own COPYRIGHT, the file of the musl release the
+/// Rust toolchain links into the Linux binaries. A new toolchain may link
+/// another one, so moving the build image to another Rust version has to come
+/// with a look at that file (the script's header says where to look).
+#[test]
+fn the_musl_copyright_is_of_the_toolchain_the_image_carries() {
+    let root = std::path::Path::new(MAKEFILE).parent().unwrap();
+    let dockerfile = std::fs::read_to_string(root.join("tools/linux/Dockerfile")).unwrap();
+    let image = dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("FROM rust:"))
+        .and_then(|rest| rest.split('-').next())
+        .expect("the Dockerfile has no FROM rust:<version> line");
+
+    let script = std::fs::read_to_string(root.join("tools/third_party_notices.py")).unwrap();
+    let noted = script
+        .lines()
+        .find_map(|line| line.strip_prefix("MUSL_FOR_RUST = \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("the script has no MUSL_FOR_RUST");
+    assert_eq!(
+        noted, image,
+        "the build image moved to Rust {image}: check that tools/licenses/musl-COPYRIGHT is still \
+         the file of the musl that toolchain links (see the header of tools/third_party_notices.py), \
+         then set MUSL_FOR_RUST there"
+    );
+}

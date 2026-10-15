@@ -48,6 +48,10 @@ TARGETS = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
 ]
+# The Rust version of the Linux build image whose musl `licenses/musl-COPYRIGHT`
+# is (a test holds it to the image's FROM line, so that moving the toolchain
+# forces the file to be looked at).
+MUSL_FOR_RUST = "1.88"
 ROOT = "kablo"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Licenses without an MIT option that are accepted, each a recorded decision
