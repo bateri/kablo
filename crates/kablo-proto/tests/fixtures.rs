@@ -74,6 +74,7 @@ fn running_work() -> Status {
         retained_from: 100,
         exit: None,
         version: "0.1.0".into(),
+        warden_version: String::new(),
     }
 }
 
@@ -249,6 +250,22 @@ fn messages() -> Vec<(&'static str, Packet)> {
             ))),
         ),
         ("status_reply", work(Message::StatusReply(running_work()))),
+        (
+            "status_reply_warden",
+            work(Message::StatusReply(Status {
+                pid: 4242,
+                size: Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                offset: 5000,
+                version: "0.2.0".into(),
+                warden_version: "0.1.0".into(),
+                ..Status::new(id("work"))
+            })),
+        ),
         (
             "status_reply_ended",
             work(Message::StatusReply(Status {
@@ -793,6 +810,32 @@ fn a_status_with_only_an_id_reads_as_zeros() {
     let status = Status::from_block(&block).unwrap();
     assert_eq!(status, Status::new(id("a")));
     assert!(Status::from_block(&[]).is_err());
+}
+
+#[test]
+fn a_status_from_before_the_warden_said_its_version_reads_it_as_unknown() {
+    // The recorded `status_reply` has the relay's version (key 11) and nothing of the
+    // warden's (key 12); a status with no warden version writes none.
+    let Some(Message::StatusReply(old)) = read_packet(&mut fixture("status_reply").as_slice())
+        .unwrap()
+        .map(|packet| packet.message)
+    else {
+        panic!("not a status reply");
+    };
+    assert_eq!(old.version, "0.1.0");
+    assert_eq!(old.warden_version, "");
+    let mut block = old.to_block();
+    assert!(!block.windows(2).any(|w| w == [0, 12]));
+    // The same block with the key appended reads with the warden's version.
+    let mut newer = Status {
+        warden_version: "0.3.0".into(),
+        ..old.clone()
+    };
+    block.extend_from_slice(&[0, 12, 0, 0, 0, 5]);
+    block.extend_from_slice(b"0.3.0");
+    assert_eq!(Status::from_block(&block).unwrap(), newer);
+    newer.warden_version.clear();
+    assert_eq!(Status::from_block(&newer.to_block()).unwrap(), old);
 }
 
 #[test]

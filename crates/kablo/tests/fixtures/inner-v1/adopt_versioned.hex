@@ -1,0 +1,14 @@
+# warden to relay: adopt "work" by a warden that says it is 0.1.0 (the 3 descriptors travel beside this frame)
+01              # kind 0x01: adopt
+00              # channel 0: terminal session
+00              # session id length 0
+00 00 00 1f     # payload length 31
+00 01           # tlv key 1
+00 00 00 04     #   length 4
+77 6f 72 6b     #   id "work"
+00 02           # tlv key 2
+00 00 00 04     #   length 4
+00 00 10 92     #   shell pid 4242
+00 04           # tlv key 4
+00 00 00 05     #   length 5
+30 2e 31 2e 30  #   warden version "0.1.0"

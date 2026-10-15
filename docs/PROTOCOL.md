@@ -173,6 +173,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 9 | u64 | `retained`: the oldest offset the journal still holds |
 | 10 | 5 bytes | `exit`: as in `ended`, present once the program has ended |
 | 11 | text | `version`: the version of the relay serving the session |
+| 12 | text | `warden_version`: the version of the warden that keeps the session; absent from a warden that did not say |
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
 A status takes in what the session's connections had sent by the time the

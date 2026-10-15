@@ -1,0 +1,11 @@
+# relay to warden: this binary reads renewal records of versions 1 to 2
+86           # kind 0x86: can renew
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 0e  # payload length 14
+00 01        # tlv key 1
+00 00 00 01  #   length 1
+01           #   lowest version 1
+00 02        # tlv key 2
+00 00 00 01  #   length 1
+02           #   highest version 2

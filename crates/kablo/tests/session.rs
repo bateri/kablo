@@ -299,6 +299,25 @@ fn a_program_that_is_not_there_is_an_error() {
 }
 
 #[test]
+fn status_and_the_listing_name_the_version_of_the_warden_as_well_as_the_relay() {
+    let mut env = Env::new();
+    let id = env.start("versions", &["--", "/bin/sleep", "600"]);
+    let status = env.connect(&id).status();
+    assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(status.warden_version, env!("CARGO_PKG_VERSION"));
+
+    let json = env.kablo().args(["list", "--json"]).output().unwrap();
+    let json = String::from_utf8_lossy(&json.stdout).into_owned();
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        json.contains(&format!(
+            "\"version\":\"{version}\",\"warden_version\":\"{version}\""
+        )),
+        "{json}"
+    );
+}
+
+#[test]
 fn status_names_the_foreground_program_its_directory_and_the_size() {
     let mut env = Env::new();
     let cwd = std::fs::canonicalize(&env.dir).unwrap();

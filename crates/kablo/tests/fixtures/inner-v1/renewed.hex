@@ -1,0 +1,8 @@
+# warden to relay: the warden replaced its program with 0.2.0
+06              # kind 0x06: renewed
+00              # channel 0: terminal session
+00              # session id length 0
+00 00 00 0b     # payload length 11
+00 01           # tlv key 1
+00 00 00 05     #   length 5
+30 2e 32 2e 30  #   text "0.2.0"

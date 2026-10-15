@@ -39,7 +39,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
@@ -66,6 +66,9 @@ pub const RELAY_YOUTH: Duration = Duration::from_secs(10);
 /// terminal, before it is killed: neither an upgrade nor the end of a session
 /// waits for one that is stuck.
 pub const QUIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The version of this build, which the relays are told.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The most program bytes one read of the terminal takes.
 const READ_CHUNK: u64 = 64 * 1024;
@@ -186,7 +189,7 @@ struct RelayLink {
     /// Which relay this is, for the life of the warden: the places a relay is
     /// kept change when it takes over, the number does not.
     serial: u64,
-    child: Child,
+    child: sys::Proc,
     chan: UnixStream,
     stage: Stage,
     /// Bytes received before the handshake is complete.
@@ -227,7 +230,7 @@ struct Warden {
     master: OwnedFd,
     journal: Journal,
     listener: UnixListener,
-    child: Child,
+    child: sys::Proc,
     /// Readable when the shell exits; gone once the exit is collected.
     watch: Option<OwnedFd>,
     exit: Option<Exit>,
@@ -271,6 +274,7 @@ impl Warden {
         };
         let pty = pty::open(size).map_err(|e| format!("cannot open a terminal: {e}"))?;
         let mut child = pty::spawn(&pty.slave, request)
+            .and_then(sys::Proc::new)
             .map_err(|e| format!("cannot start the program: {e}"))?;
         let pty::Pty { master, slave } = pty;
         // Our copy of the slave must go: while it is open the master never
@@ -537,14 +541,16 @@ impl Warden {
     fn spawn_relay(&mut self, exe: &Path) -> io::Result<RelayLink> {
         let (ours, theirs) = UnixStream::pair()?;
         ours.set_nonblocking(true)?;
-        let child = Command::new(exe)
-            .arg("relay")
-            .arg("--id")
-            .arg(self.id.as_str())
-            .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let child = sys::Proc::new(
+            Command::new(exe)
+                .arg("relay")
+                .arg("--id")
+                .arg(self.id.as_str())
+                .stdin(Stdio::from(OwnedFd::from(theirs)))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        )?;
         self.serials = self.serials.wrapping_add(1);
         Ok(RelayLink {
             serial: self.serials,
@@ -647,6 +653,7 @@ impl Warden {
             id: self.id.clone(),
             child_pid: self.child.id(),
             exit: self.exit,
+            warden_version: Some(VERSION.to_owned()),
         });
         let fds = [
             self.master.as_raw_fd(),
@@ -705,6 +712,9 @@ impl Warden {
                     self.upgrade(&path);
                 }
             }
+            // What a relay's binary reads is for a warden that renews itself;
+            // this one does not act on it yet.
+            ToWarden::CanRenew { .. } => {}
         }
     }
 

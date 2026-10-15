@@ -168,6 +168,8 @@ pub fn json(statuses: &[Status]) -> String {
         }
         out.push_str(",\"version\":");
         json_string(&mut out, status.version.as_bytes());
+        out.push_str(",\"warden_version\":");
+        json_string(&mut out, status.warden_version.as_bytes());
         out.push('}');
     }
     out.push_str(if statuses.is_empty() { "]\n" } else { "\n]\n" });
@@ -193,6 +195,7 @@ mod tests {
         };
         status.clients = 1;
         status.version = "0.1.0".to_owned();
+        status.warden_version = "0.1.0".to_owned();
         status
     }
 
@@ -254,6 +257,14 @@ mod tests {
         assert!(text.contains("\"directory\":null"), "{text}");
         assert!(text.contains("\"exit\":{\"signal\":9}"), "{text}");
         assert!(text.contains("\"exit\":null"), "{text}");
+        assert!(
+            text.contains("\"version\":\"0.1.0\",\"warden_version\":\"0.1.0\"}"),
+            "{text}"
+        );
+        // A warden that did not say its version is an empty string, as the relay's is.
+        let mut unsaid = status("c");
+        unsaid.warden_version.clear();
+        assert!(json(&[unsaid]).contains("\"warden_version\":\"\"}"));
         assert!(text.ends_with("}\n]\n"), "{text}");
         assert_eq!(text.matches("{\"id\"").count(), 2);
     }

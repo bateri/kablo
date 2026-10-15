@@ -187,6 +187,9 @@ struct Relay {
     listener: UnixListener,
     child_pid: u32,
     exit: Option<Exit>,
+    /// The version of the warden that keeps the session; empty if it did not
+    /// say.
+    warden_version: String,
     /// This relay is the one that serves (it was told `Go`): it accepts
     /// clients. Until then the listening socket is left to its other holders.
     live: bool,
@@ -292,6 +295,16 @@ impl Relay {
         let screen_at = replay_start(&journal, REPLAY_LIMIT);
         inner::write(&mut &chan, &ToWarden::Ready)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+        // Which of its records this binary reads: what a warden that renews
+        // itself needs to know before it does.
+        inner::write(
+            &mut &chan,
+            &ToWarden::CanRenew {
+                min: inner::RENEWAL_MIN_VERSION,
+                max: inner::RENEWAL_VERSION,
+            },
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
         chan.set_nonblocking(true)?;
         let mut relay = Relay {
             id: adopt.id,
@@ -304,6 +317,7 @@ impl Relay {
             listener,
             child_pid: adopt.child_pid,
             exit: adopt.exit,
+            warden_version: adopt.warden_version.unwrap_or_default(),
             live: false,
             reading: false,
             master_done: false,
@@ -479,6 +493,7 @@ impl Relay {
                 }
             }
             ToRelay::UpgradeFailed(why) => self.upgrade_failed(&why),
+            ToRelay::Renewed(version) => self.warden_version = version,
             ToRelay::Adopt(_) => {}
         }
     }
@@ -1113,6 +1128,7 @@ impl Relay {
         status.retained_from = self.journal.retained_from();
         status.exit = self.exit;
         status.version = env!("CARGO_PKG_VERSION").to_owned();
+        status.warden_version.clone_from(&self.warden_version);
         status
     }
 
@@ -1301,6 +1317,7 @@ mod tests {
             listener,
             child_pid: 1,
             exit: None,
+            warden_version: String::new(),
             live: false,
             reading: false,
             master_done: false,

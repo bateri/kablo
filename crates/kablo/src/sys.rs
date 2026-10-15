@@ -8,6 +8,8 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
 use kablo_proto::v1::Size;
@@ -352,6 +354,91 @@ pub fn kill_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// A child process, held by its number.
+///
+/// The warden keeps its shell and its relays like this instead of as
+/// [`std::process::Child`]: a number outlives the warden replacing its own
+/// program, a `Child` does not, and the new image takes the processes up again
+/// by number ([`Proc::from_pid`]). It keeps what `Child` keeps, that the exit
+/// status is collected once and that nothing is signalled after: a number
+/// whose process was collected may belong to somebody else by then.
+#[derive(Debug)]
+pub struct Proc {
+    pid: libc::pid_t,
+    status: Option<ExitStatus>,
+}
+
+impl Proc {
+    /// Takes over a child `std` started. Dropping the `Child` neither signals
+    /// nor collects it, so from here the process is this one's to collect.
+    pub fn new(child: Child) -> io::Result<Proc> {
+        Proc::from_pid(child.id())
+    }
+
+    /// A child of this process that is known by its number only. The number
+    /// must be that of a child: this process collects it.
+    pub fn from_pid(pid: u32) -> io::Result<Proc> {
+        match libc::pid_t::try_from(pid) {
+            // 0 and negative numbers address groups, not a process.
+            Ok(pid) if pid > 0 => Ok(Proc { pid, status: None }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a process number",
+            )),
+        }
+    }
+
+    /// The process's number.
+    pub fn id(&self) -> u32 {
+        // Positive by construction.
+        u32::try_from(self.pid).unwrap_or_default()
+    }
+
+    /// Kills the process; one that is already gone, or was collected, is not
+    /// an error.
+    pub fn kill(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        kill(self.pid, libc::SIGKILL)
+    }
+
+    /// Waits for the process to end and collects it. Once collected, the
+    /// same status comes back.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.collect(0)?
+            .ok_or_else(|| io::Error::other("a blocking wait returned without a status"))
+    }
+
+    /// Collects the process if it has ended; `None` if it still runs.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.collect(libc::WNOHANG)
+    }
+
+    fn collect(&mut self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        loop {
+            let mut raw: libc::c_int = 0;
+            // SAFETY: `raw` is a local that lives through the call.
+            let got = unsafe { libc::waitpid(self.pid, &raw mut raw, flags) };
+            if got == self.pid {
+                let status = ExitStatus::from_raw(raw);
+                self.status = Some(status);
+                return Ok(Some(status));
+            }
+            if got == 0 {
+                return Ok(None);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// A descriptor that becomes readable when the process `pid` (a child of this
 /// one) exits. Nothing reads it: it stays readable, so a `poll` set holds it
 /// until the exit has been collected. No signal handler is involved.
@@ -547,6 +634,54 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
+
+    fn shell(script: &str) -> Proc {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .spawn()
+            .unwrap();
+        Proc::new(child).unwrap()
+    }
+
+    #[test]
+    fn a_process_held_by_its_number_is_collected_once() {
+        let mut proc = shell("exit 7");
+        let pid = proc.id();
+        let status = proc.wait().unwrap();
+        assert_eq!(status.code(), Some(7));
+        // The status stays; nothing is signalled to a number that may be
+        // somebody else's by now, and the number is still the same.
+        assert_eq!(proc.wait().unwrap(), status);
+        assert_eq!(proc.try_wait().unwrap(), Some(status));
+        assert!(proc.kill().is_ok());
+        assert_eq!(proc.id(), pid);
+    }
+
+    #[test]
+    fn a_process_that_runs_is_killed_and_collected_by_its_number() {
+        let mut proc = shell("exec sleep 30");
+        assert_eq!(proc.try_wait().unwrap(), None);
+        proc.kill().unwrap();
+        let status = proc.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(proc.try_wait().unwrap(), Some(status));
+
+        // A child known by its number only (the way a renewed warden has
+        // its shell) is collected the same way.
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let mut again = Proc::from_pid(child.id()).unwrap();
+        drop(child);
+        assert_eq!(again.wait().unwrap().code(), Some(3));
+    }
+
+    #[test]
+    fn a_number_that_addresses_a_group_is_not_a_process() {
+        assert!(Proc::from_pid(0).is_err());
+        assert!(Proc::from_pid(u32::MAX).is_err());
+    }
 
     #[test]
     fn descriptors_cross_a_socket_with_their_first_byte() {

@@ -404,6 +404,9 @@ pub struct Status {
     pub exit: Option<Exit>,
     /// The version of the relay serving the session (empty if unknown).
     pub version: String,
+    /// The version of the warden that keeps the session (empty if it did not
+    /// say: a warden from before it did).
+    pub warden_version: String,
 }
 
 mod status_key {
@@ -418,6 +421,7 @@ mod status_key {
     pub const RETAINED_FROM: u16 = 9;
     pub const EXIT: u16 = 10;
     pub const VERSION: u16 = 11;
+    pub const WARDEN_VERSION: u16 = 12;
 }
 
 impl Status {
@@ -435,6 +439,7 @@ impl Status {
             retained_from: 0,
             exit: None,
             version: String::new(),
+            warden_version: String::new(),
         }
     }
 
@@ -461,6 +466,9 @@ impl Status {
         }
         if !self.version.is_empty() {
             w.put(status_key::VERSION, self.version.as_bytes());
+        }
+        if !self.warden_version.is_empty() {
+            w.put(status_key::WARDEN_VERSION, self.warden_version.as_bytes());
         }
         w.finish()
     }
@@ -493,6 +501,9 @@ impl Status {
                 }
                 status_key::EXIT => status.exit = Some(Exit::from_bytes(value)?),
                 status_key::VERSION => status.version = tlv::read_text(value, "status version")?,
+                status_key::WARDEN_VERSION => {
+                    status.warden_version = tlv::read_text(value, "status warden version")?
+                }
                 _ => {}
             }
         }

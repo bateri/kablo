@@ -1,0 +1,56 @@
+# warden to its next image: what it knew (shell 4242 on terminal 3, journal 4, socket 5, relay 4300 on channel 6)
+41                                                                 # kind 0x41: renewal
+00                                                                 # channel 0: terminal session
+00                                                                 # session id length 0
+00 00 00 d8                                                        # payload length 216
+00 01                                                              # tlv key 1
+00 00 00 01                                                        #   length 1
+01                                                                 #   record version 1
+00 02                                                              # tlv key 2
+00 00 00 04                                                        #   length 4
+77 6f 72 6b                                                        #   id "work"
+00 03                                                              # tlv key 3
+00 00 00 0f                                                        #   length 15
+2f 74 6d 70 2f 6b 61 62 6c 6f 2d 31 30 30 30                       #   socket directory "/tmp/kablo-1000"
+00 04                                                              # tlv key 4
+00 00 00 04                                                        #   length 4
+00 00 10 92                                                        #   shell pid 4242
+00 05                                                              # tlv key 5
+00 00 00 04                                                        #   length 4
+00 00 00 03                                                        #   terminal descriptor 3
+00 06                                                              # tlv key 6
+00 00 00 04                                                        #   length 4
+00 00 00 04                                                        #   journal descriptor 4
+00 07                                                              # tlv key 7
+00 00 00 04                                                        #   length 4
+00 00 00 05                                                        #   listening socket descriptor 5
+00 08                                                              # tlv key 8
+00 00 00 04                                                        #   length 4
+00 00 00 06                                                        #   relay channel descriptor 6
+00 09                                                              # tlv key 9
+00 00 00 04                                                        #   length 4
+00 00 10 cc                                                        #   relay pid 4300
+00 0a                                                              # tlv key 10
+00 00 00 08                                                        #   length 8
+00 00 00 00 00 00 00 02                                            #   relay number 2
+00 0b                                                              # tlv key 11
+00 00 00 16                                                        #   length 22
+2f 6f 70 74 2f 6b 61 62 6c 6f 2f 30 2e 32 2e 30 2f 6b 61 62 6c 6f  #   relay binary "/opt/kablo/0.2.0/kablo"
+00 0c                                                              # tlv key 12
+00 00 00 16                                                        #   length 22
+2f 6f 70 74 2f 6b 61 62 6c 6f 2f 30 2e 32 2e 30 2f 6b 61 62 6c 6f  #   binary relays are started from "/opt/kablo/0.2.0/kablo"
+00 0d                                                              # tlv key 13
+00 00 00 08                                                        #   length 8
+00 00 00 00 00 00 00 02                                            #   relays started 2
+00 0e                                                              # tlv key 14
+00 00 00 04                                                        #   length 4
+00 00 00 01                                                        #   strikes 1
+00 0f                                                              # tlv key 15
+00 00 00 01                                                        #   length 1
+01                                                                 #   a relay has been ready: yes
+00 10                                                              # tlv key 16
+00 00 00 04                                                        #   length 4
+00 01 00 00                                                        #   read chunk 65536
+00 11                                                              # tlv key 17
+00 00 00 01                                                        #   length 1
+00                                                                 #   shell's end delivered: no
