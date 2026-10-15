@@ -3,7 +3,7 @@ CARGO ?= cargo
 # Prerequisite order is only guaranteed under serial make; under -j the promise
 # "cheapest gate first" breaks.
 .NOTPARALLEL:
-.PHONY: check fmt clippy test linux e2e dist
+.PHONY: check fmt clippy test linux e2e dist notices notices-check
 
 # Definition of done. Homebrew rustc is not pinned (there is deliberately no
 # rust-toolchain.toml): the version is printed first so a clippy failure that
@@ -91,8 +91,26 @@ e2e:
 		set -e; cargo build --release --locked -p kablo --target "$$(uname -m)-unknown-linux-musl"'
 	tests/e2e/run.sh "$(CURDIR)/target/linux/$$(docker run --rm $(LINUX_IMAGE) uname -m)-unknown-linux-musl/release/kablo"
 
+# The notice for the third-party code in the binaries (MIT and Apache-2.0 ask
+# for it to travel with copies): generated from the product graph of the four
+# targets, kept in the repository, shipped next to the binaries. `make notices`
+# rewrites it, and `make dist` refuses to run when it is out of date — a new or
+# upgraded dependency, or a different license on one, shows up there first.
+NOTICES = THIRD-PARTY-LICENSES.txt
+NOTICES_TOOL = tools/third_party_notices.py
+
+notices:
+	@python3 -I $(NOTICES_TOOL) >$(NOTICES).partial || { rm -f $(NOTICES).partial; exit 1; }
+	@mv $(NOTICES).partial $(NOTICES)
+	@echo "$(NOTICES) written"
+
+notices-check:
+	@t=$$(mktemp) && trap 'rm -f "$$t"' EXIT && python3 -I $(NOTICES_TOOL) >"$$t" || exit 1; \
+	cmp -s "$$t" $(NOTICES) || { echo "notices: $(NOTICES) is out of date (the product graph or the tool changed); run: make notices"; exit 1; }
+
 # The binaries a release ships: dist/kablo-<version>-<target> for the four
-# targets, and SHA256SUMS next to them (tools/dist.sh is the how). The targets
+# targets, the licenses next to them (the project's own and the notice above),
+# and SHA256SUMS over all of them (tools/dist.sh is the how). The targets
 # and the names are the ones `kablo_proto::install` gives clients, and a test
 # reads these lines to prove it. The Linux ones are static musl builds made
 # and opened in a container of their own architecture (the one that is not the
@@ -107,12 +125,13 @@ DIST_LINUX_TARGETS = x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 DIST_MACOS_TARGETS = aarch64-apple-darwin x86_64-apple-darwin
 DIST_NAME = kablo-$(DIST_VERSION)-%
 DIST_SUMS = SHA256SUMS
+DIST_LICENSES = LICENSE $(NOTICES)
 DIST_TOOLCHAIN ?= stable
 
-dist:
+dist: notices-check
 	@$(call match_rust,dist)
 	@$(call need_docker,dist)
 	DIST_VERSION="$(DIST_VERSION)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
 		DIST_IMAGE="$(LINUX_IMAGE)" DIST_DOCKERFILE="$(LINUX_DOCKERFILE)" \
 		DIST_TOOLCHAIN="$(DIST_TOOLCHAIN)" DIST_LINUX_TARGETS="$(DIST_LINUX_TARGETS)" \
-		DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" tools/dist.sh
+		DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" DIST_LICENSES="$(DIST_LICENSES)" tools/dist.sh

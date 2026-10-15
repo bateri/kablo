@@ -5,12 +5,14 @@
 # dist/ is rebuilt from nothing and SHA256SUMS is written last, only when all
 # the binaries are there and each has been looked at, and run where this
 # machine can run it: a dist/ without SHA256SUMS is a build that did not
-# finish, and a stale binary can never pass for a new one.
+# finish, and a stale binary can never pass for a new one. The licenses go in
+# next to the binaries and are summed with them, so what a release carries
+# is exactly what SHA256SUMS lists.
 set -eu
 
 : "${DIST_VERSION:?}" "${DIST_NAME:?}" "${DIST_SUMS:?}" "${DIST_IMAGE:?}" \
     "${DIST_DOCKERFILE:?}" "${DIST_TOOLCHAIN:?}" \
-    "${DIST_LINUX_TARGETS:?}" "${DIST_MACOS_TARGETS:?}"
+    "${DIST_LINUX_TARGETS:?}" "${DIST_MACOS_TARGETS:?}" "${DIST_LICENSES:?}"
 
 fail() {
     echo "dist: $*" >&2
@@ -46,8 +48,14 @@ for target in $DIST_MACOS_TARGETS; do
         fail "the '$DIST_TOOLCHAIN' toolchain has no standard library for $target; run: rustup target add $target --toolchain $DIST_TOOLCHAIN"
 done
 
+for file in $DIST_LICENSES; do
+    [ -s "$file" ] || fail "$file is missing or empty (it ships in dist/)"
+done
+
 rm -rf dist
 mkdir dist
+# shellcheck disable=SC2086 # the names are words on purpose
+cp $DIST_LICENSES dist/
 
 # Linux: a static musl binary, built and then opened in a container of its own
 # architecture. The other architecture than the machine's runs emulated, which
@@ -126,6 +134,7 @@ names=""
 for target in $DIST_LINUX_TARGETS $DIST_MACOS_TARGETS; do
     names="$names $(name_of "$target")"
 done
+names="$names $DIST_LICENSES"
 (
     cd dist
     # Written under another name and renamed once it checks out, so that a
@@ -135,4 +144,4 @@ done
     $sum -c "$DIST_SUMS.partial"
     mv "$DIST_SUMS.partial" "$DIST_SUMS"
 )
-echo "==> dist/ holds $(wc -l <"dist/$DIST_SUMS" | tr -d ' ') binaries and $DIST_SUMS"
+echo "==> dist/ holds $(wc -l <"dist/$DIST_SUMS" | tr -d ' ') files, all in $DIST_SUMS"

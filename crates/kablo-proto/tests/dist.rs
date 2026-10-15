@@ -56,3 +56,35 @@ fn dist_names_a_binary_as_the_release_does() {
     }
     assert_eq!(variable(&makefile, "DIST_SUMS"), install::CHECKSUMS);
 }
+
+/// The licenses a release carries next to the binaries are files of the
+/// repository, and the notice in it is the whole one: the Apache text of the
+/// one crate with no MIT option, and musl's own COPYRIGHT for the static
+/// Linux binaries. (That it is *current* is `make dist`'s check: it needs
+/// cargo's graph, a test would only read the file it was handed.)
+#[test]
+fn dist_ships_the_licenses_and_the_notice_is_whole() {
+    let makefile = std::fs::read_to_string(MAKEFILE).unwrap();
+    let root = std::path::Path::new(MAKEFILE).parent().unwrap();
+    let notices = variable(&makefile, "NOTICES");
+    let shipped: Vec<String> = variable(&makefile, "DIST_LICENSES")
+        .split_whitespace()
+        .map(|name| name.replace("$(NOTICES)", notices))
+        .collect();
+    assert_eq!(shipped, ["LICENSE", notices]);
+    for name in &shipped {
+        let text = std::fs::read_to_string(root.join(name)).unwrap();
+        assert!(!text.trim().is_empty(), "{name} is empty");
+    }
+
+    let notice = std::fs::read_to_string(root.join(notices)).unwrap();
+    for needed in [
+        "alacritty_terminal",
+        "Apache License",
+        "Version 2.0, January 2004",
+        "Copyright (c) The Rust Project Contributors",
+        "musl as a whole is licensed under the following standard MIT license",
+    ] {
+        assert!(notice.contains(needed), "the notice lacks '{needed}'");
+    }
+}
