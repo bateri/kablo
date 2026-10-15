@@ -603,10 +603,12 @@ it works where sshd's forwarding is off. One TCP connection is one **stream**.
   stream is therefore at most the window it gave, and the bridge never has to
   stop reading its client to make room for one stream's bytes. A window has to
   hold what is on its way while the credit for it comes back, or a transfer
-  waits a round trip for each window: kablo gives each stream an equal part of
-  32 MiB per connection, between 256 KiB and 2 MiB (ssh's own window for a
-  channel), so that one transfer is as fast as ssh's and a hundred keep the
-  memory of a hundred small windows. Everything else the bridge says (session output,
+  waits a round trip for each window; one larger than that only fills the
+  queues on the way, which everything else on the connection then waits
+  behind. kablo gives a stream twice what the link carries in a round trip,
+  measured from its own credit (the time it takes to come back as bytes, and
+  the rate they come at), at least 64 KiB and at most 2 MiB (ssh's own window
+  for a channel), within an equal part of 32 MiB per connection. Everything else the bridge says (session output,
   replies) goes in the same byte stream between the pieces of stream data, which
   is why `data` comes in pieces.
 - *Half and whole closes.* `eof` says that the sender sends no more `data` on

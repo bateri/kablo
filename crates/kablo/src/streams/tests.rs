@@ -428,10 +428,11 @@ fn an_open_that_connects_is_opened_and_one_that_does_not_is_failed() {
     let mut answers: Vec<(u32, &Message)> = out.iter().map(|p| (p.stream, &p.message)).collect();
     answers.sort_by_key(|(id, _)| *id);
     assert_eq!(answers.len(), 2);
-    // A connection with a stream or two gives each the largest window.
+    // A connection that has not measured the link yet starts a stream at the
+    // start.
     let opened = out
         .iter()
-        .filter(|p| matches!(p.message, Message::Opened { window } if window == WINDOW))
+        .filter(|p| matches!(p.message, Message::Opened { window } if window == tune::START))
         .count();
     let refused = failed(&out);
     assert_eq!(opened, 1);
@@ -1127,7 +1128,7 @@ fn a_program_says_its_piece_then_eof_then_how_it_ended_then_close() {
         p.about(1),
         [
             &Message::Opened {
-                window: Config::default().window
+                window: Config::default().start
             },
             &Message::Data(b"hello $HOME\n".to_vec()),
             &Message::Eof,
@@ -2179,7 +2180,7 @@ fn credit_never_takes_the_other_end_past_the_largest_window() {
     assert!(Config::default().window <= MAX_WINDOW);
     let mut p = Programs::new(Config::default());
     p.open(1, 1000, sink());
-    assert_eq!(given(&p.said), [WINDOW]);
+    assert_eq!(given(&p.said), [tune::START]);
     // Twice the window, sent as a client would: only into the window it has.
     let start = Instant::now();
     let mut sent = 0;
@@ -2201,4 +2202,37 @@ fn credit_never_takes_the_other_end_past_the_largest_window() {
     assert!(!credits(&p, 1).is_empty());
     p.send(1, Message::Eof);
     p.finish(1);
+}
+
+#[test]
+fn a_stream_starts_at_the_window_the_last_one_learned() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sink());
+    assert_eq!(p.server.learned, None);
+    // A window's worth and more, so that credit goes out and comes back as
+    // bytes: the link is measured.
+    let start = Instant::now();
+    let mut sent = 0;
+    while sent < 4 * tune::START as usize {
+        let room = p.server.streams.get(&1).unwrap().recv_window as usize;
+        if room >= MAX_DATA {
+            p.send(1, Message::Data(vec![b'x'; MAX_DATA]));
+            sent += MAX_DATA;
+        } else {
+            p.turn();
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the program stopped taking input"
+        );
+    }
+    let learned = p.server.learned.expect("the link was measured");
+    assert!(p.server.rtt.get().is_some());
+    assert_eq!(learned, p.server.streams.get(&1).unwrap().tuner.measured());
+    p.open(2, 1000, sink());
+    assert_eq!(given(&p.said), [tune::START, learned]);
+    for id in [1, 2] {
+        p.send(id, Message::Eof);
+        p.finish(id);
+    }
 }

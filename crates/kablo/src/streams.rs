@@ -26,17 +26,20 @@
 //! `credit` is not sent for every small `data`.
 //!
 //! **How large.** A window has to hold what is on its way while the credit for
-//! it comes back, or a transfer waits a round trip for every window: 256 KiB
-//! over a link of 65 ms is 4 MB/s whatever the link carries. The streams of a
-//! connection share [`Config::budget`]: each is given an equal part of it, at
-//! most [`Config::window`] and at least [`Config::least`], so that one transfer
-//! goes as fast as ssh lets it (whose own window is 2 MiB a channel) and a
-//! hundred keep the memory where a hundred small windows had it. The part is
-//! looked at whenever credit is due: a stream whose part grew (others ended) is
-//! given the difference with its credit, and one whose part shrank (others
-//! opened) is given less credit than it took until it is down to it. Credit
-//! is what keeps the window at its part: an end gives credit until what the
-//! other may still send and what it holds unwritten come to the part.
+//! it comes back, or a transfer waits a round trip for every window, and a
+//! window larger than that only fills the carrier's queues, which typing on
+//! the same connection then waits behind. So a stream's window is what the
+//! link needs, measured by this end from its own credit: how long it takes to
+//! come back as bytes, and the rate they come at ([`crate::tune`]; a new
+//! stream starts at what the last one learned, or [`Config::start`]). That is
+//! within a part of [`Config::budget`],
+//! which the streams of a connection share equally, at most [`Config::window`]
+//! (ssh's own window for a channel) and at least [`Config::least`], so that a
+//! hundred streams keep the memory of a hundred small windows. Both are looked
+//! at whenever credit is due: credit is what keeps the window where it should
+//! be, given until what the other end may still send and what this end holds
+//! unwritten come to it, more of it when the window grew and less when it
+//! shrank.
 //!
 //! **What is read when.** A socket is read only while the stream has window to
 //! send into and fewer than [`QUEUED_SOFT`] bytes of `data` frames wait for the
@@ -133,6 +136,7 @@ use crate::dial::{self, Refusal, Target};
 use crate::outbound::Frames;
 use crate::process::{self, COMMAND_KILL_WAIT, Pipes, Program};
 use crate::sys;
+use crate::tune::{self, Rtt, Tuner};
 
 /// Bytes of `data` frames that may wait for the wire before sockets are not
 /// read.
@@ -173,6 +177,9 @@ pub struct Config {
     pub budget: u32,
     /// The smallest window given to a stream, however many share the budget.
     pub least: u32,
+    /// The window a stream starts with before the connection has learned what
+    /// the link needs.
+    pub start: u32,
     /// The most streams open at once, the ones still connecting included.
     pub max_streams: usize,
     /// The most being connected at once.
@@ -191,6 +198,7 @@ impl Default for Config {
             window: WINDOW,
             budget: WINDOW_BUDGET,
             least: LEAST_WINDOW,
+            start: tune::START,
             max_streams: MAX_STREAMS as usize,
             max_connecting: MAX_CONNECTING as usize,
             connect_timeout: CONNECT_TIMEOUT,
@@ -424,8 +432,13 @@ struct Stream {
     send_window: u32,
     /// Bytes this end still lets the other end send. With what is held
     /// unwritten (`inbox`, `errors`) it is the window this stream has now;
-    /// credit brings that to the stream's part ([`Streams::part`]).
+    /// credit brings that to what the tuner says, within the stream's part
+    /// ([`Streams::part`]).
     recv_window: u32,
+    /// Bytes received in all.
+    received: u64,
+    /// How large this end's window should be.
+    tuner: Tuner,
     /// Bytes received and not yet written to the socket.
     inbox: VecDeque<u8>,
     /// Client end of a command: the program's errors received and not yet
@@ -458,6 +471,8 @@ impl Stream {
             opening,
             send_window,
             recv_window,
+            received: 0,
+            tuner: Tuner::new(recv_window),
             inbox: VecDeque::new(),
             errors: VecDeque::new(),
             exited: None,
@@ -639,6 +654,11 @@ pub struct Streams {
     dirty: BTreeSet<u32>,
     events: Vec<Event>,
     scratch: Vec<u8>,
+    /// The connection's round trip, as the streams' credit measures it.
+    rtt: Rtt,
+    /// The window the last stream to measure the link settled on: where the
+    /// next one starts.
+    learned: Option<u32>,
 }
 
 /// The least a quarter of `window` and one byte: how many written bytes are
@@ -676,6 +696,8 @@ impl Streams {
             dirty: BTreeSet::new(),
             events: Vec::new(),
             scratch: vec![0; MAX_DATA],
+            rtt: Rtt::new(),
+            learned: None,
         }
     }
 
@@ -698,10 +720,12 @@ impl Streams {
         (config.budget / sharing).clamp(least, config.window)
     }
 
-    /// The window a stream about to be added is given: the ones there are and
-    /// it share the budget.
-    fn new_part(&self) -> u32 {
-        self.part(self.len().saturating_add(1))
+    /// The window a stream about to be added starts with: what the link was
+    /// last found to need (or the start), within the part it has when the
+    /// ones there are and it share the budget.
+    fn first_window(&self) -> u32 {
+        let part = self.part(self.len().saturating_add(1));
+        self.learned.unwrap_or(self.config.start).min(part)
     }
 
     /// Whether there are no streams.
@@ -758,7 +782,7 @@ impl Streams {
             .last_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("out of stream numbers"))?;
-        let window = self.new_part();
+        let window = self.first_window();
         let packet = Packet::new(
             id,
             Message::Open {
@@ -797,7 +821,7 @@ impl Streams {
             .last_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("out of stream numbers"))?;
-        let window = self.new_part();
+        let window = self.first_window();
         let packet = Packet::new(id, Message::OpenCommand { window, command });
         // The writer refuses a command no server could run.
         packet
@@ -930,7 +954,7 @@ impl Streams {
                     stdout: Some(stdout),
                     stderr: Some(stderr),
                 };
-                let given = self.new_part();
+                let given = self.first_window();
                 self.streams
                     .insert(id, Stream::new(End::Program(run), window, given, false));
                 out.push(Packet::new(id, Message::Opened { window: given }));
@@ -952,7 +976,7 @@ impl Streams {
             Ok(socket) => match socket.set_nonblocking(true) {
                 Ok(()) => {
                     let _ = socket.set_nodelay(true);
-                    let given = self.new_part();
+                    let given = self.first_window();
                     self.streams.insert(
                         id,
                         Stream::new(End::Socket(socket), entry.window, given, false),
@@ -1076,6 +1100,7 @@ impl Streams {
 
     /// `data` or (`Channel::Err`) `stderr` arrived.
     fn data_in(&mut self, id: u32, bytes: Vec<u8>, channel: Channel, out: &mut Vec<Packet>) {
+        let part = self.part(self.len());
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
@@ -1094,6 +1119,11 @@ impl Streams {
         }
         let size = u32::try_from(size).unwrap_or(0);
         stream.recv_window -= size;
+        stream.received = stream.received.saturating_add(u64::from(size));
+        stream
+            .tuner
+            .received(stream.received, Instant::now(), &mut self.rtt, part);
+        self.learned = Some(stream.tuner.measured());
         if stream.write_dead || (channel == Channel::Err && stream.errors_dead) {
             // Nowhere to write it: it counts as taken, and since it is not
             // held, credit for it is due like for what was written.
@@ -1294,7 +1324,8 @@ impl Streams {
     /// errors are two inboxes, written to two descriptors.)
     fn drain(&mut self, id: u32, out: &mut Vec<Packet>) {
         let part = self.part(self.len());
-        let step = credit_step(part);
+        let now = Instant::now();
+        self.rtt.look(now);
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
@@ -1356,13 +1387,19 @@ impl Streams {
             return;
         }
         // What the other end may still send and what is held unwritten come
-        // to the stream's part: credit for what was taken (written or dropped)
-        // makes up the difference, more of it when the part grew and less when
-        // it shrank, and none until a quarter of the part is due.
-        let due = part
+        // to the window the stream should have: credit for what was taken
+        // (written or dropped) makes up the difference, more of it when the
+        // window grew and less when it shrank, and none until a quarter of the
+        // window is due. The credit is what times the link.
+        let window = stream.tuner.window(&self.rtt, part);
+        let due = window
             .saturating_sub(stream.held())
             .saturating_sub(stream.recv_window);
-        if due >= step {
+        if due >= credit_step(window) {
+            let limit = stream
+                .received
+                .saturating_add(u64::from(stream.recv_window));
+            stream.tuner.crediting(limit, now, &self.rtt);
             stream.recv_window = stream.recv_window.saturating_add(due);
             out.push(Packet::new(id, Message::Credit(due)));
         }

@@ -73,10 +73,13 @@ terminal app puts the windows on top.
   exec` is interrupted. Apps that speak the protocol get the same through an
   `open` that names a program, and learn whether a server can from `features`.
   An administrator's `/etc/kablo/no-forwarding` does not touch programs.
-- **Transfers as fast as over ssh itself.** A forwarded connection or a
-  program's input and output may have as much on its way as an ssh channel
-  does (2 MiB), so a server far away is not slower through kablo; when many
-  are open at once they share 32 MiB a connection.
+- **Transfers as fast as the link, and typing that does not wait behind
+  them.** A forwarded connection or a program's input and output may have up
+  to as much on its way as an ssh channel (2 MiB), so a server far away is not
+  slower through kablo; and no more than the link needs, which kablo measures
+  as the transfer goes, so a slow link is not filled with a queue that what
+  you type then waits behind: over a link of 1 MB/s, typing during a transfer
+  echoes in about a third of a second where a fixed 2 MiB made it two.
 - **Upgrades under running sessions.** `kablo upgrade ID /path/to/new/kablo`
   (or `--all`) replaces a session's relay and then its warden, the process
   that keeps the shell, in place: the shell keeps running and an attached

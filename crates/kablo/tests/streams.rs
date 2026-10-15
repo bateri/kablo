@@ -57,8 +57,8 @@ fn bytes_cross_in_order_both_ways_and_an_end_is_an_end_not_a_close() {
     let (id, window) = bridge
         .connect_stream("127.0.0.1", port, MAX_WINDOW)
         .unwrap();
-    // A stream of its own is given the largest window the bridge gives.
-    assert_eq!(window, engine::WINDOW);
+    // A bridge that has not measured the link yet starts a stream at the start.
+    assert_eq!(window, kablo::tune::START);
     bridge.stream_send(id, &request, 7_000);
     bridge.stream_eof(id);
     bridge.until("the answer and its end", |b| {
@@ -186,7 +186,7 @@ fn a_session_is_typed_into_and_answers_while_a_transfer_is_unfinished() {
     let (stream_id, window) = bridge
         .connect_stream("127.0.0.1", port, engine::WINDOW)
         .unwrap();
-    assert_eq!(window, engine::WINDOW);
+    assert_eq!(window, kablo::tune::START);
     bridge.until("the first of the transfer", |b| {
         b.flows[&stream_id].total > 0
     });

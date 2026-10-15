@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE, pattern};
 use kablo::streams::WINDOW;
+use kablo::tune;
 use kablo_proto::tlv;
 use kablo_proto::v1::Exit;
 use kablo_proto::v1::Message;
@@ -101,8 +102,8 @@ fn output_errors_and_the_end_come_apart_and_in_order() {
     let (said, window) = bridge
         .run_command(command(&["/bin/echo", "hello", "$HOME;", "*"]), MAX_WINDOW)
         .unwrap();
-    // The bridge gives a stream of its own the largest window it gives.
-    assert_eq!(window, WINDOW);
+    // A bridge that has not measured the link yet starts a stream at the start.
+    assert_eq!(window, tune::START);
     bridge.until("the end", |b| b.flows[&said].closed);
     let flow = &bridge.flows[&said];
     // The arguments were nobody's to read as a shell would.
