@@ -106,7 +106,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture) |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered) |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -117,7 +117,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x09 | `new` | optional | TLV block, below |
 | 0x0a | `ping` | no | any bytes |
 | 0x0b | `features` | no | (empty) |
-| 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated) |
+| 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated), then optionally `answered: u64` |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
 | 0x84 | `error` | optional | `code: u16`, then UTF-8 text |
@@ -127,6 +127,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x88 | `created` | yes | status TLV block |
 | 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
 | 0x8a | `features_reply` | no | TLV block, below |
+| 0x8b | `state` | yes | TLV block, below |
 
 The first six client messages (`attach`, `detach`, `resize`, `terminate`,
 `upgrade`, `status`) are the core a relay must always understand.
@@ -174,13 +175,49 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 10 | 5 bytes | `exit`: as in `ended`, present once the program has ended |
 | 11 | text | `version`: the version of the relay serving the session |
 | 12 | text | `warden_version`: the version of the warden that keeps the session; absent from a warden that did not say |
+| 13 | u8 | `secret`: as in `state`; written only when set |
+| 14 | bytes | `remote`: as in `state` |
+| 15 | u16 | `remote_port`: as in `state` |
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
 A status takes in what the session's connections had sent by the time the
 question came: a client that left, or sent `detach`, before somebody asked is
 not counted in `clients`, whichever connection either of them was on.
 `list_reply` is a block of entries with key 1 (`session`), each holding one
-status block.
+status block. Keys 3, 4 and 13 to 15 are the terminal's state as `state` says it
+(below), looked at when the question came.
+
+### state
+
+The TLV block of `state`: what the session's terminal is doing that the bytes of
+its output do not say, as only the server, which holds the terminal, can tell.
+Every key is optional and an absent one reads as nothing.
+
+| key | value | meaning |
+|---|---|---|
+| 1 | bytes | `program`: the name of the program in the terminal's foreground, as in `status` |
+| 2 | bytes | `directory`: the foreground program's working directory, as in `status` |
+| 3 | u8 | `secret`: bit 0 is set when the terminal does not show what is typed and takes it a line at a time, which is what `sudo`, `read -s` and ssh set to ask for a password (a program that wants single keys, an editor, turns the display of what is typed off but not the line mode, and is not a secret); written only when set |
+| 4 | bytes | `remote`: the target of the interactive ssh or mosh session in the foreground, as the user typed it (`user@host`, `host`, a name from ssh's configuration); a client that shows it to a person removes control characters first |
+| 5 | u16 | `remote_port`: the port the user asked ssh for (`-p`, `-o Port=`, an `ssh://` target); absent when they asked for none, which does not say what port ssh will use |
+
+A `state` is **the whole of it**: a key that is absent is nothing now, not "as
+before", so a client keeps the last one it was given and replaces it. The server
+sends one to a client right after `attached`, and then to every attached client
+whenever any of it differs from what it last sent. A change is told a moment
+after it happens rather than at the instant: the server looks at the terminal
+when the program's output has arrived and shortly after the last of it, and
+shortly after a client's input (a program that starts, says nothing and keeps
+running is seen in that moment), and never on a timer while the session is idle.
+A session nobody is attached to is not looked at; `status` looks when asked.
+
+The server tells a client what it needs to show the program and to know when a
+password is being asked for, and no more. `remote` is a target and nothing of
+the rest of the command line (options, the command run on the other side, what
+a wrapper was given), and the environment is never read; a command that is not
+an interactive ssh or mosh session, or whose target cannot be told, has no
+`remote`. An ssh that runs a command (`ssh host uptime`) is not an interactive
+session.
 
 ### features
 
@@ -289,8 +326,10 @@ person removes control characters first.
 **Attach.** `attach(offset)` asks for the session's output starting at the
 byte `offset` (offsets count bytes the program has written since the session
 began; `u64::MAX` means "from now on"). The server answers `attached` with the
-offset the stream actually starts at, then, if the offset asked for is gone
-or the client asked for one, a picture of the screen (below), then sends
+offset the stream actually starts at and how far it has answered the program's
+questions (`answered`, below), then a `state` (section 4), then, if the offset
+asked for is gone or the client asked for one, a picture of the screen (below),
+then sends
 `output` messages whose offsets are contiguous: each one's offset is the
 previous one's plus its length. The
 `output` data is the program's bytes as written, and an `output` never carries
@@ -302,7 +341,9 @@ ends the stream and keeps the connection. An `attach` offset past the end of
 the stream is `BAD_REQUEST`.
 
 The `attach` of a client that knows its terminal carries a **view**: the
-terminal's size, and whether it wants a picture whatever the offset. The
+terminal's size, whether it wants a picture whatever the offset (bit 0), and
+whether it needs a picture rather than bytes that hold a question the server has
+already answered (bit 1, "Questions answered twice" below). The
 session's terminal takes that size before the answer, as if the client had sent
 a `resize`, so the picture is made for it; a size with a zero column or row
 count says nothing. A client without a view gets the picture for the size the
@@ -326,7 +367,10 @@ modes, the title) and end with whatever escape sequence the stream stopped in.
 `output` goes on from the picture's `offset`, so the client has the screen and
 then the program's own bytes, with nothing missing and nothing twice. A client
 can ask for a picture whatever the offset (`attach` with the picture flag), as
-a device that has never seen the session does.
+a device that has never seen the session does. `truncated` is set when the server
+decided on the picture, not when the client asked for it with that flag: because
+the bytes left the journal, or because of bit 1 of the view's flags. It says the
+bytes asked for are not coming and a picture is.
 
 A picture is one or more `picture` messages, in order, all with the same
 `offset`, `cols` and `rows`; every one but the last has `more` set. A client
@@ -363,11 +407,33 @@ questions were answered, so what it reads while it serves, and what the keeper
 read while no server did (a program that asks at once, before the relay is up;
 the moment between one relay and the next), is answered once, by whichever relay
 comes to it first, and what an earlier relay answered is not answered again.
-Colour, clipboard and pixel-size questions are never answered by the server. A
-client that replays output it missed from the journal sees the questions that
-were asked meanwhile and answers them again. The kitty keyboard question is
-answered as a terminal that has the protocol would, which is what the client's
-own terminal does when it is attached.
+Colour, clipboard and pixel-size questions are never answered by the server;
+the client's terminal answers those when it sees them, as it always does. The
+kitty keyboard question is answered as a terminal that has the protocol would,
+which is what the client's own terminal does when it is attached.
+
+**Questions answered twice.** A client that is shown output again after the
+server answered the questions in it (written while nobody was attached, or
+replayed after a dropped connection) would answer them a second time, and the
+second answer would be typed into the program. `attached` says how far the
+server has answered, in `answered`: the program has the answer to every question
+in the output before that offset (a question is where its last byte is). A
+missing `answered` is 0, which says nothing was answered and is what a server
+from before the field says. There are two ways for a client not to answer twice:
+
+- A client with a terminal emulator of its own, whose answers it can hold back
+  before they go to the server, discards the answers to questions in the output
+  before `answered` and sends the rest as it always did. This is the duty of
+  such a client; the server cannot do it for it.
+- A client that writes the bytes it is given to a terminal that answers by
+  itself, and cannot be told to keep some answers back, sets bit 1 of its view's
+  flags. When the output from the offset it asks for holds a question the server
+  has answered, the server sends a picture of the screen instead of those
+  bytes, with `truncated` set (as for output that has left the journal), and the
+  stream goes on from the picture's offset; output that holds no such question
+  is sent as bytes, and a short drop of the connection costs the picture only
+  when a question was answered meanwhile. A server from before the bit ignores
+  it, and the client's terminal answers twice as it did.
 
 **Ending.** When the program exits, the server sends the rest of its output,
 then `ended` with how it exited. The session is kept until a client has been
@@ -411,8 +477,9 @@ new relay's, with none missing and none twice.
 
 **Pulse.** The client decides when to check that the other end is alive: it
 sends `ping` and the server answers `pong` with the same bytes. The server
-never speaks unprompted except to stream `output` and to say `ended` once, so an
-idle connection costs nothing.
+never speaks unprompted except to stream `output`, to say `ended` once and to say
+`state` after a change of the terminal's state (which output or input brought
+about), so an idle connection costs nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
 the program. Output is sent a frame at a time and only when the connection

@@ -486,7 +486,9 @@ impl Conn {
     fn file(&mut self) {
         while let Some(packet) = self.decoder.next_packet().unwrap() {
             match packet.message {
-                Message::Attached { offset, truncated } => {
+                Message::Attached {
+                    offset, truncated, ..
+                } => {
                     self.attached = Some((offset, truncated));
                     self.next = offset;
                     self.data.clear();
@@ -569,6 +571,7 @@ impl Conn {
                     ypixel: 0,
                 },
                 picture: true,
+                picture_if_answered: false,
             }),
         });
         self.until("attached and its picture", |c| {
@@ -813,7 +816,9 @@ impl Bridge {
             };
             let name = packet.session.as_ref().map(|s| s.as_str().to_owned());
             match packet.message {
-                Message::Attached { offset, truncated } => {
+                Message::Attached {
+                    offset, truncated, ..
+                } => {
                     let seen = self.sessions.entry(name.unwrap()).or_default();
                     seen.attached.push((offset, truncated));
                     seen.next = offset;

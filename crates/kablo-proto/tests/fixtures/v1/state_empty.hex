@@ -1,0 +1,6 @@
+# state of "work" with nothing to say: no foreground program known, echo on, no remote session
+8b           # kind 0x8b: state
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 00  # payload length 0
+77 6f 72 6b  # session id "work"

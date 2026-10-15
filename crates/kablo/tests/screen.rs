@@ -115,6 +115,7 @@ fn a_picture_is_made_for_the_size_the_client_says() {
         view: Some(View {
             size: Size::default(),
             picture: true,
+            picture_if_answered: false,
         }),
     });
     quiet.until("a picture", |c| {
@@ -400,6 +401,7 @@ fn half_a_picture_then_a_whole_one(
                                 Message::Attached {
                                     offset: 100,
                                     truncated,
+                                    answered: 0,
                                 },
                             );
                             send(
@@ -455,6 +457,7 @@ fn a_picture_that_was_cut_short_by_a_new_relay_is_sent_again_from_the_start() {
             ypixel: 0,
         },
         picture: false,
+        picture_if_answered: false,
     };
     link.send(
         Packet::about(
@@ -560,6 +563,7 @@ fn a_terminal_bigger_than_a_screen_may_be_is_refused_and_changes_nothing() {
         view: Some(View {
             size: size(5000, 24),
             picture: true,
+            picture_if_answered: false,
         }),
     });
     other.until("an error", |c| !c.errors.is_empty());

@@ -24,10 +24,10 @@ use kablo_proto::v1::stream::{
     self, Command, FailCode, Incoming, IncomingDecoder, Side, read_incoming,
 };
 use kablo_proto::v1::{
-    self, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, State, Status, View,
-    kind, read_packet, write_packet,
+    self, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, State, Status,
+    TerminalState, View, kind, read_packet, write_packet,
 };
-use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE};
+use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE, tlv};
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1")
@@ -77,6 +77,21 @@ fn running_work() -> Status {
         exit: None,
         version: "0.1.0".into(),
         warden_version: String::new(),
+        secret: false,
+        remote: None,
+        remote_port: None,
+    }
+}
+
+/// An ssh in the foreground, asking for a password: the state the `state`
+/// and `status_reply_terminal` fixtures hold.
+fn asking_for_a_password() -> TerminalState {
+    TerminalState {
+        program: Some(b"ssh".to_vec()),
+        cwd: Some(b"/home/u/src".to_vec()),
+        secret: true,
+        remote: Some(b"user@host".to_vec()),
+        remote_port: Some(2222),
     }
 }
 
@@ -129,6 +144,23 @@ fn messages() -> Vec<(&'static str, Packet)> {
                         ypixel: 800,
                     },
                     picture: true,
+                    picture_if_answered: false,
+                }),
+            }),
+        ),
+        (
+            "attach_view_answered",
+            work(Message::Attach {
+                offset: 0x1000,
+                view: Some(View {
+                    size: Size {
+                        cols: 120,
+                        rows: 40,
+                        xpixel: 960,
+                        ypixel: 800,
+                    },
+                    picture: false,
+                    picture_if_answered: true,
                 }),
             }),
         ),
@@ -181,6 +213,7 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Attached {
                 offset: 0x1000,
                 truncated: false,
+                answered: 0,
             }),
         ),
         (
@@ -188,6 +221,15 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Attached {
                 offset: 0x2000,
                 truncated: true,
+                answered: 0,
+            }),
+        ),
+        (
+            "attached_answered",
+            work(Message::Attached {
+                offset: 0x3000,
+                truncated: false,
+                answered: 0x2000,
             }),
         ),
         (
@@ -265,6 +307,27 @@ fn messages() -> Vec<(&'static str, Packet)> {
         ),
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
+            "status_reply_terminal",
+            work(Message::StatusReply(Status {
+                pid: 4242,
+                program: Some(b"ssh".to_vec()),
+                cwd: Some(b"/home/u".to_vec()),
+                size: Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                clients: 1,
+                offset: 5000,
+                version: "0.2.0".into(),
+                secret: true,
+                remote: Some(b"user@host".to_vec()),
+                remote_port: Some(2222),
+                ..Status::new(id("work"))
+            })),
+        ),
+        (
             "status_reply_warden",
             work(Message::StatusReply(Status {
                 pid: 4242,
@@ -295,6 +358,14 @@ fn messages() -> Vec<(&'static str, Packet)> {
                 exit: Some(Exit::Code(0)),
                 ..Status::new(id("work"))
             })),
+        ),
+        (
+            "state",
+            work(Message::TerminalState(asking_for_a_password())),
+        ),
+        (
+            "state_empty",
+            work(Message::TerminalState(TerminalState::default())),
         ),
         (
             "list_reply_empty",
@@ -550,6 +621,7 @@ fn every_message_kind_has_a_fixture() {
         CREATED,
         PICTURE,
         FEATURES_REPLY,
+        STATE,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -784,7 +856,8 @@ fn a_reader_ignores_what_a_later_version_adds() {
         read_packet(&mut reader).unwrap(),
         Some(work(Message::Attached {
             offset: 0x2000,
-            truncated: false
+            truncated: false,
+            answered: 0
         }))
     );
 
@@ -813,6 +886,7 @@ fn an_attach_is_the_one_it_always_was_unless_it_carries_a_whole_view() {
             ypixel: 0,
         },
         picture: false,
+        picture_if_answered: false,
     };
     let offset = [0, 0, 0, 0, 0, 0, 0x10, 0];
     // The offset and nothing else, as the first clients sent it.
@@ -918,6 +992,212 @@ fn a_status_from_before_the_warden_said_its_version_reads_it_as_unknown() {
 }
 
 #[test]
+fn a_status_from_before_the_terminal_keys_reads_them_as_nothing() {
+    let Some(Message::StatusReply(old)) = read_packet(&mut fixture("status_reply").as_slice())
+        .unwrap()
+        .map(|packet| packet.message)
+    else {
+        panic!("not a status reply");
+    };
+    assert!(!old.secret);
+    assert_eq!((old.remote.as_ref(), old.remote_port), (None, None));
+    // A status with nothing of the sort writes none of the keys.
+    let mut block = old.to_block();
+    assert!(
+        !block
+            .windows(2)
+            .any(|w| matches!(w, [0, 13] | [0, 14] | [0, 15]))
+    );
+    // The same block with the keys appended reads with them.
+    block.extend_from_slice(&[0, 13, 0, 0, 0, 1, 1]);
+    block.extend_from_slice(&[0, 14, 0, 0, 0, 4]);
+    block.extend_from_slice(b"host");
+    block.extend_from_slice(&[0, 15, 0, 0, 0, 2, 0, 22]);
+    let newer = Status {
+        secret: true,
+        remote: Some(b"host".to_vec()),
+        remote_port: Some(22),
+        ..old.clone()
+    };
+    assert_eq!(Status::from_block(&block).unwrap(), newer);
+    assert_eq!(Status::from_block(&newer.to_block()).unwrap(), newer);
+    // A value of the wrong length is not read as another.
+    for entry in [
+        [0, 13, 0, 0, 0, 2, 1, 1].as_slice(),
+        [0, 15, 0, 0, 0, 1, 22].as_slice(),
+    ] {
+        let mut bad = old.to_block();
+        bad.extend_from_slice(entry);
+        assert!(Status::from_block(&bad).is_err(), "{entry:?}");
+    }
+}
+
+#[test]
+fn a_state_is_the_whole_of_it_and_a_field_with_nothing_to_say_is_not_written() {
+    assert_eq!(TerminalState::default().to_block(), Vec::<u8>::new());
+    assert_eq!(
+        TerminalState::from_block(&[]).unwrap(),
+        TerminalState::default()
+    );
+    let shapes = [
+        TerminalState {
+            program: Some(b"sleep".to_vec()),
+            ..TerminalState::default()
+        },
+        TerminalState {
+            secret: true,
+            ..TerminalState::default()
+        },
+        TerminalState {
+            program: Some(b"ssh".to_vec()),
+            remote: Some(b"prod".to_vec()),
+            ..TerminalState::default()
+        },
+        TerminalState {
+            cwd: Some(b"/".to_vec()),
+            remote_port: Some(22),
+            ..TerminalState::default()
+        },
+        asking_for_a_password(),
+    ];
+    for state in shapes {
+        let block = state.to_block();
+        assert_eq!(TerminalState::from_block(&block).unwrap(), state);
+        // No secret on the wire means echo is on, not "as it was".
+        let has_secret = tlv::entries(&block).any(|entry| entry.unwrap().0 == 3);
+        assert_eq!(has_secret, state.secret);
+    }
+    let plain = TerminalState {
+        program: Some(b"vim".to_vec()),
+        ..TerminalState::default()
+    };
+    assert_eq!(plain.to_block(), [0, 1, 0, 0, 0, 3, b'v', b'i', b'm']);
+}
+
+#[test]
+fn a_reader_of_a_state_skips_what_it_does_not_know_and_refuses_a_value_of_the_wrong_size() {
+    let mut block = asking_for_a_password().to_block();
+    // A key from a later version, first and last; a repeated key, the last wins.
+    block.splice(0..0, [0x0f, 0xff, 0, 0, 0, 2, 9, 9]);
+    block.extend_from_slice(&[0x0f, 0xfe, 0, 0, 0, 0]);
+    block.extend_from_slice(&[0, 4, 0, 0, 0, 5]);
+    block.extend_from_slice(b"other");
+    let state = TerminalState::from_block(&block).unwrap();
+    assert_eq!(state.remote.as_deref(), Some(b"other".as_slice()));
+    assert_eq!(state.remote_port, Some(2222));
+    // The bits of the secret's byte it does not define are not its business.
+    assert!(
+        !TerminalState::from_block(&[0, 3, 0, 0, 0, 1, 0b1111_1110])
+            .unwrap()
+            .secret
+    );
+    for bad in [
+        [0, 3, 0, 0, 0, 0].as_slice(),
+        [0, 3, 0, 0, 0, 2, 1, 1].as_slice(),
+        [0, 5, 0, 0, 0, 1, 22].as_slice(),
+        [0, 5, 0, 0, 0, 4, 0, 0, 0, 22].as_slice(),
+        [0, 1, 0, 0, 0, 9].as_slice(), // an entry cut short
+    ] {
+        assert!(TerminalState::from_block(bad).is_err(), "{bad:?}");
+    }
+    // As a message: one that is malformed costs that message and nothing after it.
+    let mut stream = raw(kind::STATE, 0, "work", &[0, 5, 0, 0, 0, 1, 22]);
+    stream.extend(fixture("state_empty"));
+    let mut reader = stream.as_slice();
+    assert!(read_packet(&mut reader).unwrap_err().is_recoverable());
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        Some(work(Message::TerminalState(TerminalState::default())))
+    );
+}
+
+#[test]
+fn an_attached_is_the_one_it_always_was_unless_it_carries_a_whole_answered_offset() {
+    let head = [0, 0, 0, 0, 0, 0, 0x10, 0, 1];
+    let attached = |answered| {
+        work(Message::Attached {
+            offset: 0x1000,
+            truncated: true,
+            answered,
+        })
+    };
+    // The offset and the flags, as the first servers sent them.
+    let plain = raw(kind::ATTACHED, 0, "work", &head);
+    assert_eq!(
+        read_packet(&mut plain.as_slice()).unwrap(),
+        Some(attached(0))
+    );
+    // Nothing answered is written as those nine bytes, so a server that has not
+    // answered anything and one from before the field are the same on the wire.
+    let mut written = Vec::new();
+    attached(0).encode(&mut written).unwrap();
+    assert_eq!(written, plain);
+    // Less than a whole offset after the flags is what a fixed layout's tail
+    // always was: ignored.
+    for cut in 1..8 {
+        let mut payload = head.to_vec();
+        payload.extend(std::iter::repeat_n(7, cut));
+        let bytes = raw(kind::ATTACHED, 0, "work", &payload);
+        assert_eq!(
+            read_packet(&mut bytes.as_slice()).unwrap(),
+            Some(attached(0)),
+            "{cut} bytes after the flags"
+        );
+    }
+    // A whole one, and whatever a later version appends after it.
+    let mut payload = head.to_vec();
+    payload.extend([0, 0, 0, 0, 0, 0, 0x08, 0, 0xde, 0xad]);
+    let bytes = raw(kind::ATTACHED, 0, "work", &payload);
+    assert_eq!(
+        read_packet(&mut bytes.as_slice()).unwrap(),
+        Some(attached(0x800))
+    );
+    // And it is written whole.
+    let mut written = Vec::new();
+    attached(0x800).encode(&mut written).unwrap();
+    assert_eq!(written, raw(kind::ATTACHED, 0, "work", &payload[..17]));
+}
+
+#[test]
+fn the_two_bits_of_a_views_flags_are_each_their_own() {
+    let view = |picture, picture_if_answered| View {
+        size: Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        },
+        picture,
+        picture_if_answered,
+    };
+    for (picture, if_answered, flags) in [
+        (false, false, 0u8),
+        (true, false, 1),
+        (false, true, 2),
+        (true, true, 3),
+    ] {
+        let packet = work(Message::Attach {
+            offset: 0,
+            view: Some(view(picture, if_answered)),
+        });
+        let frame = packet.to_frame().unwrap();
+        assert_eq!(frame.payload.last(), Some(&flags));
+        assert_eq!(Packet::from_frame(frame).unwrap(), Some(packet));
+    }
+    // The bits it does not define are not its business.
+    let mut payload = vec![0; 8];
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_1100]);
+    let bytes = raw(kind::ATTACH, 0, "work", &payload);
+    assert_eq!(
+        read_packet(&mut bytes.as_slice()).unwrap(),
+        Some(work(Message::Attach {
+            offset: 0,
+            view: Some(view(false, false))
+        }))
+    );
+}
+
+#[test]
 fn bytes_that_are_not_a_protocol_never_panic() {
     // A fixed-seed xorshift: the same garbage on every run, no dependency.
     let mut x: u64 = 0x2545_f491_4f6c_dd1d;
@@ -962,6 +1242,7 @@ fn bytes_that_are_not_a_protocol_never_panic() {
         decoder.push(&bytes);
         while let Ok(Some(_)) = decoder.next_incoming() {}
         let _ = Status::from_block(&bytes);
+        let _ = TerminalState::from_block(&bytes);
         let _ = Features::from_block(&bytes);
         let _ = WIRE.read_hello(&mut bytes.as_slice());
     }
@@ -1643,7 +1924,8 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(v1::kind_name(kind::FEATURES), "features");
     assert_eq!(v1::kind_name(kind::FEATURES_REPLY), "features_reply");
     assert_eq!(v1::kind_name(0x0c), "unknown");
-    assert_eq!(v1::kind_name(0x8b), "unknown");
+    assert_eq!(v1::kind_name(kind::STATE), "state");
+    assert_eq!(v1::kind_name(0x8c), "unknown");
     assert_eq!(stream::kind_name(stream::kind::OPEN), "stream open");
     assert_eq!(stream::kind_name(stream::kind::FAILED), "stream failed");
     assert_eq!(stream::kind_name(0x06), "unknown");

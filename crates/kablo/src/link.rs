@@ -177,9 +177,14 @@ impl Link {
             }
             Message::Resize(size) => {
                 if let Some(attach) = self.attach.as_mut() {
+                    // A resize changes the view's size and nothing else the
+                    // client asked for: bit 1 is about the bytes, not the size.
                     attach.view = Some(View {
                         size: *size,
                         picture: false,
+                        picture_if_answered: attach
+                            .view
+                            .is_some_and(|view| view.picture_if_answered),
                     });
                 }
             }
@@ -256,7 +261,9 @@ impl Link {
     fn accept(&mut self, packets: Vec<Packet>, out: &mut Vec<Packet>) {
         for packet in packets {
             match &packet.message {
-                Message::Attached { offset, truncated } => {
+                Message::Attached {
+                    offset, truncated, ..
+                } => {
                     if self.swallow > 0 {
                         self.swallow -= 1;
                         if !truncated {
@@ -344,6 +351,7 @@ impl Link {
                         (None, true) => Some(View {
                             size: Size::default(),
                             picture: true,
+                            picture_if_answered: false,
                         }),
                         (None, false) => None,
                     };

@@ -1003,6 +1003,7 @@ impl Relay {
             Message::Attached {
                 offset: start,
                 truncated,
+                answered: 0,
             },
         );
     }

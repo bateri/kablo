@@ -1,0 +1,9 @@
+# attached to "work" at offset 0x3000, the questions the program asked are answered up to 0x2000
+81                       # kind 0x81: attached
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 11              # payload length 17
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 30 00  # offset 12288
+00                       # flags: none
+00 00 00 00 00 00 20 00  # answered up to 8192

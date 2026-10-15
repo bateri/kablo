@@ -1,0 +1,45 @@
+# status of "work", ssh in the foreground asking for a password, for user@host on port 2222
+86                                # kind 0x86: status_reply
+00                                # channel 0: terminal session
+04                                # session id length 4
+00 00 00 8e                       # payload length 142
+77 6f 72 6b                       # session id "work"
+00 01                             # tlv key 1
+00 00 00 04                       #   length 4
+77 6f 72 6b                       #   id "work"
+00 02                             # tlv key 2
+00 00 00 04                       #   length 4
+00 00 10 92                       #   pid 4242
+00 03                             # tlv key 3
+00 00 00 03                       #   length 3
+73 73 68                          #   foreground program "ssh"
+00 04                             # tlv key 4
+00 00 00 07                       #   length 7
+2f 68 6f 6d 65 2f 75              #   foreground directory "/home/u"
+00 05                             # tlv key 5
+00 00 00 08                       #   length 8
+00 50 00 18 00 00 00 00           #   size (80, 24, 0, 0)
+00 06                             # tlv key 6
+00 00 00 04                       #   length 4
+00 00 00 01                       #   clients 1
+00 07                             # tlv key 7
+00 00 00 01                       #   length 1
+00                                #   state 0
+00 08                             # tlv key 8
+00 00 00 08                       #   length 8
+00 00 00 00 00 00 13 88           #   offset 5000
+00 09                             # tlv key 9
+00 00 00 08                       #   length 8
+00 00 00 00 00 00 00 00           #   retained from 0
+00 0b                             # tlv key 11
+00 00 00 05                       #   length 5
+30 2e 32 2e 30                    #   version "0.2.0"
+00 0d                             # tlv key 13
+00 00 00 01                       #   length 1
+01                                #   secret
+00 0e                             # tlv key 14
+00 00 00 09                       #   length 9
+75 73 65 72 40 68 6f 73 74        #   remote target "user@host"
+00 0f                             # tlv key 15
+00 00 00 02                       #   length 2
+08 ae                             #   remote port 2222

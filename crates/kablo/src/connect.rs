@@ -153,6 +153,7 @@ fn serve(
         .map(|size| View {
             size,
             picture: false,
+            picture_if_answered: false,
         });
     link.send(
         Packet::about(id.clone(), Message::Attach { offset, view }),
@@ -645,6 +646,7 @@ mod tests {
             Message::Attached {
                 offset: 100,
                 truncated: true,
+                answered: 0,
             },
         )
     }

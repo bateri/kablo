@@ -1,0 +1,21 @@
+# state of "work": ssh in the foreground asking for a password, for user@host on port 2222
+8b                                # kind 0x8b: state
+00                                # channel 0: terminal session
+04                                # session id length 4
+00 00 00 38                       # payload length 56
+77 6f 72 6b                       # session id "work"
+00 01                             # tlv key 1
+00 00 00 03                       #   length 3
+73 73 68                          #   foreground program "ssh"
+00 02                             # tlv key 2
+00 00 00 0b                       #   length 11
+2f 68 6f 6d 65 2f 75 2f 73 72 63  #   foreground directory "/home/u/src"
+00 03                             # tlv key 3
+00 00 00 01                       #   length 1
+01                                #   secret
+00 04                             # tlv key 4
+00 00 00 09                       #   length 9
+75 73 65 72 40 68 6f 73 74        #   remote target "user@host"
+00 05                             # tlv key 5
+00 00 00 02                       #   length 2
+08 ae                             #   remote port 2222

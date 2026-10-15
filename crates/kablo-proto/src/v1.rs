@@ -66,6 +66,8 @@ pub mod kind {
     pub const PICTURE: u8 = 0x89;
     /// `features_reply`: the answer to `features`.
     pub const FEATURES_REPLY: u8 = 0x8a;
+    /// `state`: what the session's terminal is doing, said unprompted.
+    pub const STATE: u8 = 0x8b;
 }
 
 /// The name of a message kind, for diagnostics (`"unknown"` for a kind this
@@ -93,6 +95,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::CREATED => "created",
         kind::PICTURE => "picture",
         kind::FEATURES_REPLY => "features_reply",
+        kind::STATE => "state",
         _ => "unknown",
     }
 }
@@ -172,22 +175,33 @@ pub struct View {
     /// Send a picture of the screen even if the offset asked for is still in
     /// the journal.
     pub picture: bool,
+    /// The client's terminal answers the questions in the bytes it is given and
+    /// cannot be told to keep quiet about some of them (it writes the bytes to
+    /// a terminal that is not the client's own to hold back). When the bytes
+    /// from the offset asked for hold a question the server has already
+    /// answered, send a picture instead of them: the program must not be
+    /// answered twice.
+    pub picture_if_answered: bool,
 }
 
 impl View {
     /// Bytes on the wire.
     const LEN: usize = Size::LEN + 1;
 
-    /// The wire form: a size and a flags byte (bit 0: picture).
+    /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
+    /// picture if answered).
     fn write(&self, out: &mut Vec<u8>) {
         self.size.write(out);
-        out.push(u8::from(self.picture));
+        out.push(u8::from(self.picture) | (u8::from(self.picture_if_answered) << 1));
     }
 
     fn read(fields: &mut Fields<'_>) -> Result<View> {
+        let size = Size::read(fields)?;
+        let flags = fields.u8()?;
         Ok(View {
-            size: Size::read(fields)?,
-            picture: fields.u8()? & 1 != 0,
+            size,
+            picture: flags & 1 != 0,
+            picture_if_answered: flags & 2 != 0,
         })
     }
 }
@@ -407,6 +421,12 @@ pub struct Status {
     /// The version of the warden that keeps the session (empty if it did not
     /// say: a warden from before it did).
     pub warden_version: String,
+    /// What [`TerminalState::secret`] says.
+    pub secret: bool,
+    /// What [`TerminalState::remote`] says.
+    pub remote: Option<Vec<u8>>,
+    /// What [`TerminalState::remote_port`] says.
+    pub remote_port: Option<u16>,
 }
 
 mod status_key {
@@ -422,6 +442,9 @@ mod status_key {
     pub const EXIT: u16 = 10;
     pub const VERSION: u16 = 11;
     pub const WARDEN_VERSION: u16 = 12;
+    pub const SECRET: u16 = 13;
+    pub const REMOTE: u16 = 14;
+    pub const REMOTE_PORT: u16 = 15;
 }
 
 impl Status {
@@ -440,10 +463,16 @@ impl Status {
             exit: None,
             version: String::new(),
             warden_version: String::new(),
+            secret: false,
+            remote: None,
+            remote_port: None,
         }
     }
 
-    /// The wire form, a [`tlv`] block with the keys in ascending order.
+    /// The wire form, a [`tlv`] block with the keys in ascending order. What
+    /// the terminal's state adds (`secret`, `remote`, `remote_port`) is written
+    /// only when there is something to say, so a session with none of it and
+    /// a status from before the keys existed are the same bytes.
     pub fn to_block(&self) -> Vec<u8> {
         let mut w = tlv::Writer::new();
         w.put(status_key::ID, self.id.as_str().as_bytes());
@@ -469,6 +498,15 @@ impl Status {
         }
         if !self.warden_version.is_empty() {
             w.put(status_key::WARDEN_VERSION, self.warden_version.as_bytes());
+        }
+        if self.secret {
+            w.put_u8(status_key::SECRET, 1);
+        }
+        if let Some(remote) = &self.remote {
+            w.put(status_key::REMOTE, remote);
+        }
+        if let Some(port) = self.remote_port {
+            w.put_u16(status_key::REMOTE_PORT, port);
         }
         w.finish()
     }
@@ -504,10 +542,98 @@ impl Status {
                 status_key::WARDEN_VERSION => {
                     status.warden_version = tlv::read_text(value, "status warden version")?
                 }
+                status_key::SECRET => {
+                    status.secret = tlv::read_u8(value, "status secret")? & 1 != 0
+                }
+                status_key::REMOTE => status.remote = Some(value.to_vec()),
+                status_key::REMOTE_PORT => {
+                    status.remote_port = Some(tlv::read_u16(value, "status remote port")?)
+                }
                 _ => {}
             }
         }
         Ok(status)
+    }
+}
+
+/// What the session's terminal is doing that the bytes of its output do not
+/// say, as only the server (which holds the terminal's handle) can tell: the
+/// payload of `state`. It is always the whole of it, so a field that is absent
+/// now is nothing now, not "as before".
+///
+/// Nothing in it comes from the program's arguments except the target of a
+/// remote session; the rest of a command line, and the environment, never
+/// leave the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalState {
+    /// The name of the program in the terminal's foreground (as
+    /// [`Status::program`]).
+    pub program: Option<Vec<u8>>,
+    /// The foreground program's working directory (as [`Status::cwd`]).
+    pub cwd: Option<Vec<u8>>,
+    /// The terminal does not show what is typed and takes it a line at a time:
+    /// what a program sets to ask for a password. Written only when set.
+    pub secret: bool,
+    /// The target of the interactive ssh or mosh session in the foreground, as
+    /// the user typed it (`user@host`, `host`, a name from ssh's configuration);
+    /// a person is shown it with control characters removed. Nothing else of
+    /// the command line is in it.
+    pub remote: Option<Vec<u8>>,
+    /// The port the user asked ssh for (`-p`, `-o Port=` or an `ssh://`
+    /// target). Absent when they asked for none, which says nothing of the port
+    /// ssh will use: its configuration decides.
+    pub remote_port: Option<u16>,
+}
+
+mod state_key {
+    pub const PROGRAM: u16 = 1;
+    pub const CWD: u16 = 2;
+    pub const SECRET: u16 = 3;
+    pub const REMOTE: u16 = 4;
+    pub const REMOTE_PORT: u16 = 5;
+}
+
+impl TerminalState {
+    /// The wire form, a [`tlv`] block with the keys in ascending order; a field
+    /// with nothing to say is not written.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        if let Some(program) = &self.program {
+            w.put(state_key::PROGRAM, program);
+        }
+        if let Some(cwd) = &self.cwd {
+            w.put(state_key::CWD, cwd);
+        }
+        if self.secret {
+            w.put_u8(state_key::SECRET, 1);
+        }
+        if let Some(remote) = &self.remote {
+            w.put(state_key::REMOTE, remote);
+        }
+        if let Some(port) = self.remote_port {
+            w.put_u16(state_key::REMOTE_PORT, port);
+        }
+        w.finish()
+    }
+
+    /// Reads the wire form. Every key is optional and reads as nothing when
+    /// absent; one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<TerminalState> {
+        let mut state = TerminalState::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                state_key::PROGRAM => state.program = Some(value.to_vec()),
+                state_key::CWD => state.cwd = Some(value.to_vec()),
+                state_key::SECRET => state.secret = tlv::read_u8(value, "state secret")? & 1 != 0,
+                state_key::REMOTE => state.remote = Some(value.to_vec()),
+                state_key::REMOTE_PORT => {
+                    state.remote_port = Some(tlv::read_u16(value, "state remote port")?)
+                }
+                _ => {}
+            }
+        }
+        Ok(state)
     }
 }
 
@@ -639,8 +765,8 @@ const LISTED: u16 = 1;
 pub enum Message {
     /// Client to server: stream the session starting at `offset` (or
     /// [`OFFSET_END`]). Answered by `Attached`, then a picture of the screen
-    /// when the bytes asked for are gone or the `view` asks for one, then
-    /// `Output`s.
+    /// when the bytes asked for are gone or the `view` asks for one (or asks for
+    /// one if they hold a question already answered), then `Output`s.
     Attach {
         /// The first byte the client wants.
         offset: u64,
@@ -687,6 +813,14 @@ pub enum Message {
         offset: u64,
         /// Whether the journal no longer held the offset asked for.
         truncated: bool,
+        /// How far the server has answered the questions the program asked its
+        /// terminal: the program has the answer to every question in the output
+        /// before this offset. A client with a terminal of its own that is shown
+        /// that output again must not send that terminal's answers to those
+        /// questions; the program would be answered twice. 0 says nothing was
+        /// answered, and is also what a server from before this field says; it
+        /// is not written, so the two are the same bytes.
+        answered: u64,
     },
     /// Server to client: program output starting at `offset`.
     Output {
@@ -716,6 +850,12 @@ pub enum Message {
     Created(Status),
     /// Server to client: the answer to `Features`.
     FeaturesReply(Features),
+    /// Server to client: what the session's terminal is doing (`state` on the
+    /// wire; not [`State`], where the session is in its life). Sent to a client
+    /// right after `Attached` and again whenever any of it changes, whole each
+    /// time. A server that does not know it sends none, and a client that does
+    /// not know it skips it.
+    TerminalState(TerminalState),
     /// Server to client: a piece of the screen as the bytes that build it. A
     /// picture follows an `Attached` and is one or more pieces in order, the
     /// last without `more`; the `Output` after it starts at `offset`.
@@ -766,6 +906,7 @@ impl Message {
             Message::Created(_) => kind::CREATED,
             Message::Picture { .. } => kind::PICTURE,
             Message::FeaturesReply(_) => kind::FEATURES_REPLY,
+            Message::TerminalState(_) => kind::STATE,
         }
     }
 
@@ -793,9 +934,16 @@ impl Message {
             }
             Message::Input(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.clone(),
             Message::New(new) => new.encode()?,
-            Message::Attached { offset, truncated } => {
+            Message::Attached {
+                offset,
+                truncated,
+                answered,
+            } => {
                 let mut out = offset.to_be_bytes().to_vec();
                 out.push(u8::from(*truncated));
+                if *answered != 0 {
+                    out.extend_from_slice(&answered.to_be_bytes());
+                }
                 out
             }
             Message::Output { offset, data } => {
@@ -830,6 +978,7 @@ impl Message {
             }
             Message::StatusReply(status) | Message::Created(status) => status.to_block(),
             Message::FeaturesReply(features) => features.to_block(),
+            Message::TerminalState(state) => state.to_block(),
             Message::ListReply(all) => {
                 let mut w = tlv::Writer::new();
                 for status in all {
@@ -876,10 +1025,19 @@ impl Message {
             kind::NEW => Message::New(NewSession::decode(payload)?),
             kind::PING => Message::Ping(payload.to_vec()),
             kind::FEATURES => Message::Features,
-            kind::ATTACHED => Message::Attached {
-                offset: f.u64()?,
-                truncated: f.u8()? & 1 != 0,
-            },
+            kind::ATTACHED => {
+                let offset = f.u64()?;
+                let truncated = f.u8()? & 1 != 0;
+                // Appended after the flags by a server that has more to say; an
+                // `attached` without a whole one, as the first servers sent it,
+                // answered nothing.
+                let answered = if f.len() < 8 { 0 } else { f.u64()? };
+                Message::Attached {
+                    offset,
+                    truncated,
+                    answered,
+                }
+            }
             kind::OUTPUT => Message::Output {
                 offset: f.u64()?,
                 data: f.rest().to_vec(),
@@ -906,6 +1064,7 @@ impl Message {
             }
             kind::CREATED => Message::Created(Status::from_block(payload)?),
             kind::FEATURES_REPLY => Message::FeaturesReply(Features::from_block(payload)?),
+            kind::STATE => Message::TerminalState(TerminalState::from_block(payload)?),
             kind::PICTURE => Message::Picture {
                 offset: f.u64()?,
                 cols: f.u16()?,
