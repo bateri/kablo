@@ -205,12 +205,15 @@ pub fn start(command: &[OsString]) -> Result<(Carrier, Wire), String> {
         .unwrap_or(program)
         .to_string_lossy()
         .into_owned();
+    // A program that cannot be run is named as it was given, not by its last
+    // part: "ssh -o x host kablo attach" quoted as one word would otherwise be
+    // "kablo attach", which reads as the server's kablo being missing.
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run {name}: {e}"))?;
+        .map_err(|e| format!("cannot run {}: {e}", program.to_string_lossy()))?;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill();
         let _ = child.wait();

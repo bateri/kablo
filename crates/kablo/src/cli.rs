@@ -102,7 +102,7 @@ where
     let words: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
     let all_text = words.len() == args.len();
     match (all_text, words.as_slice()) {
-        (true, ["version"]) => {
+        (true, ["version" | "-V" | "--version"]) => {
             let _ = writeln!(out, "{}", version_line());
             0
         }
@@ -493,6 +493,11 @@ mod tests {
                 "{token}"
             );
         }
+        // The spellings people type out of habit say the same, as `--help` and
+        // `-h` say what `help` does.
+        for spelling in ["--version", "-V"] {
+            assert_eq!(run_words(&[spelling]), (0, out.clone(), String::new()));
+        }
     }
 
     #[test]
@@ -501,7 +506,8 @@ mod tests {
             &[][..],
             &["bogus"],
             &["version", "extra"],
-            &["--version"],
+            &["--version", "extra"],
+            &["-v"],
             &[""],
         ] {
             let (code, out, err) = run_words(words);

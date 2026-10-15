@@ -298,7 +298,20 @@ fn something_that_is_not_a_bridge_is_said_and_is_255() {
     assert_eq!(ran.status.code(), Some(255));
     assert!(
         ran.err()
-            .contains("cannot run carrier: No such file or directory"),
+            .contains("cannot run /no/such/carrier: No such file or directory"),
+        "{}",
+        ran.err()
+    );
+
+    // A command quoted as one word is named whole, so the quoting shows, and
+    // not by its last part, which would read as kablo missing on the server.
+    let quoted = "ssh -o BatchMode=yes host .local/bin/kablo attach";
+    let running = Exec::start_over(&env, &[], &[quoted], &["/bin/echo", "x"]);
+    let ran = running.finish();
+    assert_eq!(ran.status.code(), Some(255));
+    assert!(
+        ran.err()
+            .contains(&format!("cannot run {quoted}: No such file or directory")),
         "{}",
         ran.err()
     );
