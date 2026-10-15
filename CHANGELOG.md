@@ -4,11 +4,32 @@ All notable changes to kablo are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 [Semantic Versioning](https://semver.org/).
 
-Write user-facing changes under **Unreleased** as they land: what someone
-running kablo will notice, not how the code changed. At release time rename
-the section to the new version and date. `make release` takes that section as
-the release notes, which are the text of the GitHub release. A version without
-a section is not released.
+kablo has two kinds of reader, and this file is for both:
+
+- **People who run kablo.** Write what they will notice, not how the code
+  changed: the commands, what they print and how they exit, what a session
+  does, what the README promises. Under **Added**, **Changed**, **Fixed** and
+  **Removed**.
+- **Apps that drive kablo**: a terminal app over `kablo attach`, a program
+  built on the `kablo-proto` crate. They pin a version, install it on servers
+  and read this file when they move to the next one, so every change to what
+  they rely on is also written under **For apps**: the protocol
+  (`docs/PROTOCOL.md`), the public API of `kablo-proto`, the keys of
+  `kablo list --json` and `kablo version`, the exit codes, the names and
+  targets of the release files and where `kablo_proto::install` puts them,
+  and the vte fork in `vendor/vte` (its changes are listed in its `FORK.md`).
+
+What apps rely on only grows. A message, a key, a field or a code that has
+been released keeps its meaning, and a new need is a new one. Something on its
+way out stays for at least one release and is listed under **Going**, with
+what replaces it. A change to the protocol's format is a new protocol version,
+read alongside the one before it (`docs/PROTOCOL.md`, Compatibility).
+
+Write a change under **Unreleased** in the commit that makes it, not on the
+day of the release. At release time rename the section to the new version and
+date, above a new empty Unreleased. `make release` takes that section as the
+release notes, which are the text of the GitHub release. A version without a
+section is not released.
 
 ## [Unreleased]
 
