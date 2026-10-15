@@ -101,6 +101,8 @@ pub struct Passwd {
     pub name: Vec<u8>,
     /// The login shell, empty when the entry has none.
     pub shell: Vec<u8>,
+    /// The home directory, empty when the entry has none.
+    pub home: Vec<u8>,
 }
 
 /// The passwd entry of the effective user, if there is one.
@@ -136,6 +138,7 @@ pub fn passwd() -> Option<Passwd> {
     Some(Passwd {
         name: text(entry.pw_name),
         shell: text(entry.pw_shell),
+        home: text(entry.pw_dir),
     })
 }
 
@@ -407,6 +410,17 @@ pub fn kill_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     match cvt(unsafe { libc::killpg(group, signal) }) {
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         other => other.map(drop),
+    }
+}
+
+/// Whether any process is still in the group `group`: a signal of 0 is
+/// delivered to nobody and says whether somebody could have been.
+pub fn group_exists(group: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks; a bad group is an error, not a fault.
+    match cvt(unsafe { libc::killpg(group, 0) }) {
+        Ok(_) => true,
+        // Somebody is there that we may not signal; that is somebody.
+        Err(e) => e.raw_os_error() == Some(libc::EPERM),
     }
 }
 

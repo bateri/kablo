@@ -1,10 +1,13 @@
-//! Streams: TCP connections carried over the connection to a bridge.
+//! Streams: TCP connections and programs carried over the connection to a
+//! bridge.
 //!
 //! This is the one engine of both ends. The bridge (the [`Side::Server`]) makes
-//! the connection to the target an `open` names; a client (the
-//! [`Side::Client`]) hands it a socket it has accepted and has the bridge open
-//! the other half. Once a stream is open the two ends are alike, and so is the
-//! code: bytes move between a socket and the wire under a **window** each way.
+//! the connection to the target an `open` names, or starts the program it
+//! names; a client (the [`Side::Client`]) hands it a socket it has accepted and
+//! has the bridge open the other half. Once a stream is open the two ends are
+//! alike, and so is the code: bytes move between a socket and the wire under a
+//! **window** each way. (A program is the other end of a stream the bridge
+//! makes, and for now only the bridge: see **Programs**.)
 //! Nothing here reads or writes the wire itself. The owner feeds it what
 //! arrived ([`Streams::handle`]), asks which descriptors to wait for
 //! ([`Streams::interest`]), tells it which are ready ([`Streams::ready`]) and
@@ -31,7 +34,10 @@
 //! data frames, behind them; every other control packet goes in the list the
 //! owner passed in, which the owner puts in front of the data (a `credit` must
 //! not wait for a transfer in the other direction). A `close` takes the
-//! stream's queued frames with it.
+//! stream's queued frames with it. The end of a program's stream is the one
+//! control packet pair that is queued with the data: its `exited` and the
+//! `close` after it say what happened *after* the last byte, so they wait
+//! behind the `eof`, and the stream is let go without taking the frames with it.
 //!
 //! **A stream that is not valid** (data past its window, past its end or
 //! before it was opened, a credit past the largest window) is ended with a
@@ -47,24 +53,50 @@
 //! thread is still resolving a name. The thread itself is not interrupted: it
 //! counts as connecting until it reports, which is what bounds how many there
 //! are.
+//!
+//! **Programs** (server end). An `open` that names a command starts it on the
+//! spot ([`crate::process`]: a fork and an `exec`, which is as quick as the
+//! system makes them) and answers `opened` or `failed` at once; nothing
+//! connects, so nothing is waiting. The stream's end is then the program's
+//! three pipes instead of a socket. The client's `data` is written to its
+//! input, and shut when the client says `eof`; its output and its errors are
+//! read like a socket is, out of the same window and under the same rule on
+//! what waits for the wire, and told apart on the wire by the kind of message
+//! (`data`, `stderr`). The stream's own `eof` is sent when both have ended, and
+//! its `exited`, then `close`, when the program has ended too ([`Token::Exit`]
+//! is how that is learned); the stream is over for the client without waiting
+//! for its `eof`. A program that leaves another holding its pipes keeps the
+//! stream open until that one lets go or the client closes it.
+//!
+//! A program lasts as long as its stream. A `close` (and a stream that breaks
+//! the rules) tells the program's whole process group to end and keeps the
+//! program for [`Config::kill_wait`]: it is collected the moment the group is
+//! gone, or killed when the time is up, so that nothing is left running or
+//! waiting to be collected. The wait is a timer with that stop condition and is
+//! on the loop's deadline ([`Streams::deadline`]) only while there are such
+//! programs. When the connection ends the owner calls [`Streams::shutdown`],
+//! which does the same for every program that is still running and waits for it
+//! (the one place that blocks, and it is on the way out). A bridge that is
+//! killed outright leaves its programs to the system, as it does anything.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{
-    CONNECT_TIMEOUT, FailCode, MAX_CONNECTING, MAX_DATA, MAX_HOST, MAX_STREAMS, MAX_WINDOW,
-    Message, Packet, Side,
+    CONNECT_TIMEOUT, Command, FailCode, MAX_CONNECTING, MAX_DATA, MAX_HOST, MAX_STREAMS,
+    MAX_WINDOW, Message, Packet, Side,
 };
 use kablo_proto::v1::{Features, Message as SessionMessage};
 
 use crate::dial::{self, Refusal, Target};
 use crate::outbound::Frames;
+use crate::process::{self, COMMAND_KILL_WAIT, Pipes, Program};
 use crate::sys;
 
 /// Bytes of `data` frames that may wait for the wire before sockets are not
@@ -89,6 +121,8 @@ pub struct Config {
     pub connect_timeout: Duration,
     /// How targets are reached.
     pub dial: Dial,
+    /// How long a program told to end has before it is killed.
+    pub kill_wait: Duration,
 }
 
 impl Default for Config {
@@ -99,6 +133,7 @@ impl Default for Config {
             max_connecting: MAX_CONNECTING as usize,
             connect_timeout: CONNECT_TIMEOUT,
             dial: Arc::new(dial::connect),
+            kill_wait: COMMAND_KILL_WAIT,
         }
     }
 }
@@ -108,6 +143,16 @@ impl Default for Config {
 pub enum Token {
     /// The socket of this stream.
     Stream(u32),
+    /// The input of the program of this stream, which has bytes to take.
+    Stdin(u32),
+    /// The output of the program of this stream.
+    Stdout(u32),
+    /// The errors of the program of this stream.
+    Stderr(u32),
+    /// The end of the program of this stream.
+    Exit(u32),
+    /// The end of a program (this process number) whose stream is over.
+    Dying(u32),
     /// The answers of the threads that connect.
     Connector,
 }
@@ -129,9 +174,88 @@ pub enum Event {
     },
 }
 
+/// What the other end of a stream is.
+enum End {
+    Socket(TcpStream),
+    Program(Run),
+}
+
+/// A program, and the pipes this end holds to it. A pipe is gone once it is
+/// over: the output and the errors when they have ended, the input when it is
+/// shut. That is also what leaves it out of the descriptors waited for.
+struct Run {
+    program: Program,
+    stdin: Option<OwnedFd>,
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
+}
+
+/// Which of a program's two outputs is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Out,
+    Err,
+}
+
+impl End {
+    /// Writes toward the other end: the socket, the program's input. A program
+    /// that has closed its input is a broken pipe, as a socket that is reset.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            End::Socket(socket) => socket.write(bytes),
+            End::Program(run) => match &run.stdin {
+                Some(pipe) => sys::write_fd(pipe.as_fd(), bytes),
+                None => Err(io::ErrorKind::BrokenPipe.into()),
+            },
+        }
+    }
+
+    /// Reads what the other end says; a program's output or its errors.
+    fn read(&mut self, channel: Channel, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            End::Socket(socket) => socket.read(buf),
+            End::Program(run) => {
+                let pipe = match channel {
+                    Channel::Out => &run.stdout,
+                    Channel::Err => &run.stderr,
+                };
+                match pipe {
+                    Some(pipe) => sys::read_fd(pipe.as_fd(), buf),
+                    None => Err(io::ErrorKind::WouldBlock.into()),
+                }
+            }
+        }
+    }
+
+    /// The writing half is over: the socket is shut, the program's input is
+    /// closed.
+    fn shut(&mut self) {
+        match self {
+            End::Socket(socket) => {
+                let _ = socket.shutdown(Shutdown::Write);
+            }
+            End::Program(run) => run.stdin = None,
+        }
+    }
+
+    /// `channel` has nothing more. Whether nothing is left to read.
+    fn end_reading(&mut self, channel: Channel) -> bool {
+        match self {
+            End::Socket(_) => true,
+            End::Program(run) => {
+                match channel {
+                    Channel::Out => run.stdout = None,
+                    Channel::Err => run.stderr = None,
+                }
+                run.stdout.is_none() && run.stderr.is_none()
+            }
+        }
+    }
+}
+
 /// One open stream.
 struct Stream {
-    socket: TcpStream,
+    end: End,
     /// Client end: `open` was sent and `opened` has not come.
     opening: bool,
     /// Bytes the other end still lets this end send.
@@ -146,7 +270,7 @@ struct Stream {
     sent_eof: bool,
     /// The other end has sent `eof`.
     got_eof: bool,
-    /// The writing half of the socket is shut.
+    /// The writing half of the socket (the program's input) is shut.
     shut: bool,
     /// Writing to the socket failed for good (the other end of it is gone):
     /// what arrives for it is dropped, with credit given for it so the other
@@ -156,9 +280,9 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(socket: TcpStream, send_window: u32, recv_window: u32, opening: bool) -> Stream {
+    fn new(end: End, send_window: u32, recv_window: u32, opening: bool) -> Stream {
         Stream {
-            socket,
+            end,
             opening,
             send_window,
             recv_window,
@@ -280,6 +404,19 @@ pub fn judge(first: &SessionMessage) -> Verdict {
     }
 }
 
+/// A program whose stream is over and that has been told to end.
+struct Dying {
+    program: Program,
+    /// When its group is killed if anything of it is still there; none once it
+    /// has been.
+    kill_at: Option<Instant>,
+}
+
+/// How long [`Streams::shutdown`] waits for a program it has killed to be
+/// collected before it leaves it to the system: a program the system will not
+/// let go of (it is waiting on a disk) is not worth holding up an exit for.
+const SHUTDOWN_REAP_WAIT: Duration = Duration::from_secs(1);
+
 /// A frame waiting for the wire.
 struct Queued {
     stream: u32,
@@ -297,6 +434,9 @@ pub struct Streams {
     highest: u32,
     connecting: BTreeMap<u32, Connecting>,
     connector: Option<Connector>,
+    /// Programs whose streams are over, by process number. Not streams: the
+    /// client has been told, and the number may be used again.
+    dying: BTreeMap<u32, Dying>,
     /// Server end: why streams are off, while they are.
     closed: Option<String>,
     data: VecDeque<Queued>,
@@ -313,6 +453,17 @@ fn credit_step(window: u32) -> u32 {
     (window / 4).max(1)
 }
 
+/// Answers an `open` that cannot be taken.
+fn refuse(out: &mut Vec<Packet>, id: u32, code: FailCode, text: &str) {
+    out.push(Packet::new(
+        id,
+        Message::Failed {
+            code,
+            text: text.to_owned(),
+        },
+    ));
+}
+
 impl Streams {
     /// No streams, for the `side` this end is.
     pub fn new(side: Side, config: Config) -> Streams {
@@ -324,6 +475,7 @@ impl Streams {
             highest: 0,
             connecting: BTreeMap::new(),
             connector: None,
+            dying: BTreeMap::new(),
             closed: None,
             data: VecDeque::new(),
             data_bytes: 0,
@@ -358,8 +510,9 @@ impl Streams {
             .count()
     }
 
-    /// Server end: turns streams off, with the reason `open` is answered with
-    /// (or on again with `None`). Open streams are not touched.
+    /// Server end: turns streams off, with the reason an `open` of a connection
+    /// is answered with (or on again with `None`). Open streams are not
+    /// touched, and neither are commands: whoever may log in may run a program.
     pub fn set_closed(&mut self, why: Option<String>) {
         self.closed = why;
     }
@@ -403,8 +556,10 @@ impl Streams {
         socket.set_nonblocking(true)?;
         let _ = socket.set_nodelay(true);
         self.last_id = id;
-        self.streams
-            .insert(id, Stream::new(socket, 0, self.config.window, true));
+        self.streams.insert(
+            id,
+            Stream::new(End::Socket(socket), 0, self.config.window, true),
+        );
         out.push(packet);
         Ok(id)
     }
@@ -425,15 +580,7 @@ impl Streams {
             return;
         }
         self.highest = id;
-        let mut fail = |code: FailCode, text: &str| {
-            out.push(Packet::new(
-                id,
-                Message::Failed {
-                    code,
-                    text: text.to_owned(),
-                },
-            ));
-        };
+        let mut fail = |code: FailCode, text: &str| refuse(out, id, code, text);
         if let Some(why) = &self.closed {
             return fail(FailCode::FORBIDDEN, why);
         }
@@ -480,6 +627,54 @@ impl Streams {
         }
     }
 
+    /// Server end: an `open` of a command. It is not a connection, so the switch
+    /// that turns those off is not asked, and nothing is connecting: the program
+    /// is started and the answer is given.
+    fn command_requested(&mut self, id: u32, window: u32, command: Command, out: &mut Vec<Packet>) {
+        // As for any `open`: a number not above every one seen is not answered.
+        if id <= self.highest {
+            return;
+        }
+        self.highest = id;
+        if command.check().is_err() {
+            return refuse(out, id, FailCode::BAD_REQUEST, "not a command to run");
+        }
+        if window > MAX_WINDOW {
+            return refuse(out, id, FailCode::LIMIT, "window too large");
+        }
+        if self.len() >= self.config.max_streams {
+            return refuse(out, id, FailCode::LIMIT, "too many streams");
+        }
+        match process::start(&command) {
+            Ok((
+                program,
+                Pipes {
+                    stdin,
+                    stdout,
+                    stderr,
+                },
+            )) => {
+                let run = Run {
+                    program,
+                    stdin: Some(stdin),
+                    stdout: Some(stdout),
+                    stderr: Some(stderr),
+                };
+                self.streams.insert(
+                    id,
+                    Stream::new(End::Program(run), window, self.config.window, false),
+                );
+                out.push(Packet::new(
+                    id,
+                    Message::Opened {
+                        window: self.config.window,
+                    },
+                ));
+            }
+            Err(e) => refuse(out, id, FailCode::START_FAILED, &process::system_words(&e)),
+        }
+    }
+
     /// A thread reported.
     fn connected(&mut self, done: Done, out: &mut Vec<Packet>) {
         let Some(entry) = self.connecting.remove(&done.stream) else {
@@ -495,7 +690,7 @@ impl Streams {
                     let _ = socket.set_nodelay(true);
                     self.streams.insert(
                         id,
-                        Stream::new(socket, entry.window, self.config.window, false),
+                        Stream::new(End::Socket(socket), entry.window, self.config.window, false),
                     );
                     out.push(Packet::new(
                         id,
@@ -519,18 +714,21 @@ impl Streams {
     }
 
     /// Server end: the earliest time a stream that is connecting runs out of
-    /// time.
+    /// time, or a program that was told to end is killed.
     pub fn deadline(&self) -> Option<Instant> {
         self.connecting
             .values()
             .filter(|c| c.phase == Phase::Pending)
             .map(|c| c.deadline)
+            .chain(self.dying.values().filter_map(|d| d.kill_at))
             .min()
     }
 
     /// Server end: answers `failed` (timed out) for every stream that has
-    /// been connecting past its deadline.
+    /// been connecting past its deadline, and kills the programs that were told
+    /// to end and have not.
     pub fn expire(&mut self, now: Instant, out: &mut Vec<Packet>) {
+        self.expire_programs(now);
         for (&id, entry) in &mut self.connecting {
             if entry.phase == Phase::Pending && entry.deadline <= now {
                 entry.phase = Phase::Expired;
@@ -566,11 +764,8 @@ impl Streams {
             (Side::Server, Message::Open { window, port, host }) => {
                 self.open_requested(id, window, port, host, out);
             }
-            // This server does not run programs yet: it answers an `open` for
-            // one as a server from before them does, which reads it as a
-            // target with no port and no host.
-            (Side::Server, Message::OpenCommand { window, .. }) => {
-                self.open_requested(id, window, 0, String::new(), out);
+            (Side::Server, Message::OpenCommand { window, command }) => {
+                self.command_requested(id, window, command, out);
             }
             (Side::Client, Message::Opened { window }) => self.opened(id, window, out),
             (Side::Client, Message::Failed { code, text }) => self.failed(id, code, text),
@@ -578,7 +773,9 @@ impl Streams {
             (_, Message::Credit(bytes)) => self.credit_in(id, bytes, out),
             (_, Message::Eof) => self.eof_in(id, out),
             (_, Message::Close) => self.close_in(id),
-            // `open` going to a client, `opened` or `failed` to a server.
+            // `open` going to a client, `opened` or `failed` to a server. (A
+            // client end has nothing to do with the `stderr` and `exited` of a
+            // program yet: no client end opens one through here.)
             _ => {}
         }
     }
@@ -674,20 +871,38 @@ impl Streams {
     pub fn interest(&self) -> Vec<(libc::pollfd, Token)> {
         let mut found = Vec::new();
         for (&id, stream) in &self.streams {
-            let mut events = 0;
-            if !stream.inbox.is_empty() {
-                events |= libc::POLLOUT;
-            }
-            if self.may_read(stream) {
-                events |= libc::POLLIN;
-            }
-            if events != 0 {
-                found.push((
-                    sys::want(stream.socket.as_raw_fd(), events),
-                    Token::Stream(id),
-                ));
+            let reading = self.may_read(stream);
+            let writing = !stream.inbox.is_empty();
+            match &stream.end {
+                End::Socket(socket) => {
+                    let mut events = 0;
+                    if writing {
+                        events |= libc::POLLOUT;
+                    }
+                    if reading {
+                        events |= libc::POLLIN;
+                    }
+                    if events != 0 {
+                        found.push((sys::want(socket.as_raw_fd(), events), Token::Stream(id)));
+                    }
+                }
+                End::Program(run) => {
+                    if let Some(pipe) = run.stdin.as_ref().filter(|_| writing) {
+                        found.push((sys::want(pipe.as_raw_fd(), libc::POLLOUT), Token::Stdin(id)));
+                    }
+                    if let Some(pipe) = run.stdout.as_ref().filter(|_| reading) {
+                        found.push((sys::want(pipe.as_raw_fd(), libc::POLLIN), Token::Stdout(id)));
+                    }
+                    if let Some(pipe) = run.stderr.as_ref().filter(|_| reading) {
+                        found.push((sys::want(pipe.as_raw_fd(), libc::POLLIN), Token::Stderr(id)));
+                    }
+                    if let Some(watch) = run.program.watch_fd() {
+                        found.push((sys::want(watch, libc::POLLIN), Token::Exit(id)));
+                    }
+                }
             }
         }
+        found.extend(self.dying_interest());
         let waiting = !self.connecting.is_empty();
         if let Some(connector) = self.connector.as_ref().filter(|_| waiting) {
             found.push((
@@ -700,6 +915,18 @@ impl Streams {
 
     fn may_read(&self, stream: &Stream) -> bool {
         stream.can_send() && self.data_bytes < QUEUED_SOFT
+    }
+
+    /// The ends of the programs that were told to end, while they have not
+    /// been collected.
+    fn dying_interest(&self) -> Vec<(libc::pollfd, Token)> {
+        self.dying
+            .iter()
+            .filter_map(|(&pid, dying)| {
+                let watch = dying.program.watch_fd()?;
+                Some((sys::want(watch, libc::POLLIN), Token::Dying(pid)))
+            })
+            .collect()
     }
 
     /// A descriptor from [`Streams::interest`] is ready.
@@ -720,9 +947,16 @@ impl Streams {
                     self.drain(id, out);
                 }
                 if revents & (libc::POLLIN | broken) != 0 {
-                    self.fill(id, out);
+                    self.fill(id, Channel::Out, out);
                 }
             }
+            // Writing is found out by trying: a closed input is an error on the
+            // next write, which `drain` knows what to do with.
+            Token::Stdin(id) => self.drain(id, out),
+            Token::Stdout(id) => self.fill(id, Channel::Out, out),
+            Token::Stderr(id) => self.fill(id, Channel::Err, out),
+            Token::Exit(id) => self.program_ended(id),
+            Token::Dying(pid) => self.collect(pid),
         }
     }
 
@@ -744,7 +978,7 @@ impl Streams {
         };
         while !stream.inbox.is_empty() {
             let (front, _) = stream.inbox.as_slices();
-            match stream.socket.write(front) {
+            match stream.end.write(front) {
                 Ok(0) => break,
                 Ok(n) => {
                     stream.inbox.drain(..n);
@@ -774,15 +1008,17 @@ impl Streams {
             out.push(Packet::new(id, Message::Credit(bytes)));
         }
         if ((stream.got_eof && stream.inbox.is_empty()) || stream.write_dead) && !stream.shut {
-            let _ = stream.socket.shutdown(Shutdown::Write);
+            stream.end.shut();
             stream.shut = true;
         }
         self.finish(id);
     }
 
-    /// Reads a stream's socket once, if the stream has window to send into and
-    /// the wire is not far behind, and queues what it said.
-    fn fill(&mut self, id: u32, out: &mut Vec<Packet>) {
+    /// Reads a stream's socket (or one of a program's outputs) once, if the
+    /// stream has window to send into and the wire is not far behind, and
+    /// queues what it said. The window is the stream's, whichever output the
+    /// bytes were on.
+    fn fill(&mut self, id: u32, channel: Channel, out: &mut Vec<Packet>) {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
@@ -796,44 +1032,81 @@ impl Streams {
             return;
         };
         let read = loop {
-            match stream.socket.read(buf) {
+            match stream.end.read(channel, buf) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 other => break other,
             }
         };
-        match read {
-            Ok(0) => {
-                stream.sent_eof = true;
-                if !self.queue(id, Message::Eof) {
-                    self.reset(id, out);
-                    return;
-                }
-                self.finish(id);
-            }
+        let over = match read {
+            Ok(0) => true,
             Ok(n) => {
                 stream.send_window -= u32::try_from(n).unwrap_or(0);
                 let bytes = buf.get(..n).unwrap_or_default().to_vec();
-                if !self.queue(id, Message::Data(bytes)) {
+                let message = match channel {
+                    Channel::Out => Message::Data(bytes),
+                    Channel::Err => Message::Stderr(bytes),
+                };
+                if !self.queue(id, message) {
                     self.reset(id, out);
                 }
+                return;
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => self.reset(id, out),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+            // A socket that fails to be read is over, and so is the stream. A
+            // pipe that does is a program that has nothing more to say: what
+            // it did say is carried and the end is told as any end.
+            Err(_) if matches!(stream.end, End::Socket(_)) => {
+                self.reset(id, out);
+                return;
+            }
+            Err(_) => true,
+        };
+        if over && stream.end.end_reading(channel) {
+            stream.sent_eof = true;
+            if !self.queue(id, Message::Eof) {
+                self.reset(id, out);
+                return;
+            }
+            self.finish(id);
         }
     }
 
+    /// The program of a stream has ended: it is collected, and the stream is
+    /// over if everything it said has been carried.
+    fn program_ended(&mut self, id: u32) {
+        if let Some(Stream {
+            end: End::Program(run),
+            ..
+        }) = self.streams.get_mut(&id)
+        {
+            run.program.reap();
+        }
+        self.finish(id);
+    }
+
     /// A stream both ends have said all they have to say on, and whose socket
-    /// has been told so, is over.
+    /// has been told so, is over; so is a program's once it has said all it had
+    /// (the client's `eof` does not matter: the program is gone).
     fn finish(&mut self, id: u32) {
-        let over = self
-            .streams
-            .get(&id)
-            .is_some_and(|s| s.sent_eof && s.got_eof && s.shut);
-        if over {
-            // Its `eof` may still be queued; that is the point of keeping the
-            // frames.
-            self.streams.remove(&id);
-            self.dirty.remove(&id);
+        let over = self.streams.get(&id).is_some_and(|s| match &s.end {
+            End::Socket(_) => s.sent_eof && s.got_eof && s.shut,
+            End::Program(run) => s.sent_eof && run.program.exit().is_some(),
+        });
+        if !over {
+            return;
+        }
+        // Its `eof` may still be queued; that is the point of keeping the
+        // frames.
+        let Some(stream) = self.streams.remove(&id) else {
+            return;
+        };
+        self.dirty.remove(&id);
+        if let End::Program(run) = stream.end {
+            // How it ended, and the end of the stream, go behind the `eof`.
+            if let Some(exit) = run.program.exit() {
+                self.queue(id, Message::Exited(exit));
+                self.queue(id, Message::Close);
+            }
         }
     }
 
@@ -843,12 +1116,117 @@ impl Streams {
         out.push(Packet::new(id, Message::Close));
     }
 
-    /// Drops a stream and everything queued for it.
+    /// Drops a stream and everything queued for it. The program of a stream, if
+    /// it has one, is told to end.
     fn forget(&mut self, id: u32) {
-        self.streams.remove(&id);
+        if let Some(stream) = self.streams.remove(&id) {
+            if let End::Program(Run { program, .. }) = stream.end {
+                self.dismiss(program);
+            }
+        }
         self.dirty.remove(&id);
         self.data.retain(|queued| queued.stream != id);
         self.data_bytes = self.data.iter().map(|queued| queued.frame.len()).sum();
+    }
+
+    /// Tells a program whose stream is over to end: its group is signalled and
+    /// it is kept until it has been collected and the group is gone, or the
+    /// time is up and the group is killed.
+    fn dismiss(&mut self, mut program: Program) {
+        program.terminate();
+        // (A program that has been collected and left nothing is already done.)
+        if program.reap().is_some() && !program.group_exists() {
+            return;
+        }
+        let kill_at = Some(Instant::now() + self.config.kill_wait);
+        self.dying.insert(program.id(), Dying { program, kill_at });
+    }
+
+    /// A program that was told to end has ended: it is collected, and let go if
+    /// nothing of its group is left or its group has been killed already.
+    fn collect(&mut self, pid: u32) {
+        let Some(dying) = self.dying.get_mut(&pid) else {
+            return;
+        };
+        // (A wake-up before the system will say so is looked at again.)
+        if dying.program.reap().is_none() {
+            return;
+        }
+        if dying.kill_at.is_none() || !dying.program.group_exists() {
+            self.dying.remove(&pid);
+        }
+    }
+
+    /// Kills the groups of the programs whose time is up.
+    fn expire_programs(&mut self, now: Instant) {
+        let due: Vec<u32> = self
+            .dying
+            .iter()
+            .filter(|(_, d)| d.kill_at.is_some_and(|at| at <= now))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for pid in due {
+            if let Some(dying) = self.dying.get_mut(&pid) {
+                dying.program.kill();
+                dying.kill_at = None;
+            }
+            // Collected at once if it has gone; otherwise its end is waited
+            // for with the descriptor that says so.
+            if self
+                .dying
+                .get_mut(&pid)
+                .is_some_and(|d| d.program.reap().is_some())
+            {
+                self.dying.remove(&pid);
+            }
+        }
+    }
+
+    /// The connection is ending: every program that is running is told to end,
+    /// and this waits until they have, killing what has not when its time is up
+    /// ([`Config::kill_wait`]) and giving up on what cannot be collected a
+    /// moment after that ([`SHUTDOWN_REAP_WAIT`]). The one wait in the engine;
+    /// the owner is on its way out.
+    pub fn shutdown(&mut self) {
+        let programs: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| matches!(stream.end, End::Program(_)))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in programs {
+            self.forget(id);
+        }
+        let limit = Instant::now() + self.config.kill_wait + SHUTDOWN_REAP_WAIT;
+        let mut unheard = Vec::new();
+        while !self.dying.is_empty() {
+            let now = Instant::now();
+            if now >= limit {
+                break;
+            }
+            self.expire_programs(now);
+            let found = self.dying_interest();
+            let mut set: Vec<libc::pollfd> = found.iter().map(|(fd, _)| *fd).collect();
+            let until = self
+                .dying
+                .values()
+                .filter_map(|d| d.kill_at)
+                .min()
+                .map_or(limit, |at| at.min(limit));
+            if sys::poll(&mut set, Some(until.saturating_duration_since(now))).is_err() {
+                break;
+            }
+            for ((_, token), fd) in found.into_iter().zip(&set) {
+                if fd.revents != 0 {
+                    self.ready(token, fd.revents, &mut unheard);
+                }
+            }
+        }
+        // What is left cannot be collected: the system will, when this exits.
+        // (Dropping a program waits for it.)
+        for dying in std::mem::take(&mut self.dying).into_values() {
+            std::mem::forget(dying.program);
+        }
     }
 
     /// Queues a frame of `data` or `eof` for the wire.

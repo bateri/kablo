@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use common::{Bridge, Env, Forward, client, read_exactly};
 use kablo::bridge::{FORWARDING_OFF, NO_FORWARDING};
 use kablo_proto::v1::Message;
-use kablo_proto::v1::stream::{FailCode, MAX_WINDOW};
+use kablo_proto::v1::stream::{Command, FailCode, MAX_WINDOW};
 
 /// The file, there while this is alive and gone after, with the directory it
 /// is in if this made it.
@@ -129,6 +129,16 @@ fn the_administrator_turns_streams_off_and_on_for_a_bridge_that_is_running() {
         .connect_stream("127.0.0.1", port, MAX_WINDOW)
         .unwrap_err();
     assert_eq!((code, text.as_str()), (FailCode::FORBIDDEN, FORWARDING_OFF));
+    // A program is not a connection: the switch is not about it, and the
+    // bridge says so.
+    assert!(bridge.features[1].commands);
+    let runs = Command {
+        argv: vec![b"/bin/echo".to_vec(), b"runs".to_vec()],
+        ..Command::default()
+    };
+    let (ran, _) = bridge.run_command(runs, MAX_WINDOW).unwrap();
+    bridge.until("the command's end", |b| b.flows[&ran].closed);
+    assert_eq!(bridge.flows[&ran].data, b"runs\n");
     bridge.stream_send(open, b"still open", 100);
     bridge.until("the echo", |b| b.flows[&open].data == b"still open");
 

@@ -20,6 +20,7 @@ pub mod link;
 pub mod listing;
 pub mod outbound;
 pub mod peer;
+pub mod process;
 pub mod procinfo;
 pub mod pty;
 pub mod relay;

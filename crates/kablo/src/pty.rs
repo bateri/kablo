@@ -169,9 +169,9 @@ pub fn spawn(slave: &OwnedFd, request: &NewSession) -> io::Result<Child> {
     command.spawn()
 }
 
-/// The signals a shell starts with the default action for, whatever the
-/// keeper inherited.
-const INHERITED_SIGNALS: [libc::c_int; 10] = [
+/// The signals a shell or a command starts with the default action for,
+/// whatever the keeper inherited.
+pub const INHERITED_SIGNALS: [libc::c_int; 10] = [
     libc::SIGHUP,
     libc::SIGINT,
     libc::SIGQUIT,

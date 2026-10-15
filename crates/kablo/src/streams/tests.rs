@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use kablo_proto::v1::Exit;
 use kablo_proto::v1::stream::{Incoming, IncomingDecoder};
 
 use super::*;
@@ -500,29 +501,6 @@ fn what_cannot_be_opened_is_failed_without_connecting() {
 }
 
 #[test]
-fn an_open_for_a_command_is_answered_as_a_server_from_before_commands_would() {
-    let mut server = server_with(Config::default());
-    let mut out = Vec::new();
-    let command = kablo_proto::v1::stream::Command {
-        argv: vec![b"true".to_vec()],
-        ..Default::default()
-    };
-    server.handle(
-        Side::Client,
-        Packet::new(
-            1,
-            Message::OpenCommand {
-                window: 1000,
-                command,
-            },
-        ),
-        &mut out,
-    );
-    assert_eq!(failed(&out), [(1, FailCode::BAD_REQUEST)]);
-    assert!(server.is_empty());
-}
-
-#[test]
 fn too_many_streams_and_too_many_connecting_are_the_limit() {
     let (config, gate) = gated();
     let mut server = server_with(Config {
@@ -977,4 +955,482 @@ fn a_closed_stream_takes_its_queued_frames_with_it() {
     assert_eq!(server.next_len(), None);
     assert_eq!(server.data_bytes, 0);
     assert!(out.is_empty(), "a close is not answered");
+}
+
+// --- programs ------------------------------------------------------------------
+
+fn command(argv: &[&str]) -> Command {
+    Command {
+        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        ..Command::default()
+    }
+}
+
+fn sh(script: &str) -> Command {
+    command(&["/bin/sh", "-c", script])
+}
+
+/// Whether the process `pid` is not there: not even as a program that ended and
+/// was not collected, which still answers a signal.
+fn gone(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks.
+    let found = unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), 0) };
+    found == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+fn wait_gone(what: &str, pids: &[u32]) {
+    let start = Instant::now();
+    while !pids.iter().all(|&pid| gone(pid)) {
+        assert!(start.elapsed() < PATIENCE, "{what} are still there");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A server with programs, turned by hand: what it says is kept in the order
+/// the wire would carry it (a turn's control packets, then its data frames).
+struct Programs {
+    server: Streams,
+    out: Vec<Packet>,
+    decoder: IncomingDecoder,
+    said: Vec<Packet>,
+    /// Whether credit is given back for what is received, as a client that
+    /// takes everything does.
+    credit: bool,
+}
+
+impl Programs {
+    fn new(config: Config) -> Programs {
+        Programs {
+            server: server_with(config),
+            out: Vec::new(),
+            decoder: IncomingDecoder::new(),
+            said: Vec::new(),
+            credit: true,
+        }
+    }
+
+    /// Opens stream `id` as a client would.
+    fn open(&mut self, id: u32, window: u32, command: Command) {
+        self.send(id, Message::OpenCommand { window, command });
+    }
+
+    fn send(&mut self, id: u32, message: Message) {
+        self.server
+            .handle(Side::Client, Packet::new(id, message), &mut self.out);
+        self.server.settle(&mut self.out);
+        self.collect();
+    }
+
+    fn turn(&mut self) {
+        let found = self.server.interest();
+        let mut set: Vec<libc::pollfd> = found.iter().map(|(fd, _)| *fd).collect();
+        sys::poll(&mut set, Some(Duration::from_millis(5))).unwrap();
+        for ((_, token), fd) in found.into_iter().zip(&set) {
+            if fd.revents != 0 {
+                self.server.ready(token, fd.revents, &mut self.out);
+            }
+        }
+        self.server.settle(&mut self.out);
+        self.server.expire(Instant::now(), &mut self.out);
+        self.collect();
+    }
+
+    /// Takes what the server has said: its packets, then its frames.
+    fn collect(&mut self) {
+        let mut fresh = std::mem::take(&mut self.out);
+        while let Some(frame) = self.server.take() {
+            self.decoder.push(&frame);
+            while let Some(incoming) = self.decoder.next_incoming().unwrap() {
+                match incoming {
+                    Incoming::Stream { packet, .. } => fresh.push(packet),
+                    other => panic!("a session message: {other:?}"),
+                }
+            }
+        }
+        if self.credit {
+            for packet in &fresh {
+                if let Message::Data(bytes) | Message::Stderr(bytes) = &packet.message {
+                    let credit = Message::Credit(u32::try_from(bytes.len()).unwrap());
+                    let credit = Packet::new(packet.stream, credit);
+                    self.server.handle(Side::Client, credit, &mut self.out);
+                }
+            }
+        }
+        self.said.extend(fresh);
+    }
+
+    fn until(&mut self, what: &str, done: impl Fn(&Programs) -> bool) {
+        let start = Instant::now();
+        while !done(self) {
+            self.turn();
+            assert!(start.elapsed() < PATIENCE, "timed out waiting for {what}");
+        }
+    }
+
+    /// Everything said about stream `id`, in order.
+    fn about(&self, id: u32) -> Vec<&Message> {
+        self.said
+            .iter()
+            .filter(|packet| packet.stream == id)
+            .map(|packet| &packet.message)
+            .collect()
+    }
+
+    fn bytes(&self, id: u32, errors: bool) -> Vec<u8> {
+        let mut all = Vec::new();
+        for message in self.about(id) {
+            match message {
+                Message::Data(bytes) if !errors => all.extend_from_slice(bytes),
+                Message::Stderr(bytes) if errors => all.extend_from_slice(bytes),
+                _ => {}
+            }
+        }
+        all
+    }
+
+    /// The program's process number while the stream is open.
+    fn pid(&self, id: u32) -> u32 {
+        match &self.server.streams.get(&id).unwrap().end {
+            End::Program(run) => run.program.id(),
+            End::Socket(_) => panic!("a socket"),
+        }
+    }
+
+    fn ended(&self, id: u32) -> bool {
+        self.about(id).contains(&&Message::Close)
+    }
+
+    /// Turns until the stream is over and no program is waiting to end.
+    fn finish(&mut self, id: u32) {
+        self.until("the end of the stream", |p| {
+            p.ended(id) && p.server.dying.is_empty()
+        });
+    }
+}
+
+fn opened_ids(said: &[Packet]) -> Vec<u32> {
+    said.iter()
+        .filter(|p| matches!(p.message, Message::Opened { .. }))
+        .map(|p| p.stream)
+        .collect()
+}
+
+#[test]
+fn a_program_says_its_piece_then_eof_then_how_it_ended_then_close() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, command(&["/bin/echo", "hello", "$HOME"]));
+    assert_eq!(opened_ids(&p.said), [1]);
+    // The client never says `eof` of its own, and the stream ends all the same.
+    p.finish(1);
+    assert_eq!(
+        p.about(1),
+        [
+            &Message::Opened {
+                window: Config::default().window
+            },
+            &Message::Data(b"hello $HOME\n".to_vec()),
+            &Message::Eof,
+            &Message::Exited(Exit::Code(0)),
+            &Message::Close,
+        ]
+    );
+    assert!(p.server.is_empty());
+}
+
+#[test]
+fn standard_error_is_kept_apart_and_the_exit_code_is_the_programs() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sh("echo out; echo err >&2; exit 3"));
+    p.finish(1);
+    assert_eq!(p.bytes(1, false), b"out\n");
+    assert_eq!(p.bytes(1, true), b"err\n");
+    let tail: Vec<_> = p.about(1).into_iter().rev().take(3).collect();
+    assert_eq!(
+        tail,
+        [
+            &Message::Close,
+            &Message::Exited(Exit::Code(3)),
+            &Message::Eof
+        ]
+    );
+}
+
+#[test]
+fn a_signal_that_ended_a_program_is_told_as_one() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sh("kill -9 $$"));
+    p.finish(1);
+    assert!(
+        p.about(1)
+            .contains(&&Message::Exited(Exit::Signal(libc::SIGKILL)))
+    );
+}
+
+#[test]
+fn the_end_comes_after_the_last_byte_even_when_the_pipes_close_before_the_program() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sh("echo last; exec >&- 2>&-; sleep 0.3; exit 4"));
+    p.finish(1);
+    let said = p.about(1);
+    let eof = said.iter().position(|m| **m == Message::Eof).unwrap();
+    let exited = said
+        .iter()
+        .position(|m| **m == Message::Exited(Exit::Code(4)))
+        .unwrap();
+    assert!(eof < exited, "{said:?}");
+    assert_eq!(p.bytes(1, false), b"last\n");
+}
+
+#[test]
+fn what_is_sent_in_goes_to_the_program_and_comes_back_within_the_windows() {
+    // The window this end offers is 16 KiB; 200 KiB goes through `cat`, sent
+    // only as credit comes.
+    let window = 16 * 1024;
+    let mut p = Programs::new(Config {
+        window,
+        ..Config::default()
+    });
+    p.open(1, MAX_WINDOW, command(&["/bin/cat"]));
+    let input = pattern(200 * 1024, 7);
+    let credited = |p: &Programs| -> usize {
+        p.about(1)
+            .iter()
+            .map(|m| match m {
+                Message::Credit(bytes) => *bytes as usize,
+                _ => 0,
+            })
+            .sum()
+    };
+    let mut sent = 0;
+    let start = Instant::now();
+    while sent < input.len() {
+        let room = (window as usize + credited(&p)).saturating_sub(sent);
+        let piece = room.min(4096).min(input.len() - sent);
+        if piece > 0 {
+            p.send(1, Message::Data(input[sent..sent + piece].to_vec()));
+            sent += piece;
+        }
+        p.turn();
+        assert!(start.elapsed() < PATIENCE, "the input never went in");
+    }
+    p.send(1, Message::Eof);
+    p.finish(1);
+    assert_eq!(p.bytes(1, false), input);
+    assert!(
+        p.about(1).contains(&&Message::Exited(Exit::Code(0))),
+        "{:?}",
+        p.about(1).last()
+    );
+}
+
+#[test]
+fn a_stream_that_sends_past_its_window_loses_its_program() {
+    let mut p = Programs::new(Config {
+        window: 1000,
+        ..Config::default()
+    });
+    p.open(1, 1000, command(&["/bin/cat"]));
+    let pid = p.pid(1);
+    p.send(1, Message::Data(vec![b'x'; 1001]));
+    assert!(p.ended(1), "a close was expected");
+    p.until("the program to be collected", |p| p.server.dying.is_empty());
+    wait_gone("the program of a stream that broke the rules", &[pid]);
+    assert!(p.server.is_empty());
+}
+
+#[test]
+fn output_and_errors_are_paid_for_out_of_one_window() {
+    let mut p = Programs::new(Config::default());
+    p.credit = false;
+    // Out and err as fast as they are taken, for ever. (How the window comes to
+    // be split between them is up to which pipe is read first.)
+    p.open(1, 1000, sh("while :; do echo out; echo err >&2; done"));
+    let received = |p: &Programs| p.bytes(1, false).len() + p.bytes(1, true).len();
+    p.until("the window to be used", |p| received(p) >= 1000);
+    for _ in 0..40 {
+        p.turn();
+    }
+    assert_eq!(
+        received(&p),
+        1000,
+        "no more than the window, however it is split"
+    );
+    // Credit lets more through, and still within it.
+    p.send(1, Message::Credit(500));
+    p.until("more", |p| received(p) >= 1500);
+    for _ in 0..40 {
+        p.turn();
+    }
+    assert_eq!(received(&p), 1500);
+    p.send(1, Message::Close);
+    p.until("the program to go", |p| p.server.dying.is_empty());
+}
+
+#[test]
+fn errors_alone_use_the_window_too() {
+    let mut p = Programs::new(Config::default());
+    p.credit = false;
+    p.open(1, 1000, sh("while :; do echo err >&2; done"));
+    p.until("the window to be used", |p| p.bytes(1, true).len() >= 1000);
+    for _ in 0..40 {
+        p.turn();
+    }
+    assert_eq!(p.bytes(1, true).len(), 1000);
+    assert!(p.bytes(1, false).is_empty());
+    p.send(1, Message::Credit(100));
+    p.until("more", |p| p.bytes(1, true).len() >= 1100);
+    p.send(1, Message::Close);
+    p.until("the program to go", |p| p.server.dying.is_empty());
+}
+
+#[test]
+fn a_command_that_is_not_valid_or_does_not_start_or_is_over_a_limit_is_failed() {
+    let mut p = Programs::new(Config {
+        max_streams: 2,
+        ..Config::default()
+    });
+    let mut nul = command(&["/bin/echo"]);
+    nul.argv.push(b"a\0b".to_vec());
+    p.open(1, 1000, Command::default());
+    p.open(2, 1000, nul);
+    p.open(3, 1000, command(&["/no/such/program"]));
+    let mut ask_home = command(&["/bin/true"]);
+    ask_home.cwd = Some(b"/no/such/directory".to_vec());
+    p.open(4, 1000, ask_home);
+    p.open(5, MAX_WINDOW + 1, command(&["/bin/true"]));
+    let failures: Vec<(u32, FailCode)> = failed(&p.said);
+    assert_eq!(
+        failures,
+        [
+            (1, FailCode::BAD_REQUEST),
+            (2, FailCode::BAD_REQUEST),
+            (3, FailCode::START_FAILED),
+            (4, FailCode::START_FAILED),
+            (5, FailCode::LIMIT),
+        ]
+    );
+    let words: Vec<&str> = p
+        .said
+        .iter()
+        .filter_map(|packet| match &packet.message {
+            Message::Failed { code, text } if *code == FailCode::START_FAILED => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(words, ["No such file or directory"; 2]);
+    assert!(p.server.is_empty(), "nothing was started");
+
+    // The streams limit counts programs.
+    p.open(6, 1000, command(&["/bin/cat"]));
+    p.open(7, 1000, command(&["/bin/cat"]));
+    p.open(8, 1000, command(&["/bin/cat"]));
+    assert_eq!(opened_ids(&p.said), [6, 7]);
+    assert_eq!(failed(&p.said).last(), Some(&(8, FailCode::LIMIT)));
+    // (Dropping the engine ends what is left.)
+}
+
+#[test]
+fn an_open_that_was_numbered_before_is_not_answered_twice() {
+    let mut p = Programs::new(Config::default());
+    p.open(5, 1000, command(&["/bin/cat"]));
+    p.open(5, 1000, command(&["/bin/cat"]));
+    p.open(3, 1000, command(&["/bin/cat"]));
+    assert_eq!(opened_ids(&p.said), [5]);
+    assert_eq!(p.server.len(), 1);
+}
+
+#[test]
+fn commands_run_when_connections_are_turned_off() {
+    let mut p = Programs::new(Config::default());
+    p.server.set_closed(Some("off".to_owned()));
+    p.send(1, open(1000, 80, "example.test"));
+    p.open(2, 1000, command(&["/bin/echo", "still runs"]));
+    assert_eq!(failed(&p.said), [(1, FailCode::FORBIDDEN)]);
+    p.finish(2);
+    assert_eq!(p.bytes(2, false), b"still runs\n");
+}
+
+#[test]
+fn a_close_ends_the_program_and_what_it_started_and_collects_them() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sh("sleep 60 & echo $!; echo $$; wait"));
+    p.until("the program to say who it is", |p| {
+        p.bytes(1, false).iter().filter(|&&b| b == b'\n').count() == 2
+    });
+    let said = String::from_utf8(p.bytes(1, false)).unwrap();
+    let pids: Vec<u32> = said.lines().map(|l| l.parse().unwrap()).collect();
+    assert_eq!(pids.len(), 2);
+    assert_eq!(pids.get(1), Some(&p.pid(1)));
+    assert!(!pids.iter().any(|&pid| gone(pid)));
+    p.send(1, Message::Close);
+    assert!(p.server.is_empty(), "the stream is gone at once");
+    assert_eq!(p.server.dying.len(), 1);
+    p.until("the program to be collected", |p| p.server.dying.is_empty());
+    wait_gone("the program and what it started", &pids);
+    assert_eq!(
+        p.server.deadline(),
+        None,
+        "no timer without a program waiting"
+    );
+}
+
+#[test]
+fn a_program_that_ignores_the_signal_is_killed_when_the_time_is_up() {
+    let wait = Duration::from_millis(300);
+    let mut p = Programs::new(Config {
+        kill_wait: wait,
+        ..Config::default()
+    });
+    p.open(
+        1,
+        1000,
+        sh("trap '' TERM; echo ready; while :; do sleep 1; done"),
+    );
+    p.until("the program to be ready", |p| !p.bytes(1, false).is_empty());
+    let pid = p.pid(1);
+    let closed = Instant::now();
+    p.send(1, Message::Close);
+    assert!(
+        p.server.deadline().is_some(),
+        "the time is up at some point"
+    );
+    p.until("the program to be collected", |p| p.server.dying.is_empty());
+    assert!(closed.elapsed() >= wait, "it was killed before its time");
+    wait_gone("the program that ignored the signal", &[pid]);
+}
+
+#[test]
+fn shutting_down_ends_every_program_and_waits_for_them() {
+    let wait = Duration::from_millis(300);
+    let mut p = Programs::new(Config {
+        kill_wait: wait,
+        ..Config::default()
+    });
+    p.open(1, 1000, sh("echo ready; exec sleep 60"));
+    p.open(
+        2,
+        1000,
+        sh("trap '' TERM; echo ready; while :; do sleep 1; done"),
+    );
+    p.open(3, 1000, command(&["/bin/echo", "done already"]));
+    p.until("the programs to be ready", |p| {
+        !p.bytes(1, false).is_empty() && !p.bytes(2, false).is_empty() && p.ended(3)
+    });
+    let pids = [p.pid(1), p.pid(2)];
+    let started = Instant::now();
+    p.server.shutdown();
+    assert!(started.elapsed() < wait + SHUTDOWN_REAP_WAIT, "it gave up");
+    assert!(p.server.is_empty() && p.server.dying.is_empty());
+    wait_gone("the programs of a connection that ended", &pids);
+}
+
+#[test]
+fn a_program_that_is_dropped_with_the_engine_is_collected_too() {
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, command(&["/bin/cat"]));
+    let pid = p.pid(1);
+    drop(p);
+    assert!(gone(pid));
 }

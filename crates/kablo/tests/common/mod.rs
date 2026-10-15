@@ -652,6 +652,12 @@ pub struct Flow {
     pub owed: u64,
     /// Whether the bytes are left out of `data`.
     pub discard: bool,
+    /// The bytes a command wrote as errors.
+    pub stderr: Vec<u8>,
+    /// How the command ended, as the bridge told it.
+    pub exited: Option<Exit>,
+    /// The `eof`, `exited` and `close` the bridge sent, in the order they came.
+    pub ends: Vec<&'static str>,
 }
 
 /// A client of `kablo attach` (or of anything else that speaks the protocol
@@ -866,13 +872,31 @@ impl Bridge {
                     credits.push((id, bytes.len() as u32));
                 }
             }
+            stream::Message::Stderr(bytes) => {
+                flow.total += bytes.len() as u64;
+                flow.stderr.extend_from_slice(&bytes);
+                if flow.hold {
+                    flow.owed += bytes.len() as u64;
+                } else {
+                    credits.push((id, bytes.len() as u32));
+                }
+            }
             stream::Message::Credit(bytes) => flow.credit += u64::from(bytes),
-            stream::Message::Eof => flow.eof = true,
-            stream::Message::Close => flow.closed = true,
-            other @ (stream::Message::Open { .. }
-            | stream::Message::OpenCommand { .. }
-            | stream::Message::Stderr(_)
-            | stream::Message::Exited(_)) => panic!("the bridge sent {other:?}"),
+            stream::Message::Eof => {
+                flow.eof = true;
+                flow.ends.push("eof");
+            }
+            stream::Message::Exited(exit) => {
+                flow.exited = Some(exit);
+                flow.ends.push("exited");
+            }
+            stream::Message::Close => {
+                flow.closed = true;
+                flow.ends.push("close");
+            }
+            other @ (stream::Message::Open { .. } | stream::Message::OpenCommand { .. }) => {
+                panic!("the bridge sent {other:?}")
+            }
         }
     }
 
@@ -1056,6 +1080,41 @@ impl Bridge {
             },
         );
         id
+    }
+
+    /// Sends an `open` for a command, as the next stream number, and returns it.
+    /// The answer is in [`Bridge::flows`].
+    pub fn open_command(&mut self, command: stream::Command, window: u32) -> u32 {
+        self.next_stream += 1;
+        let id = self.next_stream;
+        let (hold, discard) = std::mem::take(&mut self.next_flow);
+        let flow = self.flow(id);
+        flow.hold = hold;
+        flow.discard = discard;
+        self.stream_message(id, stream::Message::OpenCommand { window, command });
+        id
+    }
+
+    /// Opens a command and waits for the answer: the stream and the window the
+    /// bridge offered, or the stream, the code and the text of why it would
+    /// not.
+    pub fn run_command(
+        &mut self,
+        command: stream::Command,
+        window: u32,
+    ) -> Result<(u32, u32), (u32, FailCode, String)> {
+        let id = self.open_command(command, window);
+        self.until("the answer to an open", |b| {
+            b.flows
+                .get(&id)
+                .is_some_and(|f| f.opened.is_some() || f.failed.is_some())
+        });
+        let flow = self.flow(id);
+        match (flow.opened, flow.failed.clone()) {
+            (Some(window), _) => Ok((id, window)),
+            (None, Some((code, text))) => Err((id, code, text)),
+            (None, None) => unreachable!(),
+        }
     }
 
     /// Opens a stream and waits for the answer: the stream and the window the

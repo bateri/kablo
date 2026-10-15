@@ -549,7 +549,9 @@ it lasts as long as the program does and no longer than the connection.
   start (no such program, a directory that is not there, no permission, the
   system's refusal) is `failed` (8) with the system's words as the text. The
   program starts in its own process group, with no controlling terminal, in the
-  server's environment plus the `env` entries and in `cwd` or the user's home.
+  server's environment plus the `env` entries and in `cwd` or the user's home
+  (a `cwd` that is not absolute counts from there; a home that is not there is
+  not a reason to fail: the program starts where the bridge is).
   The client does not send `data` before `opened`.
 - *The program's streams.* `data` from the client is written to the program's
   standard input, under the window the server gave; `eof` from the client

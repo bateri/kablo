@@ -32,6 +32,14 @@
 //! administrator can turn them off by putting a file in [`NO_FORWARDING`]; the
 //! file is looked at again for every `open`, so the decision reaches a bridge
 //! that is already running.
+//!
+//! The same streams run programs for the client, as `ssh host command` does
+//! over a login that is already there. Those are children of the bridge and
+//! last as long as the connection: when the client goes away they are told to
+//! end, and the bridge leaves once they have. The administrator's file does not
+//! touch them, since whoever may log in may run a program. (A bridge that is
+//! killed rather than asked to stop leaves its programs behind, as any process
+//! leaves what it started.)
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
@@ -144,6 +152,13 @@ impl Bridge {
     }
 
     fn serve(&mut self) -> u8 {
+        let code = self.turns();
+        // Programs run for the client last as long as the client's connection.
+        self.streams.shutdown();
+        code
+    }
+
+    fn turns(&mut self) -> u8 {
         loop {
             if let Some(code) = self.stop {
                 return code;
@@ -493,12 +508,13 @@ fn created(dir: &std::path::Path, id: SessionId) -> Packet {
 }
 
 /// What the server can do beyond sessions: streams, unless the administrator
-/// has turned them off by the file at `switch`.
+/// has turned them off by the file at `switch`, and programs, whatever it says.
 fn features(switch: &Path) -> Features {
     match forwarding_off(switch) {
         Some(why) => Features::streams_off(why),
         None => Features::with_streams(),
     }
+    .with_commands()
 }
 
 /// Why streams are off, if the file at `switch` says so by being there, or if
@@ -569,6 +585,7 @@ mod tests {
         assert_eq!(forwarding_off(&path), None);
         assert!(features(&path).streams);
         assert_eq!(features(&path).reason, None);
+        assert!(features(&path).commands);
 
         // Its contents do not matter, and it is looked at again each time.
         std::fs::write(&path, "").unwrap();
@@ -576,6 +593,10 @@ mod tests {
         let off = features(&path);
         assert!(!off.streams);
         assert_eq!(off.reason.as_deref(), Some(FORWARDING_OFF));
+        assert!(
+            off.commands,
+            "the switch is about connections, not programs"
+        );
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(forwarding_off(&path), None);
