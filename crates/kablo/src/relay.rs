@@ -25,8 +25,13 @@
 //! questions (device attributes, the cursor position) are answered by that
 //! screen only while no client is attached, so a program that asks while nobody
 //! looks is not left waiting and one that is watched hears one answer, the
-//! client's. A relay that starts (a replacement, or a restart after a crash) has
-//! no screen to carry over and builds it again from what the journal holds.
+//! client's. A client whose terminal answers what it is shown and cannot hold
+//! its answers back says so in its view, and is sent a picture rather than
+//! bytes that hold a question already answered (`last_reply`); any other
+//! client is told how far the questions were answered (`answered`) and keeps
+//! its own answers back. A relay that starts (a replacement, or a restart after
+//! a crash) has no screen to carry over and builds it again from what the
+//! journal holds.
 //!
 //! **The terminal's state is told, not polled.** What only the server can see
 //! of the terminal (the program in the foreground, whether a password is being
@@ -263,6 +268,13 @@ struct Relay {
     screen: Screen,
     /// The offset after the last journal byte the screen has had.
     screen_at: u64,
+    /// The end of the last stretch of output that held a question the terminal
+    /// had an answer for, whoever sent it to the program (this relay with
+    /// nobody attached, or a client's own terminal). A relay that takes over
+    /// finds it again by feeding the screen the journal it holds, and counts
+    /// what it cannot replay as answered: a picture costs less than a program
+    /// answered twice.
+    last_reply: u64,
     /// The scrollback rows the screen keeps.
     history: usize,
     /// Reused to carry journal bytes to the screen.
@@ -363,6 +375,7 @@ impl Relay {
         // before the limit) is shown at the most.
         let screen = Screen::new(size.cols.min(MAX_COLS), size.rows.min(MAX_ROWS), history);
         let screen_at = replay_start(&journal, REPLAY_LIMIT);
+        let last_reply = replayed_mark(&journal, screen_at);
         inner::write(&mut &chan, &ToWarden::Ready)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
         // Which of its records this binary reads: what a warden that renews
@@ -396,6 +409,7 @@ impl Relay {
             input_sent: 0,
             screen,
             screen_at,
+            last_reply,
             history,
             scratch: vec![0; SCREEN_CHUNK],
             clients: Vec::new(),
@@ -571,6 +585,11 @@ impl Relay {
                 if self.reading {
                     self.drain_to_the_end();
                 }
+                // Nothing runs in the terminal any more: what the clients were
+                // told (a password being asked, an ssh session) is over, and
+                // no look at it follows.
+                let now = self.terminal_now();
+                self.tell_the_others(&now, usize::MAX);
             }
             ToRelay::UpgradeFailed(why) => self.upgrade_failed(&why),
             ToRelay::Renewed(version) => self.warden_version = version,
@@ -740,7 +759,9 @@ impl Relay {
                 Some(n) => {
                     self.screen.feed(self.scratch.get(..n).unwrap_or_default());
                     self.screen_at += n as u64;
-                    self.answer(answers);
+                    if self.answer(answers) && mode != Feed::Spent {
+                        self.last_reply = self.last_reply.max(self.screen_at);
+                    }
                     if answers || mode == Feed::Spent {
                         self.journal.set_answered(self.screen_at);
                     }
@@ -764,14 +785,18 @@ impl Relay {
 
     /// Sends the terminal's own answers to the program, when nobody else will:
     /// a client attached answers with its terminal, and two answers to one
-    /// question would be typed into the program.
-    fn answer(&mut self, wanted: bool) {
+    /// question would be typed into the program. Says whether the bytes just
+    /// given to the screen held a question it has an answer for, sent or not.
+    fn answer(&mut self, wanted: bool) -> bool {
         let answers = self.screen.take_replies();
-        if answers.is_empty() || !wanted || self.exit.is_some() || self.attached() > 0 {
-            return;
+        if answers.is_empty() {
+            return false;
         }
-        // The program that does not read what it is owed gets no more.
-        let _ = self.queue_input(&answers);
+        if wanted && self.exit.is_none() && self.attached() == 0 {
+            // The program that does not read what it is owed gets no more.
+            let _ = self.queue_input(&answers);
+        }
+        true
     }
 
     /// How many clients are attached.
@@ -1106,8 +1131,15 @@ impl Relay {
             self.set_size(view.size);
         }
         // The start of what was asked for is gone, or a picture was asked for:
-        // the screen stands in for what the stream would have shown.
-        let truncated = offset != OFFSET_END && offset < self.journal.retained_from();
+        // the screen stands in for what the stream would have shown. So it does
+        // for a terminal that answers what it is shown and cannot hold its
+        // answers back, when the bytes hold a question that was answered
+        // already: it would answer a second time.
+        let answered_twice = offset != OFFSET_END
+            && offset < self.last_reply
+            && view.is_some_and(|view| view.picture_if_answered);
+        let truncated =
+            (offset != OFFSET_END && offset < self.journal.retained_from()) || answered_twice;
         let picture = (truncated || view.is_some_and(|view| view.picture)).then(|| self.picture());
         let start = match &picture {
             Some(picture) => picture.offset,
@@ -1128,7 +1160,9 @@ impl Relay {
             Message::Attached {
                 offset: start,
                 truncated,
-                answered: 0,
+                // A journal that keeps no track of answers counts as all
+                // answered, as it does for the relay (`replayed_mark`).
+                answered: self.journal.answered().unwrap_or(total),
             },
         );
         // Then what the terminal is doing: before the picture and the
@@ -1239,11 +1273,11 @@ impl Relay {
         }
     }
 
-    fn status(&self) -> Status {
+    fn status(&mut self) -> Status {
         let mut status = Status::new(self.id.clone());
         status.pid = self.child_pid;
         if self.exit.is_none() {
-            let terminal = procinfo::look(self.master.as_fd(), self.child_pid);
+            let terminal = self.watch.look(self.master.as_fd(), self.child_pid);
             status.program = terminal.program;
             status.cwd = terminal.cwd;
             status.secret = terminal.secret;
@@ -1400,6 +1434,17 @@ impl Relay {
     }
 }
 
+/// Where `last_reply` starts for a relay that feeds its screen from
+/// `replay_start` on: what it will not replay counts as answered, so does all
+/// of a journal that keeps no track of answers (an older warden's), and the
+/// replay moves the mark to the end of what held a question.
+fn replayed_mark(journal: &Journal, replay_start: u64) -> u64 {
+    match journal.answered() {
+        Some(_) => replay_start,
+        None => journal.total(),
+    }
+}
+
 /// Where the screen of a journal begins: the start of the stream when nothing
 /// was dropped and no more than `limit` bytes are there, else the first line
 /// break in the last `limit` bytes that are still in the ring, so that the
@@ -1421,6 +1466,12 @@ mod tests {
     /// What the program would find waiting to be read after the relay took
     /// over a session whose journal is `journal`: the answers to its questions.
     fn answers_after_taking_over(journal: Journal) -> Vec<u8> {
+        take_over(journal).0
+    }
+
+    /// As [`answers_after_taking_over`], and where the relay then says the last
+    /// question it knows of was answered.
+    fn take_over(journal: Journal) -> (Vec<u8>, u64) {
         let pty = pty::open(pty::DEFAULT_SIZE).unwrap();
         // The program's side reads what arrives as it is.
         // SAFETY: `slave` is an open terminal and `raw` a termios the kernel fills.
@@ -1448,6 +1499,7 @@ mod tests {
             master: pty.master,
             screen: Screen::new(80, 24, 10),
             screen_at: replay_start(&journal, REPLAY_LIMIT),
+            last_reply: replayed_mark(&journal, replay_start(&journal, REPLAY_LIMIT)),
             history: 10,
             scratch: vec![0; SCREEN_CHUNK],
             journal,
@@ -1483,7 +1535,7 @@ mod tests {
                 _ => break,
             }
         }
-        got
+        (got, relay.last_reply)
     }
 
     #[test]
@@ -1521,6 +1573,53 @@ mod tests {
         journal.append(b"\x1b[6n");
         journal.forget_answers();
         assert_eq!(answers_after_taking_over(journal), b"");
+    }
+
+    #[test]
+    fn a_relay_that_takes_over_finds_the_last_question_in_what_it_replays() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(b"\x1b[6n");
+        journal.set_answered(journal.total());
+        journal.append(b"text");
+        // Answered by whoever read it, and found again when the screen is fed:
+        // the text after it holds no question.
+        assert_eq!(take_over(journal), (Vec::new(), 4));
+    }
+
+    #[test]
+    fn the_mark_is_the_end_of_the_piece_of_output_that_held_the_question() {
+        let mut journal = Journal::create(1 << 18).unwrap();
+        journal.append(b"\x1b[6n");
+        journal.append(&vec![b'x'; SCREEN_CHUNK + 100]);
+        let total = journal.total();
+        let (_, mark) = take_over(journal);
+        assert_eq!(
+            mark, SCREEN_CHUNK as u64,
+            "a piece at a time, not all of it"
+        );
+        assert!(mark < total);
+    }
+
+    #[test]
+    fn a_question_the_relay_answers_moves_the_mark_to_the_end_of_what_it_read() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(b"\x1b[6n");
+        assert_eq!(take_over(journal), (b"\x1b[1;1R".to_vec(), 4));
+    }
+
+    #[test]
+    fn output_with_no_question_leaves_the_mark_where_it_was() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(b"nothing asked here");
+        assert_eq!(take_over(journal), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_journal_that_keeps_no_track_counts_all_of_it_as_answered() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(b"\x1b[6n");
+        journal.forget_answers();
+        assert_eq!(take_over(journal), (Vec::new(), 4));
     }
 
     #[test]

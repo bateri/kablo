@@ -120,6 +120,28 @@ fn the_state_follows_what_runs_and_a_silent_program_is_seen() {
 }
 
 #[test]
+fn when_the_program_ends_the_clients_are_told_there_is_nothing_left() {
+    let mut env = Env::new();
+    // It asks for a password and ends without ever showing what is typed again.
+    let id = env.start(
+        "ends-asking",
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty -echo; echo armed; read a; exit 3",
+        ],
+    );
+    let mut a = env.connect(&id);
+    a.attach(0);
+    a.wait_for("armed", 0);
+    a.until("a secret", |c| last(c).secret);
+    a.type_in("\n");
+    a.until("the end", |c| c.ended.is_some());
+    assert_eq!(last(&a), TerminalState::default(), "{:?}", a.states);
+}
+
+#[test]
 fn a_terminal_that_stops_showing_what_is_typed_is_a_secret_until_it_shows_it_again() {
     let mut env = Env::new();
     // What `sudo`, `read -s` and ssh's password prompt do to the terminal,

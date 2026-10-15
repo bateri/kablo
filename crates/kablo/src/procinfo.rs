@@ -141,7 +141,8 @@ fn remote_target(name: &[u8], args: &[String]) -> Option<Remote> {
             }
         }
     };
-    (!remote.host.is_empty() && remote.host.len() <= MAX_TARGET).then_some(remote)
+    let host = without_secret(String::from_utf8_lossy(&remote.host).into_owned()).into_bytes();
+    (!host.is_empty() && host.len() <= MAX_TARGET).then_some(Remote { host, ..remote })
 }
 
 /// ssh's short options that take a value (`ssh(1)`'s SYNOPSIS).
@@ -159,11 +160,9 @@ struct SshWalk {
     /// A non-interactive mode: [`SSH_NON_INTERACTIVE`], `RequestTTY=no` or
     /// `SessionType=none|subsystem`.
     quiet: bool,
-    /// The last `-p`, which ssh sets as it reads it.
-    port_flag: Option<u16>,
-    /// The first `-o Port=`, which ssh takes only if the port is not set yet,
-    /// and `-p` always is.
-    port_option: Option<u16>,
+    /// The port ssh will use: the first of `-p`, `-o Port=` and the URI's, in
+    /// the order ssh reads them (each is taken only while no port is set).
+    port: Option<u16>,
 }
 
 /// ssh's arguments (without the program's name) → the target of the
@@ -175,6 +174,10 @@ fn ssh_target(args: &[String]) -> Option<Remote> {
     let mut walk = SshWalk::default();
     let (index, terminated) = walk.options(args, 0);
     let target = args.get(index)?;
+    // The URI's port comes after the options before the target and before
+    // those after it.
+    let (host, uri_port) = ssh_host(target);
+    walk.port = walk.port.or(uri_port);
     // OpenSSH parses options **again** after the target (`ssh prod -p 2222`);
     // it does not if they ended with `--`.
     let rest = if terminated {
@@ -186,10 +189,9 @@ fn ssh_target(args: &[String]) -> Option<Remote> {
     if walk.quiet || (command && !walk.tty) {
         return None;
     }
-    let (host, uri_port) = ssh_host(target);
     Some(Remote {
         host: host.into_bytes(),
-        port: uri_port.or(walk.port_flag).or(walk.port_option),
+        port: walk.port,
     })
 }
 
@@ -226,7 +228,7 @@ impl SshWalk {
                 };
                 match (flag, value) {
                     ('o', Some(value)) => self.config(value),
-                    ('p', Some(value)) => self.port_flag = port_of(value).or(self.port_flag),
+                    ('p', Some(value)) => self.port = self.port.or(port_of(value)),
                     _ => {}
                 }
                 break;
@@ -252,8 +254,8 @@ impl SshWalk {
             if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("subsystem") {
                 self.quiet = true;
             }
-        } else if key.eq_ignore_ascii_case("Port") && self.port_option.is_none() {
-            self.port_option = port_of(value);
+        } else if key.eq_ignore_ascii_case("Port") {
+            self.port = self.port.or(port_of(value));
         }
     }
 }
@@ -268,9 +270,7 @@ fn port_of(text: &str) -> Option<u16> {
 }
 
 /// The target as written, and the port it carries. Only the `ssh://` form is
-/// taken apart: the scheme and the port go, the host and the user stay, and
-/// what follows a `:` in the user (a password has no place in the form, but
-/// would be one if someone wrote it there) does not stay.
+/// taken apart: the scheme and the port go, the host and the user stay.
 fn ssh_host(target: &str) -> (String, Option<u16>) {
     let Some(rest) = target.strip_prefix("ssh://") else {
         return (target.to_owned(), None);
@@ -291,11 +291,24 @@ fn ssh_host(target: &str) -> (String, Option<u16>) {
             None => (host, None),
         },
     };
-    let host = match user.map(|user| user.split(':').next().unwrap_or_default()) {
+    let host = match user {
         Some(user) => format!("{user}@{host}"),
         None => host.to_owned(),
     };
     (host, port)
+}
+
+/// The target without what follows a `:` in its user: a password has no place
+/// in a target, in any form, but would be one if someone wrote it there
+/// (`ssh://user:secret@host`, and `user:secret@host` for mosh and for ssh,
+/// which takes the whole of it as a user name).
+fn without_secret(target: String) -> String {
+    match target.rsplit_once('@') {
+        Some((user, host)) if user.contains(':') => {
+            format!("{}@{host}", user.split(':').next().unwrap_or_default())
+        }
+        _ => target,
+    }
 }
 
 /// The mosh script's options that take a value as a separate argument (the
@@ -317,19 +330,30 @@ const MOSH_VALUED: [&str; 9] = [
 /// it does not disqualify. (`-p` is mosh's UDP port, not ssh's, and is not a
 /// `remote_port`.)
 fn mosh_target<S: AsRef<str>>(args: &[S]) -> Option<String> {
+    mosh_positionals(args)
+        .first()
+        .map(|word| (*word).to_owned())
+}
+
+/// The arguments that are not options (or their values), up to a `--`; the one
+/// after a `--` that comes first is the target.
+fn mosh_positionals<S: AsRef<str>>(args: &[S]) -> Vec<&str> {
+    let mut found = Vec::new();
     let mut words = args.iter().map(AsRef::as_ref);
     while let Some(word) = words.next() {
         if word == "--" {
-            return words.next().map(str::to_owned);
+            if found.is_empty() {
+                found.extend(words.next());
+            }
+            break;
         }
         if !word.starts_with('-') {
-            return Some(word.to_owned());
-        }
-        if MOSH_VALUED.contains(&word) {
+            found.push(word);
+        } else if MOSH_VALUED.contains(&word) {
             words.next();
         }
     }
-    None
+    found
 }
 
 /// `mosh-client`'s arguments → its target. The script passes the client its
@@ -343,14 +367,30 @@ fn mosh_client_target(args: &[String]) -> Option<Remote> {
     }
     let line = line.strip_suffix('|').unwrap_or(line);
     // The line was joined without quoting: `--ssh="ssh -i ~/.ssh/k"` is split
-    // into words and its value leaves a word that is not an option behind. A
-    // word with a character that cannot be in a host is skipped.
+    // into words and its value leaves words behind. A word with a character
+    // that cannot be in a host is skipped.
     let words: Vec<&str> = line
         .split_whitespace()
         .filter(|word| !word.contains(['/', '=', '~']))
         .collect();
+    let positional = mosh_positionals(&words);
+    // The value of `--ssh` or `--server` is a command line of any number of
+    // words, and nothing in the joined line tells where it ends: a word that
+    // is not an option (`-i mykey`) is not told from the target. Such a line is
+    // read only when it leaves one word to be the target.
+    let open_value = line.split_whitespace().any(|word| {
+        ["--ssh", "--server"].iter().any(|option| {
+            word == *option
+                || word
+                    .strip_prefix(option)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    });
+    if open_value && positional.len() != 1 {
+        return None;
+    }
     Some(Remote {
-        host: mosh_target(&words)?.into_bytes(),
+        host: positional.first()?.as_bytes().to_vec(),
         port: None,
     })
 }
@@ -589,15 +629,16 @@ mod tests {
             remote_in("ssh", &["ssh", "-o", "Port 2200", "prod"]),
             port("prod", 2200)
         );
-        // ssh sets `-p` as it reads it and takes `-o Port=` only when no port
-        // is set: the last `-p` wins, then the first `-o`.
-        assert_eq!(remote("ssh", "ssh -p 1 -p 2 prod"), port("prod", 2));
+        // ssh takes a port only while none is set, whichever way it is given:
+        // the first of them wins (`ssh -G` says so).
+        assert_eq!(remote("ssh", "ssh -p 1 -p 2 prod"), port("prod", 1));
         assert_eq!(
             remote("ssh", "ssh -o Port=1 -o Port=2 prod"),
             port("prod", 1)
         );
-        assert_eq!(remote("ssh", "ssh -o Port=1 -p 2 prod"), port("prod", 2));
+        assert_eq!(remote("ssh", "ssh -o Port=1 -p 2 prod"), port("prod", 1));
         assert_eq!(remote("ssh", "ssh -p 2 -o Port=1 prod"), port("prod", 2));
+        assert_eq!(remote("ssh", "ssh prod -p 1 -p 2"), port("prod", 1));
         // Not a port: ssh refuses it and the session never starts.
         assert_eq!(remote("ssh", "ssh -p 0 prod"), host("prod"));
         assert_eq!(remote("ssh", "ssh -p http prod"), host("prod"));
@@ -614,18 +655,39 @@ mod tests {
         assert_eq!(remote("ssh", "ssh ssh://h/path"), host("h"));
         assert_eq!(remote("ssh", "ssh ssh://[::1]:22"), port("::1", 22));
         assert_eq!(remote("ssh", "ssh ssh://u@[fe80::1]"), host("u@fe80::1"));
-        // The URI's port beats a `-p`: it is read after the options.
-        assert_eq!(remote("ssh", "ssh -p 1 ssh://h:2"), port("h", 2));
+        // The URI's port is read after the options before it and before those
+        // after it; the first port set stays.
+        assert_eq!(remote("ssh", "ssh -p 1 ssh://h:2"), port("h", 1));
+        assert_eq!(remote("ssh", "ssh ssh://h:2 -p 1"), port("h", 2));
+        assert_eq!(remote("ssh", "ssh ssh://h -p 1"), port("h", 1));
         // Written without a scheme the target is the user's own text.
         assert_eq!(remote("ssh", "ssh user@fe80::1"), host("user@fe80::1"));
     }
 
     #[test]
-    fn a_password_in_an_ssh_uri_is_not_part_of_the_target() {
+    fn a_password_in_a_target_is_not_part_of_it_in_any_form() {
         assert_eq!(
             remote("ssh", "ssh ssh://deploy:hunter2@h:22"),
             port("deploy@h", 22)
         );
+        assert_eq!(remote("ssh", "ssh deploy:hunter2@h"), host("deploy@h"));
+        assert_eq!(
+            remote("ssh", "ssh deploy:hunter2@fe80::1"),
+            host("deploy@fe80::1")
+        );
+        assert_eq!(
+            remote("perl", "perl /usr/bin/mosh deploy:hunter2@h"),
+            host("deploy@h")
+        );
+        assert_eq!(
+            remote_in(
+                "mosh-client",
+                &["mosh-client", "-# deploy:hunter2@h |", "1.2.3.4", "1"]
+            ),
+            host("deploy@h")
+        );
+        // The password may hold an `@`.
+        assert_eq!(remote("ssh", "ssh deploy:p@ss@h"), host("deploy@h"));
     }
 
     #[test]
@@ -704,6 +766,30 @@ mod tests {
                     "10.0.0.5",
                     "1"
                 ]
+            ),
+            host("prod")
+        );
+        // The value of `--ssh` is any number of words: with one that is not
+        // an option (`mykey`, `bob`) left beside the target there is no telling
+        // which is the target, and none is told.
+        for line in [
+            "-# --ssh=ssh -i mykey prod |",
+            "-# --ssh=ssh -l bob prod |",
+            "-# --ssh ssh -l bob prod |",
+            "-# --server=mosh-server new -s prod |",
+            "-# --ssh=ssh -i mykey prod -- tmux |",
+        ] {
+            assert_eq!(
+                remote_in("mosh-client", &["mosh-client", line, "10.0.0.5", "1"]),
+                None,
+                "{line}"
+            );
+        }
+        // Where it leaves the target alone it is read.
+        assert_eq!(
+            remote_in(
+                "mosh-client",
+                &["mosh-client", "-# --ssh=ssh -v prod |", "10.0.0.5", "1"]
             ),
             host("prod")
         );

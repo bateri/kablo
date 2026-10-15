@@ -806,21 +806,29 @@ pub enum Message {
     /// `Ping` that follows (and one that has not skips this and sends only the
     /// `Pong`).
     Features,
-    /// Server to client: the stream starts at `offset`; `truncated` says bytes
-    /// the client asked for had already left the journal.
+    /// Server to client: the stream starts at `offset`; `truncated` says the
+    /// bytes the client asked for are not coming and a picture is, because they
+    /// had left the journal or held a question the server answered (see
+    /// [`View::picture_if_answered`]).
     Attached {
         /// The offset of the first `Output` that follows (and of the picture
         /// before it, if one is sent).
         offset: u64,
-        /// Whether the journal no longer held the offset asked for.
+        /// Whether the picture that follows takes the place of bytes the
+        /// client asked for: the journal no longer held the offset asked for,
+        /// or the view asked for a picture in place of bytes that hold a
+        /// question the server already answered. Not set for a picture the
+        /// client asked for outright.
         truncated: bool,
         /// How far the server has answered the questions the program asked its
-        /// terminal: the program has the answer to every question in the output
-        /// before this offset. A client with a terminal of its own that is shown
-        /// that output again must not send that terminal's answers to those
-        /// questions; the program would be answered twice. 0 says nothing was
-        /// answered, and is also what a server from before this field says; it
-        /// is not written, so the two are the same bytes.
+        /// terminal: every question in the output before this offset was
+        /// answered by the server, or left to a client that was attached when
+        /// the output was read; the program is owed no answer to them. A client
+        /// with a terminal of its own that is shown that output again must not
+        /// send that terminal's answers to those questions; the program would
+        /// be answered twice. 0 says nothing was answered, and is also what a
+        /// server from before this field says; it is not written, so the two are
+        /// the same bytes.
         answered: u64,
     },
     /// Server to client: program output starting at `offset`.

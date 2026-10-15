@@ -405,6 +405,9 @@ pub struct Conn {
     pub next: u64,
     /// What `attached` said: where the stream starts, and whether it was cut.
     pub attached: Option<(u64, bool)>,
+    /// How far `attached` said the questions were answered (0 when it does not
+    /// say), from the last one.
+    pub answered: u64,
     /// Every picture received, across attaches.
     pub pictures: Vec<Pic>,
     pub ended: Option<Exit>,
@@ -443,6 +446,7 @@ impl Conn {
             data: Vec::new(),
             next: 0,
             attached: None,
+            answered: 0,
             pictures: Vec::new(),
             ended: None,
             errors: Vec::new(),
@@ -501,10 +505,13 @@ impl Conn {
         while let Some(packet) = self.decoder.next_packet().unwrap() {
             match packet.message {
                 Message::Attached {
-                    offset, truncated, ..
+                    offset,
+                    truncated,
+                    answered,
                 } => {
                     self.note("attached");
                     self.attached = Some((offset, truncated));
+                    self.answered = answered;
                     self.next = offset;
                     self.data.clear();
                 }
@@ -600,6 +607,35 @@ impl Conn {
         self.until("attached and its picture", |c| {
             c.attached.is_some() && c.pictures.last().is_some_and(|p| p.complete)
         });
+        self.attached.unwrap()
+    }
+
+    /// Attaches as a terminal of `cols` by `rows` that answers what it is shown
+    /// and cannot hold its answers back (as `kablo connect` is); returns where
+    /// the stream starts and whether the session cut it, once the picture that
+    /// takes the place of the bytes is whole.
+    pub fn attach_if_answered(&mut self, offset: u64, cols: u16, rows: u16) -> (u64, bool) {
+        self.attached = None;
+        self.pictures.clear();
+        self.send(Message::Attach {
+            offset,
+            view: Some(View {
+                size: Size {
+                    cols,
+                    rows,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                picture: false,
+                picture_if_answered: true,
+            }),
+        });
+        self.until("attached", |c| c.attached.is_some());
+        if self.attached.is_some_and(|(_, truncated)| truncated) {
+            self.until("its picture", |c| {
+                c.pictures.last().is_some_and(|p| p.complete)
+            });
+        }
         self.attached.unwrap()
     }
 

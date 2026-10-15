@@ -330,6 +330,162 @@ fn a_relay_that_takes_over_does_not_answer_what_was_asked_before_it() {
     );
 }
 
+/// Asks where the cursor is and sends back whatever it is told, so that every
+/// answer the program gets shows in the stream: `ESC [ 6 n` (4 bytes) and, with
+/// nobody to hold it back, the session's answer `ESC [ 1 ; 1 R` (6).
+const ASK_AND_ECHO: [&str; 4] = [
+    "--",
+    "/bin/sh",
+    "-c",
+    "stty raw -echo; printf '\\033[6n'; exec cat",
+];
+
+/// What the session's stream is when `ASK_AND_ECHO` has been answered once.
+const ASKED_AND_ANSWERED: u64 = 10;
+
+/// What a terminal does: answers a cursor position question when it is shown
+/// one, and reads for `wait` (a question that is not shown is not answered).
+fn answer_like_a_terminal(client: &mut Conn, wait: Duration) {
+    let start = Instant::now();
+    let mut answered_up_to = 0;
+    while start.elapsed() < wait {
+        client.pump(Duration::from_millis(20));
+        let asked = count(&client.data, b"\x1b[6n");
+        for _ in answered_up_to..asked {
+            client.type_in("\x1b[1;1R");
+        }
+        answered_up_to = asked;
+    }
+}
+
+#[test]
+fn a_client_gets_the_bytes_and_is_told_how_far_the_session_answered() {
+    let mut env = Env::new();
+    let id = env.start("told", &ASK_AND_ECHO);
+    wait_for_output(&env, &id, ASKED_AND_ANSWERED);
+    let mut client = env.connect(&id);
+    // The bytes are all there, question and answer; it is up to the client not
+    // to answer a second time, and it is told what the session answered.
+    assert_eq!(client.attach(0), (0, false));
+    assert_eq!(client.answered, ASKED_AND_ANSWERED);
+    client.wait_for("\x1b[6n\x1b[1;1R", 0);
+}
+
+#[test]
+fn a_terminal_that_cannot_hold_its_answers_back_is_shown_a_picture_not_the_question() {
+    let mut env = Env::new();
+    let id = env.start("picture", &ASK_AND_ECHO);
+    wait_for_output(&env, &id, ASKED_AND_ANSWERED);
+    let mut client = env.connect(&id);
+    let (start, truncated) = client.attach_if_answered(0, 80, 24);
+    assert!(truncated, "the picture takes the place of the bytes");
+    assert_eq!(start, ASKED_AND_ANSWERED, "the stream goes on from the end");
+    assert_eq!(client.picture().offset, start);
+    assert_eq!(client.answered, ASKED_AND_ANSWERED);
+    // Whatever it is shown it answers: it was shown no question, so the
+    // program gets no second answer.
+    answer_like_a_terminal(&mut client, Duration::from_millis(500));
+    assert!(client.data.is_empty(), "{:?}", client.data);
+    let mut witness = env.connect(&id);
+    witness.attach(0);
+    witness.pump(Duration::from_millis(300));
+    assert_eq!(count(&witness.data, b"\x1b[1;1R"), 1, "answered once");
+    // The same terminal asked for the bytes would have answered again.
+    let mut before = env.connect(&id);
+    before.attach(0);
+    answer_like_a_terminal(&mut before, Duration::from_millis(500));
+    witness.pump(Duration::from_millis(300));
+    assert_eq!(count(&witness.data, b"\x1b[1;1R"), 2, "the duplicate");
+}
+
+#[test]
+fn a_terminal_that_cannot_hold_its_answers_back_gets_bytes_when_nothing_was_asked() {
+    let mut env = Env::new();
+    let id = env.start("plain", &["--", "/bin/sh", "-c", "echo hello; exec cat"]);
+    wait_for_output(&env, &id, 7);
+    let mut client = env.connect(&id);
+    assert_eq!(client.attach_if_answered(0, 80, 24), (0, false));
+    client.wait_for("hello\r\n", 0);
+    // And when what it asks for starts after the question there is no picture
+    // either.
+    let ask = env.start("past", &ASK_AND_ECHO);
+    wait_for_output(&env, &ask, ASKED_AND_ANSWERED);
+    let mut late = env.connect(&ask);
+    assert_eq!(
+        late.attach_if_answered(ASKED_AND_ANSWERED, 80, 24),
+        (ASKED_AND_ANSWERED, false)
+    );
+}
+
+#[test]
+fn a_question_a_client_answered_is_not_shown_again_to_a_terminal_that_would_answer() {
+    let mut env = Env::new();
+    // The program asks once a client is there to answer.
+    let program = "read go; stty raw -echo; printf '\\033[6n'; exec cat";
+    let id = env.start("answered-by-a-client", &["--", "/bin/sh", "-c", program]);
+    let mut first = env.connect(&id);
+    first.attach(0);
+    first.type_in("go\n");
+    first.wait_for("\x1b[6n", 0);
+    first.type_in("\x1b[9;9R");
+    // The program has it: `cat` sends it back.
+    first.wait_for("\x1b[9;9R", 0);
+    first.send(Message::Detach);
+    let mut control = env.connect(&id);
+    let start = Instant::now();
+    while control.status().clients != 0 {
+        assert!(start.elapsed() < PATIENCE, "the client never left");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The session never wrote an answer of its own, yet the question is
+    // answered: a terminal that answers what it is shown is not shown it again.
+    let mut back = env.connect(&id);
+    let (_, truncated) = back.attach_if_answered(0, 80, 24);
+    assert!(truncated);
+    assert!(back.answered > 0);
+    let mut witness = env.connect(&id);
+    witness.attach(0);
+    witness.pump(Duration::from_millis(300));
+    assert_eq!(count(&witness.data, b"\x1b[1;1R"), 0);
+    assert_eq!(count(&witness.data, b"\x1b[9;9R"), 1);
+}
+
+#[test]
+fn a_relay_that_took_over_does_not_show_a_question_it_cannot_say_was_unanswered() {
+    let mut env = Env::new();
+    let asking = env.start("swapped-asking", &ASK_AND_ECHO);
+    let quiet = env.start(
+        "swapped-quiet",
+        &["--", "/bin/sh", "-c", "echo hi; exec cat"],
+    );
+    wait_for_output(&env, &asking, ASKED_AND_ANSWERED);
+    wait_for_output(&env, &quiet, 4);
+    for id in [&asking, &quiet] {
+        let newer = env.newer_kablo(id);
+        let said = env
+            .kablo()
+            .arg("upgrade")
+            .arg(id)
+            .arg(&newer)
+            .output()
+            .unwrap();
+        assert!(
+            said.status.success(),
+            "{}",
+            String::from_utf8_lossy(&said.stderr)
+        );
+    }
+
+    // The question was answered before the relay changed: still a picture.
+    let mut after = env.connect(&asking);
+    assert!(after.attach_if_answered(0, 80, 24).1);
+    // Output that held none is still bytes.
+    let mut plain = env.connect(&quiet);
+    assert_eq!(plain.attach_if_answered(0, 80, 24), (0, false));
+    plain.wait_for("hi\r\n", 0);
+}
+
 #[test]
 fn the_scrollback_a_session_is_started_with_is_what_its_picture_holds() {
     let mut env = Env::new();

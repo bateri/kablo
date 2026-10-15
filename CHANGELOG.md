@@ -44,6 +44,18 @@ terminal app puts the windows on top.
   the cursor position and mode and size reports are answered by the session
   itself, so a program that asks its terminal something does not stall until a
   client returns.
+- **A client can show what runs in the terminal.** Every attached client is
+  told which program is in front and its directory, whether the terminal is
+  asking for a password, and where an interactive `ssh` or `mosh` in front
+  connects to (the target and nothing else of its command line). It is told
+  when that changes, and the session looks only after output or typing, never
+  on a timer while nothing happens. The protocol's `status` carries the same.
+- **A program is not answered twice when you come back.** A question that was
+  answered already (where the cursor is, what the terminal is) used to be
+  answered again by your terminal when the output was shown again, and the
+  second answer was typed into the program. `kablo connect` is now shown a
+  picture of the screen in place of such output, and an app with a terminal of
+  its own is told how far the questions were answered.
 - **Ports through kablo's own connection.** `kablo forward 8080:localhost:3000
   -- ssh devbox kablo attach` does what `ssh -L` does, over the one connection
   of `kablo attach`, so it works where sshd has forwarding turned off. Only

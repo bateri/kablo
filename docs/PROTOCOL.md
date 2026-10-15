@@ -210,6 +210,9 @@ when the program's output has arrived and shortly after the last of it, and
 shortly after a client's input (a program that starts, says nothing and keeps
 running is seen in that moment), and never on a timer while the session is idle.
 A session nobody is attached to is not looked at; `status` looks when asked.
+When the program ends the server sends a `state` with nothing in it (unless the
+clients were told that already) before `ended`: a password that was being asked
+for, or an ssh session, is over with it.
 
 The server tells a client what it needs to show the program and to know when a
 password is being asked for, and no more. `remote` is a target and nothing of
@@ -352,8 +355,9 @@ rest, and answers as it always did (no picture).
 
 **Coming back.** A client that lost its connection attaches again with the
 offset after the last byte it received and gets exactly the bytes it missed, no
-more and no fewer. Output produced while nobody was attached is kept in a
-bounded journal.
+more and no fewer (a client that sets bit 1 of its view may get a picture
+instead, "Questions answered twice" below). Output produced while nobody was
+attached is kept in a bounded journal.
 
 **Truncation and the picture.** The server keeps a screen of its own, built
 from every byte the program writes with the parser bateri uses. When the
@@ -412,14 +416,16 @@ the client's terminal answers those when it sees them, as it always does. The
 kitty keyboard question is answered as a terminal that has the protocol would,
 which is what the client's own terminal does when it is attached.
 
-**Questions answered twice.** A client that is shown output again after the
-server answered the questions in it (written while nobody was attached, or
-replayed after a dropped connection) would answer them a second time, and the
-second answer would be typed into the program. `attached` says how far the
-server has answered, in `answered`: the program has the answer to every question
-in the output before that offset (a question is where its last byte is). A
-missing `answered` is 0, which says nothing was answered and is what a server
-from before the field says. There are two ways for a client not to answer twice:
+**Questions answered twice.** A client that is shown output again after a
+question in it was answered (written while nobody was attached, or replayed
+after a dropped connection) would answer it a second time, and the second
+answer would be typed into the program. `attached` says how far the questions
+were answered, in `answered`: every question in the output before that offset (a
+question is where its last byte is) was answered by the server, or was read
+while a client was attached and left to that client's terminal. The program is
+owed no answer to those, and a client does not give one. A missing `answered` is
+0, which says nothing was answered and is what a server from before the field
+says. There are two ways for a client not to answer twice:
 
 - A client with a terminal emulator of its own, whose answers it can hold back
   before they go to the server, discards the answers to questions in the output
@@ -427,13 +433,31 @@ from before the field says. There are two ways for a client not to answer twice:
   such a client; the server cannot do it for it.
 - A client that writes the bytes it is given to a terminal that answers by
   itself, and cannot be told to keep some answers back, sets bit 1 of its view's
-  flags. When the output from the offset it asks for holds a question the server
-  has answered, the server sends a picture of the screen instead of those
-  bytes, with `truncated` set (as for output that has left the journal), and the
-  stream goes on from the picture's offset; output that holds no such question
-  is sent as bytes, and a short drop of the connection costs the picture only
-  when a question was answered meanwhile. A server from before the bit ignores
-  it, and the client's terminal answers twice as it did.
+  flags. When the output from the offset it asks for holds a question that was
+  answered (by the server or by a client's terminal), the server sends a picture
+  of the screen instead of those bytes, with `truncated` set (as for output that
+  has left the journal), and the stream goes on from the picture's offset;
+  output that holds no such question is sent as bytes, and a short drop of the
+  connection costs the picture only when a question was answered meanwhile. The
+  server judges the output it read a stretch at a time, so a picture can take
+  the place of some output that held no question beside one that did. A server
+  from before the bit ignores it, and the client's terminal answers twice as it
+  did.
+
+The `answered` a client was told stays what it is for as long as it is attached,
+also across a relay that is replaced (the bridge does not repeat the swallowed
+`attached`). A program that asks in the moment between two relays has the
+question answered by the relay that comes, and a client with a terminal of its
+own, which learns nothing of it, answers it a second time.
+
+A client that was attached when a question was read, and did not get to
+answer it, leaves that question unanswered for good: it is below `answered`,
+and nobody answers it later. That is a connection lost before the bytes with
+the question reached the client's terminal, whether or not the server noticed
+at once (a relay replaced meanwhile is the same), and for a client that sets
+bit 1 it is also a picture sent in place of such bytes. A program that asked a
+plain terminal in the moment its connection broke would have gone without its
+answer too.
 
 **Ending.** When the program exits, the server sends the rest of its output,
 then `ended` with how it exited. The session is kept until a client has been

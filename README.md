@@ -109,7 +109,12 @@ the terminal back; ending the program (`exit`) ends the session, and
 session printed while you were gone: if the journal still reaches back to the
 start, you get the bytes the program wrote; if not, your terminal is reset and
 gets a picture of the session's screen (the screen, the scrollback it kept, the
-modes the program set), and the program's own output goes on from there.
+modes the program set), and the program's own output goes on from there. You
+get the picture too when the output you would be shown holds a question that
+was answered already, by the session while you were gone or by your terminal
+earlier (where the cursor is, what the terminal is): your terminal would answer
+it again and the second answer would be typed into the program, as `^[[12;1R`
+at the prompt.
 `--fresh` skips the past and shows only what comes next.
 When the session cannot take what you type for a moment, `connect` holds it
 and tries again (a few seconds at most, then it says why and exits); when the
@@ -373,9 +378,14 @@ memory of where its relay comes from (see *Limits*).
   attached**: device attributes, the cursor position, mode and size reports, and
   whether the kitty keyboard protocol is there (answered as a terminal that has
   it would, as the client's own terminal does).
-  With a client attached its own terminal answers, and a client that replays
-  output it missed answers the questions asked meanwhile again. Colours, the
-  clipboard and the size in pixels are never answered by the session.
+  With a client attached its own terminal answers. A client that comes back
+  is not left to answer them again: `kablo connect` gets a picture of the screen
+  in place of bytes that hold a question the session answered, and an app that
+  has a terminal of its own is told how far the questions were answered (see
+  below). A client that was attached when a question was asked, and was lost
+  before the question reached its terminal, leaves the question unanswered, as
+  a plain terminal would have. Colours, the clipboard
+  and the size in pixels are never answered by the session.
 - **A program that does not read its input** gets only so much of it. The
   session holds 1 MiB of typed bytes for it; past that, an `input` is not
   written and its sender is told (`INPUT_FULL` in the protocol; through the
@@ -441,6 +451,14 @@ memory of where its relay comes from (see *Limits*).
   every message of every shipped version are kept as test fixtures.
   `kablo version` prints one line of `key=value` tokens
   (`version=… wire_min=… wire_max=…`): keys may be added to it, none removed.
+- **The terminal's state and its answers** are told, not asked for. Every
+  attached client is sent a `state` right after `attached` and again when it
+  changes: the program in the foreground and its directory, whether the terminal
+  is asking for a password, and where an interactive `ssh` or `mosh` goes (the
+  target only, never the rest of its command line). `attached` also says how
+  far the session answered the program's questions, so an app with a terminal
+  of its own that is shown output again can leave those questions unanswered.
+  Both are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Putting kablo on a server** follows one set of rules, in
   `kablo_proto::install`, so that two apps do not leave two copies behind:
 

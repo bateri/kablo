@@ -704,6 +704,56 @@ fn connect_puts_a_session_on_a_terminal_and_a_detach_leaves_it_running() {
 }
 
 #[test]
+fn connect_is_shown_a_picture_and_not_a_question_the_session_answered_while_it_was_away() {
+    let mut env = Env::new();
+    // The program asks where the cursor is, with nobody to answer but the
+    // session, and sends back whatever it is told: every answer it gets shows
+    // in the stream (the question is 4 bytes, the session's answer 6).
+    let id = env.start(
+        "asked-while-away",
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty raw -echo; printf '\\033[6n'; exec cat",
+        ],
+    );
+    let mut control = env.connect(&id);
+    let start = Instant::now();
+    while control.status().offset < 10 {
+        assert!(start.elapsed() < PATIENCE, "the session never answered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Shown the bytes, this terminal would answer too and the program would be
+    // answered twice; it is shown the screen instead (after a reset, as every
+    // picture is).
+    let mut tty = Tty::run(&env, &["connect", &id]);
+    tty.show("\x1bc");
+    while control.status().clients == 0 {
+        assert!(start.elapsed() < PATIENCE, "never attached");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // What a terminal does with a question when it is shown one.
+    let mut answers = 0;
+    for _ in 0..10 {
+        tty.drain(Duration::from_millis(50));
+        if tty.text().matches("\x1b[6n").count() > answers {
+            answers += 1;
+            tty.type_in(b"\x1b[1;1R");
+        }
+    }
+    assert_eq!(answers, 0, "shown the question: {:?}", tty.text());
+    assert_eq!(
+        control.status().offset,
+        10,
+        "something more reached the program"
+    );
+    tty.type_in(&[0x1c]);
+    assert_eq!(tty.wait().code(), Some(0));
+}
+
+#[test]
 fn connect_ends_with_the_programs_own_status_when_it_ends() {
     let mut env = Env::new();
     let id = env.start("finishes", &SH);

@@ -10,7 +10,11 @@
 //! was closed and comes back is filled again with what it missed. When the
 //! journal no longer reaches back to the start, the session sends a picture of
 //! the screen in its place: the terminal is reset and the picture is written to
-//! it, then the program's own output goes on from where the picture ends.
+//! it, then the program's own output goes on from where the picture ends. So
+//! it does when the bytes it would be shown hold a question that was answered
+//! already (by the session while nobody was here, or by a terminal that was):
+//! this terminal would answer it again and the second answer would be typed
+//! into the program (the view says so, and the session decides).
 //! `--fresh` attaches at the end instead and shows only what comes next.
 //!
 //! The connection is a [`Link`], so a relay that is replaced while a person is
@@ -147,14 +151,18 @@ fn serve(
     let offset = if fresh { OFFSET_END } else { 0 };
     // The terminal's size goes with the attach, so that a picture of the screen
     // is made for it; the resize after it is for a session that predates views.
-    let view = sys::window_size(input)
+    // The bytes are written to this terminal as they are, and it answers the
+    // questions in them by itself: it is not shown one that was answered.
+    let answers_itself = sys::is_tty(output);
+    let size = sys::window_size(input)
         .ok()
-        .filter(|size| size.cols > 0 && size.rows > 0)
-        .map(|size| View {
-            size,
-            picture: false,
-            picture_if_answered: false,
-        });
+        .filter(|size| size.cols > 0 && size.rows > 0);
+    // (A view with no size leaves the session's terminal as it is.)
+    let view = (size.is_some() || answers_itself).then(|| View {
+        size: size.unwrap_or_default(),
+        picture: false,
+        picture_if_answered: answers_itself,
+    });
     link.send(
         Packet::about(id.clone(), Message::Attach { offset, view }),
         now,
