@@ -651,8 +651,9 @@ pub struct Features {
     /// The most streams the server keeps open at once on a connection (0: not
     /// said, so [`stream::MAX_STREAMS`]).
     pub max_streams: u32,
-    /// The largest window the server accepts for a stream, and offers one (0:
-    /// not said, so [`stream::MAX_WINDOW`]).
+    /// The largest window the server takes for a stream: a client gives no
+    /// larger one (0: not said, so [`stream::MAX_WINDOW`]). What the server
+    /// gives is its own choice, never more than [`stream::MAX_WINDOW`].
     pub max_window: u32,
     /// The most bytes the server takes in one stream `data` message (0: not
     /// said, so [`stream::MAX_DATA`]).

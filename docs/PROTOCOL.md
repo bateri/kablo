@@ -233,7 +233,7 @@ a reply with no `streams` says there are none.
 | 1 | u8 | `streams`: bit 0 is set when the server takes streams (channel 1) |
 | 2 | text | `reason`: when `streams` is clear and the server knows streams, why they are off; text for a person, who sees it with control characters removed |
 | 3 | u32 | `max_streams`: how many streams a connection may have open at once |
-| 4 | u32 | `max_window`: the largest window the server takes for a stream and offers for one |
+| 4 | u32 | `max_window`: the largest window the server takes for a stream; a client gives none larger. What the server gives is its own choice, within the limit in section 6 |
 | 5 | u32 | `max_data`: the most bytes the server takes in one stream `data` |
 | 6 | u8 | `commands`: bit 0 is set when the server runs programs for the client (an `open` with an `argv`, below); written only when set |
 
@@ -590,14 +590,23 @@ it works where sshd's forwarding is off. One TCP connection is one **stream**.
   may send before it has to wait. The client's is in `open` and is what the
   server may send; the server's is in `opened` and is what the client may send.
   An end that has taken bytes (the server by writing them to the target's
-  socket, the client by handing them to its own) sends `credit` with their
-  number, which adds to the other end's window. A window is at most 256 KiB,
-  and an end never has more than that left to send; a `data` is at most 32 KiB.
-  An end that breaks one of these (it sends past its window, or more than 32
-  KiB in a `data`, or sends credit that takes the other's window past the
-  largest) loses the stream: the one that sees it answers with `close`. What an end keeps for a stream is therefore at
-  most one window, and the bridge never has to stop reading its client to make
-  room for one stream's bytes. Everything else the bridge says (session output,
+  socket, the client by handing them to its own) sends `credit`, which adds to
+  the other end's window. How large a window an end gives is its own choice
+  and may change while the stream lasts: credit for more than it took makes
+  the window larger, credit held back makes it smaller (the other end, out of
+  window, waits). Every end takes a window of up to 16 MiB, so an end never
+  has more than that left to send (a client gives no more than the server's
+  `max_window` when it says less); a `data` is at most 32 KiB. An end that
+  breaks one of these (it sends past its window, or more than 32 KiB in a
+  `data`, or sends credit that takes the other's window past 16 MiB) loses the
+  stream: the one that sees it answers with `close`. What an end keeps for a
+  stream is therefore at most the window it gave, and the bridge never has to
+  stop reading its client to make room for one stream's bytes. A window has to
+  hold what is on its way while the credit for it comes back, or a transfer
+  waits a round trip for each window: kablo gives each stream an equal part of
+  32 MiB per connection, between 256 KiB and 2 MiB (ssh's own window for a
+  channel), so that one transfer is as fast as ssh's and a hundred keep the
+  memory of a hundred small windows. Everything else the bridge says (session output,
   replies) goes in the same byte stream between the pieces of stream data, which
   is why `data` comes in pieces.
 - *Half and whole closes.* `eof` says that the sender sends no more `data` on
@@ -686,7 +695,7 @@ it lasts as long as the program does and no longer than the connection.
 | replies queued for one client | 4 MiB, then the client is dropped |
 | streams open on one connection | 128, counting the ones still connecting; one more is `failed` (5) |
 | streams connecting at once on one connection | 16; one more is `failed` (5) |
-| window of a stream, and credit outstanding | 256 KiB; an `open` asking for more is `failed` (5) |
+| window of a stream, and credit outstanding | 16 MiB; an `open` asking for more is `failed` (5) |
 | bytes in one stream `data` or `stderr` | 32 KiB |
 | time to connect a stream | 10 seconds, then `failed` (4) |
 | host in an `open` | 253 bytes |

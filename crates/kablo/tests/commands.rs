@@ -20,6 +20,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE, pattern};
+use kablo::streams::WINDOW;
 use kablo_proto::tlv;
 use kablo_proto::v1::Exit;
 use kablo_proto::v1::Message;
@@ -100,7 +101,8 @@ fn output_errors_and_the_end_come_apart_and_in_order() {
     let (said, window) = bridge
         .run_command(command(&["/bin/echo", "hello", "$HOME;", "*"]), MAX_WINDOW)
         .unwrap();
-    assert_eq!(window, MAX_WINDOW);
+    // The bridge gives a stream of its own the largest window it gives.
+    assert_eq!(window, WINDOW);
     bridge.until("the end", |b| b.flows[&said].closed);
     let flow = &bridge.flows[&said];
     // The arguments were nobody's to read as a shell would.
@@ -148,7 +150,7 @@ fn the_environment_and_the_directory_are_the_clients() {
 fn input_larger_than_the_window_goes_in_as_credit_comes_and_comes_back_whole() {
     let env = Env::new();
     let mut bridge = Bridge::start(&env);
-    let input = pattern(2 << 20, 9);
+    let input = pattern(4 * WINDOW as usize, 9);
     let (id, window) = bridge
         .run_command(command(&["/bin/cat"]), MAX_WINDOW)
         .unwrap();

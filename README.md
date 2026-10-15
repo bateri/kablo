@@ -432,7 +432,8 @@ memory of where its relay comes from (see *Limits*).
 - **A command is a program, not a session.** It has no terminal, it is not
   kept when the connection ends, and nothing of what it wrote is kept for a
   client that comes back. It counts among the 128 streams of a connection and
-  its output and errors share one window of 256 KiB.
+  its output and errors share one window: 2 MiB, as an ssh channel has, or a
+  smaller part when many streams share the connection's 32 MiB.
 - **The carrier of `kablo exec` and `kablo forward` is a command line,** so it
   cannot hold a `--` of its own (`kablo exec`); put such a command in a script.
 - Windows and the BSDs are not supported, and a server with SELinux enforcing

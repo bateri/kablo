@@ -1816,7 +1816,8 @@ fn the_limits_of_streams_are_the_ones_the_features_say() {
     assert!(on.streams);
     assert_eq!(on.reason, None);
     assert_eq!(on.max_streams, 128);
-    assert_eq!(on.max_window, 256 * 1024);
+    assert_eq!(on.max_window, 16 * 1024 * 1024);
+    assert_eq!(on.max_window, stream::MAX_WINDOW);
     assert_eq!(on.max_data, 32 * 1024);
     assert_eq!(usize::try_from(on.max_data).unwrap(), stream::MAX_DATA);
     assert_eq!(stream::MAX_STREAMS, 128);

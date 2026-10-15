@@ -11,7 +11,7 @@
 00 00 00 80  #   128 streams at once
 00 04        # tlv key 4: largest window
 00 00 00 04  #   length 4
-00 04 00 00  #   windows up to 262144 bytes
+01 00 00 00  #   windows up to 16777216 bytes
 00 05        # tlv key 5: most data
 00 00 00 04  #   length 4
 00 00 80 00  #   32768 bytes in a data message

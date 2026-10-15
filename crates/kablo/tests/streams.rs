@@ -57,7 +57,8 @@ fn bytes_cross_in_order_both_ways_and_an_end_is_an_end_not_a_close() {
     let (id, window) = bridge
         .connect_stream("127.0.0.1", port, MAX_WINDOW)
         .unwrap();
-    assert_eq!(window, MAX_WINDOW);
+    // A stream of its own is given the largest window the bridge gives.
+    assert_eq!(window, engine::WINDOW);
     bridge.stream_send(id, &request, 7_000);
     bridge.stream_eof(id);
     bridge.until("the answer and its end", |b| {
@@ -178,12 +179,14 @@ fn a_session_is_typed_into_and_answers_while_a_transfer_is_unfinished() {
     let id = echo_session(&mut env, &mut bridge, "echo");
 
     // The client takes nothing of the transfer yet (no credit), so the bridge
-    // holds at most a window of it. The session is typed into meanwhile.
+    // sends at most the window the client gave, which is less than the
+    // transfer. The session is typed into meanwhile.
     bridge.next_flow = (true, false);
+    assert!(total > engine::WINDOW as usize);
     let (stream_id, window) = bridge
-        .connect_stream("127.0.0.1", port, MAX_WINDOW)
+        .connect_stream("127.0.0.1", port, engine::WINDOW)
         .unwrap();
-    assert_eq!(window, MAX_WINDOW);
+    assert_eq!(window, engine::WINDOW);
     bridge.until("the first of the transfer", |b| {
         b.flows[&stream_id].total > 0
     });

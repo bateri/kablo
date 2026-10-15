@@ -41,9 +41,14 @@ use crate::{Error, Result};
 /// The most bytes one `data` message carries.
 pub const MAX_DATA: usize = 32 * 1024;
 
-/// The largest window an end offers for a stream: the bytes the other end may
-/// send before it is given more.
-pub const MAX_WINDOW: u32 = 256 * 1024;
+/// The largest window an end may give for a stream (the bytes the other end
+/// may send before it is given more), and so the most an end ever has left to
+/// send on one. Every end takes a window up to this; how large a window it
+/// gives is its own choice and may change while the stream lasts, since the
+/// window is what it keeps memory for. The ceiling is far above what an end
+/// gives today so that a later one can give more without the ends that
+/// exist now taking it for a breach.
+pub const MAX_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// The most streams a connection keeps open at once, counting the ones still
 /// being connected.

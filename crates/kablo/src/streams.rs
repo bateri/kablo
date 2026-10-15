@@ -25,6 +25,19 @@
 //! the window, so the other end always has most of its window left and a
 //! `credit` is not sent for every small `data`.
 //!
+//! **How large.** A window has to hold what is on its way while the credit for
+//! it comes back, or a transfer waits a round trip for every window: 256 KiB
+//! over a link of 65 ms is 4 MB/s whatever the link carries. The streams of a
+//! connection share [`Config::budget`]: each is given an equal part of it, at
+//! most [`Config::window`] and at least [`Config::least`], so that one transfer
+//! goes as fast as ssh lets it (whose own window is 2 MiB a channel) and a
+//! hundred keep the memory where a hundred small windows had it. The part is
+//! looked at whenever credit is due: a stream whose part grew (others ended) is
+//! given the difference with its credit, and one whose part shrank (others
+//! opened) is given less credit than it took until it is down to it. Credit
+//! is what keeps the window at its part: an end gives credit until what the
+//! other may still send and what it holds unwritten come to the part.
+//!
 //! **What is read when.** A socket is read only while the stream has window to
 //! send into and fewer than [`QUEUED_SOFT`] bytes of `data` frames wait for the
 //! wire, so a transfer the wire cannot keep up with stops being read instead of
@@ -44,7 +57,7 @@
 //! lost to the `close` that follows `exited`.)
 //!
 //! **A stream that is not valid** (data past its window, past its end or
-//! before it was opened, a credit past the largest window) is ended with a
+//! before it was opened, a credit past [`MAX_WINDOW`]) is ended with a
 //! `close` and the connection goes on. Frames for a stream this end does not
 //! have are ignored: an end that sent `close` has frames of the stream still on
 //! their way to the other.
@@ -136,12 +149,30 @@ const PIPE_BUF: usize = 512;
 /// Tests put their own here.
 pub type Dial = Arc<dyn Fn(&Target, Instant) -> Result<TcpStream, Refusal> + Send + Sync>;
 
+/// The largest window a stream is given: ssh's own window for a channel, which
+/// is what a transfer carried over ssh gets in any case.
+pub const WINDOW: u32 = 2 * 1024 * 1024;
+
+/// The smallest window a stream is given when many share the budget.
+pub const LEAST_WINDOW: u32 = 256 * 1024;
+
+/// The window the streams of a connection share: a least window for every
+/// stream a connection may have.
+pub const WINDOW_BUDGET: u32 = MAX_STREAMS * LEAST_WINDOW;
+
+const _: () = assert!(WINDOW <= MAX_WINDOW && LEAST_WINDOW <= WINDOW);
+
 /// What an end is willing to do.
 #[derive(Clone)]
 pub struct Config {
-    /// The window offered for each stream: what the other end may send before
-    /// it is given credit.
+    /// The largest window given to a stream: what the other end may send
+    /// before it is given credit, when few streams share [`Config::budget`].
     pub window: u32,
+    /// The window all streams share; each is given an equal part, within
+    /// [`Config::least`] and [`Config::window`].
+    pub budget: u32,
+    /// The smallest window given to a stream, however many share the budget.
+    pub least: u32,
     /// The most streams open at once, the ones still connecting included.
     pub max_streams: usize,
     /// The most being connected at once.
@@ -157,7 +188,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            window: MAX_WINDOW,
+            window: WINDOW,
+            budget: WINDOW_BUDGET,
+            least: LEAST_WINDOW,
             max_streams: MAX_STREAMS as usize,
             max_connecting: MAX_CONNECTING as usize,
             connect_timeout: CONNECT_TIMEOUT,
@@ -389,7 +422,9 @@ struct Stream {
     opening: bool,
     /// Bytes the other end still lets this end send.
     send_window: u32,
-    /// Bytes this end still lets the other end send.
+    /// Bytes this end still lets the other end send. With what is held
+    /// unwritten (`inbox`, `errors`) it is the window this stream has now;
+    /// credit brings that to the stream's part ([`Streams::part`]).
     recv_window: u32,
     /// Bytes received and not yet written to the socket.
     inbox: VecDeque<u8>,
@@ -403,8 +438,6 @@ struct Stream {
     /// arrives for them is dropped, with credit for it, and the program goes
     /// on.
     errors_dead: bool,
-    /// Bytes written to the socket that the other end has not been told of.
-    uncredited: u32,
     /// This end has sent `eof`: the socket said it had nothing more.
     sent_eof: bool,
     /// The other end has sent `eof`.
@@ -429,12 +462,17 @@ impl Stream {
             errors: VecDeque::new(),
             exited: None,
             errors_dead: false,
-            uncredited: 0,
             sent_eof: false,
             got_eof: false,
             shut: false,
             write_dead: false,
         }
+    }
+
+    /// Bytes received and not written yet: the part of the window this end
+    /// holds.
+    fn held(&self) -> u32 {
+        u32::try_from(self.inbox.len().saturating_add(self.errors.len())).unwrap_or(u32::MAX)
     }
 
     /// Whether the socket may be read: the stream is open, has window to send
@@ -651,6 +689,21 @@ impl Streams {
         self.streams.len() + self.connecting.len()
     }
 
+    /// The window a stream is given while `sharing` streams (it among them)
+    /// share the budget: an equal part, within the least and the largest.
+    fn part(&self, sharing: usize) -> u32 {
+        let config = &self.config;
+        let least = config.least.min(config.window);
+        let sharing = u32::try_from(sharing.max(1)).unwrap_or(u32::MAX);
+        (config.budget / sharing).clamp(least, config.window)
+    }
+
+    /// The window a stream about to be added is given: the ones there are and
+    /// it share the budget.
+    fn new_part(&self) -> u32 {
+        self.part(self.len().saturating_add(1))
+    }
+
     /// Whether there are no streams.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -705,10 +758,11 @@ impl Streams {
             .last_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("out of stream numbers"))?;
+        let window = self.new_part();
         let packet = Packet::new(
             id,
             Message::Open {
-                window: self.config.window,
+                window,
                 port,
                 host: host.to_owned(),
             },
@@ -720,10 +774,8 @@ impl Streams {
         socket.set_nonblocking(true)?;
         let _ = socket.set_nodelay(true);
         self.last_id = id;
-        self.streams.insert(
-            id,
-            Stream::new(End::Socket(socket), 0, self.config.window, true),
-        );
+        self.streams
+            .insert(id, Stream::new(End::Socket(socket), 0, window, true));
         out.push(packet);
         Ok(id)
     }
@@ -745,13 +797,8 @@ impl Streams {
             .last_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("out of stream numbers"))?;
-        let packet = Packet::new(
-            id,
-            Message::OpenCommand {
-                window: self.config.window,
-                command,
-            },
-        );
+        let window = self.new_part();
+        let packet = Packet::new(id, Message::OpenCommand { window, command });
         // The writer refuses a command no server could run.
         packet
             .encode(self.side, &mut Vec::new())
@@ -772,10 +819,8 @@ impl Streams {
             errors,
             files,
         };
-        self.streams.insert(
-            id,
-            Stream::new(End::Local(held), 0, self.config.window, true),
-        );
+        self.streams
+            .insert(id, Stream::new(End::Local(held), 0, window, true));
         out.push(packet);
         Ok(id)
     }
@@ -885,16 +930,10 @@ impl Streams {
                     stdout: Some(stdout),
                     stderr: Some(stderr),
                 };
-                self.streams.insert(
-                    id,
-                    Stream::new(End::Program(run), window, self.config.window, false),
-                );
-                out.push(Packet::new(
-                    id,
-                    Message::Opened {
-                        window: self.config.window,
-                    },
-                ));
+                let given = self.new_part();
+                self.streams
+                    .insert(id, Stream::new(End::Program(run), window, given, false));
+                out.push(Packet::new(id, Message::Opened { window: given }));
             }
             Err(e) => refuse(out, id, FailCode::START_FAILED, &process::system_words(&e)),
         }
@@ -913,16 +952,12 @@ impl Streams {
             Ok(socket) => match socket.set_nonblocking(true) {
                 Ok(()) => {
                     let _ = socket.set_nodelay(true);
+                    let given = self.new_part();
                     self.streams.insert(
                         id,
-                        Stream::new(End::Socket(socket), entry.window, self.config.window, false),
+                        Stream::new(End::Socket(socket), entry.window, given, false),
                     );
-                    out.push(Packet::new(
-                        id,
-                        Message::Opened {
-                            window: self.config.window,
-                        },
-                    ));
+                    out.push(Packet::new(id, Message::Opened { window: given }));
                     return;
                 }
                 Err(_) => Refusal::new(FailCode::UNREACHABLE, "could not connect"),
@@ -1060,8 +1095,8 @@ impl Streams {
         let size = u32::try_from(size).unwrap_or(0);
         stream.recv_window -= size;
         if stream.write_dead || (channel == Channel::Err && stream.errors_dead) {
-            // Nowhere to write it: it counts as taken.
-            stream.uncredited = stream.uncredited.saturating_add(size);
+            // Nowhere to write it: it counts as taken, and since it is not
+            // held, credit for it is due like for what was written.
         } else if channel == Channel::Err {
             stream.errors.extend(bytes);
         } else {
@@ -1258,7 +1293,8 @@ impl Streams {
     /// has said it is done and everything is written. (A command's output and
     /// errors are two inboxes, written to two descriptors.)
     fn drain(&mut self, id: u32, out: &mut Vec<Packet>) {
-        let step = credit_step(self.config.window);
+        let part = self.part(self.len());
+        let step = credit_step(part);
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
@@ -1278,9 +1314,6 @@ impl Streams {
                     Ok(0) => break,
                     Ok(n) => {
                         inbox.drain(..n);
-                        stream.uncredited = stream
-                            .uncredited
-                            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1290,8 +1323,6 @@ impl Streams {
                     // heard is not worth running.
                     Err(e) if command => {
                         if channel == Channel::Err {
-                            let dropped = u32::try_from(inbox.len()).unwrap_or(u32::MAX);
-                            stream.uncredited = stream.uncredited.saturating_add(dropped);
                             inbox.clear();
                             stream.errors_dead = true;
                         } else {
@@ -1305,8 +1336,6 @@ impl Streams {
                     // hung up has its answer carried; a reset socket fails the
                     // read too, and that ends the stream).
                     Err(_) => {
-                        let dropped = u32::try_from(inbox.len()).unwrap_or(u32::MAX);
-                        stream.uncredited = stream.uncredited.saturating_add(dropped);
                         inbox.clear();
                         stream.write_dead = true;
                         break;
@@ -1326,10 +1355,16 @@ impl Streams {
             }
             return;
         }
-        if stream.uncredited >= step {
-            let bytes = std::mem::take(&mut stream.uncredited);
-            stream.recv_window = stream.recv_window.saturating_add(bytes);
-            out.push(Packet::new(id, Message::Credit(bytes)));
+        // What the other end may still send and what is held unwritten come
+        // to the stream's part: credit for what was taken (written or dropped)
+        // makes up the difference, more of it when the part grew and less when
+        // it shrank, and none until a quarter of the part is due.
+        let due = part
+            .saturating_sub(stream.held())
+            .saturating_sub(stream.recv_window);
+        if due >= step {
+            stream.recv_window = stream.recv_window.saturating_add(due);
+            out.push(Packet::new(id, Message::Credit(due)));
         }
         let written = stream.inbox.is_empty() && stream.errors.is_empty();
         if ((stream.got_eof && written) || stream.write_dead) && !stream.shut {

@@ -428,9 +428,10 @@ fn an_open_that_connects_is_opened_and_one_that_does_not_is_failed() {
     let mut answers: Vec<(u32, &Message)> = out.iter().map(|p| (p.stream, &p.message)).collect();
     answers.sort_by_key(|(id, _)| *id);
     assert_eq!(answers.len(), 2);
+    // A connection with a stream or two gives each the largest window.
     let opened = out
         .iter()
-        .filter(|p| matches!(p.message, Message::Opened { window } if window == MAX_WINDOW))
+        .filter(|p| matches!(p.message, Message::Opened { window } if window == WINDOW))
         .count();
     let refused = failed(&out);
     assert_eq!(opened, 1);
@@ -2085,4 +2086,119 @@ fn a_regular_file_takes_what_it_is_given_in_one_write() {
     assert_eq!(std::fs::read(&path).unwrap(), sent);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
+}
+
+// --- the window the streams share ------------------------------------------------
+
+/// The windows the server gave, in the order it gave them.
+fn given(said: &[Packet]) -> Vec<u32> {
+    said.iter()
+        .filter_map(|p| match p.message {
+            Message::Opened { window } => Some(window),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The credit the server gave stream `id`, in order.
+fn credits(p: &Programs, id: u32) -> Vec<u32> {
+    p.about(id)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Credit(bytes) => Some(*bytes),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A program that takes its input and says nothing.
+fn sink() -> Command {
+    sh("cat >/dev/null")
+}
+
+#[test]
+fn the_streams_of_a_connection_share_the_window_within_the_least_and_the_largest() {
+    let mut p = Programs::new(Config {
+        window: 1000,
+        budget: 2000,
+        least: 100,
+        ..Config::default()
+    });
+    for id in 1..=25 {
+        p.open(id, 1000, sink());
+    }
+    let given = given(&p.said);
+    assert_eq!(given.len(), 25);
+    // 2000 shared by one, two, three, four: the largest twice, then a part.
+    assert_eq!(given[..4], [1000, 1000, 666, 500]);
+    // By twenty streams a part is the least, and it goes no lower.
+    assert_eq!(given[19], 100);
+    assert!(given[19..].iter().all(|&w| w == 100), "{given:?}");
+    for id in 1..=25 {
+        p.send(id, Message::Eof);
+    }
+    for id in 1..=25 {
+        p.finish(id);
+    }
+}
+
+#[test]
+fn credit_brings_a_stream_to_its_part_as_other_streams_come_and_go() {
+    let mut p = Programs::new(Config {
+        window: 1000,
+        budget: 1000,
+        least: 100,
+        ..Config::default()
+    });
+    p.open(1, 1000, sink());
+    p.open(2, 1000, sink());
+    // The first had the whole budget; the second is given half of it, and half
+    // is the first one's part from now on.
+    assert_eq!(given(&p.said), [1000, 500]);
+    // 400 bytes taken: the other end may still send 600, more than the part,
+    // so nothing is given back.
+    p.send(1, Message::Data(vec![b'x'; 400]));
+    assert_eq!(credits(&p, 1), []);
+    // 400 more: 200 left, and 300 of credit makes it the part.
+    p.send(1, Message::Data(vec![b'x'; 400]));
+    assert_eq!(credits(&p, 1), [300]);
+    // The second ends, and the first's part is the whole budget again: the
+    // next credit gives what it took and the difference.
+    p.send(2, Message::Eof);
+    p.finish(2);
+    p.send(1, Message::Data(vec![b'x'; 100]));
+    assert_eq!(credits(&p, 1), [300, 600]);
+    p.send(1, Message::Eof);
+    p.finish(1);
+}
+
+#[test]
+fn credit_never_takes_the_other_end_past_the_largest_window() {
+    // However much has been taken, what the other end may send stays within the
+    // part, which stays within the protocol's ceiling.
+    assert!(Config::default().window <= MAX_WINDOW);
+    let mut p = Programs::new(Config::default());
+    p.open(1, 1000, sink());
+    assert_eq!(given(&p.said), [WINDOW]);
+    // Twice the window, sent as a client would: only into the window it has.
+    let start = Instant::now();
+    let mut sent = 0;
+    while sent < 2 * WINDOW as usize {
+        let room = p.server.streams.get(&1).unwrap().recv_window as usize;
+        if room >= MAX_DATA {
+            p.send(1, Message::Data(vec![b'x'; MAX_DATA]));
+            sent += MAX_DATA;
+        } else {
+            p.turn();
+        }
+        let stream = p.server.streams.get(&1).unwrap();
+        assert!(stream.recv_window + stream.held() <= WINDOW);
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the program stopped taking input"
+        );
+    }
+    assert!(!credits(&p, 1).is_empty());
+    p.send(1, Message::Eof);
+    p.finish(1);
 }
