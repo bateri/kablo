@@ -465,11 +465,9 @@ fn a_long_gap_over_ssh_comes_back_as_the_right_screen() {
     let id = format!("{prefix}-0");
     let (mut first, _) = server.bridge();
     // A ring small enough for a few hundred lines to wrap.
-    let new = NewSession {
-        argv: vec![b"/bin/sh".to_vec()],
-        journal_size: Some(16 * 1024),
-        ..NewSession::default()
-    };
+    let mut new = NewSession::default();
+    new.argv = vec![b"/bin/sh".to_vec()];
+    new.journal_size = Some(16 * 1024);
     first.try_new_with(Some(&id), new).expect("a session");
     first.attach(&id, 0);
     let filler = "x".repeat(200);

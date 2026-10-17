@@ -99,23 +99,22 @@ fn a_session_the_bridge_starts_takes_the_program_the_directory_and_the_size() {
     let mut bridge = Bridge::start(&env);
     let id = env.name("shaped");
     env.track(&id);
-    let request = NewSession {
-        argv: vec![
-            b"/bin/sh".to_vec(),
-            b"-c".to_vec(),
-            b"pwd; echo $GREETING; sleep 60".to_vec(),
-        ],
-        env: vec![(b"GREETING".to_vec(), b"hello from the client".to_vec())],
-        cwd: Some(b"/usr".to_vec()),
-        size: Some(Size {
-            cols: 100,
-            rows: 30,
-            xpixel: 0,
-            ypixel: 0,
-        }),
-        journal_size: Some(64 * 1024),
-        history: None,
-    };
+    let mut request = NewSession::default();
+    request.argv = vec![
+        b"/bin/sh".to_vec(),
+        b"-c".to_vec(),
+        b"pwd; echo $GREETING; sleep 60".to_vec(),
+    ];
+    request.env = vec![(b"GREETING".to_vec(), b"hello from the client".to_vec())];
+    request.cwd = Some(b"/usr".to_vec());
+    request.size = Some(Size {
+        cols: 100,
+        rows: 30,
+        xpixel: 0,
+        ypixel: 0,
+    });
+    request.journal_size = Some(64 * 1024);
+    request.history = None;
     bridge.send(Some(&id), Message::New(request));
     bridge.until("created", |b| !b.created.is_empty());
     let status = bridge.created.pop().unwrap();
@@ -131,11 +130,9 @@ fn a_journal_of_a_size_nobody_can_have_is_a_bad_request_and_starts_nothing() {
     let mut bridge = Bridge::start(&env);
     let id = env.name("huge");
     for size in [0, 16 * 1024 - 1, (1 << 30) + 1, u64::MAX] {
-        let request = NewSession {
-            argv: vec![b"/bin/sh".to_vec()],
-            journal_size: Some(size),
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = vec![b"/bin/sh".to_vec()];
+        request.journal_size = Some(size);
         bridge.send(Some(&id), Message::New(request));
         let (session, code, text) = bridge.next_error();
         assert_eq!(session.as_deref(), Some(id.as_str()), "{size}");
@@ -545,14 +542,12 @@ impl Tty {
         .unwrap();
         let mut argv = vec![env!("CARGO_BIN_EXE_kablo").as_bytes().to_vec()];
         argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
-        let request = NewSession {
-            argv,
-            env: vec![(
-                b"KABLO_DIR".to_vec(),
-                env.dir.as_os_str().as_encoded_bytes().to_vec(),
-            )],
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = argv;
+        request.env = vec![(
+            b"KABLO_DIR".to_vec(),
+            env.dir.as_os_str().as_encoded_bytes().to_vec(),
+        )];
         let child = kablo::pty::spawn(&pty.slave, &request).unwrap();
         Tty {
             master: pty.master,

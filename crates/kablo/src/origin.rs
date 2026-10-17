@@ -136,14 +136,12 @@ mod tests {
     impl LiveSession {
         fn new() -> LiveSession {
             let pty = pty::open(pty::DEFAULT_SIZE).unwrap();
-            let request = NewSession {
-                argv: vec![
-                    b"/bin/sh".to_vec(),
-                    b"-c".to_vec(),
-                    b"sleep 60 & echo program=$!; wait".to_vec(),
-                ],
-                ..Default::default()
-            };
+            let mut request = NewSession::default();
+            request.argv = vec![
+                b"/bin/sh".to_vec(),
+                b"-c".to_vec(),
+                b"sleep 60 & echo program=$!; wait".to_vec(),
+            ];
             let shell = pty::spawn(&pty.slave, &request).unwrap();
             let program = read_program(&pty);
             LiveSession {

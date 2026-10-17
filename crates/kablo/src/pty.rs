@@ -248,15 +248,13 @@ mod tests {
             ypixel: 0,
         })
         .unwrap();
-        let request = NewSession {
-            argv: vec![
-                b"/bin/sh".to_vec(),
-                b"-c".to_vec(),
-                b"tty >/dev/null && stty size; echo $TERM $COLORTERM $X; exit 7".to_vec(),
-            ],
-            env: vec![(b"X".to_vec(), b"y".to_vec())],
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = vec![
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            b"tty >/dev/null && stty size; echo $TERM $COLORTERM $X; exit 7".to_vec(),
+        ];
+        request.env = vec![(b"X".to_vec(), b"y".to_vec())];
         let mut child = spawn(&pty.slave, &request).unwrap();
         let Pty { master, slave } = pty;
         drop(slave);
@@ -270,10 +268,8 @@ mod tests {
     #[test]
     fn a_signal_is_not_an_exit_code() {
         let pty = open(DEFAULT_SIZE).unwrap();
-        let request = NewSession {
-            argv: vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"kill -9 $$".to_vec()],
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"kill -9 $$".to_vec()];
         let mut child = spawn(&pty.slave, &request).unwrap();
         assert_eq!(exit_of(child.wait().unwrap()), Exit::Signal(libc::SIGKILL));
     }
@@ -281,16 +277,14 @@ mod tests {
     #[test]
     fn the_request_may_override_the_defaults_and_pick_the_directory() {
         let pty = open(DEFAULT_SIZE).unwrap();
-        let request = NewSession {
-            argv: vec![
-                b"/bin/sh".to_vec(),
-                b"-c".to_vec(),
-                b"echo $TERM; pwd".to_vec(),
-            ],
-            env: vec![(b"TERM".to_vec(), b"dumb".to_vec())],
-            cwd: Some(b"/".to_vec()),
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = vec![
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            b"echo $TERM; pwd".to_vec(),
+        ];
+        request.env = vec![(b"TERM".to_vec(), b"dumb".to_vec())];
+        request.cwd = Some(b"/".to_vec());
         let mut child = spawn(&pty.slave, &request).unwrap();
         let Pty { master, slave } = pty;
         drop(slave);
@@ -302,10 +296,8 @@ mod tests {
     #[test]
     fn a_program_that_is_not_there_is_an_error_not_a_session() {
         let pty = open(DEFAULT_SIZE).unwrap();
-        let request = NewSession {
-            argv: vec![b"/nonexistent/program".to_vec()],
-            ..NewSession::default()
-        };
+        let mut request = NewSession::default();
+        request.argv = vec![b"/nonexistent/program".to_vec()];
         let err = spawn(&pty.slave, &request).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }

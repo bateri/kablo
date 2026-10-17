@@ -555,11 +555,9 @@ mod tests {
     #[test]
     fn the_foreground_of_a_terminal_is_named() {
         let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
-        let request = kablo_proto::v1::NewSession {
-            argv: vec![b"/bin/sleep".to_vec(), b"5".to_vec()],
-            cwd: Some(b"/".to_vec()),
-            ..Default::default()
-        };
+        let mut request = kablo_proto::v1::NewSession::default();
+        request.argv = vec![b"/bin/sleep".to_vec(), b"5".to_vec()];
+        request.cwd = Some(b"/".to_vec());
         let mut child = crate::pty::spawn(&pty.slave, &request).unwrap();
         let state = look(pty.master.as_fd(), child.id());
         child.kill().unwrap();

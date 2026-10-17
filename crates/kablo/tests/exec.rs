@@ -430,9 +430,10 @@ fn bridge(kind: Kind, sock: UnixStream) {
         for packet in asked {
             let reply = match (&kind, packet.message) {
                 (_, Message::Ping(bytes)) => Some(Message::Pong(bytes)),
-                (Kind::Streams, Message::Features) => Some(Message::FeaturesReply(Features {
-                    streams: true,
-                    ..Features::default()
+                (Kind::Streams, Message::Features) => Some(Message::FeaturesReply({
+                    let mut features = Features::default();
+                    features.streams = true;
+                    features
                 })),
                 (Kind::Rejects, Message::Features) => Some(Message::Error {
                     code: ErrorCode::BAD_REQUEST,

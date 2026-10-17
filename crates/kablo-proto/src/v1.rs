@@ -298,7 +298,11 @@ impl ErrorCode {
 
 /// What a `new` asks for. Every field is optional: an empty request starts
 /// the user's login shell at the server's default size.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from `NewSession::default()` and set the fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NewSession {
     /// The command as an argument vector (never a shell string); empty means
     /// the user's login shell.
@@ -407,7 +411,11 @@ fn split_env(entry: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// What the server knows of one session.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from [`Status::new`] and set the fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Status {
     /// The session.
     pub id: SessionId,
@@ -654,7 +662,12 @@ impl TerminalState {
 /// What a server can do beyond terminal sessions: the answer to `features`.
 /// A key that is absent reads as its zero, so a server that knows nothing of
 /// streams answers (if at all) with the default, which has them off.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from [`Features::with_streams`], [`Features::streams_off`] or the
+/// default and set the fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Features {
     /// Whether the server takes [`stream`]s.
     pub streams: bool,

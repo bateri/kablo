@@ -1019,10 +1019,8 @@ impl Bridge {
         id: Option<&str>,
         argv: &[&str],
     ) -> Result<Status, (ErrorCode, String)> {
-        let new = NewSession {
-            argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-            ..NewSession::default()
-        };
+        let mut new = NewSession::default();
+        new.argv = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
         self.try_new_with(id, new)
     }
 

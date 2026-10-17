@@ -943,10 +943,8 @@ mod tests {
         // as its controlling terminal, and so has everything it starts; one
         // that made a session of its own has none.
         let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
-        let request = kablo_proto::v1::NewSession {
-            argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
-            ..Default::default()
-        };
+        let mut request = kablo_proto::v1::NewSession::default();
+        request.argv = vec![b"/bin/sleep".to_vec(), b"60".to_vec()];
         let mut on_terminal = crate::pty::spawn(&pty.slave, &request).unwrap();
         let mut detached = {
             use std::os::unix::process::CommandExt;

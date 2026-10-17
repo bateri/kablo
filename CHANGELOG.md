@@ -50,10 +50,18 @@ section is not released.
   body that cannot be read reads as), `Ask`, `Decline`, `AskReply(Standing)` and
   `Ticket`; `v1::stream::Message` gains `OpenTicket` and the constructor `open_mail`;
   `v1::stream::FailCode::DECLINED` is 9; `v1::Features` gains the field `mailbox`
-  (build it with `Features::with_mailbox`, or keep `..Features::default()` in a
-  struct literal). `Offers` and `Standing` are `#[non_exhaustive]` and made with
-  `Offers::with_tickets` and `Standing::idle`. Nothing in the bridge sends or
-  takes mail yet.
+  (build it with `Features::with_mailbox`). `Offers` and `Standing` are
+  `#[non_exhaustive]` and made with `Offers::with_tickets` and `Standing::idle`.
+  Nothing in the bridge sends or takes mail yet.
+- **Changed, `kablo-proto`: `Features`, `Status` and `NewSession` are
+  `#[non_exhaustive]`.** Code outside the crate could write them as struct
+  expressions in 0.1.0 (`Features { streams: true, ..Features::default() }`) and
+  can no longer. Make one with its constructor and set the fields, which stay
+  public: `Features::with_streams()`, `Features::streams_off(why)` or
+  `Features::default()`; `Status::new(id)`; `NewSession::default()`. Reading is
+  as before, except that a pattern naming the fields of one ends in `..`. This is
+  so that a field added to them later, as `Features::mailbox` is in this release,
+  breaks no app that builds them. The wire format is not touched.
 
 ## [0.1.0] - 2026-10-15
 

@@ -59,29 +59,36 @@ fn work(message: Message) -> Packet {
     Packet::about(id("work"), message)
 }
 
+/// `value` after `edit` has set what it should. `Features`, `Status` and
+/// `NewSession` are `#[non_exhaustive]`: a crate other than `kablo-proto` makes
+/// one with its constructor and sets the fields, never with a struct expression.
+fn with<T>(mut value: T, edit: impl FnOnce(&mut T)) -> T {
+    edit(&mut value);
+    value
+}
+
 fn running_work() -> Status {
-    Status {
-        id: id("work"),
-        pid: 4242,
-        program: Some(b"vim".to_vec()),
-        cwd: Some(b"/home/u/src".to_vec()),
-        size: Size {
+    with(Status::new(id("work")), |s| {
+        s.pid = 4242;
+        s.program = Some(b"vim".to_vec());
+        s.cwd = Some(b"/home/u/src".to_vec());
+        s.size = Size {
             cols: 120,
             rows: 40,
             xpixel: 960,
             ypixel: 800,
-        },
-        clients: 2,
-        state: State::RUNNING,
-        offset: 123_456,
-        retained_from: 100,
-        exit: None,
-        version: "0.1.0".into(),
-        warden_version: String::new(),
-        secret: false,
-        remote: None,
-        remote_port: None,
-    }
+        };
+        s.clients = 2;
+        s.state = State::RUNNING;
+        s.offset = 123_456;
+        s.retained_from = 100;
+        s.exit = None;
+        s.version = "0.1.0".into();
+        s.warden_version = String::new();
+        s.secret = false;
+        s.remote = None;
+        s.remote_port = None;
+    })
 }
 
 /// An ssh in the foreground, asking for a password: the state the `state`
@@ -97,39 +104,38 @@ fn asking_for_a_password() -> TerminalState {
 }
 
 fn broken_build() -> Status {
-    Status {
-        pid: 4300,
-        size: Size {
+    with(Status::new(id("build-1")), |s| {
+        s.pid = 4300;
+        s.size = Size {
             cols: 80,
             rows: 24,
             xpixel: 0,
             ypixel: 0,
-        },
-        state: State::BROKEN,
-        offset: 77,
-        version: "0.1.0".into(),
-        ..Status::new(id("build-1"))
-    }
+        };
+        s.state = State::BROKEN;
+        s.offset = 77;
+        s.version = "0.1.0".into();
+    })
 }
 
 /// Every message fixture and what it says.
 fn messages() -> Vec<(&'static str, Packet)> {
-    let full_new = NewSession {
-        argv: vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"echo hi".to_vec()],
-        env: vec![
+    let full_new = with(NewSession::default(), |n| {
+        n.argv = vec![b"/bin/sh".to_vec(), b"-c".to_vec(), b"echo hi".to_vec()];
+        n.env = vec![
             (b"TERM".to_vec(), b"xterm-256color".to_vec()),
             (b"FOO".to_vec(), b"a=b".to_vec()),
-        ],
-        cwd: Some(b"/tmp".to_vec()),
-        size: Some(Size {
+        ];
+        n.cwd = Some(b"/tmp".to_vec());
+        n.size = Some(Size {
             cols: 80,
             rows: 24,
             xpixel: 0,
             ypixel: 0,
-        }),
-        journal_size: Some(1 << 20),
-        history: None,
-    };
+        });
+        n.journal_size = Some(1 << 20);
+        n.history = None;
+    });
     vec![
         ("attach", work(Message::attach(0x1000))),
         ("attach_end", work(Message::attach(v1::OFFSET_END))),
@@ -198,11 +204,10 @@ fn messages() -> Vec<(&'static str, Packet)> {
             "new_history",
             Packet::about(
                 id("build-1"),
-                Message::New(NewSession {
-                    argv: vec![b"/bin/sh".to_vec()],
-                    history: Some(5000),
-                    ..NewSession::default()
-                }),
+                Message::New(with(NewSession::default(), |n| {
+                    n.argv = vec![b"/bin/sh".to_vec()];
+                    n.history = Some(5000);
+                })),
             ),
         ),
         (
@@ -344,56 +349,53 @@ fn messages() -> Vec<(&'static str, Packet)> {
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
             "status_reply_terminal",
-            work(Message::StatusReply(Status {
-                pid: 4242,
-                program: Some(b"ssh".to_vec()),
-                cwd: Some(b"/home/u".to_vec()),
-                size: Size {
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.program = Some(b"ssh".to_vec());
+                s.cwd = Some(b"/home/u".to_vec());
+                s.size = Size {
                     cols: 80,
                     rows: 24,
                     xpixel: 0,
                     ypixel: 0,
-                },
-                clients: 1,
-                offset: 5000,
-                version: "0.2.0".into(),
-                secret: true,
-                remote: Some(b"user@host".to_vec()),
-                remote_port: Some(2222),
-                ..Status::new(id("work"))
-            })),
+                };
+                s.clients = 1;
+                s.offset = 5000;
+                s.version = "0.2.0".into();
+                s.secret = true;
+                s.remote = Some(b"user@host".to_vec());
+                s.remote_port = Some(2222);
+            }))),
         ),
         (
             "status_reply_warden",
-            work(Message::StatusReply(Status {
-                pid: 4242,
-                size: Size {
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.size = Size {
                     cols: 80,
                     rows: 24,
                     xpixel: 0,
                     ypixel: 0,
-                },
-                offset: 5000,
-                version: "0.2.0".into(),
-                warden_version: "0.1.0".into(),
-                ..Status::new(id("work"))
-            })),
+                };
+                s.offset = 5000;
+                s.version = "0.2.0".into();
+                s.warden_version = "0.1.0".into();
+            }))),
         ),
         (
             "status_reply_ended",
-            work(Message::StatusReply(Status {
-                pid: 4242,
-                size: Size {
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.size = Size {
                     cols: 80,
                     rows: 24,
                     xpixel: 0,
                     ypixel: 0,
-                },
-                state: State::ENDED,
-                offset: 5000,
-                exit: Some(Exit::Code(0)),
-                ..Status::new(id("work"))
-            })),
+                };
+                s.state = State::ENDED;
+                s.offset = 5000;
+                s.exit = Some(Exit::Code(0));
+            }))),
         ),
         (
             "state",
@@ -415,17 +417,16 @@ fn messages() -> Vec<(&'static str, Packet)> {
             "created",
             Packet::about(
                 id("build-1"),
-                Message::Created(Status {
-                    pid: 4300,
-                    size: Size {
+                Message::Created(with(Status::new(id("build-1")), |s| {
+                    s.pid = 4300;
+                    s.size = Size {
                         cols: 80,
                         rows: 24,
                         xpixel: 0,
                         ypixel: 0,
-                    },
-                    version: "0.1.0".into(),
-                    ..Status::new(id("build-1"))
-                }),
+                    };
+                    s.version = "0.1.0".into();
+                })),
             ),
         ),
     ]
@@ -835,31 +836,27 @@ fn a_sender_cannot_produce_what_a_receiver_refuses() {
     let nul =
         |new: NewSession| write_packet(&mut Vec::new(), &Packet::connection(Message::New(new)));
     assert!(
-        nul(NewSession {
-            argv: vec![b"a\0b".to_vec()],
-            ..Default::default()
-        })
+        nul(with(NewSession::default(), |n| {
+            n.argv = vec![b"a\0b".to_vec()];
+        }))
         .is_err()
     );
     assert!(
-        nul(NewSession {
-            env: vec![(b"A=B".to_vec(), b"c".to_vec())],
-            ..Default::default()
-        })
+        nul(with(NewSession::default(), |n| {
+            n.env = vec![(b"A=B".to_vec(), b"c".to_vec())];
+        }))
         .is_err()
     );
     assert!(
-        nul(NewSession {
-            env: vec![(b"".to_vec(), b"c".to_vec())],
-            ..Default::default()
-        })
+        nul(with(NewSession::default(), |n| {
+            n.env = vec![(b"".to_vec(), b"c".to_vec())];
+        }))
         .is_err()
     );
     assert!(
-        nul(NewSession {
-            cwd: Some(Vec::new()),
-            ..Default::default()
-        })
+        nul(with(NewSession::default(), |n| {
+            n.cwd = Some(Vec::new());
+        }))
         .is_err()
     );
     assert!(
@@ -1047,10 +1044,7 @@ fn a_status_from_before_the_warden_said_its_version_reads_it_as_unknown() {
     let mut block = old.to_block();
     assert!(!block.windows(2).any(|w| w == [0, 12]));
     // The same block with the key appended reads with the warden's version.
-    let mut newer = Status {
-        warden_version: "0.3.0".into(),
-        ..old.clone()
-    };
+    let mut newer = with(old.clone(), |s| s.warden_version = "0.3.0".into());
     block.extend_from_slice(&[0, 12, 0, 0, 0, 5]);
     block.extend_from_slice(b"0.3.0");
     assert_eq!(Status::from_block(&block).unwrap(), newer);
@@ -1080,12 +1074,11 @@ fn a_status_from_before_the_terminal_keys_reads_them_as_nothing() {
     block.extend_from_slice(&[0, 14, 0, 0, 0, 4]);
     block.extend_from_slice(b"host");
     block.extend_from_slice(&[0, 15, 0, 0, 0, 2, 0, 22]);
-    let newer = Status {
-        secret: true,
-        remote: Some(b"host".to_vec()),
-        remote_port: Some(22),
-        ..old.clone()
-    };
+    let newer = with(old.clone(), |s| {
+        s.secret = true;
+        s.remote = Some(b"host".to_vec());
+        s.remote_port = Some(22);
+    });
     assert_eq!(Status::from_block(&block).unwrap(), newer);
     assert_eq!(Status::from_block(&newer.to_block()).unwrap(), newer);
     // A value of the wrong length is not read as another.
@@ -1901,13 +1894,7 @@ fn the_limits_of_streams_are_the_ones_the_features_say() {
     assert!(!on.commands);
     let both = on.clone().with_commands();
     assert!(both.commands);
-    assert_eq!(
-        Features {
-            commands: false,
-            ..both
-        },
-        on
-    );
+    assert_eq!(with(both, |f| f.commands = false), on);
 }
 
 #[test]
@@ -1932,22 +1919,18 @@ fn features_read_as_zeros_unless_the_server_says_more() {
     block.extend([0, 3, 0, 0, 0, 4, 0, 0, 0, 5]);
     assert_eq!(
         Features::from_block(&block).unwrap(),
-        Features {
-            max_streams: 5,
-            ..Features::default()
-        }
+        with(Features::default(), |f| f.max_streams = 5)
     );
     block.extend([0, 1, 0, 0, 0, 1, 0b0000_0011]);
     block.extend([0, 3, 0, 0, 0, 4, 0, 0, 0, 6]);
     block.extend([0, 5, 0, 0, 0, 4, 0, 0, 1, 0]);
     assert_eq!(
         Features::from_block(&block).unwrap(),
-        Features {
-            streams: true,
-            max_streams: 6,
-            max_data: 256,
-            ..Features::default()
-        }
+        with(Features::default(), |f| {
+            f.streams = true;
+            f.max_streams = 6;
+            f.max_data = 256;
+        })
     );
 
     // Commands: bit 0 of its byte, absent when clear, last wins.
