@@ -70,7 +70,8 @@ offset  size  field
 A session is named by 1 to 64 bytes of `[A-Za-z0-9._-]`. The id in a frame
 header says which session the message concerns; it is empty for a message about
 the connection itself (`list`, `ping`, `pong`, `list_reply`, and a `new` that
-lets the server pick the name). A server's socket for a session is
+lets the server pick the name; a `ping` may also name the session whose `write`
+it confirms, section 5, Driving a session without attaching). A server's socket for a session is
 `<id>.sock`, which is why the alphabet has no separator. A frame on channel 1
 has none: it names its stream in the payload.
 
@@ -116,7 +117,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x07 | `input` | yes | the bytes |
 | 0x08 | `list` | no | (empty) |
 | 0x09 | `new` | optional | TLV block, below |
-| 0x0a | `ping` | no | any bytes |
+| 0x0a | `ping` | optional | any bytes |
 | 0x0b | `features` | no | (empty), or a TLV block, below |
 | 0x0c | `ask` | optional | (empty) |
 | 0x0d | `decline` | no | `ticket: u32`, then UTF-8 text |
@@ -675,7 +676,8 @@ output of that command carry this protocol for every session on the server at
 once, each message naming its session in the frame header. The bridge
 (`kablo attach`) forwards a request for a session to that session's socket and
 what comes back to the client, and answers four things itself because they
-are about the connection: `ping` (a `pong` with the same bytes), `list` (it asks
+are about the connection: `ping` (a `pong` with the same bytes; but see Typing in
+section 5 for one that names a session a `write` is waiting to be confirmed at), `list` (it asks
 every session for its status and replies with the sessions that answered),
 `new` (it starts the session and replies `created` with its status), `label` (it
 sets or clears the label of the session) and `features` (a `features_reply`, at
@@ -835,7 +837,10 @@ answers).
   when it was taken. A sender that wants to know sends a `ping` after it, naming
   the same session, and its `pong` comes after the `error` the `write` has, if it
   has one: a `pong` with no `error` before it says the keys were queued for the
-  program. A `write` is sent **at most once**: a connection that is lost before
+  program. (A bridge sends such a `ping` on to the session's relay only while a
+  `write` of the client's to that session is not yet confirmed; any other `ping`
+  is answered by the bridge itself, named session or not, so a pulse is answered
+  while a relay is being replaced.) A `write` is sent **at most once**: a connection that is lost before
   the `pong` leaves the sender not knowing whether it arrived, and sending it
   again would press the keys twice, so the sender says that and does not.
 - *Reading.* `read` is a question like `status`, answered after everything the

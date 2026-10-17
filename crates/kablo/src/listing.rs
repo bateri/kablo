@@ -59,8 +59,9 @@ pub fn table(statuses: &[Status]) -> String {
         "DIRECTORY",
         "SIZE",
         "CLIENTS",
+        "LABEL",
     ];
-    let mut rows: Vec<[String; 7]> = vec![header.map(str::to_owned)];
+    let mut rows: Vec<[String; 8]> = vec![header.map(str::to_owned)];
     for status in statuses {
         let unknown = status.state == State::BROKEN;
         let dash = || "-".to_owned();
@@ -84,9 +85,15 @@ pub fn table(statuses: &[Status]) -> String {
             } else {
                 status.clients.to_string()
             },
+            // Last, because it is whatever the person wrote and the rest
+            // line up before it.
+            status
+                .label
+                .as_deref()
+                .map_or_else(String::new, |label| printable(label.as_bytes())),
         ]);
     }
-    let mut widths = [0usize; 7];
+    let mut widths = [0usize; 8];
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
@@ -95,13 +102,16 @@ pub fn table(statuses: &[Status]) -> String {
     let mut text = String::new();
     for row in &rows {
         let last = row.len() - 1;
+        let mut line = String::new();
         for (i, (cell, width)) in row.iter().zip(&widths).enumerate() {
             if i == last {
-                text.push_str(cell);
+                line.push_str(cell);
             } else {
-                let _ = write!(text, "{cell:<width$}  ");
+                let _ = write!(line, "{cell:<width$}  ");
             }
         }
+        // A session with no label leaves the last cell empty.
+        text.push_str(line.trim_end());
         text.push('\n');
     }
     text
@@ -181,6 +191,8 @@ pub fn json(statuses: &[Status]) -> String {
             }
             None => out.push_str(",\"remote_port\":null"),
         }
+        out.push_str(",\"label\":");
+        json_optional(&mut out, status.label.as_deref().map(str::as_bytes));
         out.push('}');
     }
     out.push_str(if statuses.is_empty() { "]\n" } else { "\n]\n" });
@@ -237,6 +249,20 @@ mod tests {
             lines[3].starts_with("gone-wrong  broken          -    -"),
             "{text}"
         );
+        // The label is the last column, and a line with none ends where its
+        // clients do.
+        assert!(lines[0].ends_with("CLIENTS  LABEL"), "{text}");
+        assert!(lines[1].ends_with("80x24  1"), "{text}");
+        let mut named = status("n");
+        named.label = Some("build \u{1b}[2J".to_owned());
+        let text = table(&[named]);
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap()
+                .ends_with("  1        build ?[2J"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -271,7 +297,7 @@ mod tests {
         assert!(
             text.contains(
                 "\"version\":\"0.1.0\",\"warden_version\":\"0.1.0\",\
-                 \"secret\":false,\"remote\":null,\"remote_port\":null}"
+                 \"secret\":false,\"remote\":null,\"remote_port\":null,\"label\":null}"
             ),
             "{text}"
         );
@@ -284,10 +310,13 @@ mod tests {
         asking.secret = true;
         asking.remote = Some(b"ada@devbox".to_vec());
         asking.remote_port = Some(2222);
-        assert!(
-            json(&[asking])
-                .contains("\"secret\":true,\"remote\":\"ada@devbox\",\"remote_port\":2222}"),
-        );
+        assert!(json(&[asking]).contains(
+            "\"secret\":true,\"remote\":\"ada@devbox\",\"remote_port\":2222,\"label\":null}"
+        ),);
+        // The label a person gave, escaped like the rest.
+        let mut named = status("e");
+        named.label = Some("the \"build\"".to_owned());
+        assert!(json(&[named]).contains("\"label\":\"the \\\"build\\\"\"}"));
         assert!(text.ends_with("}\n]\n"), "{text}");
         assert_eq!(text.matches("{\"id\"").count(), 2);
     }

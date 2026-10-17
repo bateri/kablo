@@ -28,7 +28,10 @@
 //! connection there is and never again. One that finds the link without a
 //! connection is answered with an error and typed nowhere; one whose connection
 //! is lost before the `ping` that follows it was answered leaves the client with an
-//! error that says it cannot know ([`UNSURE`]).
+//! error that says it cannot know ([`UNSURE`]). A `ping` is the link's business
+//! only while a `write` waits for one ([`Link::awaits_confirmation`]); any other is
+//! the owner's to answer, since a link that is replaced must not take a pulse for
+//! typing.
 //!
 //! The link talks to its owner through packets: [`Link::send`] takes what the
 //! client sent, and everything that is to go back to the client is pushed to
@@ -114,6 +117,10 @@ pub struct Link {
     /// was written before them, and a connection that ends before they come back
     /// cannot say whether it was.
     pings: u32,
+    /// A `write` went on the connection and no `ping` has been sent after it.
+    typed: bool,
+    /// How many connections the link has made again.
+    reconnects: u32,
     /// Requests that arrived while there was no connection to put them on.
     parked: Vec<Packet>,
     parked_bytes: usize,
@@ -146,6 +153,8 @@ impl Link {
                 reads: VecDeque::new(),
                 waiting: false,
                 pings: 0,
+                typed: false,
+                reconnects: 0,
                 parked: Vec::new(),
                 parked_bytes: 0,
                 give_up_at: Some(now + WAIT),
@@ -176,6 +185,21 @@ impl Link {
     /// Whether the client is attached to the session.
     pub fn is_attached(&self) -> bool {
         self.attach.is_some()
+    }
+
+    /// Whether a `write` is waiting to be confirmed: one went on the connection
+    /// and the `pong` of a `ping` after it has not come. A `ping` the client
+    /// sends now is the answer to that, and goes to the session (its `pong`
+    /// comes after the `write`'s `error`); any other is not the link's.
+    pub fn awaits_confirmation(&self) -> bool {
+        self.typed || self.pings > 0
+    }
+
+    /// How many times the link has connected again after losing a connection.
+    /// A caller that put together an answer that came in pieces knows by it that
+    /// a new connection has begun the answer again.
+    pub fn reconnects(&self) -> u32 {
+        self.reconnects
     }
 
     /// The client used the session at `now`.
@@ -244,7 +268,10 @@ impl Link {
             Message::Status => self.status_pending += 1,
             Message::Read(capture) => self.reads.push_back(*capture),
             Message::Wait => self.waiting = true,
-            Message::Ping(_) => self.pings += 1,
+            Message::Ping(_) => {
+                self.pings += 1;
+                self.typed = false;
+            }
             _ => {}
         }
         let Some(peer) = self.peer.as_mut() else {
@@ -264,7 +291,19 @@ impl Link {
             return None;
         };
         peer.queue(&packet);
+        let typing = matches!(packet.message, Message::Write(_));
+        if typing {
+            self.typed = true;
+        }
         if peer.flush().is_err() {
+            // A write on a connection that is found to be gone at once may or
+            // may not have been typed, and no `pong` is going to say: the client
+            // is told now, before the `pong` of the `ping` that follows (which
+            // the owner would answer itself, with no link left to ask).
+            if typing {
+                self.typed = false;
+                out.push(unavailable(&self.id, UNSURE));
+            }
             self.lost(now, out);
         }
         None
@@ -417,6 +456,7 @@ impl Link {
         // the confirmation was on the connection that is gone.
         if self.pings > 0 {
             self.pings = 0;
+            self.typed = false;
             out.push(unavailable(&self.id, UNSURE));
         }
         // Nothing owed to this client any more: let go. The end of the program
@@ -441,6 +481,7 @@ impl Link {
     fn reconnect(&mut self, now: Instant, out: &mut Vec<Packet>) {
         match Peer::connect(&self.path) {
             Ok(mut peer) => {
+                self.reconnects += 1;
                 // Whatever the old connection owed died with it.
                 self.swallow = 0;
                 if let Some(attach) = &self.attach {
@@ -588,6 +629,70 @@ mod tests {
 
     fn about(message: Message) -> Packet {
         Packet::about(Id::new("s").unwrap(), message)
+    }
+
+    #[test]
+    fn a_ping_is_the_links_only_while_a_write_waits_for_one() {
+        let dir = PathBuf::from(format!("/tmp/kl{}-confirm", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        sockdir::ensure_dir(&dir).unwrap();
+        let id = Id::new("s").unwrap();
+        let listener = UnixListener::bind(sockdir::socket_path(&dir, &id)).unwrap();
+        let now = Instant::now();
+        let mut link = Link::open(&dir, id.clone(), now).unwrap();
+        let _held = listener.accept().unwrap();
+        let mut out = Vec::new();
+        assert!(!link.awaits_confirmation());
+
+        link.send(
+            about(Message::Write(vec![Stroke::text("x")])),
+            now,
+            &mut out,
+        );
+        assert!(link.awaits_confirmation());
+        link.send(about(Message::Ping(b"p".to_vec())), now, &mut out);
+        assert!(
+            link.awaits_confirmation(),
+            "the ping is still to be answered"
+        );
+        link.accept(vec![about(Message::Pong(b"p".to_vec()))], &mut out);
+        assert!(!link.awaits_confirmation());
+        assert_eq!(out.len(), 1, "only the pong, which is the client's");
+
+        // A write and a ping lost with the connection: the client is told it
+        // cannot know, once, instead of the `pong`.
+        out.clear();
+        link.send(
+            about(Message::Write(vec![Stroke::text("y")])),
+            now,
+            &mut out,
+        );
+        link.send(about(Message::Ping(b"q".to_vec())), now, &mut out);
+        link.lost(now, &mut out);
+        assert_eq!(out, [unavailable(&id, UNSURE)]);
+        assert!(!link.awaits_confirmation());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_cannot_be_flushed_is_said_to_be_unknown() {
+        let dir = PathBuf::from(format!("/tmp/kl{}-flush", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        sockdir::ensure_dir(&dir).unwrap();
+        let id = Id::new("s").unwrap();
+        let listener = UnixListener::bind(sockdir::socket_path(&dir, &id)).unwrap();
+        let now = Instant::now();
+        let mut link = Link::open(&dir, id.clone(), now).unwrap();
+        // The relay takes the connection and is gone before the write.
+        drop(listener.accept().unwrap());
+        let mut out = Vec::new();
+        link.send(
+            about(Message::Write(vec![Stroke::text("z")])),
+            now,
+            &mut out,
+        );
+        assert_eq!(out, [unavailable(&id, UNSURE)], "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

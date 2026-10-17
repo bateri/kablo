@@ -409,10 +409,12 @@ impl Bridge {
     fn handle(&mut self, packet: Packet, now: Instant, outgoing: &mut Vec<Packet>) {
         let Packet { session, message } = packet;
         match (session, message) {
-            // A ping that names a session the client is using goes the way its
-            // requests do, so that its answer comes after theirs: after the
-            // error a `write` has, if it has one.
-            (Some(id), Message::Ping(bytes)) if self.is_linked(&id) => {
+            // A ping that names a session a `write` of the client's is waiting to
+            // be confirmed at goes the way the `write` did, so that its answer comes
+            // after the error the `write` has, if it has one. Any other ping is the
+            // bridge's own, as it always was: a pulse is answered whether or not a
+            // relay is being replaced.
+            (Some(id), Message::Ping(bytes)) if self.is_confirming(&id) => {
                 self.route(id, Message::Ping(bytes), now, outgoing);
             }
             (session, Message::Ping(bytes)) => outgoing.push(Packet {
@@ -531,11 +533,12 @@ impl Bridge {
         }
     }
 
-    /// Whether the client has a link to session `id` that is there.
-    fn is_linked(&self, id: &SessionId) -> bool {
+    /// Whether the client has a link to session `id`, that is there, with a
+    /// `write` that waits to be confirmed.
+    fn is_confirming(&self, id: &SessionId) -> bool {
         self.links
             .iter()
-            .any(|link| link.id() == id && !link.is_gone())
+            .any(|link| link.id() == id && !link.is_gone() && link.awaits_confirmation())
     }
 
     /// Gives session `id` this label, or none if it is empty; says nothing when

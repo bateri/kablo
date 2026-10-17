@@ -53,6 +53,37 @@ section is not released.
   its own in the socket directory, which it makes if it is not there, for as
   long as it runs; only the same user connects to it (README, Security).
 
+- **Drive a session from the machine it runs on, without attaching to it:
+  `kablo send`, `send-key`, `capture`, `wait` and `label`.** A program there
+  (an agent, a script) types text and keys into a session, reads its screen,
+  waits for its program to end and names the session, while the session goes on
+  answering what its program asks its terminal and an app that shows it is not
+  disturbed. `kablo send [ID] [TEXT | -]` types text without pressing Enter
+  (from the input when there is none), `kablo send-key [ID] KEY...` presses
+  keys (`enter`, `tab`, `escape`, `backspace`, `space`, the arrows, `home`,
+  `end`, `pageup`, `pagedown`, `insert`, `delete`, `f1` to `f12`, `shift+tab`,
+  `ctrl+X`, `alt+X`) as the terminal would send them in the modes the program
+  has set, `kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]`
+  prints the screen as text or, with `--vt`, as the bytes that draw it, `kablo
+  wait ID [--for TIME]` ends with the program's status (128 plus the signal's
+  number after a signal) and `kablo label [ID] [TEXT]` sets or shows the
+  session's label. A session is named by its id or its label (the label
+  without regard to case); a name that fits more than one session does
+  nothing and lists them. With no name a command means the terminal it runs
+  in, and from outside every session it ends with `64`. `wait` ends with `124`
+  when `--for` ran out and `255` for kablo's own trouble; the others end with
+  `0`, or `1` for kablo's own trouble (`capture` ends with `141` when its output
+  is closed on it). A relay replaced by `kablo upgrade`
+  does not end a `wait`, and text is never typed twice. A session started by
+  kablo 0.1.0 has a relay that does not know these commands: each one says so
+  and names `kablo upgrade` instead of waiting for ever (README, Driving a
+  session).
+- **`kablo new --label TEXT` and `--wait`; `kablo list` shows labels.** A label
+  is a name for a session that can be changed, at most 64 bytes. `--wait`
+  prints the id, waits for the program to end, ends with its status and takes
+  the session over, so it is not kept for a day. `kablo list` has a `LABEL`
+  column at the end, and `kablo list --json` the key `label`.
+
 ### For apps
 
 - **Protocol: driving a session without attaching.** An app, or a program on the
@@ -77,15 +108,17 @@ section is not released.
   they were.
 - **`kablo attach` serves them.** The bridge carries `write`, `read` and `wait` to
   the session's relay without attaching to it, and a `ping` that names a session
-  the client has sent requests to goes to that relay too, so its `pong` comes
-  after the `error` that a `write` before it has, if it has one (any other `ping`
-  is still the bridge's own). When the relay is replaced (`kablo upgrade`) a
+  a `write` of the client's is waiting to be confirmed at goes to that relay too,
+  so its `pong` comes after the `error` that the `write` has, if it has one (any
+  other `ping`, named session or not, is still the bridge's own, so a pulse is
+  answered while a relay is being replaced). When the relay is replaced (`kablo upgrade`) a
   `read` and a `wait` are asked again of the new one and the client notices
   nothing; a `write` never is, because it would press the keys twice: one that
   comes while the connection to the session is being made again is answered
   `unavailable` and typed nowhere, and a `ping` whose connection is lost before
-  the `pong` comes is answered `unavailable` instead, which says the `write`
-  before it may or may not have been typed. The bridge answers `label` by writing the session's label to a file
+  the `pong` comes (or a `write` that finds the connection gone as it is sent) is
+  answered `unavailable` instead, which says the `write` may or may not have been
+  typed. The bridge answers `label` by writing the session's label to a file
   in the socket directory, which the relay reads for `status` and removes when the
   session is gone (`UNKNOWN_SESSION` when there is no such session); a `new` that
   carries a label makes it, and a session made under the name of one that is gone
@@ -104,6 +137,19 @@ section is not released.
   `v1::MAX_SCREEN_TEXT` are new. A label over `MAX_LABEL` is refused when it is
   sent and when it is read, in a `label` and in a `new`; a `status` carries what the
   server says and is read whole.
+- **The commands that drive a session, and what an app can rely on of them.** A
+  relay from kablo 0.2.0 on takes the messages above and a label; a session's
+  `status` says which release serves it (`version`), and a program or an app that
+  wants these reads that, because an older relay answers none of them. `kablo
+  list --json` gains the key `label` (a string, or `null` for a session with
+  none; nothing else of it changes). The exit status of `kablo wait` and `kablo
+  new --wait` is the program's (its exit code, or 128 plus the signal's number),
+  `124` when `--for` ran out and `255` when kablo itself could not (no such
+  session, a name that fits several, a relay that is too old, the connection
+  lost); `kablo send`, `send-key`, `capture` and `label` end with `0`, with `1`
+  when kablo could not, and with `64` for a command line that does not parse
+  (`capture` also ends quietly with `141` if whatever reads its output goes away).
+  A program's own `124` or `255` cannot be told from kablo's by the status alone.
 - **Protocol: mail.** A program on the server can hand bytes to the app that is
   connected, and get bytes back, with kablo carrying them unread and saying which
   terminal they come from (`docs/PROTOCOL.md`, section 5, Mail). Added to

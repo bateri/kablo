@@ -7,11 +7,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_ROWS, NewSession, Size};
+use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size};
 
 use crate::{
-    app, bridge, connect, exec, forward, inner, journal, launch, listing, relay, scan, sockdir,
-    sys, upgrade, warden,
+    app, bridge, connect, drive, exec, forward, inner, journal, launch, listing, relay, scan,
+    sockdir, sys, upgrade, warden,
 };
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
@@ -23,6 +23,11 @@ commands:
   new       start a session that outlives its clients; prints its id
   list      show the sessions on this machine
   connect   use a session from this terminal (Ctrl-\\ leaves it running)
+  send      type text to a session, without attaching to it
+  send-key  press keys in a session, without attaching to it
+  capture   print what a session's screen shows
+  wait      wait for the program in a session to end; ends with its status
+  label     show or set a session's label
   attach    carry every session over this program's input and output; for
             programs (`ssh host kablo attach`), not for people
   forward   carry connections to local ports to ports the server reaches, as
@@ -36,11 +41,16 @@ commands:
   version   print the version and the protocol versions this build speaks
   help      print this text
 
-kablo new [--id ID] [--cols N] [--rows N] [--cwd DIR] [--env NAME=VALUE]...
-          [--journal-size BYTES[K|M|G]] [--history ROWS]
+kablo new [--id ID] [--label TEXT] [--wait] [--cols N] [--rows N] [--cwd DIR]
+          [--env NAME=VALUE]... [--journal-size BYTES[K|M|G]] [--history ROWS]
           [-- PROGRAM [ARGUMENT]...]
 kablo list [--json]
 kablo connect [--fresh] ID
+kablo send [ID] [TEXT | -]
+kablo send-key [ID] KEY...
+kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]
+kablo wait ID [--for TIME]
+kablo label [ID] [TEXT]
 kablo attach
 kablo forward [--bind ADDRESS] (PORT | LOCAL:HOST:PORT)... -- COMMAND [ARGUMENT]...
 kablo exec [--cwd DIR] [--env NAME=VALUE]... -- COMMAND [ARGUMENT]... -- PROGRAM [ARGUMENT]...
@@ -72,6 +82,11 @@ where
             Some("new") => return command_new(rest, out, err),
             Some("list") => return command_list(rest, out, err),
             Some("connect") => return command_connect(rest, err),
+            Some("send") => return drive::send(rest, err),
+            Some("send-key") => return drive::send_key(rest, err),
+            Some("capture") => return drive::capture(rest, out, err),
+            Some("wait") => return drive::wait(rest, err),
+            Some("label") => return drive::label(rest, out, err),
             Some("attach") => return command_attach(rest, err),
             Some("forward") => return command_forward(rest, out, err),
             Some("exec") => return command_exec(rest, err),
@@ -121,7 +136,7 @@ where
     }
 }
 
-fn usage_error(err: &mut dyn Write, why: &str) -> u8 {
+pub(crate) fn usage_error(err: &mut dyn Write, why: &str) -> u8 {
     let _ = writeln!(err, "kablo: {why}");
     let _ = write!(err, "{USAGE}");
     EXIT_USAGE
@@ -169,6 +184,8 @@ fn internal(args: &[OsString]) -> Result<Internal, &'static str> {
 struct NewArgs {
     id: Option<SessionId>,
     request: NewSession,
+    /// Wait for the program to end and end with its status.
+    wait: bool,
 }
 
 fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
@@ -190,6 +207,14 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
                     "an id is 1 to 64 characters of letters, digits, '.', '_' and '-'".to_owned()
                 })?);
             }
+            "--label" => {
+                let text = value()?.to_str().ok_or("a label is text")?;
+                if text.len() > MAX_LABEL {
+                    return Err(format!("a label is at most {MAX_LABEL} bytes"));
+                }
+                parsed.request.label = Some(text.to_owned());
+            }
+            "--wait" => parsed.wait = true,
             "--cols" => cols = Some(number(value()?, "--cols", MAX_COLS)?),
             "--rows" => rows = Some(number(value()?, "--rows", MAX_ROWS)?),
             "--cwd" => {
@@ -426,11 +451,18 @@ fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u
         Ok(parsed) => parsed,
         Err(why) => return usage_error(err, &why),
     };
+    // What the command ends with when kablo itself cannot: 255 when it is to end
+    // with a program's status, which has 1 of its own.
+    let trouble = if parsed.wait {
+        drive::EXIT_WAIT_TROUBLE
+    } else {
+        1
+    };
     let dir = match sockdir::socket_dir() {
         Ok(dir) => dir,
         Err(e) => {
             let _ = writeln!(err, "kablo: {e}");
-            return 1;
+            return trouble;
         }
     };
     let id = match parsed.id {
@@ -439,18 +471,30 @@ fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u
             Ok(id) => id,
             Err(e) => {
                 let _ = writeln!(err, "kablo: cannot make a session id: {e}");
-                return 1;
+                return trouble;
             }
         },
     };
     match launch::launch(&dir, &id, &parsed.request) {
         Ok(()) => {
             let _ = writeln!(out, "{id}");
+            let _ = out.flush();
+            if let Some(label) = &parsed.request.label
+                && let Some(note) = drive::clash_note(&dir, &id, label)
+            {
+                let _ = writeln!(err, "kablo: {note}");
+            }
+            if parsed.wait {
+                // The program's status, and the session is taken over once it
+                // has ended: waiting is how an agent runs a program, and one
+                // that ran hundreds would leave hundreds of ended sessions.
+                return drive::await_end(&dir, &id, err);
+            }
             0
         }
         Err(why) => {
             let _ = writeln!(err, "kablo: {why}");
-            1
+            trouble
         }
     }
 }

@@ -101,6 +101,8 @@ directory, `--env NAME=VALUE` an addition to the environment, and
 `--journal-size 32M` how much output is kept for a client that comes back
 (16K to 1G; the default is 8M). `--history 5000` is how many rows of scrollback
 the session's screen keeps for the picture (0 to 100000; the default is 2000).
+`--label TEXT` gives it a name you can change later, and `--wait` waits for the
+program to end and ends with its status ([below](#driving-a-session)).
 
 `kablo connect ID` puts the session on your terminal: what you type goes to
 the program, what it writes goes to your screen, and resizing the window
@@ -123,14 +125,87 @@ program is not reading its input at all, the terminal rings its bell for the
 keys that were refused and `connect` stays, so Ctrl-\ still works.
 
 `kablo list` is a table for people and `kablo list --json` is JSON for
-programs (keys are added to it, never removed). A session whose shell lives
-but whose relay keeps failing is listed as `broken`.
+programs (keys are added to it, never removed; `label` is the session's label
+or `null`). A session whose shell lives but whose relay keeps failing is listed
+as `broken`.
 
 Over ssh the same commands work from a terminal: `ssh -t host kablo connect
 build`.
 
 Sessions are kept in `/tmp/kablo-<uid>/`; `KABLO_DIR` points kablo somewhere
 else, which is what the tests do.
+
+## Driving a session
+
+```sh
+kablo new --id tests --label "unit tests" -- sh
+kablo send tests 'cargo test'
+kablo send-key tests enter
+kablo wait tests --for 10m      # ends with 124 if the program is still running
+kablo capture tests --trim      # what the screen shows
+```
+
+A program on the same machine (an agent, a script, you from another terminal)
+can type into a session, press keys in it, read its screen and wait for its
+program to end, all without attaching to it. Nothing here counts as a client:
+the session goes on answering what its program asks its terminal (where the
+cursor is, what the terminal is), and an app that shows the session is neither
+disturbed nor told.
+
+- **Which session.** The id, or the session's label (an id exactly, a label
+  without regard to case). A name that fits more than one session, an id that is
+  another's label included, does nothing: the matches are printed and the
+  command ends with 1 (255 for `wait`), so that nothing is typed into the wrong
+  terminal. With no name, a command means the terminal it runs in, which is
+  what the system says of the process, never anything it claims; run outside
+  every session it ends with 64 and tells you to name one. `wait` always names
+  its session, since it cannot wait for itself.
+- **`kablo send [ID] [TEXT | -]`** types text and does not press Enter. One word
+  is the text, for the terminal it runs in; two are the session and the text;
+  none, or a lone `-`, types what is read from the input (at most about 1 MiB).
+  It ends with `0` once the session has said the text was typed, and with `1`,
+  and the reason, if the program has ended, is not reading what was typed
+  before (the session holds 1 MiB of it) or the connection was lost before the
+  session said which. **Text is typed at most once**: a send is never repeated,
+  so a lost connection is reported as not knowing.
+- **`kablo send-key [ID] KEY...`** presses keys: `enter`, `tab`, `escape`,
+  `backspace`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`,
+  `pagedown`, `insert`, `delete`, `f1` to `f12`, `shift+tab`, and `ctrl+X` or
+  `alt+X` for a character (`ctrl+c` interrupts the program). The first word is
+  the session unless it is the name of a key. The keys are sent as the terminal
+  would send them in the modes the program has set (application cursor keys,
+  the kitty keyboard protocol), not as fixed bytes.
+- **`kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]`** prints the
+  rows the screen shows, a line each. `--history 200` adds up to that many rows
+  of the scrollback above them, `--unwrap` joins the rows the terminal wrapped
+  back into the lines the program wrote, and `--trim` drops the blank lines at
+  the end. `--vt` alone prints the screen as the bytes that draw it, what a
+  client that comes back is sent as its picture. It ends quietly with 141 if
+  whatever reads its output goes away (`| head`), as `kablo exec` does.
+- **`kablo wait ID [--for TIME]`** waits for the program to end and ends with
+  its status: its exit code, or 128 and the number of the signal that killed it
+  (as `kablo connect` does). `--for 30s` (`ms`, `s`, `m` or `h`) gives up
+  after that time with **124**, the status of GNU `timeout`. **255 is kablo's
+  own**: no such session, a name that fits several, a relay that is too old, a
+  connection that was lost for good (a program may end with 124 or 255 too, and
+  the status alone does not tell the two apart, as with `ssh`). Having seen the end does not close the
+  session: it is kept, as before, for the clients that have not been told, so
+  a `capture` after the `wait` reads the program's last output. A relay that is
+  replaced by `kablo upgrade` meanwhile does not end the wait.
+- **`kablo label [ID] [TEXT]`** gives the session a name you can change (at most
+  64 bytes; an empty text clears it). One word is the text, for the terminal it
+  runs in, so an agent names its own terminal with `kablo label build`; two are
+  the session and the text; none prints the label of the terminal it runs in.
+  `kablo list` shows every session's label.
+- **`kablo new --wait`** starts the session, prints its id, waits for the program
+  to end and ends with its status, and then takes the session over: it is not
+  kept for a day, as a session nobody was told about is, so a script that runs a
+  hundred programs this way leaves nothing behind.
+- **Sessions started by kablo 0.1.0** have a relay that does not know these
+  commands, and would let a `wait` wait for ever. Each command asks the session
+  which release serves it and stops, saying so, if it is from before 0.2.0:
+  `kablo upgrade ID PATH` with a newer `kablo` replaces the relay without
+  disturbing the session.
 
 ## Staying alive after you log out
 
@@ -463,6 +538,19 @@ memory of where its relay comes from (see *Limits*).
   keeps working: `status`, `list`, `resize`, `detach` and `terminate` are
   answered, and its output goes on flowing. The refused bytes are not queued
   anywhere, so send them again once the program reads.
+- **Every `wait` holds one of a relay's 64 client places** while it waits, so
+  very many of them can keep an app from connecting to the session.
+- **The keys `send-key` sends are as right as the relay's idea of the
+  terminal's modes.** A relay that was replaced or restarted rebuilds its screen
+  from the journal (see above), and until the program sets its modes again they
+  can be approximate: `send-key up` can briefly send the sequence for the other
+  cursor mode.
+- **A `wait` that starts after a client has been told the program ended** can
+  find no session (255): that client took the session over and it is gone. Getting
+  the program's status for certain is what `new --wait` and a `wait` that was
+  already waiting are for.
+- **A label is a file in the socket directory.** A system that clears `/tmp` by
+  age can remove it; the session then has no label, which is not an error.
 - **There is no command to end a session by force.** Apps do it with the
   protocol's `terminate`, which hangs up the shell; a program that ignores the
   hang-up, a stuck one, or a `broken` session is ended with `kill`: find the
@@ -522,6 +610,17 @@ memory of where its relay comes from (see *Limits*).
   every message of every shipped version are kept as test fixtures.
   `kablo version` prints one line of `key=value` tokens
   (`version=… wire_min=… wire_max=…`): keys may be added to it, none removed.
+- **Driving a session without attaching** (typing text and keys, reading the
+  screen as text or as a picture, waiting for the program to end, a label) is
+  messages of the session channel, which neither attach the sender nor change
+  what the session answers its program (section 5 of
+  [docs/PROTOCOL.md](docs/PROTOCOL.md)). A relay from kablo 0.2.0 on takes them;
+  an older one skips what it does not know, so an app reads `version` in
+  `status` before it relies on them. `status` and `new` carry the label, and
+  `list --json` has the key `label`. `kablo wait` and `kablo new --wait` end with
+  the program's status, 124 when `--for` ran out and 255 for kablo's own trouble;
+  the other commands end with `0`, `1` for kablo's own trouble and `64` for a
+  command line that does not parse.
 - **Mail from programs on the server** goes to the app through the bridge it
   already runs: `kablo app` hands a program's bytes to the app that is connected
   and carries the app's back, under a ticket that names the terminal the program

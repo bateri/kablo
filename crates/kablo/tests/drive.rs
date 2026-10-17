@@ -581,7 +581,7 @@ fn the_bridge_types_reads_and_confirms() {
     assert_err(got, ErrorCode::BAD_REQUEST);
     assert_eq!(bridge.errors.len(), 1);
     // A ping with no session is the bridge's own, and so is one for a session
-    // there is no link to.
+    // there is no link to, or none a write waits to be confirmed at.
     let pongs = bridge.pongs.len();
     bridge.send(None, Message::Ping(b"a".to_vec()));
     bridge.send(Some("nobody"), Message::Ping(b"b".to_vec()));
@@ -603,10 +603,9 @@ fn a_wait_through_the_bridge_goes_on_over_an_upgrade_and_gets_the_end() {
         )
         .unwrap();
     bridge.send(Some(&id), Message::Wait);
-    // Make sure the relay has it before it is replaced: its answer to a ping
+    // Make sure the relay has it before it is replaced: its answer to a status
     // comes after what was asked on the same connection.
-    bridge.send(Some(&id), Message::Ping(b"there".to_vec()));
-    bridge.until("the pong", |b| !b.pongs.is_empty());
+    bridge.status(&id);
     let newer = env.newer_kablo("wait");
     let said = env
         .kablo()

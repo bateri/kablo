@@ -14,6 +14,7 @@ pub mod cli;
 pub mod connect;
 pub mod conversation;
 pub mod dial;
+pub mod drive;
 pub mod exec;
 pub mod forward;
 pub mod handshake;
