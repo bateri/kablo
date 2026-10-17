@@ -1,0 +1,7 @@
+# open stream 1 on a mailbox, ready to take 262144 bytes: no target, no command, no ticket
+01           # kind 0x01: open
+01           # channel 1: streams
+00           # session id length 0
+00 00 00 08  # payload length 8
+00 00 00 01  # stream 1
+00 04 00 00  # window 262144

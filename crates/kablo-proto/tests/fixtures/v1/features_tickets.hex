@@ -1,0 +1,8 @@
+# features (connection level), from a client that takes tickets
+0b           # kind 0x0b: features
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 07  # payload length 7
+00 01        # tlv key 1: tickets
+00 00 00 01  #   length 1
+01           #   the sender takes tickets

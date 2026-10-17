@@ -1,0 +1,6 @@
+# ticket 8: bytes are waiting, from no terminal
+8d           # kind 0x8d: ticket
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 04  # payload length 4
+00 00 00 08  # ticket 8

@@ -366,6 +366,31 @@ fn frames_of_a_stream_that_is_over_are_ignored_and_so_is_an_old_number() {
 }
 
 #[test]
+fn an_open_that_answers_a_ticket_is_one_with_no_target_to_a_bridge_that_takes_no_mail() {
+    let env = Env::new();
+    let mut bridge = Bridge::start(&env);
+    // The same answer as an `open` with no port and no host, which a ticket's
+    // block was read as before there were tickets.
+    bridge.stream_message(
+        1,
+        stream::Message::OpenTicket {
+            window: 10,
+            ticket: 7,
+        },
+    );
+    bridge.stream_message(2, stream::Message::open_mail(10));
+    bridge.until("both answered", |b| {
+        [1, 2]
+            .iter()
+            .all(|id| b.flows.get(id).is_some_and(|f| f.failed.is_some()))
+    });
+    for id in [1, 2] {
+        let (code, _) = bridge.flows[&id].failed.clone().unwrap();
+        assert_eq!(code, FailCode::BAD_REQUEST, "stream {id}");
+    }
+}
+
+#[test]
 fn a_client_that_goes_away_closes_every_target_and_ends_the_bridge() {
     let env = Env::new();
     let mut bridge = Bridge::start(&env);

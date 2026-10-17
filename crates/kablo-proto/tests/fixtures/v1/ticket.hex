@@ -1,0 +1,7 @@
+# ticket 7: bytes are waiting, from the terminal "work"
+8d           # kind 0x8d: ticket
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 04  # payload length 4
+77 6f 72 6b  # session id "work"
+00 00 00 07  # ticket 7

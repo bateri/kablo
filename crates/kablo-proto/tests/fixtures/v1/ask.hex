@@ -1,0 +1,5 @@
+# ask (connection level): where does the sender stand? The bridge finds the sender's terminal itself
+0c           # kind 0x0c: ask
+00           # channel 0: terminal session
+00           # session id length 0
+00 00 00 00  # payload length 0

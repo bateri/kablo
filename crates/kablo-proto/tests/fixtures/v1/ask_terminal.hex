@@ -1,0 +1,6 @@
+# ask about the terminal "work" (a question about that terminal, not about the sender)
+0c           # kind 0x0c: ask
+00           # channel 0: terminal session
+04           # session id length 4
+00 00 00 00  # payload length 0
+77 6f 72 6b  # session id "work"

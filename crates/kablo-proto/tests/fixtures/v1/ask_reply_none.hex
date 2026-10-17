@@ -1,0 +1,14 @@
+# the sender runs in no terminal; the client was last in one an hour ago and takes no tickets
+8c                       # kind 0x8c: ask_reply
+00                       # channel 0: terminal session
+00                       # session id length 0
+00 00 00 1c              # payload length 28
+00 01                    # tlv key 1: attached
+00 00 00 01              #   length 1
+00                       #   not attached
+00 02                    # tlv key 2: idle
+00 00 00 08              #   length 8
+00 00 00 00 00 36 ee 80  #   3600000 milliseconds
+00 03                    # tlv key 3: tickets
+00 00 00 01              #   length 1
+00                       #   the client takes no tickets

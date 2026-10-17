@@ -1051,6 +1051,11 @@ impl Streams {
             (Side::Server, Message::OpenCommand { window, command }) => {
                 self.command_requested(id, window, command, out);
             }
+            // A ticket answers mail, which this end does not take: an `open`
+            // with no target to connect to, as it was read before tickets.
+            (Side::Server, Message::OpenTicket { window, .. }) => {
+                self.open_requested(id, window, 0, String::new(), out);
+            }
             (Side::Client, Message::Opened { window }) => self.opened(id, window, out),
             (Side::Client, Message::Failed { code, text }) => self.failed(id, code, text),
             (Side::Client, Message::Stderr(bytes)) => {

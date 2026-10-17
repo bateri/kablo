@@ -116,7 +116,9 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x08 | `list` | no | (empty) |
 | 0x09 | `new` | optional | TLV block, below |
 | 0x0a | `ping` | no | any bytes |
-| 0x0b | `features` | no | (empty) |
+| 0x0b | `features` | no | (empty), or a TLV block, below |
+| 0x0c | `ask` | optional | (empty) |
+| 0x0d | `decline` | no | `ticket: u32`, then UTF-8 text |
 | 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated), then optionally `answered: u64` |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
@@ -128,6 +130,8 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
 | 0x8a | `features_reply` | no | TLV block, below |
 | 0x8b | `state` | yes | TLV block, below |
+| 0x8c | `ask_reply` | optional | TLV block, below |
+| 0x8d | `ticket` | optional | `ticket: u32` |
 
 The first six client messages (`attach`, `detach`, `resize`, `terminate`,
 `upgrade`, `status`) are the core a relay must always understand.
@@ -224,7 +228,16 @@ session.
 
 ### features
 
-The TLV block of `features_reply`: what the server can do beyond terminal
+A `features` may carry a TLV block saying what its sender can take. One without
+a block says nothing, and so does one whose block cannot be read: a reader that
+knows the block and finds it malformed answers as if there were none. Every key
+is optional and an absent one reads as zero.
+
+| key | value | meaning |
+|---|---|---|
+| 1 | u8 | `tickets`: bit 0 is set when the sender is an app that takes tickets (section 5, Mail) |
+
+The TLV block of `features_reply` is what the server can do beyond terminal
 sessions. Every key is optional and an absent one reads as zero (or nothing), so
 a reply with no `streams` says there are none.
 
@@ -236,10 +249,44 @@ a reply with no `streams` says there are none.
 | 4 | u32 | `max_window`: the largest window the server takes for a stream; a client gives none larger. What the server gives is its own choice, within the limit in section 6 |
 | 5 | u32 | `max_data`: the most bytes the server takes in one stream `data` |
 | 6 | u8 | `commands`: bit 0 is set when the server runs programs for the client (an `open` with an `argv`, below); written only when set |
+| 7 | u8 | `mailbox`: bit 0 is set when the bridge keeps a mailbox and gives its client the tickets of the mail that comes to it (section 5, Mail); written only when set |
 
 A limit that is absent or zero is the one in section 6. `commands` is
 independent of `streams`: a server whose administrator has turned streams off
 (section 5) still runs commands, and says so.
+
+### ask, ask_reply, ticket and decline
+
+The messages of mail (section 5, Mail): a program on the server that wants to
+hand bytes to the app that is connected to the server asks the bridge where it
+stands, and the bridge gives the app a ticket for the bytes.
+
+`ask` has no payload (a reader ignores what is there). Its session id, when it
+has one, is the terminal the question is about; without one it is about the
+terminal the asker runs in, which the bridge finds out itself. The answer is
+`ask_reply`: its session id is the terminal the answer is about, or empty when
+there is none, and its payload is a TLV block. Every key is optional and an absent
+one reads as zero.
+
+| key | value | meaning |
+|---|---|---|
+| 1 | u8 | `attached`: bit 0 is set when the bridge's client is attached to that terminal |
+| 2 | u64 | `idle`: the milliseconds since the client last used that terminal, when `attached`; otherwise since it last used any terminal of this server. Using a terminal is attaching to it or sending it `input`; a client that has just connected counts as having used one just now |
+| 3 | u8 | `tickets`: bit 0 is set when the client takes tickets (`tickets` in its `features`) |
+
+The terminal of an answer is a running session and is never something the asker
+says about itself: the bridge finds it from the process at the other end of the
+connection, the session whose terminal that process has or whose shell it
+descends from. An `ask` that names a terminal gets an answer about that terminal
+and no more; it does not change where the asker's bytes are said to come from.
+
+`ticket` is the bridge telling its client that bytes are waiting for it. It
+carries the number of the ticket, which the bridge picks counting up from 1 on
+the connection and never uses twice, and its session id is the terminal the bytes
+come from (found as above), empty when they come from none. The client answers
+with an `open` that carries the number (Stream messages, below) or with
+`decline`, which names the ticket it refuses and gives text in the client's own
+words, for a person, who sees it with control characters removed.
 
 ### error codes
 
@@ -280,9 +327,12 @@ each.
 | 0x87 | `stderr` | the bytes (a command's standard error) |
 | 0x88 | `exited` | the exit status, 5 bytes laid out as in `ended`: a kind (0 exit code, 1 signal) and an `i32` (a command's end) |
 
-The TLV block of `open` holds either a target to connect to or a command to
-run. A block with an `argv` entry is a command, and its `port` and `host` are
-not read; any other is a target.
+The TLV block of `open` holds a target to connect to, a command to run, or a
+ticket to answer. A block with a `ticket` entry answers that ticket, and
+nothing else in it is read; a block with an `argv` entry is a command, and its
+`port` and `host` are not read; any other is a target. A target with no
+`port` and no `host` is what a sender of mail writes to open a conversation
+(section 5, Mail): an empty block.
 
 | key | value | meaning |
 |---|---|---|
@@ -291,13 +341,16 @@ not read; any other is a target.
 | 3 | bytes | `argv`: one argument of the command; repeats, in order, and the first is the program |
 | 4 | bytes | `env`: one variable to add to the server's environment, `NAME=VALUE` (the name is what comes before the first `=`); repeats |
 | 5 | bytes | `cwd`: the directory to start in; the user's home when absent |
+| 6 | u32 | `ticket`: the number of the ticket (`ticket`, above) this `open` answers |
 
 A reader checks the structure of a stream message and nothing else: an `open`
 without a `port` or a `host` reads as port 0 and an empty host, and the server
-answers it with `failed` like any other `open` it cannot use; so does one with
-a command it will not run (below). Senders do not produce them (port 0, an
-empty host, a host over 253 bytes or with a NUL, a `data` or `stderr` over
-32 KiB, a command that is not valid).
+answers it with `failed` like any other `open` it cannot use (a mailbox takes
+it as a conversation, section 5, Mail); so does one with a command it will not
+run (below). Senders do not produce them (port 0 with a host, an empty host with
+a port, a host over 253 bytes or with a NUL, a `data` or `stderr` over 32 KiB, a
+command that is not valid); the one `open` with neither a port nor a host is
+the sender of mail's.
 
 A command is valid when it has a program that is not empty, no NUL appears in
 any argument, variable or the directory, every variable has a name, the
@@ -319,6 +372,7 @@ The `code` of `failed`.
 | 6 | the server has streams turned off |
 | 7 | the `open` makes no sense (port 0, an empty or too long host; for a command, one that is not valid) |
 | 8 | the command could not be started; the text says why, as the system does |
+| 9 | the app declined the ticket; the text is the app's own words, as sent in `decline` |
 
 A code a reader has no name for is still a failure. The text is short English
 that reads after a colon ("connection refused"); a client that shows it to a
@@ -679,6 +733,59 @@ it lasts as long as the program does and no longer than the connection.
   the connection and not longer; work that has to outlive it is a session.
 - *The administrator.* The switch that turns streams off (section 5, Streams)
   does not touch commands: a person who can log in can run a program.
+
+**Mail.** A program on the server can hand bytes to the app that is connected
+to the server, and get bytes back; kablo carries them without looking at them and
+says which terminal they come from. What the bytes mean is between the program
+and the app. The program is the *sender*, the app is the bridge's *client*.
+
+- *The mailbox.* A bridge may keep a mailbox: a socket of its own in the socket
+  directory of the user it runs as, beside the sessions'. A sender connects to it
+  as a client, with the handshake of section 1, and the bridge takes only
+  connections of its own user. A bridge with a mailbox says so in `features_reply`
+  (`mailbox`); an older one does not, and has none.
+- *Taking tickets.* A client that wants mail says so in its `features` (`tickets`)
+  and is given a ticket for each conversation that comes to it. A bridge gives
+  tickets to no client that has not said so, and an old client, which never says,
+  is sent nothing it does not know.
+- *Asking.* A sender may connect to every mailbox on the server and send `ask`
+  to each, to see where it stands before it sends anything: `ask_reply` says the
+  terminal the sender runs in (found by the bridge, never by the sender), whether
+  the client is attached to it, how long since the client used it and whether the
+  client takes tickets. The choice among the bridges is the sender's: `kablo app`
+  takes, among the clients that take tickets, the least idle of those attached
+  to the terminal, and when there is none, the least idle of all. A sender that
+  runs in no terminal has `attached` clear on every answer and gets the second.
+- *Handing over.* The sender numbers its stream as any client does and sends an
+  `open` with an empty block and a window (the bytes the client may send it). The
+  bridge sends its client a `ticket`, with the terminal in the session id. The
+  client opens a stream of its own, numbered as it numbers its streams, with
+  `open` carrying `ticket` and a window (the bytes the sender may send it), or
+  sends `decline`. When it opens, the bridge answers each end with `opened`
+  carrying the window the other gave, and from then on joins the two streams: a
+  `data`, `credit`, `eof` or `close` from one is the same message to the other,
+  with the number of the other's stream and the kind of the bridge's end (the
+  sender's `data` reaches the client as a server `data`, and the client's reaches
+  the sender the same way). The windows are the two ends' own, so the bridge
+  keeps no bytes of the conversation beyond what the windows let through, and
+  `stderr` and `exited` are not used. A conversation counts among the streams of
+  both connections.
+- *When it does not get there.* The sender's `open` is answered `failed` (2) when
+  the bridge has no client that takes tickets, (5) when the connection has too
+  many streams, and (9) with the client's text when it declines. An `open` that
+  answers a ticket that is not outstanding (it was answered, or the sender gave it
+  up) is `failed` (7).
+- *The end.* `eof` ends one direction as in any stream, and `close` ends both. The
+  client's `close` is the end of the conversation from the app's side and reaches
+  the sender as `close`. A sender that gives up (a `close` for its stream, or the
+  end of its connection) has the bridge forget the ticket if the client has not
+  answered it, and `close` the client's stream if it has. When the client's
+  connection to the bridge ends, the bridge ends with it and so does every
+  connection to its mailbox, with no `close` on the streams that were open: a sender
+  that sees its connection end without one knows the app went away. A sender that
+  waits for the client to answer a ticket for longer than it will wait does the
+  same as one that gives up: how long is its own choice, since a bridge sets no
+  timers.
 
 ## 6. Limits
 

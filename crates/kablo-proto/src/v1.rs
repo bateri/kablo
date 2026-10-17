@@ -15,6 +15,7 @@
 //! module and fixtures, and v1 stays readable.
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::frame::{self, CHANNEL_SESSION, FrameDecoder, MAX_PAYLOAD, RawFrame};
 use crate::tlv;
@@ -46,6 +47,10 @@ pub mod kind {
     pub const PING: u8 = 0x0a;
     /// `features`: ask what the server can do beyond sessions.
     pub const FEATURES: u8 = 0x0b;
+    /// `ask`: ask the bridge where the asker stands for mail.
+    pub const ASK: u8 = 0x0c;
+    /// `decline`: refuse a ticket.
+    pub const DECLINE: u8 = 0x0d;
     /// `attached`: the answer to `attach`.
     pub const ATTACHED: u8 = 0x81;
     /// `output`: bytes from the program.
@@ -68,6 +73,10 @@ pub mod kind {
     pub const FEATURES_REPLY: u8 = 0x8a;
     /// `state`: what the session's terminal is doing, said unprompted.
     pub const STATE: u8 = 0x8b;
+    /// `ask_reply`: the answer to `ask`.
+    pub const ASK_REPLY: u8 = 0x8c;
+    /// `ticket`: bytes are waiting for the client.
+    pub const TICKET: u8 = 0x8d;
 }
 
 /// The name of a message kind, for diagnostics (`"unknown"` for a kind this
@@ -85,6 +94,8 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::NEW => "new",
         kind::PING => "ping",
         kind::FEATURES => "features",
+        kind::ASK => "ask",
+        kind::DECLINE => "decline",
         kind::ATTACHED => "attached",
         kind::OUTPUT => "output",
         kind::ENDED => "ended",
@@ -96,6 +107,8 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::PICTURE => "picture",
         kind::FEATURES_REPLY => "features_reply",
         kind::STATE => "state",
+        kind::ASK_REPLY => "ask_reply",
+        kind::TICKET => "ticket",
         _ => "unknown",
     }
 }
@@ -662,6 +675,10 @@ pub struct Features {
     /// is a [`stream::Command`]. Independent of `streams`: an administrator
     /// who turns streams off has not turned commands off.
     pub commands: bool,
+    /// Whether the bridge keeps a mailbox and gives its client the tickets of
+    /// the mail that comes to it (see [`Offers::tickets`]). Written only when
+    /// set, so a bridge without one is the bytes it was before there was mail.
+    pub mailbox: bool,
 }
 
 mod features_key {
@@ -671,6 +688,7 @@ mod features_key {
     pub const MAX_WINDOW: u16 = 4;
     pub const MAX_DATA: u16 = 5;
     pub const COMMANDS: u16 = 6;
+    pub const MAILBOX: u16 = 7;
 }
 
 impl Features {
@@ -683,6 +701,7 @@ impl Features {
             max_window: stream::MAX_WINDOW,
             max_data: u32::try_from(stream::MAX_DATA).unwrap_or(u32::MAX),
             commands: false,
+            mailbox: false,
         }
     }
 
@@ -690,6 +709,14 @@ impl Features {
     pub fn with_commands(self) -> Features {
         Features {
             commands: true,
+            ..self
+        }
+    }
+
+    /// The same features, and the bridge keeps a mailbox.
+    pub fn with_mailbox(self) -> Features {
+        Features {
+            mailbox: true,
             ..self
         }
     }
@@ -724,6 +751,9 @@ impl Features {
         if self.commands {
             w.put_u8(features_key::COMMANDS, 1);
         }
+        if self.mailbox {
+            w.put_u8(features_key::MAILBOX, 1);
+        }
         w.finish()
     }
 
@@ -752,10 +782,142 @@ impl Features {
                 features_key::COMMANDS => {
                     features.commands = tlv::read_u8(value, "features commands")? & 1 != 0
                 }
+                features_key::MAILBOX => {
+                    features.mailbox = tlv::read_u8(value, "features mailbox")? & 1 != 0
+                }
                 _ => {}
             }
         }
         Ok(features)
+    }
+}
+
+/// What a client says about itself in the body of a `features`. Nothing in it is
+/// a promise the bridge can check; a key that is absent reads as its zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Offers {
+    /// Whether the client is an app that takes tickets: the bridge gives it one
+    /// for each conversation that comes to its mailbox, and gives none to a client
+    /// that did not say so.
+    pub tickets: bool,
+}
+
+mod offers_key {
+    pub const TICKETS: u16 = 1;
+}
+
+impl Offers {
+    /// A client that takes tickets.
+    pub fn with_tickets() -> Offers {
+        Offers { tickets: true }
+    }
+
+    /// The wire form, a [`tlv`] block with the keys in ascending order. It is
+    /// never empty, so that a body is told from the absence of one.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        w.put_u8(offers_key::TICKETS, u8::from(self.tickets));
+        w.finish()
+    }
+
+    /// Reads the wire form. Every key is optional and reads as zero when
+    /// absent; one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<Offers> {
+        let mut offers = Offers::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            if key == offers_key::TICKETS {
+                offers.tickets = tlv::read_u8(value, "features tickets")? & 1 != 0;
+            }
+        }
+        Ok(offers)
+    }
+}
+
+/// Where a bridge's client stands for mail: the payload of `ask_reply`. The
+/// terminal it is about is the session id of the packet. A key that is absent
+/// reads as its zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Standing {
+    /// Whether the client is attached to that terminal.
+    pub attached: bool,
+    /// How long since the client last used that terminal when it is attached,
+    /// and since it last used any terminal of the server when it is not.
+    /// Using one is attaching to it or sending it input. Whole milliseconds on
+    /// the wire.
+    pub idle: Duration,
+    /// Whether the client takes tickets (see [`Offers::tickets`]).
+    pub tickets: bool,
+}
+
+mod standing_key {
+    pub const ATTACHED: u16 = 1;
+    pub const IDLE: u16 = 2;
+    pub const TICKETS: u16 = 3;
+}
+
+impl Standing {
+    /// A client that is not attached to the terminal, took no tickets, and
+    /// has been idle this long.
+    pub fn idle(idle: Duration) -> Standing {
+        Standing {
+            idle,
+            ..Standing::default()
+        }
+    }
+
+    /// The same, and the client is attached to the terminal.
+    pub fn with_attached(self) -> Standing {
+        Standing {
+            attached: true,
+            ..self
+        }
+    }
+
+    /// The same, and the client takes tickets.
+    pub fn with_tickets(self) -> Standing {
+        Standing {
+            tickets: true,
+            ..self
+        }
+    }
+
+    /// The wire form, a [`tlv`] block with the keys in ascending order.
+    /// Durations too long for the field (584 million years) are written as the
+    /// longest.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        w.put_u8(standing_key::ATTACHED, u8::from(self.attached));
+        w.put_u64(
+            standing_key::IDLE,
+            u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX),
+        );
+        w.put_u8(standing_key::TICKETS, u8::from(self.tickets));
+        w.finish()
+    }
+
+    /// Reads the wire form. Every key is optional and reads as zero when
+    /// absent; one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<Standing> {
+        let mut standing = Standing::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                standing_key::ATTACHED => {
+                    standing.attached = tlv::read_u8(value, "ask reply attached")? & 1 != 0
+                }
+                standing_key::IDLE => {
+                    standing.idle = Duration::from_millis(tlv::read_u64(value, "ask reply idle")?)
+                }
+                standing_key::TICKETS => {
+                    standing.tickets = tlv::read_u8(value, "ask reply tickets")? & 1 != 0
+                }
+                _ => {}
+            }
+        }
+        Ok(standing)
     }
 }
 
@@ -807,6 +969,24 @@ pub enum Message {
     /// `Ping` that follows (and one that has not skips this and sends only the
     /// `Pong`).
     Features,
+    /// Client to server: the same as `Features`, and the client says what it
+    /// takes. A `features` with a body that cannot be read is read as one
+    /// without, so a body is never a reason to refuse the question.
+    FeaturesWith(Offers),
+    /// Client to server: ask where the asker stands for mail. The session id of
+    /// the packet, if any, is the terminal the question is about; without one it
+    /// is about the terminal the asker runs in, which the bridge finds out
+    /// itself. Answered by `AskReply`.
+    Ask,
+    /// Client to server: the client refuses a ticket. The sender's `open` is
+    /// answered `failed` with [`stream::FailCode::DECLINED`] and this text.
+    Decline {
+        /// The ticket refused.
+        ticket: u32,
+        /// In the client's own words, for a person, who sees it with control
+        /// characters removed.
+        text: String,
+    },
     /// Server to client: the stream starts at `offset`; `truncated` says the
     /// bytes the client asked for are not coming and a picture is, because they
     /// had left the journal or held a question the server answered (see
@@ -866,6 +1046,15 @@ pub enum Message {
     /// time. A server that does not know it sends none, and a client that does
     /// not know it skips it.
     TerminalState(TerminalState),
+    /// Server to client: the answer to `Ask`. The session id of the packet is the
+    /// terminal the answer is about, and none when there is none.
+    AskReply(Standing),
+    /// Server to client: bytes are waiting for the client. The number is the
+    /// ticket's, which the client answers with an `open` that carries it
+    /// ([`stream::Message::OpenTicket`]) or with `Decline`. The session id of
+    /// the packet is the terminal the bytes come from, and none when they come
+    /// from none.
+    Ticket(u32),
     /// Server to client: a piece of the screen as the bytes that build it. A
     /// picture follows an `Attached` and is one or more pieces in order, the
     /// last without `more`; the `Output` after it starts at `offset`.
@@ -905,7 +1094,9 @@ impl Message {
             Message::List => kind::LIST,
             Message::New(_) => kind::NEW,
             Message::Ping(_) => kind::PING,
-            Message::Features => kind::FEATURES,
+            Message::Features | Message::FeaturesWith(_) => kind::FEATURES,
+            Message::Ask => kind::ASK,
+            Message::Decline { .. } => kind::DECLINE,
             Message::Attached { .. } => kind::ATTACHED,
             Message::Output { .. } => kind::OUTPUT,
             Message::Ended(_) => kind::ENDED,
@@ -917,12 +1108,25 @@ impl Message {
             Message::Picture { .. } => kind::PICTURE,
             Message::FeaturesReply(_) => kind::FEATURES_REPLY,
             Message::TerminalState(_) => kind::STATE,
+            Message::AskReply(_) => kind::ASK_REPLY,
+            Message::Ticket(_) => kind::TICKET,
         }
     }
 
     fn payload(&self) -> Result<Vec<u8>> {
         Ok(match self {
-            Message::Detach | Message::Status | Message::List | Message::Features => Vec::new(),
+            Message::Detach
+            | Message::Status
+            | Message::List
+            | Message::Features
+            | Message::Ask => Vec::new(),
+            Message::FeaturesWith(offers) => offers.to_block(),
+            Message::Decline { ticket, text } => {
+                let mut out = ticket.to_be_bytes().to_vec();
+                out.extend_from_slice(text.as_bytes());
+                out
+            }
+            Message::Ticket(ticket) => ticket.to_be_bytes().to_vec(),
             Message::Attach { offset, view } => {
                 let mut out = offset.to_be_bytes().to_vec();
                 if let Some(view) = view {
@@ -989,6 +1193,7 @@ impl Message {
             Message::StatusReply(status) | Message::Created(status) => status.to_block(),
             Message::FeaturesReply(features) => features.to_block(),
             Message::TerminalState(state) => state.to_block(),
+            Message::AskReply(standing) => standing.to_block(),
             Message::ListReply(all) => {
                 let mut w = tlv::Writer::new();
                 for status in all {
@@ -1034,7 +1239,18 @@ impl Message {
             kind::LIST => Message::List,
             kind::NEW => Message::New(NewSession::decode(payload)?),
             kind::PING => Message::Ping(payload.to_vec()),
-            kind::FEATURES => Message::Features,
+            // A body that is not there or cannot be read is a `features` that
+            // says nothing, as it has always been: the question is never refused
+            // for what is said with it.
+            kind::FEATURES => match Offers::from_block(payload) {
+                Ok(offers) if !payload.is_empty() => Message::FeaturesWith(offers),
+                _ => Message::Features,
+            },
+            kind::ASK => Message::Ask,
+            kind::DECLINE => Message::Decline {
+                ticket: f.u32()?,
+                text: String::from_utf8_lossy(f.rest()).into_owned(),
+            },
             kind::ATTACHED => {
                 let offset = f.u64()?;
                 let truncated = f.u8()? & 1 != 0;
@@ -1075,6 +1291,8 @@ impl Message {
             kind::CREATED => Message::Created(Status::from_block(payload)?),
             kind::FEATURES_REPLY => Message::FeaturesReply(Features::from_block(payload)?),
             kind::STATE => Message::TerminalState(TerminalState::from_block(payload)?),
+            kind::ASK_REPLY => Message::AskReply(Standing::from_block(payload)?),
+            kind::TICKET => Message::Ticket(f.u32()?),
             kind::PICTURE => Message::Picture {
                 offset: f.u64()?,
                 cols: f.u16()?,

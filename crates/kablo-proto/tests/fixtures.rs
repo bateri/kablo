@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kablo_proto::frame::{self, RawFrame};
 use kablo_proto::hello::Reply;
@@ -24,8 +25,8 @@ use kablo_proto::v1::stream::{
     self, Command, FailCode, Incoming, IncomingDecoder, Side, read_incoming,
 };
 use kablo_proto::v1::{
-    self, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, State, Status,
-    TerminalState, View, kind, read_packet, write_packet,
+    self, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size, Standing,
+    State, Status, TerminalState, View, kind, read_packet, write_packet,
 };
 use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE, tlv};
 
@@ -305,6 +306,41 @@ fn messages() -> Vec<(&'static str, Packet)> {
                 Features::streams_off("turned off by the server's administrator").with_commands(),
             )),
         ),
+        (
+            "features_reply_mailbox",
+            Packet::connection(Message::FeaturesReply(
+                Features::with_streams().with_commands().with_mailbox(),
+            )),
+        ),
+        (
+            "features_tickets",
+            Packet::connection(Message::FeaturesWith(Offers::with_tickets())),
+        ),
+        ("ask", Packet::connection(Message::Ask)),
+        ("ask_terminal", work(Message::Ask)),
+        (
+            "ask_reply",
+            work(Message::AskReply(
+                Standing::idle(Duration::from_millis(1500))
+                    .with_attached()
+                    .with_tickets(),
+            )),
+        ),
+        (
+            "ask_reply_none",
+            Packet::connection(Message::AskReply(Standing::idle(Duration::from_millis(
+                3_600_000,
+            )))),
+        ),
+        ("ticket", work(Message::Ticket(7))),
+        ("ticket_none", Packet::connection(Message::Ticket(8))),
+        (
+            "decline",
+            Packet::connection(Message::Decline {
+                ticket: 7,
+                text: "no room".into(),
+            }),
+        ),
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
             "status_reply_terminal",
@@ -517,6 +553,33 @@ fn streams() -> Vec<(&'static str, Side, stream::Packet)> {
                 },
             ),
         ),
+        (
+            "stream_open_ticket",
+            Side::Client,
+            on(
+                2,
+                S::OpenTicket {
+                    window: 65_536,
+                    ticket: 7,
+                },
+            ),
+        ),
+        (
+            "stream_open_mail",
+            Side::Client,
+            on(1, S::open_mail(262_144)),
+        ),
+        (
+            "stream_failed_declined",
+            Side::Server,
+            on(
+                1,
+                S::Failed {
+                    code: FailCode::DECLINED,
+                    text: "no room".into(),
+                },
+            ),
+        ),
     ]
 }
 
@@ -611,6 +674,8 @@ fn every_message_kind_has_a_fixture() {
         NEW,
         PING,
         FEATURES,
+        ASK,
+        DECLINE,
         ATTACHED,
         OUTPUT,
         ENDED,
@@ -622,6 +687,8 @@ fn every_message_kind_has_a_fixture() {
         PICTURE,
         FEATURES_REPLY,
         STATE,
+        ASK_REPLY,
+        TICKET,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -1244,6 +1311,8 @@ fn bytes_that_are_not_a_protocol_never_panic() {
         let _ = Status::from_block(&bytes);
         let _ = TerminalState::from_block(&bytes);
         let _ = Features::from_block(&bytes);
+        let _ = Offers::from_block(&bytes);
+        let _ = Standing::from_block(&bytes);
         let _ = WIRE.read_hello(&mut bytes.as_slice());
     }
 }
@@ -1924,9 +1993,13 @@ fn features_read_as_zeros_unless_the_server_says_more() {
 fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(v1::kind_name(kind::FEATURES), "features");
     assert_eq!(v1::kind_name(kind::FEATURES_REPLY), "features_reply");
-    assert_eq!(v1::kind_name(0x0c), "unknown");
+    assert_eq!(v1::kind_name(kind::ASK), "ask");
+    assert_eq!(v1::kind_name(kind::DECLINE), "decline");
+    assert_eq!(v1::kind_name(0x0e), "unknown");
     assert_eq!(v1::kind_name(kind::STATE), "state");
-    assert_eq!(v1::kind_name(0x8c), "unknown");
+    assert_eq!(v1::kind_name(kind::ASK_REPLY), "ask_reply");
+    assert_eq!(v1::kind_name(kind::TICKET), "ticket");
+    assert_eq!(v1::kind_name(0x8e), "unknown");
     assert_eq!(stream::kind_name(stream::kind::OPEN), "stream open");
     assert_eq!(stream::kind_name(stream::kind::FAILED), "stream failed");
     assert_eq!(stream::kind_name(0x06), "unknown");
@@ -1934,6 +2007,7 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(stream::kind_name(stream::kind::EXITED), "stream exited");
     assert_eq!(stream::kind_name(0x89), "unknown");
     assert_eq!(FailCode::START_FAILED, FailCode(8));
+    assert_eq!(FailCode::DECLINED, FailCode(9));
 }
 
 /// What a reader from before commands made of a frame of channel 1: it had the
@@ -1981,6 +2055,8 @@ fn a_reader_from_before_commands_skips_the_new_kinds_and_reads_a_command_open_as
             S::OpenCommand { .. } => {
                 assert_eq!(old, Some(("open", 0, String::new())), "{name}")
             }
+            // An open that answers a ticket has no port and no host for it.
+            S::OpenTicket { .. } => assert_eq!(old, Some(("open", 0, String::new())), "{name}"),
             S::Open { port, host, .. } => {
                 assert_eq!(old, Some(("open", *port, host.clone())), "{name}")
             }
@@ -2033,4 +2109,371 @@ fn a_command_conversation_reads_in_order_however_it_arrives() {
         vars,
         [(&b"LC_ALL"[..], &b"C"[..]), (&b"FOO"[..], &b"a=b"[..])]
     );
+}
+
+#[test]
+fn a_features_with_a_body_is_the_features_it_always_was_to_a_reader_that_does_not_read_it() {
+    // The kind is what a reader from before the body goes by: it took any
+    // payload for the question.
+    let with = session_message("features_tickets");
+    assert_eq!(with.message.kind(), kind::FEATURES);
+    assert_eq!(fixture("features_tickets")[0], kind::FEATURES);
+    assert_eq!(
+        Message::Features.kind(),
+        Message::FeaturesWith(Offers::default()).kind()
+    );
+
+    // The body is always something, so it is told from none, and a client
+    // that takes no tickets still says it.
+    for offers in [Offers::default(), Offers::with_tickets()] {
+        let packet = Packet::connection(Message::FeaturesWith(offers));
+        let mut wire = Vec::new();
+        write_packet(&mut wire, &packet).unwrap();
+        assert_ne!(&wire[3..7], &[0, 0, 0, 0], "{offers:?}: a body");
+        assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(packet));
+    }
+
+    // Only the first bit of the byte is read, a key from the future is
+    // skipped, and the last of a repeated key wins; a body of nothing but
+    // keys from the future is a body that says nothing.
+    let body = |block: &[u8]| {
+        let wire = raw(kind::FEATURES, CHANNEL_SESSION, "", block);
+        read_packet(&mut wire.as_slice()).unwrap().unwrap().message
+    };
+    let mut block = vec![0x0f, 0xff, 0, 0, 0, 1, 9];
+    assert_eq!(body(&block), Message::FeaturesWith(Offers::default()));
+    block.extend([0, 1, 0, 0, 0, 1, 0b1111_1111]);
+    assert_eq!(body(&block), Message::FeaturesWith(Offers::with_tickets()));
+    block.extend([0, 1, 0, 0, 0, 1, 0b0000_0010]);
+    assert_eq!(body(&block), Message::FeaturesWith(Offers::default()));
+
+    // A body that cannot be read leaves the question as it was: the value of
+    // the wrong length, and an entry cut short.
+    for bad in [
+        &[0, 1, 0, 0, 0, 2, 1, 1][..],
+        &[0, 1, 0, 0, 0, 9, 1],
+        &[1, 2, 3],
+    ] {
+        assert_eq!(body(bad), Message::Features, "{bad:?}");
+    }
+    assert_eq!(body(&[]), Message::Features);
+}
+
+#[test]
+fn the_mailbox_is_written_only_when_set_and_a_reader_from_before_it_reads_the_rest() {
+    assert!(!Features::default().mailbox);
+    assert!(!Features::with_streams().with_commands().mailbox);
+    // Written only when set: a bridge without a mailbox is the bytes it was.
+    assert_eq!(
+        Features::with_streams().with_commands().to_block(),
+        fixture("features_reply_commands")[7..]
+    );
+    let with = Features::with_streams()
+        .with_commands()
+        .with_mailbox()
+        .to_block();
+    assert_eq!(with, fixture("features_reply_mailbox")[7..]);
+    assert_eq!(
+        with.len(),
+        Features::with_streams().with_commands().to_block().len() + 7
+    );
+    assert!(Features::from_block(&with).unwrap().mailbox);
+
+    // Bit 0 of its byte, absent when clear, the last wins.
+    let mut block = with.clone();
+    block.extend([0, 7, 0, 0, 0, 1, 0b1111_1110]);
+    assert!(!Features::from_block(&block).unwrap().mailbox);
+    assert!(
+        !Features::from_block(&[0, 1, 0, 0, 0, 1, 1])
+            .unwrap()
+            .mailbox
+    );
+    assert!(Features::from_block(&[0, 7, 0, 0, 0, 2, 1, 1]).is_err());
+
+    // What a reader that has the keys 1 to 6 makes of the reply: everything but
+    // the mailbox, whatever follows the keys it knows.
+    let before_mail = |block: &[u8]| {
+        let mut features = Features::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry.unwrap();
+            match key {
+                1 => features.streams = value[0] & 1 != 0,
+                2 => features.reason = Some(String::from_utf8(value.to_vec()).unwrap()),
+                3 => features.max_streams = u32::from_be_bytes(value.try_into().unwrap()),
+                4 => features.max_window = u32::from_be_bytes(value.try_into().unwrap()),
+                5 => features.max_data = u32::from_be_bytes(value.try_into().unwrap()),
+                6 => features.commands = value[0] & 1 != 0,
+                _ => {}
+            }
+        }
+        features
+    };
+    assert_eq!(
+        before_mail(&with),
+        Features::with_streams().with_commands(),
+        "the keys it knows"
+    );
+}
+
+#[test]
+fn an_ask_reply_reads_as_zeros_unless_the_bridge_says_more() {
+    let reply = |block: &[u8]| {
+        let wire = raw(kind::ASK_REPLY, CHANNEL_SESSION, "work", block);
+        read_packet(&mut wire.as_slice()).unwrap().unwrap()
+    };
+    // Nothing said: not attached, no idle time, no tickets.
+    assert_eq!(reply(&[]), work(Message::AskReply(Standing::default())));
+    assert!(!Standing::default().attached && !Standing::default().tickets);
+    assert_eq!(Standing::default().idle, Duration::ZERO);
+
+    // Bit 0 of the flag bytes, a key from the future skipped between the known
+    // ones, the last of a repeated key wins.
+    let mut block = Vec::new();
+    block.extend([0, 1, 0, 0, 0, 1, 0b1111_1110]); // attached: bit 0 clear
+    block.extend([0x0f, 0xff, 0, 0, 0, 2, 9, 9]);
+    block.extend([0, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 5]);
+    block.extend([0, 3, 0, 0, 0, 1, 0b0000_0011]);
+    assert_eq!(
+        reply(&block),
+        work(Message::AskReply(
+            Standing::idle(Duration::from_millis(5)).with_tickets()
+        ))
+    );
+    block.extend([0, 1, 0, 0, 0, 1, 1]);
+    block.extend([0, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(
+        reply(&block),
+        work(Message::AskReply(
+            Standing::idle(Duration::from_millis(256))
+                .with_attached()
+                .with_tickets()
+        ))
+    );
+
+    // Whole milliseconds, and a duration too long for the field is the longest.
+    let long = Standing::idle(Duration::from_secs(u64::MAX));
+    assert_eq!(
+        Standing::from_block(&long.to_block()).unwrap().idle,
+        Duration::from_millis(u64::MAX)
+    );
+    let sub = Standing::idle(Duration::from_micros(1999));
+    assert_eq!(
+        Standing::from_block(&sub.to_block()).unwrap().idle,
+        Duration::from_millis(1)
+    );
+
+    // A value of the wrong length and an entry cut short make the message
+    // malformed, which costs that message alone.
+    for bad in [
+        &[0, 1, 0, 0, 0, 2, 1, 1][..],
+        &[0, 2, 0, 0, 0, 4, 0, 0, 0, 1],
+        &[0, 3, 0, 0, 0, 9, 0],
+    ] {
+        let mut wire = raw(kind::ASK_REPLY, CHANNEL_SESSION, "work", bad);
+        wire.extend(fixture("ask"));
+        let err = read_packet(&mut wire.as_slice()).unwrap_err();
+        assert!(err.is_recoverable(), "{bad:?}: {err}");
+    }
+}
+
+#[test]
+fn an_ask_has_nothing_to_be_wrong_about_and_a_ticket_and_a_decline_are_read_as_prefixes() {
+    let ask = raw(kind::ASK, CHANNEL_SESSION, "", &[1, 2, 3]);
+    assert_eq!(
+        read_packet(&mut ask.as_slice()).unwrap(),
+        Some(Packet::connection(Message::Ask))
+    );
+    // Bytes after the number of a ticket are for a later version.
+    let wire = raw(kind::TICKET, CHANNEL_SESSION, "work", &[0, 0, 1, 2, 9, 9]);
+    assert_eq!(
+        read_packet(&mut wire.as_slice()).unwrap(),
+        Some(work(Message::Ticket(258)))
+    );
+    // A number cut short and a decline without one are malformed, which costs
+    // that message alone.
+    for (k, short) in [
+        (kind::TICKET, &[0, 0, 1][..]),
+        (kind::DECLINE, &[]),
+        (kind::DECLINE, &[0, 0]),
+    ] {
+        let mut wire = raw(k, CHANNEL_SESSION, "", short);
+        wire.extend(fixture("ping"));
+        let mut reader = wire.as_slice();
+        assert!(read_packet(&mut reader).unwrap_err().is_recoverable());
+        assert_eq!(
+            read_packet(&mut reader).unwrap(),
+            Some(session_message("ping")),
+            "the frame after it is read"
+        );
+    }
+    // A decline without text is one, and text that is not UTF-8 is read as the
+    // replacement characters, as the text of an `error` is.
+    let wire = raw(kind::DECLINE, CHANNEL_SESSION, "", &[0, 0, 0, 3, 0xff]);
+    assert_eq!(
+        read_packet(&mut wire.as_slice()).unwrap(),
+        Some(Packet::connection(Message::Decline {
+            ticket: 3,
+            text: "\u{fffd}".into()
+        }))
+    );
+    let wire = raw(kind::DECLINE, CHANNEL_SESSION, "", &[0, 0, 0, 3]);
+    assert_eq!(
+        read_packet(&mut wire.as_slice()).unwrap(),
+        Some(Packet::connection(Message::Decline {
+            ticket: 3,
+            text: String::new()
+        }))
+    );
+}
+
+#[test]
+fn an_open_that_answers_a_ticket_is_told_by_the_ticket_and_the_sender_of_mail_by_having_nothing() {
+    use stream::Message as S;
+    use stream::kind as k;
+    let read = |payload: &[u8]| {
+        let wire = raw(k::OPEN, CHANNEL_STREAM, "", payload);
+        match read_incoming(&mut wire.as_slice()).unwrap().unwrap() {
+            Incoming::Stream { packet, .. } => packet.message,
+            other => panic!("not a stream message: {other:?}"),
+        }
+    };
+    // The ticket wins over everything else in the block, and a key from the
+    // future is skipped: nothing else is read.
+    let mut payload = vec![0, 0, 0, 5, 0, 0, 0, 9];
+    payload.extend([0, 1, 0, 0, 0, 2, 0x0b, 0xb8]); // a port
+    payload.extend([0, 2, 0, 0, 0, 1, b'h']); // a host
+    payload.extend([0, 3, 0, 0, 0, 2, b's', b'h']); // an argument
+    payload.extend([0x0f, 0xff, 0, 0, 0, 1, 9]);
+    payload.extend([0, 6, 0, 0, 0, 4, 0, 0, 0x01, 0x02]);
+    assert_eq!(
+        read(&payload),
+        S::OpenTicket {
+            window: 9,
+            ticket: 258
+        }
+    );
+    // The last of a repeated ticket wins.
+    payload.extend([0, 6, 0, 0, 0, 4, 0, 0, 0, 3]);
+    assert_eq!(
+        read(&payload),
+        S::OpenTicket {
+            window: 9,
+            ticket: 3
+        }
+    );
+    // A ticket of the wrong length is malformed, which costs that message alone.
+    let mut wire = raw(
+        k::OPEN,
+        CHANNEL_STREAM,
+        "",
+        &[0, 0, 0, 5, 0, 0, 0, 9, 0, 6, 0, 0, 0, 2, 0, 1],
+    );
+    wire.extend(fixture("stream_open"));
+    assert!(
+        read_incoming(&mut wire.as_slice())
+            .unwrap_err()
+            .is_recoverable()
+    );
+
+    // The sender of mail opens with nothing in the block, which is read as an
+    // `open` with no port and no host, as it always was.
+    assert_eq!(
+        read(&fixture("stream_open_mail")[7..]),
+        S::open_mail(262_144)
+    );
+    assert_eq!(
+        S::open_mail(262_144),
+        S::Open {
+            window: 262_144,
+            port: 0,
+            host: String::new()
+        }
+    );
+    // Nothing else with no port or no host can be written.
+    let write = |message: S| {
+        stream::write_packet(
+            &mut Vec::new(),
+            &stream::Packet::new(1, message),
+            Side::Client,
+        )
+    };
+    let open = |port: u16, host: &str| S::Open {
+        window: 1,
+        port,
+        host: host.into(),
+    };
+    assert!(write(open(0, "")).is_ok());
+    assert!(write(open(0, "example.org")).is_err(), "port 0");
+    assert!(write(open(80, "")).is_err(), "no host");
+    // And only the client opens, with a ticket as with a target.
+    assert!(
+        stream::write_packet(
+            &mut Vec::new(),
+            &stream::Packet::new(
+                1,
+                S::OpenTicket {
+                    window: 1,
+                    ticket: 1
+                }
+            ),
+            Side::Server
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_conversation_of_mail_reads_in_order_however_it_arrives() {
+    // (fixture, on channel 1)
+    let order = [
+        ("features_tickets", false),
+        ("ping", false),
+        ("features_reply_mailbox", false),
+        ("pong", false),
+        ("ask", false),
+        ("ask_reply", false),
+        ("stream_open_mail", true),
+        ("ticket", false),
+        ("stream_open_ticket", true),
+        ("stream_opened", true),
+        ("stream_client_data", true),
+        ("ticket_none", false),
+        ("decline", false),
+        ("stream_failed_declined", true),
+        ("ask_terminal", false),
+        ("ask_reply_none", false),
+        ("stream_server_close", true),
+    ];
+    let mut wire = Vec::new();
+    let mut all = Vec::new();
+    let mut sessions = Vec::new();
+    for (name, on_stream) in order {
+        wire.extend(fixture(name));
+        if on_stream {
+            let (from, packet) = stream_message(name);
+            all.push(Incoming::Stream { from, packet });
+        } else {
+            let packet = session_message(name);
+            sessions.push(packet.clone());
+            all.push(Incoming::Session(packet));
+        }
+    }
+    for piece in [1, 3, 13, 4096] {
+        let mut incoming = IncomingDecoder::new();
+        let mut old = PacketDecoder::new();
+        let (mut got_all, mut got_sessions) = (Vec::new(), Vec::new());
+        for chunk in wire.chunks(piece) {
+            incoming.push(chunk);
+            while let Some(i) = incoming.next_incoming().unwrap() {
+                got_all.push(i);
+            }
+            old.push(chunk);
+            while let Some(p) = old.next_packet().unwrap() {
+                got_sessions.push(p);
+            }
+        }
+        assert_eq!(got_all, all, "pieces of {piece}");
+        assert_eq!(got_sessions, sessions, "pieces of {piece}");
+        assert_eq!(incoming.pending() + old.pending(), 0, "pieces of {piece}");
+    }
 }

@@ -1,0 +1,7 @@
+# the client declines ticket 7
+0d                       # kind 0x0d: decline
+00                       # channel 0: terminal session
+00                       # session id length 0
+00 00 00 0b              # payload length 11
+00 00 00 07              # ticket 7
+6e 6f 20 72 6f 6f 6d     # text "no room"

@@ -966,7 +966,9 @@ impl Bridge {
                 flow.closed = true;
                 flow.ends.push("close");
             }
-            other @ (stream::Message::Open { .. } | stream::Message::OpenCommand { .. }) => {
+            other @ (stream::Message::Open { .. }
+            | stream::Message::OpenCommand { .. }
+            | stream::Message::OpenTicket { .. }) => {
                 panic!("the bridge sent {other:?}")
             }
         }

@@ -33,6 +33,28 @@ section is not released.
 
 ## [Unreleased]
 
+### For apps
+
+- **Protocol: mail.** A program on the server can hand bytes to the app that is
+  connected, and get bytes back, with kablo carrying them unread and saying which
+  terminal they come from (`docs/PROTOCOL.md`, section 5, Mail). Added to
+  version 1 and nothing else changed: on the session channel `ask` (0x0c) and
+  `decline` (0x0d) from the client, `ask_reply` (0x8c) and `ticket` (0x8d) from
+  the bridge; on the stream channel an `open` key 6 (`ticket`) and failure code 9
+  (the app declined); in `features` an optional body (key 1, `tickets`: the app
+  takes tickets) and in `features_reply` key 7 (`mailbox`). A reader that does
+  not know them skips them, so an older bridge or app is unaffected and an app
+  tells an older bridge from one with a mailbox by `mailbox` being absent.
+- **`kablo-proto`: the API for it.** `v1::Message` gains `FeaturesWith(Offers)`
+  (a `features` with a body; `Features` stays the one without, and is also what a
+  body that cannot be read reads as), `Ask`, `Decline`, `AskReply(Standing)` and
+  `Ticket`; `v1::stream::Message` gains `OpenTicket` and the constructor `open_mail`;
+  `v1::stream::FailCode::DECLINED` is 9; `v1::Features` gains the field `mailbox`
+  (build it with `Features::with_mailbox`, or keep `..Features::default()` in a
+  struct literal). `Offers` and `Standing` are `#[non_exhaustive]` and made with
+  `Offers::with_tickets` and `Standing::idle`. Nothing in the bridge sends or
+  takes mail yet.
+
 ## [0.1.0] - 2026-10-15
 
 The first release. kablo holds the terminal of a shell so the programs in it

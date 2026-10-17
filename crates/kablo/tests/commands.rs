@@ -24,8 +24,8 @@ use kablo::streams::WINDOW;
 use kablo::tune;
 use kablo_proto::tlv;
 use kablo_proto::v1::Exit;
-use kablo_proto::v1::Message;
 use kablo_proto::v1::stream::{self, FailCode, MAX_WINDOW};
+use kablo_proto::v1::{Message, Offers};
 
 fn command(argv: &[&str]) -> stream::Command {
     stream::Command {
@@ -92,6 +92,19 @@ fn a_bridge_says_it_runs_commands() {
     bridge.until("features", |b| b.features.len() == 1);
     assert!(bridge.features[0].commands);
     assert!(bridge.features[0].streams);
+}
+
+#[test]
+fn a_bridge_answers_a_features_that_says_what_its_client_takes_as_it_answers_any() {
+    let env = Env::new();
+    let mut bridge = Bridge::start(&env);
+    bridge.send(None, Message::FeaturesWith(Offers::with_tickets()));
+    bridge.send(None, Message::Features);
+    bridge.until("both answers", |b| b.features.len() == 2);
+    assert_eq!(bridge.features[0], bridge.features[1]);
+    assert!(bridge.features[0].streams);
+    // Nothing here keeps a mailbox yet.
+    assert!(!bridge.features[0].mailbox);
 }
 
 #[test]

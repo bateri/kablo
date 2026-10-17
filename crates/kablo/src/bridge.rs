@@ -347,9 +347,11 @@ impl Bridge {
                 session,
                 message: Message::Pong(bytes),
             }),
-            (_, Message::Features) => outgoing.push(Packet::connection(Message::FeaturesReply(
-                features(Path::new(NO_FORWARDING)),
-            ))),
+            // The body of a `features` says what the client takes; nothing here
+            // gives mail yet, so it is read as the question without one.
+            (_, Message::Features | Message::FeaturesWith(_)) => outgoing.push(Packet::connection(
+                Message::FeaturesReply(features(Path::new(NO_FORWARDING))),
+            )),
             (_, Message::List) => match Scan::start(&self.dir, scan::WAIT) {
                 Ok(scan) => self.scans.push(scan),
                 Err(e) => outgoing.push(failure(None, ErrorCode::UNAVAILABLE, &e.to_string())),
@@ -373,7 +375,10 @@ impl Bridge {
     /// every `open`, so that an administrator's decision reaches streams
     /// opened after it.
     fn handle_stream(&mut self, from: wire::Side, packet: wire::Packet) {
-        if matches!(packet.message, wire::Message::Open { .. }) {
+        if matches!(
+            packet.message,
+            wire::Message::Open { .. } | wire::Message::OpenTicket { .. }
+        ) {
             self.streams
                 .set_closed(forwarding_off(Path::new(NO_FORWARDING)).map(str::to_owned));
         }

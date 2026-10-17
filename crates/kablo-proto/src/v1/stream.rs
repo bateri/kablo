@@ -159,6 +159,9 @@ impl FailCode {
     /// The command could not be started; the text says why, as the system
     /// does ("No such file or directory").
     pub const START_FAILED: FailCode = FailCode(8);
+    /// The app declined the ticket a conversation was handed over with; the text
+    /// is the app's own ([`super::Message::Decline`]).
+    pub const DECLINED: FailCode = FailCode(9);
 }
 
 /// A program to run, which an `open` asks for in place of a connection. The
@@ -263,6 +266,18 @@ pub enum Message {
         /// What to run.
         command: Command,
     },
+    /// Client to server: the app's answer to a ticket ([`super::Message::Ticket`]),
+    /// which opens its end of the conversation the ticket stands for. The same
+    /// `open` on the wire as [`Message::Open`], told from it by the `ticket`;
+    /// nothing else in the block is read. `window` is how many bytes the other
+    /// end of the conversation may send before it has to wait for a `Credit`.
+    /// Answered by `Opened` or `Failed`.
+    OpenTicket {
+        /// The bytes the server may send before a `Credit`.
+        window: u32,
+        /// The number of the ticket answered.
+        ticket: u32,
+    },
     /// Server to client: the stream is connected. `window` is how many bytes
     /// the server takes before the client has to wait for a `Credit`.
     Opened {
@@ -309,10 +324,16 @@ mod open_key {
     pub const ARGV: u16 = 3;
     pub const ENV: u16 = 4;
     pub const CWD: u16 = 5;
+    pub const TICKET: u16 = 6;
 }
 
-/// What an `open` asks for must be something a server could connect to.
+/// What an `open` asks for must be something a server could connect to, or
+/// nothing at all: an `open` with neither a port nor a host is the one a sender
+/// of mail makes (see [`Message::open_mail`]).
 fn check_target(port: u16, host: &str) -> Result<()> {
+    if port == 0 && host.is_empty() {
+        return Ok(());
+    }
     if port == 0 || host.is_empty() || host.len() > MAX_HOST || host.contains('\0') {
         return Err(Error::Malformed("stream target"));
     }
@@ -350,11 +371,28 @@ fn shape(side: Side, kind: u8) -> Option<Shape> {
 }
 
 impl Message {
+    /// The `open` a sender of mail makes to open a conversation on a mailbox:
+    /// no target, no command and no ticket. It is the `open` that has no port
+    /// and no host, which anywhere but a mailbox is answered `failed` with
+    /// [`FailCode::BAD_REQUEST`], and is read back as [`Message::Open`] with port
+    /// 0 and an empty host. `window` is how many bytes the app may send it
+    /// before it has to wait for a `Credit`.
+    pub fn open_mail(window: u32) -> Message {
+        Message::Open {
+            window,
+            port: 0,
+            host: String::new(),
+        }
+    }
+
     /// The kind byte of the message when `from` sends it; an error for a
     /// message that end does not send (an `Open` from the server).
     pub fn kind(&self, from: Side) -> Result<u8> {
         Ok(match (self, from) {
-            (Message::Open { .. } | Message::OpenCommand { .. }, Side::Client) => kind::OPEN,
+            (
+                Message::Open { .. } | Message::OpenCommand { .. } | Message::OpenTicket { .. },
+                Side::Client,
+            ) => kind::OPEN,
             (Message::Opened { .. }, Side::Server) => kind::OPENED,
             (Message::Failed { .. }, Side::Server) => kind::FAILED,
             (Message::Stderr(_), Side::Server) => kind::STDERR,
@@ -377,11 +415,21 @@ impl Message {
             Message::Open { window, port, host } => {
                 check_target(*port, host)?;
                 out.extend_from_slice(&window.to_be_bytes());
-                let mut target = tlv::Writer::new();
-                target
-                    .put_u16(open_key::PORT, *port)
-                    .put(open_key::HOST, host.as_bytes());
-                out.extend_from_slice(&target.finish());
+                // No target at all is an empty block, not a port 0 and a host
+                // with nothing in it.
+                if *port != 0 {
+                    let mut target = tlv::Writer::new();
+                    target
+                        .put_u16(open_key::PORT, *port)
+                        .put(open_key::HOST, host.as_bytes());
+                    out.extend_from_slice(&target.finish());
+                }
+            }
+            Message::OpenTicket { window, ticket } => {
+                out.extend_from_slice(&window.to_be_bytes());
+                let mut block = tlv::Writer::new();
+                block.put_u32(open_key::TICKET, *ticket);
+                out.extend_from_slice(&block.finish());
             }
             Message::OpenCommand { window, command } => {
                 command.check()?;
@@ -408,7 +456,8 @@ impl Message {
         Ok(out)
     }
 
-    /// What an `open` asks for. Every key is optional: a block with an `argv`
+    /// What an `open` asks for. Every key is optional: a block with a `ticket`
+    /// answers that ticket and nothing else in it is read, one with an `argv`
     /// is a command (and its port and host, if it has any, are not used), any
     /// other is a target, and a missing port or host reads as 0 and empty,
     /// which the server answers with `BAD_REQUEST`. What is not valid in a
@@ -419,9 +468,11 @@ impl Message {
         let mut host = String::new();
         let mut command = None::<Command>;
         let mut cwd = None;
+        let mut ticket = None;
         for entry in tlv::entries(block) {
             let (key, value) = entry?;
             match key {
+                open_key::TICKET => ticket = Some(tlv::read_u32(value, "stream open ticket")?),
                 open_key::PORT => port = tlv::read_u16(value, "stream open port")?,
                 open_key::HOST => host = String::from_utf8_lossy(value).into_owned(),
                 open_key::ARGV => command
@@ -435,6 +486,9 @@ impl Message {
                 open_key::CWD => cwd = Some(value.to_vec()),
                 _ => {}
             }
+        }
+        if let Some(ticket) = ticket {
+            return Ok(Message::OpenTicket { window, ticket });
         }
         Ok(match command {
             Some(command) if !command.argv.is_empty() => Message::OpenCommand {

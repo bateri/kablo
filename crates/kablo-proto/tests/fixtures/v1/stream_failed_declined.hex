@@ -1,0 +1,8 @@
+# stream 1 did not open: the app declined the ticket
+86                    # kind 0x86: failed
+01                    # channel 1: streams
+00                    # session id length 0
+00 00 00 0d           # payload length 13
+00 00 00 01           # stream 1
+00 09                 # code 9: the app declined the ticket
+6e 6f 20 72 6f 6f 6d  # text "no room"
