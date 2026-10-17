@@ -528,6 +528,23 @@ pub fn kill(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Whether a process with this id exists. A process of another user is one
+/// that exists (the call is refused, not unanswered); a zombie is one too.
+/// Id 0 and the ids `kill` reads as groups are no process.
+pub fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process can be signalled.
+    match cvt(unsafe { libc::kill(pid, 0) }) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() != Some(libc::ESRCH),
+    }
+}
+
 /// Sends `signal` to every process of the group `group`. A group that is
 /// already gone is not an error.
 pub fn kill_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
@@ -880,6 +897,18 @@ mod tests {
     fn a_number_that_addresses_a_group_is_not_a_process() {
         assert!(Proc::from_pid(0).is_err());
         assert!(Proc::from_pid(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn a_process_exists_until_it_has_ended_and_been_collected() {
+        assert!(process_exists(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_exists(pid));
+        // What `kill` reads as a group, or cannot read at all, is none.
+        assert!(!process_exists(0));
+        assert!(!process_exists(u32::MAX));
     }
 
     #[test]

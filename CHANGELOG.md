@@ -52,7 +52,9 @@ section is not released.
   `v1::stream::FailCode::DECLINED` is 9; `v1::Features` gains the field `mailbox`
   (build it with `Features::with_mailbox`). `Offers` and `Standing` are
   `#[non_exhaustive]` and made with `Offers::with_tickets` and `Standing::idle`.
-  Nothing in the bridge sends or takes mail yet.
+  The bridge keeps a mailbox (`mail-<pid>` in the socket directory, made if the
+  directory is not there) and answers `ask` on it, but it does not say `mailbox`
+  in `features_reply` and hands no mail over yet.
 - **Changed, `kablo-proto`: `Features`, `Status` and `NewSession` are
   `#[non_exhaustive]`.** Code outside the crate could write them as struct
   expressions in 0.1.0 (`Features { streams: true, ..Features::default() }`) and

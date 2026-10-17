@@ -92,6 +92,9 @@ pub struct Link {
     /// The program's end was handed to the client: nothing more will come.
     finished: bool,
     gone: bool,
+    /// When the client last used the session: attached to it or sent it input.
+    /// The link opens on the client's first request, so it starts as that.
+    used: Instant,
 }
 
 impl Link {
@@ -113,6 +116,7 @@ impl Link {
                 retry_at: None,
                 finished: false,
                 gone: false,
+                used: now,
             }),
             Err(e) => Err(Box::new(refusal(&id, &e))),
         }
@@ -131,6 +135,16 @@ impl Link {
     /// Whether the client is attached to the session.
     pub fn is_attached(&self) -> bool {
         self.attach.is_some()
+    }
+
+    /// The client used the session at `now`.
+    pub fn touch(&mut self, now: Instant) {
+        self.used = now;
+    }
+
+    /// How long since the client last used the session.
+    pub fn idle(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.used)
     }
 
     /// The descriptor to wait on, if there is a connection. `reading` is

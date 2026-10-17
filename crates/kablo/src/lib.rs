@@ -20,6 +20,7 @@ pub mod journal;
 pub mod launch;
 pub mod link;
 pub mod listing;
+pub mod mailbox;
 pub mod origin;
 pub mod outbound;
 pub mod peer;

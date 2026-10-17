@@ -340,6 +340,13 @@ memory of where its relay comes from (see *Limits*).
   0700, owned by you. Anything else is refused, not repaired. Every
   connection to a session's socket is checked for the uid of the process on
   the other end (`SO_PEERCRED`, `getpeereid`), and another user's is closed.
+- A running `kablo attach` keeps a mailbox in that same directory, `mail-<pid>`,
+  a socket on which programs of yours on the machine can ask where the app
+  connected through that bridge stands: which terminal it is at, and how long
+  ago it last used it. It is as private as a session's: the same directory, and a
+  connection from another user's process is closed. The terminal an answer names
+  is what the kernel says of the process that asked, never anything that
+  process claims. The mailbox goes when the bridge does.
 - kablo opens no network port on the server. Remote access is your ssh login
   running one command; whoever can log in as you can use your sessions, as
   they can use any other process of yours. (`kablo forward` listens on the

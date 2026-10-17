@@ -33,6 +33,13 @@
 //! file is looked at again for every `open`, so the decision reaches a bridge
 //! that is already running.
 //!
+//! A program on the server can hand bytes to the app the bridge carries. The
+//! bridge keeps a mailbox for that, a socket of its own beside the sessions' (see
+//! [`crate::mailbox`]); for now it answers a program that asks where the app
+//! stands, and nothing more. What it needs to say is kept here, since only the
+//! bridge sees what its client does: when the client last attached to a session
+//! or typed into one.
+//!
 //! The same streams run programs for the client, as `ssh host command` does
 //! over a login that is already there. Those are children of the bridge and
 //! last as long as the connection: when the client goes away they are told to
@@ -47,13 +54,14 @@ use std::time::Instant;
 
 use kablo_proto::v1::stream::{self as wire, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, Features, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, NewSession, Packet,
+    ErrorCode, Features, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, NewSession, Packet, Standing,
 };
 use kablo_proto::{SessionId, WIRE};
 
 use crate::handshake::{self, Step};
 use crate::launch::{self, Failure};
 use crate::link::Link;
+use crate::mailbox::{self, Mailbox};
 use crate::outbound::{self, Outbound};
 use crate::scan::{self, Scan};
 use crate::streams::{self, Streams};
@@ -85,6 +93,7 @@ enum Source {
     Link(usize),
     Probe(usize, usize),
     Stream(streams::Token),
+    Mail(mailbox::Token),
 }
 
 /// Runs the bridge on standard input and output in socket directory `dir`.
@@ -119,6 +128,12 @@ struct Bridge {
     stream_out: Vec<wire::Packet>,
     links: Vec<Link>,
     scans: Vec<Scan>,
+    /// The bridge's mailbox, if it could be opened.
+    mailbox: Option<Mailbox>,
+    /// When the client last used any session: attached to it or typed into it.
+    /// A bridge is started by a client that has just connected, and that is a
+    /// use, so this starts as the start.
+    used: Instant,
     stop: Option<u8>,
     read_buf: Vec<u8>,
 }
@@ -131,6 +146,8 @@ impl Bridge {
         chunk: usize,
     ) -> Bridge {
         Bridge {
+            mailbox: Mailbox::open(&dir).ok(),
+            used: Instant::now(),
             dir,
             input,
             output,
@@ -190,6 +207,12 @@ impl Bridge {
                 set.push(fd);
                 sources.push(Source::Stream(token));
             }
+            if let Some(mailbox) = &self.mailbox {
+                for (fd, token) in mailbox.interest() {
+                    set.push(fd);
+                    sources.push(Source::Mail(token));
+                }
+            }
             let wait = self
                 .next_deadline()
                 .map(|at| at.saturating_duration_since(Instant::now()));
@@ -218,6 +241,12 @@ impl Bridge {
                     Source::Stream(token) => {
                         self.streams.ready(*token, fd.revents, &mut self.stream_out);
                     }
+                    Source::Mail(token) => {
+                        if let Some(mailbox) = self.mailbox.as_mut() {
+                            let standings = Standings::new(&self.links, self.used, now);
+                            mailbox.ready(*token, fd.revents, &|t| standings.of(t));
+                        }
+                    }
                 }
             }
             for link in &mut self.links {
@@ -228,6 +257,10 @@ impl Bridge {
             }
             self.finish_scans(&mut outgoing);
             self.links.retain(|link| !link.is_gone());
+            if let Some(mailbox) = self.mailbox.as_mut() {
+                let standings = Standings::new(&self.links, self.used, now);
+                mailbox.settle(now, &|t| standings.of(t));
+            }
             self.streams.settle(&mut self.stream_out);
             self.streams.expire(now, &mut self.stream_out);
             for packet in &outgoing {
@@ -253,6 +286,7 @@ impl Bridge {
             .filter_map(Link::deadline)
             .chain(self.scans.iter().filter_map(Scan::deadline))
             .chain(self.streams.deadline())
+            .chain(self.mailbox.as_ref().and_then(Mailbox::deadline))
             .min()
     }
 
@@ -419,6 +453,11 @@ impl Bridge {
             }
         };
         if let Some(link) = self.links.get_mut(index) {
+            // Attaching and typing are what using a session is.
+            if matches!(message, Message::Attach { .. } | Message::Input(_)) {
+                link.touch(now);
+                self.used = now;
+            }
             link.send(Packet::about(id, message), now, outgoing);
         }
     }
@@ -496,6 +535,37 @@ impl Bridge {
             ErrorCode::UNAVAILABLE,
             "no unused session id could be made",
         ));
+    }
+}
+
+/// Where the client stands, as the mailbox is asked: what [`Standing`] says of
+/// it, for a terminal that is a session of this bridge's.
+struct Standings<'a> {
+    links: &'a [Link],
+    /// When the client last used any session.
+    used: Instant,
+    now: Instant,
+}
+
+impl<'a> Standings<'a> {
+    fn new(links: &'a [Link], used: Instant, now: Instant) -> Standings<'a> {
+        Standings { links, used, now }
+    }
+
+    /// The client is attached to the terminal when its link to that session is
+    /// attached; it has then been idle since it last used that session.
+    /// Otherwise it has been idle since it last used any: a program whose app
+    /// is not at its terminal is told how close the app is to the machine.
+    fn of(&self, terminal: Option<&SessionId>) -> Standing {
+        let attached = terminal.and_then(|id| {
+            self.links
+                .iter()
+                .find(|link| link.id() == id && !link.is_gone() && link.is_attached())
+        });
+        match attached {
+            Some(link) => Standing::idle(link.idle(self.now)).with_attached(),
+            None => Standing::idle(self.now.saturating_duration_since(self.used)),
+        }
     }
 }
 
@@ -644,5 +714,72 @@ mod tests {
         let (dir, path) = switch("none");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(forwarding_off(&path), None);
+    }
+
+    /// A bridge that reads nothing, over `dir`.
+    fn bridge_over(dir: &Path) -> Bridge {
+        // SAFETY: the descriptors are only named, to build the bridge; these
+        // tests read and write none of them.
+        let (input, output) = unsafe { (BorrowedFd::borrow_raw(0), BorrowedFd::borrow_raw(1)) };
+        Bridge::new(dir.to_owned(), input, output, 512)
+    }
+
+    #[test]
+    fn a_mailbox_that_is_in_use_but_not_asked_a_question_sets_no_timer() {
+        use std::os::unix::net::UnixStream;
+        let (dir, _) = switch("mailbox-timer");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut bridge = bridge_over(&dir);
+        assert_eq!(bridge.next_deadline(), None, "nobody is connected");
+
+        let mailbox = sockdir::mailbox_path(&dir, std::process::id());
+        let _program = UnixStream::connect(&mailbox).unwrap();
+        let stand = |_: Option<&SessionId>| Standing::default();
+        let open = bridge.mailbox.as_mut().unwrap();
+        open.ready(mailbox::Token::Listener, libc::POLLIN, &stand);
+        assert_eq!(open.interest().len(), 2, "the listener and the program");
+        open.settle(Instant::now(), &stand);
+        assert_eq!(bridge.next_deadline(), None, "a program is connected");
+        drop(bridge);
+        assert!(!mailbox.exists(), "the name goes with the bridge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_client_is_attached_to_a_terminal_from_its_attach_and_idle_from_its_last_use() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+        let (dir, _) = switch("standing");
+        std::fs::remove_dir_all(&dir).unwrap();
+        sockdir::ensure_dir(&dir).unwrap();
+        let id = SessionId::new("shell").unwrap();
+        let _session = UnixListener::bind(sockdir::socket_path(&dir, &id)).unwrap();
+        let start = Instant::now();
+        let mut out = Vec::new();
+        let mut link = Link::open(&dir, id.clone(), start).unwrap();
+
+        let later = start + Duration::from_secs(10);
+        let standing = Standings::new(std::slice::from_ref(&link), start, later).of(Some(&id));
+        assert!(!standing.attached);
+        assert_eq!(standing.idle, Duration::from_secs(10), "since any use");
+
+        let attach = Packet::about(
+            id.clone(),
+            Message::Attach {
+                offset: 0,
+                view: None,
+            },
+        );
+        link.send(attach, later, &mut out);
+        link.touch(later);
+        let used = later + Duration::from_secs(3);
+        let any = Standings::new(std::slice::from_ref(&link), later, used);
+        let standing = any.of(Some(&id));
+        assert!(standing.attached);
+        assert_eq!(standing.idle, Duration::from_secs(3), "since the attach");
+        let other = SessionId::new("other").unwrap();
+        assert!(!any.of(Some(&other)).attached, "not to another");
+        assert!(!any.of(None).attached, "nor to no terminal");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -105,6 +105,63 @@ pub fn session_ids(dir: &Path) -> io::Result<Vec<SessionId>> {
     Ok(ids)
 }
 
+/// The name every mailbox starts with. The rest is the pid of the bridge that
+/// keeps it, and there is no `.sock` at the end: [`session_ids`] reads that
+/// ending as a session, and a mailbox is not one.
+const MAILBOX_PREFIX: &str = "mail-";
+
+/// The path of the mailbox of the bridge `pid` in `dir`: the socket a program
+/// on the server connects to in order to talk to the app that bridge carries.
+pub fn mailbox_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{MAILBOX_PREFIX}{pid}"))
+}
+
+/// A mailbox in the socket directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailboxFile {
+    /// The bridge that keeps it.
+    pub pid: u32,
+    /// Where it is.
+    pub path: PathBuf,
+}
+
+/// The mailboxes in `dir` whose bridge is running, by pid. One whose bridge is
+/// gone (no process has its pid) was left by a bridge that was killed, and is
+/// removed.
+///
+/// That is the whole test of whether a mailbox is stale. Whether the bridge
+/// answers is not: a bridge that is new, or busy, is slow to accept, and a
+/// refused connection would send the one who tried to delete the name of a
+/// bridge that is there.
+pub fn mailboxes(dir: &Path) -> io::Result<Vec<MailboxFile>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(mailbox_pid) else {
+            continue;
+        };
+        if sys::process_exists(pid) {
+            found.push(MailboxFile {
+                pid,
+                path: entry.path(),
+            });
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    found.sort_by_key(|mailbox| mailbox.pid);
+    Ok(found)
+}
+
+/// The pid in the name of a mailbox, if `name` is one: `mail-` and the number
+/// written as [`mailbox_path`] writes it, and nothing else.
+fn mailbox_pid(name: &str) -> Option<u32> {
+    let number = name.strip_prefix(MAILBOX_PREFIX)?;
+    let pid: u32 = number.parse().ok()?;
+    (pid > 0 && number == pid.to_string()).then_some(pid)
+}
+
 /// Binds the socket of a new session. A socket file left behind by a session
 /// that no longer exists (nothing answers on it) is replaced; one that
 /// answers is [`io::ErrorKind::AddrInUse`].
@@ -227,6 +284,63 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "now it answers");
         drop(replaced);
         assert_eq!(session_ids(&dir).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pid of a process that has ended and been waited for.
+    fn a_pid_that_is_gone() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_mailbox_is_stale_when_its_bridge_is_gone_and_not_when_it_is_only_silent() {
+        let dir = scratch("sd-mail");
+        ensure_dir(&dir).unwrap();
+        let gone = a_pid_that_is_gone();
+        let stale = mailbox_path(&dir, gone);
+        let silent = mailbox_path(&dir, std::process::id());
+        // Both are sockets nobody accepts on; only the pid tells them apart.
+        leave_a_stale_socket(&stale);
+        leave_a_stale_socket(&silent);
+        // Names that are not mailboxes are left where they are.
+        let others = ["mail-0", "mail-007", "mail-1x", "mail-", "mailbox"];
+        for name in others {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+
+        let found = mailboxes(&dir).unwrap();
+        assert_eq!(
+            found,
+            vec![MailboxFile {
+                pid: std::process::id(),
+                path: silent.clone()
+            }]
+        );
+        assert!(!stale.exists(), "the stale one is removed");
+        assert!(silent.exists(), "one that does not answer is not stale");
+        for name in others {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mailbox_is_not_a_session() {
+        let dir = scratch("sd-mail-ids");
+        ensure_dir(&dir).unwrap();
+        leave_a_stale_socket(&mailbox_path(&dir, std::process::id()));
+        assert!(session_ids(&dir).unwrap().is_empty());
+        let session = socket_path(&dir, &SessionId::new("mail-5").unwrap());
+        leave_a_stale_socket(&session);
+        assert_eq!(session_ids(&dir).unwrap().len(), 1);
+        assert_eq!(
+            mailboxes(&dir).unwrap().len(),
+            1,
+            "a session is not a mailbox"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
