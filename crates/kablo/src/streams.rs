@@ -641,6 +641,9 @@ pub struct Streams {
     last_id: u32,
     /// Server end: the highest number an `open` has had.
     highest: u32,
+    /// Server end: streams of the connection that something other than these
+    /// keeps (the conversations of mail), which count against the limit.
+    held: usize,
     connecting: BTreeMap<u32, Connecting>,
     connector: Option<Connector>,
     /// Programs whose streams are over, by process number. Not streams: the
@@ -687,6 +690,7 @@ impl Streams {
             streams: BTreeMap::new(),
             last_id: 0,
             highest: 0,
+            held: 0,
             connecting: BTreeMap::new(),
             connector: None,
             dying: BTreeMap::new(),
@@ -699,6 +703,25 @@ impl Streams {
             rtt: Rtt::new(),
             learned: None,
         }
+    }
+
+    /// Server end: takes the number of an `open` that something else answers (a
+    /// ticket's), so that the numbers stay as strictly rising as they are for
+    /// the `open`s these streams answer. `false` when the number is not above
+    /// every one seen: a leftover of a stream that is over, or a mistake, which
+    /// is not answered.
+    pub fn reserve(&mut self, id: u32) -> bool {
+        if id <= self.highest {
+            return false;
+        }
+        self.highest = id;
+        true
+    }
+
+    /// Server end: how many streams of the connection something else holds,
+    /// which an `open` is judged against along with the ones here.
+    pub fn hold(&mut self, held: usize) {
+        self.held = held;
     }
 
     /// The side this end speaks as: the one to encode the packets it makes with.
@@ -884,7 +907,7 @@ impl Streams {
         if window > MAX_WINDOW {
             return fail(FailCode::LIMIT, "window too large");
         }
-        if self.len() >= self.config.max_streams {
+        if self.len().saturating_add(self.held) >= self.config.max_streams {
             return fail(FailCode::LIMIT, "too many streams");
         }
         if self.connecting.len() >= self.config.max_connecting {
@@ -936,7 +959,7 @@ impl Streams {
         if window > MAX_WINDOW {
             return refuse(out, id, FailCode::LIMIT, "window too large");
         }
-        if self.len() >= self.config.max_streams {
+        if self.len().saturating_add(self.held) >= self.config.max_streams {
             return refuse(out, id, FailCode::LIMIT, "too many streams");
         }
         match process::start(&command) {

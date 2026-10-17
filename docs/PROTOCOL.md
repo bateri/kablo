@@ -774,7 +774,8 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   the bridge has no client that takes tickets, (5) when the connection has too
   many streams, and (9) with the client's text when it declines. An `open` that
   answers a ticket that is not outstanding (it was answered, or the sender gave it
-  up) is `failed` (7).
+  up) is `failed` (7), and so is one on a mailbox that names a target to connect to
+  or a command to run: a mailbox is for neither.
 - *The end.* `eof` ends one direction as in any stream, and `close` ends both. The
   client's `close` is the end of the conversation from the app's side and reaches
   the sender as `close`. A sender that gives up (a `close` for its stream, or the

@@ -103,8 +103,8 @@ fn a_bridge_answers_a_features_that_says_what_its_client_takes_as_it_answers_any
     bridge.until("both answers", |b| b.features.len() == 2);
     assert_eq!(bridge.features[0], bridge.features[1]);
     assert!(bridge.features[0].streams);
-    // Nothing here keeps a mailbox yet.
-    assert!(!bridge.features[0].mailbox);
+    // What the client takes does not change what the bridge says it has.
+    assert!(bridge.features[0].mailbox);
 }
 
 #[test]

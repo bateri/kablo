@@ -53,8 +53,14 @@ section is not released.
   (build it with `Features::with_mailbox`). `Offers` and `Standing` are
   `#[non_exhaustive]` and made with `Offers::with_tickets` and `Standing::idle`.
   The bridge keeps a mailbox (`mail-<pid>` in the socket directory, made if the
-  directory is not there) and answers `ask` on it, but it does not say `mailbox`
-  in `features_reply` and hands no mail over yet.
+  directory is not there), answers `ask` on it, says `mailbox` in
+  `features_reply`, and gives a client that has said it takes tickets a `ticket`
+  for each stream a program opens there; the client's `open` that answers it
+  joins the two streams, and the bridge passes `data`, `credit`, `eof` and
+  `close` between them under the windows the two ends gave (an end that breaks
+  one loses the stream: both are sent `close`). The client going away ends the
+  bridge and with it every connection to the mailbox, with no `close` on the
+  streams that were open.
 - **Changed, `kablo-proto`: `Features`, `Status` and `NewSession` are
   `#[non_exhaustive]`.** Code outside the crate could write them as struct
   expressions in 0.1.0 (`Features { streams: true, ..Features::default() }`) and

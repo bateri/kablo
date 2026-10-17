@@ -342,11 +342,14 @@ memory of where its relay comes from (see *Limits*).
   the other end (`SO_PEERCRED`, `getpeereid`), and another user's is closed.
 - A running `kablo attach` keeps a mailbox in that same directory, `mail-<pid>`,
   a socket on which programs of yours on the machine can ask where the app
-  connected through that bridge stands: which terminal it is at, and how long
-  ago it last used it. It is as private as a session's: the same directory, and a
-  connection from another user's process is closed. The terminal an answer names
-  is what the kernel says of the process that asked, never anything that
-  process claims. The mailbox goes when the bridge does.
+  connected through that bridge stands (which terminal it is at, and how long
+  ago it last used it) and hand it bytes, which kablo carries without looking at
+  them. It is as private as a session's: the same directory, and a connection
+  from another user's process is closed. The terminal an answer or a hand-over
+  names is what the kernel says of the process that asked, never anything that
+  process claims. What the app does with the bytes is up to the app; kablo
+  hands over nothing to an app that has not said it takes them. The mailbox goes
+  when the bridge does, and with it every conversation in it.
 - kablo opens no network port on the server. Remote access is your ssh login
   running one command; whoever can log in as you can use your sessions, as
   they can use any other process of yours. (`kablo forward` listens on the

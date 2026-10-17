@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, Exit, Features, Message, NewSession, Packet, PacketDecoder, Size, Status,
+    ErrorCode, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size, Status,
     TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
@@ -734,6 +734,8 @@ pub struct Bridge {
     pub sessions: HashMap<String, Seen>,
     pub flows: HashMap<u32, Flow>,
     pub features: Vec<Features>,
+    /// Every ticket received: the terminal it names and its number.
+    pub tickets: Vec<(Option<String>, u32)>,
     /// Every byte received after the handshake, once recording (see
     /// [`Bridge::record`]).
     pub raw: Option<Vec<u8>>,
@@ -794,6 +796,7 @@ impl Bridge {
                 sessions: HashMap::new(),
                 flows: HashMap::new(),
                 features: Vec::new(),
+                tickets: Vec::new(),
                 raw: None,
                 next_stream: 0,
                 next_flow: (false, false),
@@ -917,6 +920,7 @@ impl Bridge {
                 Message::StatusReply(status) => self.statuses.push(status),
                 Message::Pong(bytes) => self.pongs.push(bytes),
                 Message::FeaturesReply(features) => self.features.push(features),
+                Message::Ticket(ticket) => self.tickets.push((name, ticket)),
                 other => panic!("the bridge sent {other:?}"),
             }
         }
@@ -1151,6 +1155,29 @@ impl Bridge {
                 host: host.to_owned(),
             },
         );
+        id
+    }
+
+    /// Says the app takes tickets, as an app does in its `features`, and waits
+    /// until the bridge has taken it in: what is sent to a mailbox after this
+    /// returns finds the bridge knowing.
+    pub fn take_tickets(&mut self) {
+        self.send(None, Message::FeaturesWith(Offers::with_tickets()));
+        let before = self.pongs.len();
+        self.send(None, Message::Ping(vec![0x7a]));
+        self.until("the pong", |b| b.pongs.len() > before);
+    }
+
+    /// Answers `ticket` with an `open` for the next stream number, giving
+    /// `window`, and returns the number. The answer is in [`Bridge::flows`].
+    pub fn answer_ticket(&mut self, ticket: u32, window: u32) -> u32 {
+        self.next_stream += 1;
+        let id = self.next_stream;
+        let (hold, discard) = std::mem::take(&mut self.next_flow);
+        let flow = self.flow(id);
+        flow.hold = hold;
+        flow.discard = discard;
+        self.stream_message(id, stream::Message::OpenTicket { window, ticket });
         id
     }
 

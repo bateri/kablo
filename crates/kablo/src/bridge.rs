@@ -35,10 +35,14 @@
 //!
 //! A program on the server can hand bytes to the app the bridge carries. The
 //! bridge keeps a mailbox for that, a socket of its own beside the sessions' (see
-//! [`crate::mailbox`]); for now it answers a program that asks where the app
-//! stands, and nothing more. What it needs to say is kept here, since only the
-//! bridge sees what its client does: when the client last attached to a session
-//! or typed into one.
+//! [`crate::mailbox`]): a program connects to it, asks where the app stands, and
+//! opens a stream; the app is given a ticket for the stream, which says the
+//! terminal the program runs in, and answers it by opening a stream of its own.
+//! The bridge joins the two ([`crate::conversation`]) and passes what each
+//! sends on to the other, without looking at it and without keeping any: the
+//! windows are the two ends' own. What it needs to say of the app is kept here,
+//! since only the bridge sees what its client does: when the client last
+//! attached to a session or typed into one, and whether it takes tickets.
 //!
 //! The same streams run programs for the client, as `ssh host command` does
 //! over a login that is already there. Those are children of the bridge and
@@ -134,6 +138,10 @@ struct Bridge {
     /// A bridge is started by a client that has just connected, and that is a
     /// use, so this starts as the start.
     used: Instant,
+    /// Whether the client takes tickets for the mail that comes to the mailbox
+    /// (it said so in its `features`). A client that has not said so is given
+    /// none.
+    tickets: bool,
     stop: Option<u8>,
     read_buf: Vec<u8>,
 }
@@ -148,6 +156,7 @@ impl Bridge {
         Bridge {
             mailbox: Mailbox::open(&dir).ok(),
             used: Instant::now(),
+            tickets: false,
             dir,
             input,
             output,
@@ -168,8 +177,19 @@ impl Bridge {
         self.out.pending()
     }
 
+    /// The answer to a `features`.
+    fn features_reply(&self) -> Packet {
+        Packet::connection(Message::FeaturesReply(features(
+            Path::new(NO_FORWARDING),
+            self.mailbox.is_some(),
+        )))
+    }
+
     fn serve(&mut self) -> u8 {
         let code = self.turns();
+        // The mail is for the client, and the client has gone: the programs
+        // that were handing it over see their connections end.
+        self.mailbox = None;
         // Programs run for the client last as long as the client's connection.
         self.streams.shutdown();
         code
@@ -208,7 +228,9 @@ impl Bridge {
                 sources.push(Source::Stream(token));
             }
             if let Some(mailbox) = &self.mailbox {
-                for (fd, token) in mailbox.interest() {
+                // What the programs send is for the client, so they are not
+                // read while it has more than it is taking.
+                for (fd, token) in mailbox.interest(reading) {
                     set.push(fd);
                     sources.push(Source::Mail(token));
                 }
@@ -243,7 +265,8 @@ impl Bridge {
                     }
                     Source::Mail(token) => {
                         if let Some(mailbox) = self.mailbox.as_mut() {
-                            let standings = Standings::new(&self.links, self.used, now);
+                            let standings =
+                                Standings::new(&self.links, self.used, self.tickets, now);
                             mailbox.ready(*token, fd.revents, &|t| standings.of(t));
                         }
                     }
@@ -258,8 +281,11 @@ impl Bridge {
             self.finish_scans(&mut outgoing);
             self.links.retain(|link| !link.is_gone());
             if let Some(mailbox) = self.mailbox.as_mut() {
-                let standings = Standings::new(&self.links, self.used, now);
+                let standings = Standings::new(&self.links, self.used, self.tickets, now);
                 mailbox.settle(now, &|t| standings.of(t));
+                // The tickets are said on the session channel with the rest;
+                // the streams' messages follow the other streams'.
+                mailbox.drain(&mut outgoing, &mut self.stream_out);
             }
             self.streams.settle(&mut self.stream_out);
             self.streams.expire(now, &mut self.stream_out);
@@ -381,11 +407,18 @@ impl Bridge {
                 session,
                 message: Message::Pong(bytes),
             }),
-            // The body of a `features` says what the client takes; nothing here
-            // gives mail yet, so it is read as the question without one.
-            (_, Message::Features | Message::FeaturesWith(_)) => outgoing.push(Packet::connection(
-                Message::FeaturesReply(features(Path::new(NO_FORWARDING))),
-            )),
+            (_, Message::Features) => outgoing.push(self.features_reply()),
+            // The body of a `features` says what the client takes. A `features`
+            // without one asks and says nothing of it.
+            (_, Message::FeaturesWith(offers)) => {
+                self.tickets = offers.tickets;
+                outgoing.push(self.features_reply());
+            }
+            (_, Message::Decline { ticket, text }) => {
+                if let Some(mailbox) = self.mailbox.as_mut() {
+                    mailbox.decline(ticket, text);
+                }
+            }
             (_, Message::List) => match Scan::start(&self.dir, scan::WAIT) {
                 Ok(scan) => self.scans.push(scan),
                 Err(e) => outgoing.push(failure(None, ErrorCode::UNAVAILABLE, &e.to_string())),
@@ -409,6 +442,21 @@ impl Bridge {
     /// every `open`, so that an administrator's decision reaches streams
     /// opened after it.
     fn handle_stream(&mut self, from: wire::Side, packet: wire::Packet) {
+        let mut packet = packet;
+        if let (wire::Side::Client, Some(mailbox)) = (from, self.mailbox.as_mut()) {
+            // An `open` that answers a ticket is numbered among the streams
+            // like any other, and the streams it makes count with theirs.
+            if matches!(packet.message, wire::Message::OpenTicket { .. })
+                && !self.streams.reserve(packet.stream)
+            {
+                return;
+            }
+            match mailbox.from_app(packet, self.streams.len()) {
+                None => return,
+                Some(not_mail) => packet = not_mail,
+            }
+            self.streams.hold(mailbox.joined());
+        }
         if matches!(
             packet.message,
             wire::Message::Open { .. } | wire::Message::OpenTicket { .. }
@@ -544,12 +592,19 @@ struct Standings<'a> {
     links: &'a [Link],
     /// When the client last used any session.
     used: Instant,
+    /// Whether the client takes tickets.
+    tickets: bool,
     now: Instant,
 }
 
 impl<'a> Standings<'a> {
-    fn new(links: &'a [Link], used: Instant, now: Instant) -> Standings<'a> {
-        Standings { links, used, now }
+    fn new(links: &'a [Link], used: Instant, tickets: bool, now: Instant) -> Standings<'a> {
+        Standings {
+            links,
+            used,
+            tickets,
+            now,
+        }
     }
 
     /// The client is attached to the terminal when its link to that session is
@@ -562,9 +617,14 @@ impl<'a> Standings<'a> {
                 .iter()
                 .find(|link| link.id() == id && !link.is_gone() && link.is_attached())
         });
-        match attached {
+        let standing = match attached {
             Some(link) => Standing::idle(link.idle(self.now)).with_attached(),
             None => Standing::idle(self.now.saturating_duration_since(self.used)),
+        };
+        if self.tickets {
+            standing.with_tickets()
+        } else {
+            standing
         }
     }
 }
@@ -583,13 +643,20 @@ fn created(dir: &std::path::Path, id: SessionId) -> Packet {
 }
 
 /// What the server can do beyond sessions: streams, unless the administrator
-/// has turned them off by the file at `switch`, and programs, whatever it says.
-fn features(switch: &Path) -> Features {
-    match forwarding_off(switch) {
+/// has turned them off by the file at `switch`, and programs, whatever it says;
+/// and mail, when the bridge could open its mailbox (`mailbox`), which the
+/// switch does not touch either, since whoever may log in may talk to the app.
+fn features(switch: &Path, mailbox: bool) -> Features {
+    let features = match forwarding_off(switch) {
         Some(why) => Features::streams_off(why),
         None => Features::with_streams(),
     }
-    .with_commands()
+    .with_commands();
+    if mailbox {
+        features.with_mailbox()
+    } else {
+        features
+    }
 }
 
 /// Why streams are off, if the file at `switch` says so by being there, or if
@@ -658,14 +725,14 @@ mod tests {
     fn streams_are_on_until_the_file_is_there() {
         let (dir, path) = switch("on");
         assert_eq!(forwarding_off(&path), None);
-        assert!(features(&path).streams);
-        assert_eq!(features(&path).reason, None);
-        assert!(features(&path).commands);
+        assert!(features(&path, false).streams);
+        assert_eq!(features(&path, false).reason, None);
+        assert!(features(&path, false).commands);
 
         // Its contents do not matter, and it is looked at again each time.
         std::fs::write(&path, "").unwrap();
         assert_eq!(forwarding_off(&path), Some(FORWARDING_OFF));
-        let off = features(&path);
+        let off = features(&path, false);
         assert!(!off.streams);
         assert_eq!(off.reason.as_deref(), Some(FORWARDING_OFF));
         assert!(
@@ -675,7 +742,18 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(forwarding_off(&path), None);
-        assert!(features(&path).streams);
+        assert!(features(&path, false).streams);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mail_is_said_when_there_is_a_mailbox_and_the_switch_does_not_touch_it() {
+        let (dir, path) = switch("mail");
+        assert!(!features(&path, false).mailbox);
+        assert!(features(&path, true).mailbox);
+        std::fs::write(&path, "").unwrap();
+        let off = features(&path, true);
+        assert!(!off.streams && off.mailbox);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -691,9 +769,9 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(forwarding_off(&path), Some(FORWARDING_UNCHECKED));
-        assert!(!features(&path).streams);
+        assert!(!features(&path, false).streams);
         assert_eq!(
-            features(&path).reason.as_deref(),
+            features(&path, false).reason.as_deref(),
             Some(FORWARDING_UNCHECKED)
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -737,7 +815,7 @@ mod tests {
         let stand = |_: Option<&SessionId>| Standing::default();
         let open = bridge.mailbox.as_mut().unwrap();
         open.ready(mailbox::Token::Listener, libc::POLLIN, &stand);
-        assert_eq!(open.interest().len(), 2, "the listener and the program");
+        assert_eq!(open.interest(true).len(), 2, "the listener and the program");
         open.settle(Instant::now(), &stand);
         assert_eq!(bridge.next_deadline(), None, "a program is connected");
         drop(bridge);
@@ -759,7 +837,8 @@ mod tests {
         let mut link = Link::open(&dir, id.clone(), start).unwrap();
 
         let later = start + Duration::from_secs(10);
-        let standing = Standings::new(std::slice::from_ref(&link), start, later).of(Some(&id));
+        let standing =
+            Standings::new(std::slice::from_ref(&link), start, false, later).of(Some(&id));
         assert!(!standing.attached);
         assert_eq!(standing.idle, Duration::from_secs(10), "since any use");
 
@@ -773,13 +852,15 @@ mod tests {
         link.send(attach, later, &mut out);
         link.touch(later);
         let used = later + Duration::from_secs(3);
-        let any = Standings::new(std::slice::from_ref(&link), later, used);
+        let any = Standings::new(std::slice::from_ref(&link), later, true, used);
         let standing = any.of(Some(&id));
         assert!(standing.attached);
         assert_eq!(standing.idle, Duration::from_secs(3), "since the attach");
         let other = SessionId::new("other").unwrap();
         assert!(!any.of(Some(&other)).attached, "not to another");
         assert!(!any.of(None).attached, "nor to no terminal");
+        assert!(standing.tickets, "the client said it takes tickets");
+        assert!(!Standings::new(&[], later, false, used).of(None).tickets);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

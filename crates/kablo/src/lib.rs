@@ -11,6 +11,7 @@ pub mod bridge;
 pub mod carrier;
 pub mod cli;
 pub mod connect;
+pub mod conversation;
 pub mod dial;
 pub mod exec;
 pub mod forward;

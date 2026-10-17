@@ -1,11 +1,13 @@
 //! The bridge's mailbox, with real bridges and real sessions: a program on the
-//! machine connects to it and asks where the app the bridge carries stands.
+//! machine connects to it, asks where the app the bridge carries stands, and
+//! hands it bytes. The app is a test with a connection to the bridge, as the
+//! app is a program with one to `kablo attach`.
 //!
 //! The program is this test, or this test's binary run again inside a session
 //! (`mail_sender_in_a_session`, which does nothing unless it is told where the
-//! mailbox is): the terminal an answer names is found by the kernel's word on
-//! the process that connected, so a sender has to be in the terminal to be
-//! found there.
+//! mailbox is): the terminal an answer or a ticket names is found by the
+//! kernel's word on the process that connected, so a sender has to be in the
+//! terminal to be found there.
 
 // Test support: a failure here is a failed test.
 #![allow(
@@ -17,10 +19,11 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE};
 use kablo::sockdir;
@@ -33,10 +36,31 @@ const SH: [&str; 2] = ["--", "/bin/sh"];
 /// The variable that tells `mail_sender_in_a_session` where the mailbox is.
 const MAILBOX: &str = "KABLO_TEST_MAILBOX";
 
+/// What a sender has seen of one of its streams.
+#[derive(Default)]
+struct Got {
+    /// The window the bridge offered in `opened`: what the sender may send.
+    opened: Option<u32>,
+    failed: Option<(FailCode, String)>,
+    data: Vec<u8>,
+    eof: bool,
+    closed: bool,
+    /// Bytes of credit received.
+    credit: u64,
+    /// Bytes sent so far.
+    sent: u64,
+    /// Whether received bytes are held back (no credit is given for them).
+    hold: bool,
+}
+
 /// A program connected to a mailbox.
 struct Sender {
     sock: UnixStream,
     decoder: IncomingDecoder,
+    streams: HashMap<u32, Got>,
+    next_stream: u32,
+    /// The connection is over.
+    ended: bool,
 }
 
 impl Sender {
@@ -48,6 +72,105 @@ impl Sender {
         Sender {
             sock,
             decoder: IncomingDecoder::new(),
+            streams: HashMap::new(),
+            next_stream: 0,
+            ended: false,
+        }
+    }
+
+    /// Opens a stream to hand bytes over, giving `window`, and returns its
+    /// number.
+    fn open(&mut self, window: u32) -> u32 {
+        self.next_stream += 1;
+        let id = self.next_stream;
+        self.stream_message(id, stream::Message::open_mail(window));
+        id
+    }
+
+    fn stream_message(&mut self, id: u32, message: stream::Message) {
+        let mut bytes = Vec::new();
+        stream::Packet::new(id, message)
+            .encode(Side::Client, &mut bytes)
+            .unwrap();
+        self.sock.write_all(&bytes).unwrap();
+    }
+
+    /// Sends bytes on a stream, in `data` messages of at most 32 KiB. The
+    /// caller keeps within the window.
+    fn send_data(&mut self, id: u32, bytes: &[u8]) {
+        let mut wire = Vec::new();
+        for chunk in bytes.chunks(32 * 1024) {
+            stream::Packet::new(id, stream::Message::Data(chunk.to_vec()))
+                .encode(Side::Client, &mut wire)
+                .unwrap();
+        }
+        self.sock.write_all(&wire).unwrap();
+        self.got(id).sent += bytes.len() as u64;
+    }
+
+    fn got(&mut self, id: u32) -> &mut Got {
+        self.streams.entry(id).or_default()
+    }
+
+    /// How many bytes the sender may send on `id` now.
+    fn allowed(&mut self, id: u32) -> u64 {
+        let got = self.got(id);
+        (u64::from(got.opened.unwrap_or(0)) + got.credit).saturating_sub(got.sent)
+    }
+
+    /// Reads for up to `wait` and files what arrived.
+    fn pump(&mut self, wait: Duration) {
+        // A socket the other end has closed may refuse a timeout; the read
+        // then says the same.
+        let _ = self.sock.set_read_timeout(Some(wait));
+        let mut buf = vec![0u8; 64 * 1024];
+        match self.sock.read(&mut buf) {
+            Ok(0) => self.ended = true,
+            Ok(n) => self.decoder.push(&buf[..n]),
+            Err(e) if common::nothing_yet(&e) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => self.ended = true,
+            Err(e) => panic!("the mailbox does not answer: {e}"),
+        }
+        let mut credits = Vec::new();
+        while let Some(incoming) = self.decoder.next_incoming().unwrap() {
+            let Incoming::Stream {
+                from: Side::Server,
+                packet,
+            } = incoming
+            else {
+                continue;
+            };
+            let id = packet.stream;
+            let got = self.got(id);
+            match packet.message {
+                stream::Message::Opened { window } => got.opened = Some(window),
+                stream::Message::Failed { code, text } => got.failed = Some((code, text)),
+                stream::Message::Data(bytes) => {
+                    got.data.extend_from_slice(&bytes);
+                    if !got.hold {
+                        credits.push((id, bytes.len() as u32));
+                    }
+                }
+                stream::Message::Credit(bytes) => got.credit += u64::from(bytes),
+                stream::Message::Eof => got.eof = true,
+                stream::Message::Close => got.closed = true,
+                other => panic!("the mailbox sent {other:?}"),
+            }
+        }
+        for (id, bytes) in credits {
+            self.stream_message(id, stream::Message::Credit(bytes));
+        }
+    }
+
+    /// Pumps until `done` holds or the patience is out.
+    fn until(&mut self, what: &str, done: impl Fn(&mut Sender) -> bool) {
+        let start = Instant::now();
+        loop {
+            self.pump(Duration::from_millis(20));
+            if done(self) {
+                return;
+            }
+            assert!(start.elapsed() < PATIENCE, "timed out waiting for {what}");
         }
     }
 
@@ -62,6 +185,7 @@ impl Sender {
     /// connection.
     fn next(&mut self) -> Option<Incoming> {
         let mut buf = [0u8; 4096];
+        self.sock.set_read_timeout(Some(PATIENCE)).unwrap();
         loop {
             if let Some(incoming) = self.decoder.next_incoming().unwrap() {
                 return Some(incoming);
@@ -339,7 +463,8 @@ fn what_a_mailbox_does_not_take_is_refused_and_the_connection_goes_on() {
         }))
     ));
 
-    // No mail is handed over yet: a conversation is refused, whoever opens it.
+    // An app that has not said it takes tickets is handed nothing: the
+    // conversation is refused.
     let mut bytes = Vec::new();
     stream::Packet::new(1, stream::Message::open_mail(65536))
         .encode(Side::Client, &mut bytes)
@@ -376,10 +501,388 @@ fn what_a_mailbox_does_not_take_is_refused_and_the_connection_goes_on() {
 }
 
 #[test]
-fn the_bridge_does_not_say_it_has_a_mailbox_yet() {
+fn the_bridge_says_it_has_a_mailbox_and_that_it_takes_what_the_app_says_it_takes() {
     let env = Env::new();
     let mut bridge = Bridge::start(&env);
     bridge.send(None, Message::Features);
     bridge.until("the features", |b| !b.features.is_empty());
-    assert!(!bridge.features[0].mailbox);
+    assert!(bridge.features[0].mailbox);
+
+    // Asking says nothing about what the app takes; saying so does.
+    let mut sender = Sender::to(&mailbox_of(&env, &bridge));
+    assert!(!sender.ask(None).1.tickets);
+    bridge.take_tickets();
+    assert!(sender.ask(None).1.tickets);
+    bridge.send(None, Message::Features);
+    bridge.until("the features", |b| b.features.len() == 3);
+    assert!(sender.ask(None).1.tickets, "a question is not a statement");
+}
+
+// --- handing bytes over ------------------------------------------------------
+
+/// A sender opens a stream with `to_sender` as its window and the app answers
+/// the ticket with `to_app`. Returns the sender's stream, the app's and the
+/// terminal the ticket named, once both ends are open.
+fn hand_over(
+    app: &mut Bridge,
+    sender: &mut Sender,
+    to_sender: u32,
+    to_app: u32,
+) -> (u32, u32, Option<String>) {
+    let seen = app.tickets.len();
+    let s = sender.open(to_sender);
+    app.until("a ticket", |b| b.tickets.len() > seen);
+    let (terminal, ticket) = app.tickets[seen].clone();
+    let a = app.answer_ticket(ticket, to_app);
+    app.until("the app's stream to open", |b| {
+        b.flows
+            .get(&a)
+            .is_some_and(|f| f.opened.is_some() || f.failed.is_some())
+    });
+    sender.until("the sender's stream to open", |x| {
+        x.streams
+            .get(&s)
+            .is_some_and(|g| g.opened.is_some() || g.failed.is_some())
+    });
+    (s, a, terminal)
+}
+
+/// An app that takes tickets, and a sender connected to its bridge.
+fn app_and_sender(env: &Env) -> (Bridge, Sender) {
+    let mut app = Bridge::start(env);
+    app.take_tickets();
+    let sender = Sender::to(&mailbox_of(env, &app));
+    (app, sender)
+}
+
+#[test]
+fn what_a_program_hands_over_reaches_the_app_as_it_is_and_what_the_app_says_goes_back() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+
+    let s = sender.open(1000);
+    app.until("the ticket", |b| !b.tickets.is_empty());
+    assert_eq!(
+        app.tickets,
+        [(None, 1)],
+        "from no terminal, and the first ticket"
+    );
+    let a = app.answer_ticket(1, 2000);
+    app.until("the app's stream to open", |b| {
+        b.flows.get(&a).is_some_and(|f| f.opened.is_some())
+    });
+    sender.until("the sender's stream to open", |x| {
+        x.streams.get(&s).is_some_and(|g| g.opened.is_some())
+    });
+    // Each end is told the window the other gave.
+    assert_eq!(app.flows[&a].opened, Some(1000));
+    assert_eq!(sender.streams[&s].opened, Some(2000));
+
+    let up: Vec<u8> = (0..=255).chain(0..100).collect();
+    sender.send_data(s, &up);
+    app.until("the bytes", |b| b.flows[&a].data.len() == up.len());
+    assert_eq!(app.flows[&a].data, up);
+    app.stream_send(a, b"and back\r\n\x1b[0m", 5);
+    sender.until("the answer", |x| x.streams[&s].data.len() == 14);
+    assert_eq!(sender.streams[&s].data, b"and back\r\n\x1b[0m");
+
+    // One end is done sending and the other goes on.
+    sender.stream_message(s, stream::Message::Eof);
+    app.until("the eof", |b| b.flows[&a].eof);
+    app.stream_send(a, b"more", 4);
+    sender.until("more", |x| x.streams[&s].data.len() == 18);
+    app.stream_eof(a);
+    sender.until("the eof", |x| x.streams[&s].eof);
+    assert!(!sender.streams[&s].closed && !app.flows[&a].closed);
+}
+
+#[test]
+fn the_app_closing_is_the_end_of_the_conversation_for_the_program_and_the_programs_for_the_app() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+
+    let (s, a, _) = hand_over(&mut app, &mut sender, 1000, 1000);
+    app.stream_close(a);
+    sender.until("the close", |x| x.streams[&s].closed);
+    assert_eq!(sender.streams[&s].failed, None);
+
+    // And the other way, on a stream that has seen data.
+    let (s, a, _) = hand_over(&mut app, &mut sender, 1000, 1000);
+    sender.send_data(s, b"x");
+    app.until("the byte", |b| b.flows[&a].data.len() == 1);
+    sender.stream_message(s, stream::Message::Close);
+    app.until("the close", |b| b.flows[&a].closed);
+}
+
+#[test]
+fn a_ticket_the_app_declines_fails_the_open_with_the_apps_words() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+
+    let s = sender.open(1000);
+    app.until("the ticket", |b| !b.tickets.is_empty());
+    app.send(
+        None,
+        Message::Decline {
+            ticket: 1,
+            text: "not at the moment".to_owned(),
+        },
+    );
+    sender.until("the failure", |x| x.streams[&s].failed.is_some());
+    assert_eq!(
+        sender.streams[&s].failed,
+        Some((FailCode::DECLINED, "not at the moment".to_owned()))
+    );
+    // The ticket is spent.
+    let a = app.answer_ticket(1, 1000);
+    app.until("the failure", |b| b.flows[&a].failed.is_some());
+    assert_eq!(
+        app.flows[&a].failed.as_ref().unwrap().0,
+        FailCode::BAD_REQUEST
+    );
+    assert!(!sender.streams[&s].closed);
+}
+
+#[test]
+fn a_ticket_that_is_not_outstanding_is_a_failed_open() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+
+    // One that was never given.
+    let a = app.answer_ticket(99, 1000);
+    app.until("the failure", |b| b.flows[&a].failed.is_some());
+    assert_eq!(
+        app.flows[&a].failed.as_ref().unwrap().0,
+        FailCode::BAD_REQUEST
+    );
+
+    // One the program gave up before it was answered.
+    let s = sender.open(1000);
+    app.until("the ticket", |b| !b.tickets.is_empty());
+    sender.stream_message(s, stream::Message::Close);
+    sender.send(None, Message::Ping(vec![1]));
+    assert!(matches!(
+        sender.next(),
+        Some(Incoming::Session(Packet {
+            message: Message::Pong(_),
+            ..
+        }))
+    ));
+    let late = app.answer_ticket(1, 1000);
+    app.until("the failure", |b| b.flows[&late].failed.is_some());
+    assert_eq!(
+        app.flows[&late].failed.as_ref().unwrap().0,
+        FailCode::BAD_REQUEST
+    );
+
+    // And one that was answered.
+    let (_, a, _) = hand_over(&mut app, &mut sender, 1000, 1000);
+    let twice = app.answer_ticket(2, 1000);
+    app.until("the failure", |b| b.flows[&twice].failed.is_some());
+    assert!(app.flows[&a].failed.is_none() && !app.flows[&a].closed);
+}
+
+#[test]
+fn what_is_not_mail_is_refused_on_a_mailbox_that_takes_mail() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+
+    sender.next_stream += 1;
+    let target = sender.next_stream;
+    sender.stream_message(
+        target,
+        stream::Message::Open {
+            window: 1000,
+            port: 80,
+            host: "localhost".to_owned(),
+        },
+    );
+    sender.until("the failure", |x| x.streams[&target].failed.is_some());
+    assert_eq!(
+        sender.streams[&target].failed.as_ref().unwrap().0,
+        FailCode::BAD_REQUEST
+    );
+    // A window nobody takes.
+    let big = sender.open(stream::MAX_WINDOW + 1);
+    sender.until("the failure", |x| x.streams[&big].failed.is_some());
+    assert_eq!(
+        sender.streams[&big].failed.as_ref().unwrap().0,
+        FailCode::LIMIT
+    );
+    assert!(app.tickets.is_empty(), "the app was asked nothing");
+    app.pump(Duration::from_millis(50));
+    assert!(app.tickets.is_empty());
+}
+
+/// The program `mail_open_in_a_session` runs in a session's terminal: opens a
+/// stream on the mailbox it is told of and says what became of it. Run by
+/// itself, as a test, it does nothing.
+#[test]
+fn mail_open_in_a_session() {
+    let Some(mailbox) = std::env::var_os(MAILBOX) else {
+        return;
+    };
+    let mut sender = Sender::to(Path::new(&mailbox));
+    let s = sender.open(4096);
+    sender.until("an answer", |x| {
+        x.streams
+            .get(&s)
+            .is_some_and(|g| g.opened.is_some() || g.failed.is_some())
+    });
+    let got = &sender.streams[&s];
+    println!(
+        "mail-open opened={} failed={}",
+        got.opened.is_some(),
+        got.failed.is_some()
+    );
+}
+
+#[test]
+fn a_ticket_names_the_terminal_the_program_runs_in_and_none_for_one_that_runs_in_none() {
+    let mut env = Env::new();
+    let id = env.start("mail-ticket", &SH);
+    let (mut app, mut outside) = app_and_sender(&env);
+    let mailbox = mailbox_of(&env, &app);
+    let exe = std::env::current_exe().unwrap();
+    let command = format!(
+        "{MAILBOX}={} {} --exact mail_open_in_a_session --nocapture\n",
+        mailbox.display(),
+        exe.display()
+    );
+    let mut shell = env.connect(&id);
+    shell.attach(0);
+    let before = shell.data.len();
+    shell.type_in(&command);
+
+    // The program in the terminal: its ticket names the terminal.
+    app.until("the ticket", |b| !b.tickets.is_empty());
+    assert_eq!(app.tickets[0].0.as_deref(), Some(id.as_str()));
+    let a = app.answer_ticket(app.tickets[0].1, 1000);
+    app.until("the stream", |b| b.flows[&a].opened.is_some());
+    shell.until("the program to hear of it", |c| {
+        String::from_utf8_lossy(c.data.get(before..).unwrap_or_default())
+            .contains("mail-open opened=true")
+    });
+
+    // This test is in no terminal of the bridge's.
+    let (_, _, terminal) = hand_over(&mut app, &mut outside, 1000, 1000);
+    assert_eq!(terminal, None);
+}
+
+#[test]
+fn when_a_program_goes_away_the_app_is_told_and_when_the_app_does_the_programs_are_not() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+    let mut other = Sender::to(&mailbox_of(&env, &app));
+    let (_, a, _) = hand_over(&mut app, &mut sender, 1000, 1000);
+    let (os, oa, _) = hand_over(&mut app, &mut other, 1000, 1000);
+
+    // The program leaves, with a conversation open and one asked of a ticket.
+    drop(sender);
+    app.until("the close", |b| b.flows[&a].closed);
+    assert!(!app.flows[&oa].closed, "the other conversation is its own");
+
+    // The app leaves: the bridge ends with it, and the program sees its
+    // connection end, with no `close` on the stream.
+    let mailbox = mailbox_of(&env, &app);
+    app.hang_up();
+    assert!(app.wait_exit().success());
+    other.until("the end of the connection", |x| x.ended);
+    assert!(!other.streams[&os].closed, "the connection ended, no more");
+    assert!(!mailbox.exists());
+}
+
+#[test]
+fn mail_in_both_directions_comes_whole_when_it_is_megabytes() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+    // Windows far under what is sent, so that credit is what keeps it going.
+    let (s, a, _) = hand_over(&mut app, &mut sender, 256 * 1024, 128 * 1024);
+
+    let up = common::pattern(5 * 1024 * 1024, 3);
+    let down = common::pattern(6 * 1024 * 1024 + 17, 9);
+    let (mut up_sent, mut down_sent) = (0usize, 0usize);
+    let start = Instant::now();
+    while app.flows[&a].total < up.len() as u64 || sender.streams[&s].data.len() < down.len() {
+        assert!(start.elapsed() < PATIENCE, "timed out");
+        let room = (sender.allowed(s) as usize)
+            .min(up.len() - up_sent)
+            .min(96 * 1024);
+        if room > 0 {
+            sender.send_data(s, &up[up_sent..up_sent + room]);
+            up_sent += room;
+        }
+        let flow = app.flow(a);
+        let room = ((u64::from(flow.opened.unwrap()) + flow.credit).saturating_sub(flow.sent)
+            as usize)
+            .min(down.len() - down_sent)
+            .min(96 * 1024);
+        if room > 0 {
+            app.stream_send(a, &down[down_sent..down_sent + room], 8 * 1024);
+            down_sent += room;
+        }
+        sender.pump(Duration::from_millis(1));
+        app.pump(Duration::from_millis(1));
+    }
+    assert!(app.flows[&a].data == up, "what the program sent");
+    assert!(sender.streams[&s].data == down, "what the app sent");
+}
+
+#[test]
+fn a_program_that_does_not_read_holds_up_nothing_else_and_nothing_past_its_window() {
+    let mut env = Env::new();
+    let id = env.start("mail-slow", &SH);
+    let (mut app, mut slow) = app_and_sender(&env);
+    let mut brisk = Sender::to(&mailbox_of(&env, &app));
+    let window = 1024 * 1024;
+    let (s, a, _) = hand_over(&mut app, &mut slow, window, 4096);
+    let (bs, ba, _) = hand_over(&mut app, &mut brisk, 4096, 4096);
+
+    // The app sends the slow program a whole window, which it does not read:
+    // far more than a connection that does not read its answers is let leave.
+    slow.got(s).hold = true;
+    app.stream_send(a, &common::pattern(window as usize, 5), 32 * 1024);
+    app.attach(&id, 0);
+    app.type_in(&id, "echo reached-the-app\n");
+    app.wait_for(&id, "reached-the-app\r\n");
+
+    // The rest of the bridge goes on: the other conversation, both ways.
+    brisk.send_data(bs, b"quick");
+    app.until("the bytes", |b| b.flows[&ba].data == b"quick");
+    app.stream_send(ba, b"quick back", 100);
+    brisk.until("the answer", |x| x.streams[&bs].data == b"quick back");
+
+    // The slow program was not closed for it, and gets all of it when it reads.
+    slow.streams.get_mut(&s).unwrap().hold = false;
+    slow.until("all of it", |x| x.streams[&s].data.len() == window as usize);
+    assert!(slow.streams[&s].data == common::pattern(window as usize, 5));
+
+    // The app that sends more than it was given loses the conversation.
+    let (s2, a2, _) = hand_over(&mut app, &mut slow, 1000, 4096);
+    app.stream_send(a2, &[0u8; 1001], 1001);
+    app.until("the close", |b| b.flows[&a2].closed);
+    slow.until("the close", |x| x.streams[&s2].closed);
+    assert!(!slow.ended, "the connection stays");
+    let _ = a;
+}
+
+#[test]
+fn conversations_and_forwarded_connections_share_the_numbers_of_the_streams() {
+    let env = Env::new();
+    let (mut app, mut sender) = app_and_sender(&env);
+    let port = common::target(common::echo);
+
+    let (first, _) = app.connect_stream("127.0.0.1", port, 65536).unwrap();
+    let (s, a, _) = hand_over(&mut app, &mut sender, 4096, 4096);
+    let (second, _) = app.connect_stream("127.0.0.1", port, 65536).unwrap();
+    assert!(first < a && a < second);
+
+    app.stream_send(first, b"one", 3);
+    app.stream_send(second, b"two", 3);
+    sender.send_data(s, b"mail");
+    app.until("everything", |b| {
+        b.flows[&first].data == b"one"
+            && b.flows[&second].data == b"two"
+            && b.flows[&a].data == b"mail"
+    });
 }
