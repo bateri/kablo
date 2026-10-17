@@ -1181,6 +1181,21 @@ impl Bridge {
         id
     }
 
+    /// Waits for the `n`th ticket (from 0) the app is given and answers it with
+    /// `window`, then waits until the app's stream is open or refused. Returns
+    /// the stream.
+    pub fn take_ticket(&mut self, n: usize, window: u32) -> u32 {
+        self.until("a ticket", |b| b.tickets.len() > n);
+        let ticket = self.tickets[n].1;
+        let a = self.answer_ticket(ticket, window);
+        self.until("the app's stream to open", |b| {
+            b.flows
+                .get(&a)
+                .is_some_and(|f| f.opened.is_some() || f.failed.is_some())
+        });
+        a
+    }
+
     /// Sends an `open` for a command, as the next stream number, and returns it.
     /// The answer is in [`Bridge::flows`].
     pub fn open_command(&mut self, command: stream::Command, window: u32) -> u32 {
@@ -1339,6 +1354,12 @@ pub fn echo(mut connection: TcpStream) {
 /// hold a port that refuses: macOS drops the connection instead of refusing.)
 pub fn closed_port() -> u16 {
     1
+}
+
+/// Sends `signal` to `pid`, a process this test started.
+pub fn signal(pid: u32, signal: libc::c_int) {
+    // SAFETY: a signal to a process this test started.
+    unsafe { libc::kill(pid as libc::pid_t, signal) };
 }
 
 /// Bytes that show where they are in a stream: a swapped or dropped piece

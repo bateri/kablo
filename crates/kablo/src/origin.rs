@@ -74,13 +74,13 @@ fn find_with(
     }
     let mut pid = peer;
     for _ in 0..MAX_ANCESTORS {
-        if let Some(candidate) = candidates.iter().find(|c| c.shell == pid) {
-            return found(candidate);
-        }
-        // Process 1 is the top, and 0 is what a parent outside this pid
-        // namespace reads as.
+        // Process 1 is the top, and 0 is what a parent (or a peer) outside this
+        // pid namespace reads as: neither is a shell of a session.
         if pid <= 1 {
             break;
+        }
+        if let Some(candidate) = candidates.iter().find(|c| c.shell == pid) {
+            return found(candidate);
         }
         match lineage(pid) {
             Some(own) => pid = own.parent,
@@ -309,5 +309,16 @@ mod tests {
         assert_eq!(find_with(2, &within, &chain), Origin::Terminal(id("a")));
         let beyond = [running("a", 2 + last, None)];
         assert_eq!(find_with(2, &beyond, &chain), Origin::None);
+    }
+
+    #[test]
+    fn a_peer_that_reads_as_process_0_or_1_is_from_no_session_whatever_a_shell_reads_as() {
+        // A peer in another pid namespace reads as 0; a session whose shell
+        // read as 0 or 1 would otherwise claim every one of them.
+        let process = table(&[]);
+        for pid in [0, 1] {
+            let shell = [running("a", pid, None)];
+            assert_eq!(find_with(pid, &shell, &process), Origin::None);
+        }
     }
 }

@@ -165,6 +165,12 @@ after the last one it received and gets exactly those. If a session's relay
 dies or is replaced while a client is attached, `attach` connects again and
 the stream continues without a gap, a repeat, or a word to the client.
 
+The same connection is how a program on the server reaches the app: `kablo app`
+there hands bytes to the app that is connected through `kablo attach` and brings
+its answer back, from inside a session or outside every one (`ssh host kablo app`
+is from none), with nothing to set up on the ssh side. [Talking to the
+app](#talking-to-the-app) has the rest.
+
 What a terminal app does with that is its own business; the protocol is in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
@@ -325,14 +331,15 @@ kablo app
   input tells the app there is no more; the app may go on answering. It ends
   when the app closes the conversation, or when both sides have said all they
   had.
-- **Exit status.** `0` when the conversation was had and it ended. `69` when no
-  app that takes these conversations is connected, or no bridge is running at all;
-  an app connected through a kablo from before this one has no mailbox to be
+- **Exit status.** `0` when the conversation was had and it ended. `64` when it is
+  given an argument. `69` when no app that takes these conversations is connected,
+  or no bridge is running at all; an app connected through a kablo from before this one has no mailbox to be
   reached by, and `kablo upgrade` does not change a bridge that is running, so
   such an app has to connect again (the message says so). `1` for everything
   else, each with its own words on standard error: the connection to the app was
   lost, the app declined (its words are shown with control characters removed),
-  the app did not take the conversation within 10 seconds, or what the app said
+  the app did not take the conversation within 10 seconds, the bridge would not
+  hand it over (a limit of the connection to the app), or what the app said
   could not be written. After Ctrl-C, `SIGTERM` or `SIGHUP`, which end the
   conversation, it is 128 plus the signal's number; if whatever reads standard output goes away
   it ends quietly with 141, as `kablo exec` does.

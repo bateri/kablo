@@ -43,11 +43,15 @@ section is not released.
   session the program runs in, or that it runs in none; what they mean is
   between the program and the app. It goes to the app that was last used at the
   program's session, or else the one last used anywhere on the machine. It ends
-  with `0` when the conversation ended, `69` when no app that takes these
-  conversations is connected, `1` for anything else that went wrong (each says
-  what on standard error), and 128 plus the signal's number after a signal. A
-  bridge that is running when kablo is upgraded keeps no mailbox until its app
-  connects again, which the message for `69` says (README, Talking to the app).
+  with `0` when the conversation ended, `64` when it is given an argument (it
+  takes none), `69` when no app that takes these conversations is connected, `1`
+  for anything else that went wrong (each says what on standard error), 128 plus
+  the signal's number after a signal, and `141` when whatever reads its output
+  goes away. A bridge that is running when kablo is upgraded keeps no mailbox
+  until its app connects again, which the message for `69` says (README, Talking
+  to the app). To be reachable, each `kablo attach` now listens on a socket of
+  its own in the socket directory, which it makes if it is not there, for as
+  long as it runs; only the same user connects to it (README, Security).
 
 ### For apps
 
@@ -76,17 +80,23 @@ section is not released.
   (it then sends `close`), and nowhere else; a bridge that does not answer is
   left out. Exit codes: `0` ended, `69` no app that takes tickets is connected
   (no mailbox, no client that says `tickets`, or the bridge's `failed` code 2
-  with no client to give a ticket to), `1` the app declined (code 9), did not
-  answer, went away without `close` or the conversation could not be written, and
-  128 plus the signal's number when it was ended by `SIGINT`, `SIGTERM` or
-  `SIGHUP` (141 for `SIGPIPE`: whatever reads its output went away).
+  with no client to give a ticket to), `64` an argument was given, `1` the app
+  declined (code 9), did not answer, went away without `close`, the bridge
+  refused for another reason (`failed` code 5 or 8: a window or a number of
+  streams over a limit, tickets used up, the terminal could not be looked for) or
+  the conversation could not be written, and 128 plus the signal's number when it
+  was ended by `SIGINT`, `SIGTERM` or `SIGHUP` (141 for `SIGPIPE`: whatever reads
+  its output went away).
 - **`kablo-proto`: the API for it.** `v1::Message` gains `FeaturesWith(Offers)`
   (a `features` with a body; `Features` stays the one without, and is also what a
   body that cannot be read reads as), `Ask`, `Decline`, `AskReply(Standing)` and
   `Ticket`; `v1::stream::Message` gains `OpenTicket` and the constructor `open_mail`;
   `v1::stream::FailCode::DECLINED` is 9; `v1::Features` gains the field `mailbox`
-  (build it with `Features::with_mailbox`). `Offers` and `Standing` are
-  `#[non_exhaustive]` and made with `Offers::with_tickets` and `Standing::idle`.
+  (build it with `Features::with_mailbox`). `v1::kind` gains `ASK`, `DECLINE`,
+  `ASK_REPLY` and `TICKET`. `Offers` and `Standing` are `#[non_exhaustive]` and
+  made with `Offers::with_tickets` and `Standing::idle` (then
+  `Standing::with_attached` and `Standing::with_tickets`); both have `to_block`
+  and `from_block`.
   The bridge keeps a mailbox (`mail-<pid>` in the socket directory, made if the
   directory is not there), answers `ask` on it, says `mailbox` in
   `features_reply`, and gives a client that has said it takes tickets a `ticket`
@@ -96,6 +106,12 @@ section is not released.
   one loses the stream: both are sent `close`). The client going away ends the
   bridge and with it every connection to the mailbox, with no `close` on the
   streams that were open.
+- **Changed, `kablo-proto`: breaking for code that matches `Message`, and for code
+  that builds `Features`, `Status` or `NewSession`.** `v1::Message` and
+  `v1::stream::Message` are not `#[non_exhaustive]` and have the variants above
+  now, so a `match` on them with no catch-all arm no longer compiles; and a
+  `features` that has a body reads as `FeaturesWith`, so a server that answers
+  only `Message::Features` does not answer it.
 - **Changed, `kablo-proto`: `Features`, `Status` and `NewSession` are
   `#[non_exhaustive]`.** Code outside the crate could write them as struct
   expressions in 0.1.0 (`Features { streams: true, ..Features::default() }`) and

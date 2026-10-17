@@ -195,13 +195,7 @@ impl Conversations {
             return;
         };
         let Some(ticket) = self.last_ticket.checked_add(1) else {
-            return self.refuse(
-                sender,
-                stream,
-                FailCode::UNREACHABLE,
-                "no tickets left",
-                said,
-            );
+            return self.refuse(sender, stream, FailCode::LIMIT, "no tickets left", said);
         };
         let Some(conversation) = self.list.get_mut(i) else {
             return;
@@ -275,7 +269,7 @@ impl Conversations {
             return said.failed(
                 sender,
                 sender_stream,
-                FailCode::UNREACHABLE,
+                code,
                 &format!("the app could not take it: {text}"),
             );
         }
@@ -704,5 +698,19 @@ mod tests {
         assert!(table.is_empty());
         assert_eq!(said.to_app.len(), 1);
         assert_eq!(said.to_senders.len(), 1);
+        // The sender is told the app's limit, not that no app is there: the
+        // first would be a conversation to try again, the second a reason to
+        // look for another app.
+        assert!(
+            matches!(
+                &said.to_senders[0].1.message,
+                wire::Message::Failed {
+                    code: FailCode::LIMIT,
+                    ..
+                }
+            ),
+            "{:?}",
+            said.to_senders[0]
+        );
     }
 }

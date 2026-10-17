@@ -345,6 +345,15 @@ impl Question {
                     message: Message::AskReply(standing),
                     ..
                 }))) => self.standing = Some(standing),
+                // A bridge that refuses the question (it has too many waiting)
+                // has answered: there is nothing more to wait for from it.
+                Ok(Some(Incoming::Session(Packet {
+                    message: Message::Error { .. },
+                    ..
+                }))) => {
+                    self.over = true;
+                    break;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) if e.is_recoverable() => {}
@@ -535,13 +544,6 @@ impl<'a> Conversing<'a> {
             if let Err(e) = sys::poll(&mut set, timeout) {
                 return Ended::Failed(format!("cannot wait for the app: {e}"));
             }
-            if waiting && Instant::now() >= answer_by {
-                self.streams.close(id, &mut self.control);
-                self.send();
-                return Ended::Failed(
-                    "the app did not take the conversation; it was given up on".to_owned(),
-                );
-            }
             for (fd, source) in set.iter().zip(&sources) {
                 if fd.revents == 0 {
                     continue;
@@ -572,6 +574,15 @@ impl<'a> Conversing<'a> {
             }
             if let Some(ended) = ended {
                 return ended;
+            }
+            // Only once what was ready has been handled: an answer that came
+            // in the poll that ran out is an answer.
+            if waiting && self.streams.opening() > 0 && Instant::now() >= answer_by {
+                self.streams.close(id, &mut self.control);
+                self.send();
+                return Ended::Failed(
+                    "the app did not take the conversation; it was given up on".to_owned(),
+                );
             }
         }
     }

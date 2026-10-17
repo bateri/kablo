@@ -25,7 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{Bridge, Env, PATIENCE};
+use common::{Bridge, Env, PATIENCE, signal};
 use kablo::sockdir;
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder, Side};
 use kablo_proto::v1::{ErrorCode, Message, Packet, Standing};
@@ -218,11 +218,6 @@ fn mailbox_of(env: &Env, bridge: &Bridge) -> PathBuf {
     let path = sockdir::mailbox_path(&env.dir, bridge.pid());
     assert!(path.exists(), "{} is not there", path.display());
     path
-}
-
-fn signal(pid: u32, signal: libc::c_int) {
-    // SAFETY: a signal to a bridge this test started.
-    unsafe { libc::kill(pid as libc::pid_t, signal) };
 }
 
 /// The program `the_sender_in_a_session` runs in a session's terminal: asks

@@ -274,11 +274,12 @@ one reads as zero.
 | 2 | u64 | `idle`: the milliseconds since the client last used that terminal, when `attached`; otherwise since it last used any terminal of this server. Using a terminal is attaching to it or sending it `input`; a client that has just connected counts as having used one just now |
 | 3 | u8 | `tickets`: bit 0 is set when the client takes tickets (`tickets` in its `features`) |
 
-The terminal of an answer is a running session and is never something the asker
-says about itself: the bridge finds it from the process at the other end of the
-connection, the session whose terminal that process has or whose shell it
-descends from. An `ask` that names a terminal gets an answer about that terminal
-and no more; it does not change where the asker's bytes are said to come from.
+The terminal of an answer to an `ask` that names none is a running session and is
+never something the asker says about itself: the bridge finds it from the process
+at the other end of the connection, the session whose terminal that process has or
+whose shell it descends from. An `ask` that names a terminal gets an answer about
+that terminal and no more; it does not change where the asker's bytes are said to
+come from.
 
 `ticket` is the bridge telling its client that bytes are waiting for it. It
 carries the number of the ticket, which the bridge picks counting up from 1 on
@@ -365,13 +366,13 @@ The `code` of `failed`.
 | code | meaning |
 |---|---|
 | 1 | the target refused the connection |
-| 2 | the target cannot be reached, or connecting failed in a way no other code names |
+| 2 | the target cannot be reached, or connecting failed in a way no other code names; on a mailbox, the bridge has no client that takes tickets |
 | 3 | the host name could not be resolved |
 | 4 | the target did not answer in time |
-| 5 | too many streams on the connection, or a window over the largest |
+| 5 | too many streams on the connection, or a window over the largest; on a mailbox, the same of the client's answer to a ticket, or the bridge's tickets are used up |
 | 6 | the server has streams turned off |
 | 7 | the `open` makes no sense (port 0, an empty or too long host; for a command, one that is not valid) |
-| 8 | the command could not be started; the text says why, as the system does |
+| 8 | the command could not be started; the text says why, as the system does; on a mailbox, the bridge could not look for the terminal the sender runs in |
 | 9 | the app declined the ticket; the text is the app's own words, as sent in `decline` |
 
 A code a reader has no name for is still a failure. The text is short English
@@ -772,7 +773,10 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   both connections.
 - *When it does not get there.* The sender's `open` is answered `failed` (2) when
   the bridge has no client that takes tickets, (5) when the connection has too
-  many streams, and (9) with the client's text when it declines. An `open` that
+  many streams, when the client's answer to the ticket has a window over the
+  largest or the client has too many streams, or when the bridge's tickets are
+  used up, (8) when the bridge cannot look for the terminal the sender runs in,
+  and (9) with the client's text when it declines. An `open` that
   answers a ticket that is not outstanding (it was answered, or the sender gave it
   up) is `failed` (7), and so is one on a mailbox that names a target to connect to
   or a command to run: a mailbox is for neither.

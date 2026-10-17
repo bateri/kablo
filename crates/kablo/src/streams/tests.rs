@@ -2325,6 +2325,28 @@ fn a_conversation_of_mail_is_over_when_both_ends_have_ended_their_side() {
 }
 
 #[test]
+fn a_conversation_both_ends_have_ended_is_ended_while_what_the_app_said_is_still_to_be_written() {
+    let (local, mut term) = terminal();
+    let mut alone = Alone::mail(1 << 20, local);
+    // More than a pipe holds, then the app's `eof`, then the program ends its
+    // input: nothing more is to come either way, though little of it is written.
+    let said: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+    for piece in said.chunks(MAX_DATA) {
+        alone.hears(Message::Data(piece.to_vec()));
+    }
+    alone.hears(Message::Eof);
+    assert!(!alone.client.ended(1), "this end is not done");
+    term.typed = None;
+    let start = Instant::now();
+    while !alone.client.ended(1) {
+        alone.turn();
+        assert!(start.elapsed() < PATIENCE, "the input never ended");
+    }
+    assert_eq!(alone.events, [Event::Opened(1)], "not while bytes are held");
+    assert!(!alone.client.is_empty());
+}
+
+#[test]
 fn a_conversation_of_mail_has_no_errors_and_no_exit_status() {
     for rule_breaker in [Message::Stderr(b"err".to_vec()), Message::Eof] {
         let (local, _term) = terminal();

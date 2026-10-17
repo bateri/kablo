@@ -19,11 +19,12 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, whole,
+    Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, signal,
+    whole,
 };
 use kablo_proto::v1::{ErrorCode, Message, NewSession, State};
 
@@ -801,4 +802,221 @@ fn kablo_exec_ends_with_its_ssh_and_the_servers_program_goes_with_the_connection
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+// --- kablo app ---------------------------------------------------------------------
+
+/// An app as one connects over ssh, saying it takes tickets.
+fn app_over_ssh(server: &Server) -> Bridge {
+    let (mut app, _) = server.bridge();
+    app.take_tickets();
+    app
+}
+
+/// `ssh host kablo app`, with its input, output and errors piped. sshd gives it
+/// no terminal (`-T`), so it is in none of the server's sessions.
+fn sender(server: &Server, input: Stdio) -> Child {
+    server
+        .ssh("kablo app")
+        .stdin(input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Waits for `child` to end, and returns how it did and what it wrote.
+fn ended(mut child: Child) -> Output {
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > PATIENCE {
+            let _ = child.kill();
+            panic!("kablo app never ended");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn said(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// What the server's startup file prints (tests/e2e/bashrc) before any command
+/// that ssh runs there, on its standard output: ssh's, not kablo's.
+const STARTUP_NOISE: &[u8] = b"kablo-e2e: noise from .bashrc before the program starts\n";
+
+/// What `kablo app` itself wrote, of the standard output of a `ssh host kablo
+/// app`: what is left after the startup file's words.
+fn written_by_the_program(stdout: &[u8]) -> &[u8] {
+    stdout
+        .strip_prefix(STARTUP_NOISE)
+        .unwrap_or_else(|| panic!("the startup file said nothing first: {stdout:?}"))
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn a_program_in_a_session_over_ssh_is_from_that_session_with_its_terminal_and_without_it() {
+    let server = server();
+    let prefix = prefix("mail-in");
+    let id = format!("{prefix}-0");
+    let mut app = app_over_ssh(&server);
+    app.try_new(Some(&id), &["/bin/sh"]).expect("a session");
+    app.attach(&id, 0);
+
+    // From the session's own terminal: the kernel says which it is.
+    app.type_in(
+        &id,
+        "echo from-the-terminal | kablo app; echo \"[terminal=$?]\"\n",
+    );
+    let a = app.take_ticket(0, 4096);
+    assert_eq!(app.tickets[0].0.as_deref(), Some(id.as_str()));
+    app.until("what the program wrote", |b| {
+        b.flows[&a].data == b"from-the-terminal\n"
+    });
+    app.stream_send(a, b"answer-terminal\n", 16);
+    app.stream_close(a);
+    app.wait_for(&id, "answer-terminal\r\n[terminal=0]\r\n");
+
+    // Without its terminal (`setsid` drops it): the parents say which.
+    app.type_in(
+        &id,
+        "echo from-the-parents | setsid -w kablo app; echo \"[parents=$?]\"\n",
+    );
+    let b = app.take_ticket(1, 4096);
+    assert_eq!(app.tickets[1].0.as_deref(), Some(id.as_str()));
+    app.until("what the program wrote", |b2| {
+        b2.flows[&b].data == b"from-the-parents\n"
+    });
+    app.stream_send(b, b"answer-parents\n", 15);
+    app.stream_close(b);
+    app.wait_for(&id, "answer-parents\r\n[parents=0]\r\n");
+
+    assert!(app.errors.is_empty(), "{:?}", app.errors);
+    drop(app);
+    server.clean_up(&prefix);
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn a_program_that_ssh_starts_is_from_no_session_and_what_the_app_says_comes_out_as_it_is() {
+    let server = server();
+    let mut app = app_over_ssh(&server);
+
+    let mut program = sender(&server, Stdio::piped());
+    let mut input = program.stdin.take().unwrap();
+    input
+        .write_all(b"from outside \x1b[1mevery\x00session")
+        .unwrap();
+    drop(input);
+    let a = app.take_ticket(0, 4096);
+    assert_eq!(app.tickets[0].0, None, "from no session");
+    app.until("what the program wrote", |b| {
+        b.flows[&a].eof && b.flows[&a].data == b"from outside \x1b[1mevery\x00session"
+    });
+    app.stream_send(a, b"answer \x1b[0m\r\n\x00end", 8);
+    app.stream_close(a);
+
+    let ran = ended(program);
+    assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
+    assert_eq!(
+        written_by_the_program(&ran.stdout),
+        b"answer \x1b[0m\r\n\x00end"
+    );
+    assert_eq!(said(&ran.stderr), "");
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn an_app_that_goes_away_ends_the_open_conversation_without_a_close_and_the_next_one_finds_no_app()
+{
+    let server = server();
+    let mut app = app_over_ssh(&server);
+
+    let mut program = sender(&server, Stdio::piped());
+    let mut input = program.stdin.take().unwrap();
+    input.write_all(b"half").unwrap();
+    let a = app.take_ticket(0, 4096);
+    app.until("what the program wrote", |b| b.flows[&a].data == b"half");
+    drop(app);
+
+    let ran = ended(program);
+    drop(input);
+    assert_eq!(ran.status.code(), Some(1), "{}", said(&ran.stderr));
+    assert!(
+        said(&ran.stderr).contains("the app went away"),
+        "{}",
+        said(&ran.stderr)
+    );
+
+    // The bridge goes with its connection, and its mailbox with it.
+    let start = Instant::now();
+    while server.count("kablo attach") > 0 {
+        assert!(start.elapsed() < PATIENCE, "the bridge outlived its ssh");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ran = ended(sender(&server, Stdio::null()));
+    assert_eq!(ran.status.code(), Some(69), "{}", said(&ran.stderr));
+    let words = said(&ran.stderr);
+    assert!(words.contains("no app is connected"), "{words}");
+    assert_eq!(written_by_the_program(&ran.stdout), b"");
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn an_app_that_connects_again_is_given_the_conversations_not_the_half_dead_connection_it_left() {
+    let server = server();
+    let prefix = prefix("mail-half");
+    let id = format!("{prefix}-0");
+
+    // The app, at a terminal of the server.
+    let mut old = app_over_ssh(&server);
+    old.try_new(Some(&id), &["/bin/sh"]).expect("a session");
+    old.attach(&id, 0);
+    old.type_in(&id, "echo up\n");
+    old.wait_for(&id, "up\r\n");
+
+    // The network goes: the app's ssh hangs, nothing closes the connection,
+    // and the bridge on the server goes on as if the app were there.
+    signal(old.pid(), libc::SIGSTOP);
+
+    // The app comes back over a new connection and takes the terminal again.
+    let mut new = app_over_ssh(&server);
+    new.attach(&id, 0);
+    new.type_in(
+        &id,
+        "echo from-the-terminal | kablo app; echo \"[terminal=$?]\"\n",
+    );
+    let a = new.take_ticket(0, 4096);
+    assert_eq!(new.tickets[0].0.as_deref(), Some(id.as_str()));
+    new.until("what the program wrote", |b| {
+        b.flows[&a].data == b"from-the-terminal\n"
+    });
+    new.stream_send(a, b"answer\n", 7);
+    new.stream_close(a);
+    new.wait_for(&id, "answer\r\n[terminal=0]\r\n");
+
+    // A program outside every session goes to the one used last as well.
+    let mut program = sender(&server, Stdio::piped());
+    let mut input = program.stdin.take().unwrap();
+    input.write_all(b"from outside").unwrap();
+    drop(input);
+    let b = new.take_ticket(1, 4096);
+    assert_eq!(new.tickets[1].0, None);
+    new.stream_send(b, b"ok", 2);
+    new.stream_close(b);
+    let ran = ended(program);
+    assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
+    assert_eq!(written_by_the_program(&ran.stdout), b"ok");
+
+    // The old connection comes back. Anything given to it would be ahead of the
+    // answer to a ping on the same stream.
+    signal(old.pid(), libc::SIGCONT);
+    let before = old.pongs.len();
+    old.send(None, Message::Ping(vec![0x5a]));
+    old.until("the pong", |b| b.pongs.len() > before);
+    assert!(old.tickets.is_empty(), "{:?}", old.tickets);
+
+    drop((old, new));
+    server.clean_up(&prefix);
 }

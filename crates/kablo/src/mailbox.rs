@@ -698,7 +698,7 @@ impl Mailbox {
             }),
             Err(e) => {
                 self.conversations
-                    .refuse(id, stream, FailCode::UNREACHABLE, &e.to_string(), said)
+                    .refuse(id, stream, FailCode::START_FAILED, &e.to_string(), said)
             }
         }
     }

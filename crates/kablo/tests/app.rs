@@ -18,7 +18,7 @@ use std::os::fd::OwnedFd;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Bridge, Env, PATIENCE};
+use common::{Bridge, Env, PATIENCE, signal};
 use kablo::app::{self, Patience};
 use kablo::streams::Local;
 use kablo_proto::v1::Message;
@@ -56,25 +56,6 @@ fn app_that_takes_mail(env: &Env) -> Bridge {
     app
 }
 
-/// Answers the `n`th ticket (from 0) the app has been given, with `window`, and
-/// waits until the app's stream is open. Returns the stream.
-fn take(app: &mut Bridge, n: usize, window: u32) -> u32 {
-    app.until("a ticket", |b| b.tickets.len() > n);
-    let (_, ticket) = app.tickets[n].clone();
-    let a = app.answer_ticket(ticket, window);
-    app.until("the app's stream to open", |b| {
-        b.flows
-            .get(&a)
-            .is_some_and(|f| f.opened.is_some() || f.failed.is_some())
-    });
-    a
-}
-
-fn signal(pid: u32, signal: libc::c_int) {
-    // SAFETY: a signal to a process this test started.
-    unsafe { libc::kill(pid as libc::pid_t, signal) };
-}
-
 #[test]
 fn what_the_program_writes_reaches_the_app_and_what_the_app_says_comes_out_as_it_is() {
     let env = Env::new();
@@ -85,7 +66,7 @@ fn what_the_program_writes_reaches_the_app_and_what_the_app_says_comes_out_as_it
     let asked: &[u8] = b"ask: all of it\n\x1b[1mraw\x00bytes";
     stdin.write_all(asked).unwrap();
     drop(stdin);
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     assert_eq!(app.tickets[0].0, None, "from no terminal");
     app.until("the bytes and the end of them", |b| {
         b.flows[&a].eof && b.flows[&a].data.len() == asked.len()
@@ -109,7 +90,7 @@ fn the_program_ending_its_input_and_the_app_ending_its_output_end_the_conversati
     let mut child = spawn(&env);
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"question").unwrap();
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     app.until("the question", |b| b.flows[&a].data == b"question");
     // The program has more to say until it ends its input.
     assert!(child.try_wait().unwrap().is_none());
@@ -131,7 +112,7 @@ fn what_the_app_says_just_before_it_closes_is_not_lost() {
 
     let mut child = spawn(&env);
     let stdin = child.stdin.take().unwrap();
-    let a = take(&mut app, 0, 1 << 20);
+    let a = app.take_ticket(0, 1 << 20);
     // All the window allows, and the close right behind it, to a program whose
     // output is a pipe that nobody has begun to read: most of it is still
     // waiting to be written when the close comes.
@@ -165,7 +146,7 @@ fn megabytes_go_both_ways_whole() {
     });
     let reader = std::thread::spawn(move || child.wait_with_output().unwrap());
 
-    let a = take(&mut app, 0, 64 * 1024);
+    let a = app.take_ticket(0, 64 * 1024);
     let mut sent = 0;
     let start = Instant::now();
     while app.flows[&a].total < up.len() as u64 || sent < down.len() {
@@ -214,7 +195,7 @@ fn from_a_session_the_ticket_names_it_and_the_status_is_the_apps_to_give() {
     );
     let before = shell.data.len();
     shell.type_in(&command);
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     assert_eq!(app.tickets[0].0.as_deref(), Some(id.as_str()));
     app.until("what was written", |b| {
         b.flows[&a].data == b"from the shell" && b.flows[&a].eof
@@ -250,7 +231,7 @@ fn with_two_apps_the_one_at_the_terminal_wins_and_away_from_a_terminal_the_one_u
         env.dir.display()
     );
     shell.type_in(&command);
-    let a = take(&mut at_first, 0, 4096);
+    let a = at_first.take_ticket(0, 4096);
     assert_eq!(at_first.tickets[0].0.as_deref(), Some(first.as_str()));
     assert!(at_second.tickets.is_empty());
     at_first.stream_close(a);
@@ -258,7 +239,7 @@ fn with_two_apps_the_one_at_the_terminal_wins_and_away_from_a_terminal_the_one_u
     // From no terminal: the app used last.
     let mut child = spawn(&env);
     drop(child.stdin.take());
-    let b = take(&mut at_second, 0, 4096);
+    let b = at_second.take_ticket(0, 4096);
     assert_eq!(at_second.tickets[0].0, None);
     assert_eq!(at_first.tickets.len(), 1);
     at_second.stream_close(b);
@@ -283,7 +264,7 @@ fn an_app_that_comes_back_through_a_new_bridge_gets_it_before_the_half_dead_one_
         env.dir.display()
     );
     shell.type_in(&command);
-    let a = take(&mut new, 0, 4096);
+    let a = new.take_ticket(0, 4096);
     assert!(old.tickets.is_empty(), "the half dead one was not asked");
     new.stream_close(a);
 }
@@ -296,7 +277,7 @@ fn an_app_that_does_not_take_mail_is_passed_over() {
 
     let mut child = spawn(&env);
     drop(child.stdin.take());
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     app.stream_close(a);
     assert_eq!(child.wait().unwrap().code(), Some(0));
     quiet.pump(Duration::from_millis(50));
@@ -365,7 +346,7 @@ fn a_bridge_that_is_gone_but_for_its_name_is_no_bridge_and_a_silent_one_is_not_w
         (status, words)
     });
     let started = Instant::now();
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     app.stream_close(a);
     let (status, words) = talking.join().unwrap();
     signal(silent.pid(), libc::SIGCONT);
@@ -453,7 +434,7 @@ fn an_app_that_goes_away_in_the_middle_is_1_and_so_is_one_whose_connection_ends(
     let mut child = spawn(&env);
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"half").unwrap();
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     app.until("the bytes", |b| b.flows[&a].data == b"half");
     app.hang_up();
     let output = child.wait_with_output().unwrap();
@@ -473,7 +454,7 @@ fn ctrl_c_closes_the_conversation_and_ends_with_130() {
 
     let mut child = spawn(&env);
     let stdin = child.stdin.take().unwrap();
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     signal(child.id(), libc::SIGINT);
     app.until("the close", |b| b.flows[&a].closed);
     let output = child.wait_with_output().unwrap();
@@ -489,7 +470,7 @@ fn a_reader_of_its_output_that_goes_away_ends_it_quietly_with_141_and_closes_the
     let mut child = spawn(&env);
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    let a = take(&mut app, 0, 4096);
+    let a = app.take_ticket(0, 4096);
     drop(stdout);
     app.stream_send(a, b"to nobody", 9);
     app.until("the close", |b| b.flows[&a].closed);

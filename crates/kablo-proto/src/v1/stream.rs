@@ -141,14 +141,15 @@ impl FailCode {
     /// The target refused the connection.
     pub const REFUSED: FailCode = FailCode(1);
     /// There is no way to the target, or connecting failed in a way no other
-    /// code names.
+    /// code names; on a mailbox, the bridge has no client that takes tickets.
     pub const UNREACHABLE: FailCode = FailCode(2);
     /// The host name could not be resolved.
     pub const UNRESOLVED: FailCode = FailCode(3);
     /// The target did not answer within [`CONNECT_TIMEOUT`].
     pub const TIMED_OUT: FailCode = FailCode(4);
     /// The connection has too many streams ([`MAX_STREAMS`], [`MAX_CONNECTING`])
-    /// or the window offered is over [`MAX_WINDOW`].
+    /// or the window offered is over [`MAX_WINDOW`]; on a mailbox, the same of
+    /// the app's answer to a ticket, or the bridge's tickets are used up.
     pub const LIMIT: FailCode = FailCode(5);
     /// The server has streams turned off.
     pub const FORBIDDEN: FailCode = FailCode(6);
@@ -157,7 +158,8 @@ impl FailCode {
     /// ([`Command::check`]).
     pub const BAD_REQUEST: FailCode = FailCode(7);
     /// The command could not be started; the text says why, as the system
-    /// does ("No such file or directory").
+    /// does ("No such file or directory"). On a mailbox, the bridge could not
+    /// look for the terminal the sender runs in.
     pub const START_FAILED: FailCode = FailCode(8);
     /// The app declined the ticket a conversation was handed over with; the text
     /// is the app's own ([`super::Message::Decline`]).

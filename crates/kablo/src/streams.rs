@@ -812,13 +812,14 @@ impl Streams {
     }
 
     /// Client end of a command: whether the server has said how the program
-    /// ended; of a conversation of mail, whether the app has closed it. The
-    /// stream is then over but for what was said and is still to be written
-    /// here ([`Event::Exited`], [`Event::Over`] tell when it is all written).
+    /// ended; of a conversation of mail, whether the app has closed it or both
+    /// ends have said all they had. The stream is then over but for what was
+    /// said and is still to be written here ([`Event::Exited`], [`Event::Over`]
+    /// tell when it is all written).
     pub fn ended(&self, id: u32) -> bool {
-        self.streams
-            .get(&id)
-            .is_some_and(|s| s.exited.is_some() || s.peer_closed)
+        self.streams.get(&id).is_some_and(|s| {
+            s.exited.is_some() || s.peer_closed || (s.end.is_mail() && s.sent_eof && s.got_eof)
+        })
     }
 
     /// What has happened to opened streams since this was last asked.
