@@ -1,0 +1,18 @@
+# write to "work": press ctrl+c, the up arrow, then shift+alt+F5
+0e                                  # kind 0x0e: write
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 21                         # payload length 33
+77 6f 72 6b                         # session id "work"
+00 02                               # tlv key 2: key
+00 00 00 05                         #   length 5
+00 00 00 63                         #   key 99, the key that types "c"
+04                                  #   control
+00 02                               # tlv key 2: key
+00 00 00 05                         #   length 5
+00 00 e0 08                         #   key 0xe008, the up arrow
+00                                  #   no modifiers
+00 02                               # tlv key 2: key
+00 00 00 05                         #   length 5
+00 00 e0 18                         #   key 0xe018, F5
+03                                  #   shift and alt

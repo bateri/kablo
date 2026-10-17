@@ -1,0 +1,13 @@
+# write to "work": type "echo hi", then press Enter
+0e                                  # kind 0x0e: write
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 18                         # payload length 24
+77 6f 72 6b                         # session id "work"
+00 01                               # tlv key 1: text
+00 00 00 07                         #   length 7
+65 63 68 6f 20 68 69                #   "echo hi"
+00 02                               # tlv key 2: key
+00 00 00 05                         #   length 5
+00 00 00 0d                         #   key 13, Enter
+00                                  #   no modifiers

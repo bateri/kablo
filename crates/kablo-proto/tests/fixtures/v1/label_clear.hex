@@ -1,0 +1,6 @@
+# take the label off "work"
+11                                  # kind 0x11: label
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 00                         # payload length 0: no text, no label
+77 6f 72 6b                         # session id "work"

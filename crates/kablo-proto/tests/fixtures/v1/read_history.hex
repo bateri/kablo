@@ -1,0 +1,12 @@
+# read "work" as text with 500 rows of scrollback and wrapped rows joined
+0f                                  # kind 0x0f: read
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 11                         # payload length 17
+77 6f 72 6b                         # session id "work"
+00 02                               # tlv key 2: history
+00 00 00 04                         #   length 4
+00 00 01 f4                         #   500 rows
+00 03                               # tlv key 3: unwrap
+00 00 00 01                         #   length 1
+01                                  #   join the rows the terminal wrapped

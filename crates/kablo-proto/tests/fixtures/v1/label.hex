@@ -1,0 +1,7 @@
+# label "work" "deploy"
+11                                  # kind 0x11: label
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 06                         # payload length 6
+77 6f 72 6b                         # session id "work"
+64 65 70 6c 6f 79                   # the label: "deploy"

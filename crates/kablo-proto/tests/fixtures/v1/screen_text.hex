@@ -1,0 +1,11 @@
+# the text of the screen of "work" at offset 0x1000, 80 columns by 24 rows, all of it in this piece
+8e                                  # kind 0x8e: screen_text
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 1a                         # payload length 26
+77 6f 72 6b                         # session id "work"
+00 00 00 00 00 00 10 00             # offset 4096
+00 50 00 18                         # read from 80 columns, 24 rows
+00                                  # flags: no more pieces
+24 20 65 63 68 6f 20 68 69 0a       # the line "$ echo hi", ended by a line feed
+68 69 0a                            # the line "hi", ended by a line feed

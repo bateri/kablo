@@ -1,0 +1,9 @@
+# new session "build-1" labeled "tests"
+09                                  # kind 0x09: new
+00                                  # channel 0: terminal session
+07                                  # session id length 7
+00 00 00 0b                         # payload length 11
+62 75 69 6c 64 2d 31                # session id "build-1"
+00 07                               # tlv key 7: label
+00 00 00 05                         #   length 5
+74 65 73 74 73                      #   "tests"

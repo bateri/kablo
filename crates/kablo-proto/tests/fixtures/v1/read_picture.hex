@@ -1,0 +1,9 @@
+# read "work" as the bytes that build the screen
+0f                                  # kind 0x0f: read
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 07                         # payload length 7
+77 6f 72 6b                         # session id "work"
+00 01                               # tlv key 1: picture
+00 00 00 01                         #   length 1
+01                                  #   a picture, not text

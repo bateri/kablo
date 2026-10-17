@@ -25,8 +25,8 @@ use kablo_proto::v1::stream::{
     self, Command, FailCode, Incoming, IncomingDecoder, Side, read_incoming,
 };
 use kablo_proto::v1::{
-    self, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size, Standing,
-    State, Status, TerminalState, View, kind, read_packet, write_packet,
+    self, Capture, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size,
+    Standing, State, Status, Stroke, TerminalState, View, key, kind, read_packet, write_packet,
 };
 use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE, tlv};
 
@@ -88,6 +88,7 @@ fn running_work() -> Status {
         s.secret = false;
         s.remote = None;
         s.remote_port = None;
+        s.label = None;
     })
 }
 
@@ -309,6 +310,13 @@ fn messages() -> Vec<(&'static str, Packet)> {
             }),
         ),
         (
+            "error_ended",
+            work(Message::Error {
+                code: v1::ErrorCode::ENDED,
+                text: "the program has ended".into(),
+            }),
+        ),
+        (
             "pong",
             Packet::connection(Message::Pong(b"pingdata".to_vec())),
         ),
@@ -369,6 +377,81 @@ fn messages() -> Vec<(&'static str, Packet)> {
                 ticket: 7,
                 text: "no room".into(),
             }),
+        ),
+        (
+            "write",
+            work(Message::Write(vec![
+                Stroke::text("echo hi"),
+                Stroke::key(key::ENTER, 0),
+            ])),
+        ),
+        (
+            "write_keys",
+            work(Message::Write(vec![
+                Stroke::key(u32::from('c'), key::mods::CTRL),
+                Stroke::key(key::UP, 0),
+                Stroke::key(key::function(5).unwrap(), key::mods::SHIFT | key::mods::ALT),
+            ])),
+        ),
+        ("read", work(Message::Read(Capture::default()))),
+        (
+            "read_history",
+            work(Message::Read(with(Capture::default(), |c| {
+                c.history = 500;
+                c.unwrap = true;
+            }))),
+        ),
+        (
+            "read_picture",
+            work(Message::Read(with(Capture::default(), |c| {
+                c.picture = true;
+            }))),
+        ),
+        ("wait", work(Message::Wait)),
+        ("label", work(Message::Label("deploy".into()))),
+        ("label_clear", work(Message::Label(String::new()))),
+        (
+            "screen_text",
+            work(Message::ScreenText {
+                offset: 0x1000,
+                cols: 80,
+                rows: 24,
+                more: false,
+                data: b"$ echo hi\nhi\n".to_vec(),
+            }),
+        ),
+        (
+            "screen_text_more",
+            work(Message::ScreenText {
+                offset: 0x1000,
+                cols: 80,
+                rows: 24,
+                more: true,
+                data: b"$ echo h".to_vec(),
+            }),
+        ),
+        (
+            "new_label",
+            Packet::about(
+                id("build-1"),
+                Message::New(with(NewSession::default(), |n| {
+                    n.label = Some("tests".into());
+                })),
+            ),
+        ),
+        (
+            "status_reply_label",
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.size = Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                };
+                s.offset = 5000;
+                s.label = Some("tests".into());
+            }))),
         ),
         ("status_reply", work(Message::StatusReply(running_work()))),
         (
@@ -698,6 +781,10 @@ fn every_message_kind_has_a_fixture() {
         FEATURES,
         ASK,
         DECLINE,
+        WRITE,
+        READ,
+        WAIT,
+        LABEL,
         ATTACHED,
         OUTPUT,
         ENDED,
@@ -711,6 +798,7 @@ fn every_message_kind_has_a_fixture() {
         STATE,
         ASK_REPLY,
         TICKET,
+        SCREEN_TEXT,
     ] {
         assert!(kinds.contains(&k), "kind {k:#04x} has no fixture");
     }
@@ -1314,6 +1402,7 @@ fn bytes_that_are_not_a_protocol_never_panic() {
         let _ = Features::from_block(&bytes);
         let _ = Offers::from_block(&bytes);
         let _ = Standing::from_block(&bytes);
+        let _ = Capture::from_block(&bytes);
         let _ = WIRE.read_hello(&mut bytes.as_slice());
     }
 }
@@ -1983,11 +2072,16 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(v1::kind_name(kind::FEATURES_REPLY), "features_reply");
     assert_eq!(v1::kind_name(kind::ASK), "ask");
     assert_eq!(v1::kind_name(kind::DECLINE), "decline");
-    assert_eq!(v1::kind_name(0x0e), "unknown");
+    assert_eq!(v1::kind_name(kind::WRITE), "write");
+    assert_eq!(v1::kind_name(kind::READ), "read");
+    assert_eq!(v1::kind_name(kind::WAIT), "wait");
+    assert_eq!(v1::kind_name(kind::LABEL), "label");
+    assert_eq!(v1::kind_name(0x12), "unknown");
     assert_eq!(v1::kind_name(kind::STATE), "state");
     assert_eq!(v1::kind_name(kind::ASK_REPLY), "ask_reply");
     assert_eq!(v1::kind_name(kind::TICKET), "ticket");
-    assert_eq!(v1::kind_name(0x8e), "unknown");
+    assert_eq!(v1::kind_name(kind::SCREEN_TEXT), "screen_text");
+    assert_eq!(v1::kind_name(0x8f), "unknown");
     assert_eq!(stream::kind_name(stream::kind::OPEN), "stream open");
     assert_eq!(stream::kind_name(stream::kind::FAILED), "stream failed");
     assert_eq!(stream::kind_name(0x06), "unknown");
@@ -2464,4 +2558,348 @@ fn a_conversation_of_mail_reads_in_order_however_it_arrives() {
         assert_eq!(got_sessions, sessions, "pieces of {piece}");
         assert_eq!(incoming.pending() + old.pending(), 0, "pieces of {piece}");
     }
+}
+
+#[test]
+fn the_keys_have_the_numbers_kitty_gives_them() {
+    // The four kitty's protocol writes in its sequences.
+    assert_eq!(
+        [key::TAB, key::ENTER, key::ESCAPE, key::BACKSPACE],
+        [9, 13, 27, 127]
+    );
+    // The others, in the private use area, as kitty's own key table numbers them
+    // (0xe000 is escape; enter, tab and backspace take the next three, and these
+    // follow).
+    assert_eq!(
+        [
+            key::INSERT,
+            key::DELETE,
+            key::LEFT,
+            key::RIGHT,
+            key::UP,
+            key::DOWN,
+            key::PAGE_UP,
+            key::PAGE_DOWN,
+            key::HOME,
+            key::END,
+        ],
+        [
+            57348, 57349, 57350, 57351, 57352, 57353, 57354, 57355, 57356, 57357
+        ]
+    );
+    // F13 and F35 are the numbers kitty's protocol publishes; F1 to F12 come before
+    // F13 in the table and are one after the other.
+    assert_eq!(key::function(1), Some(57364));
+    assert_eq!(key::function(12), Some(57375));
+    assert_eq!(key::function(13), Some(57376));
+    assert_eq!(key::function(35), Some(57398));
+    assert_eq!(key::function(0), None);
+    assert_eq!(key::function(36), None);
+    // The modifiers are kitty's bits.
+    assert_eq!(
+        [
+            key::mods::SHIFT,
+            key::mods::ALT,
+            key::mods::CTRL,
+            key::mods::SUPER,
+            key::mods::HYPER,
+            key::mods::META
+        ],
+        [1, 2, 4, 8, 16, 32]
+    );
+}
+
+#[test]
+fn the_kinds_of_driving_go_the_way_their_halves_say() {
+    for (k, from_server) in [
+        (kind::WRITE, false),
+        (kind::READ, false),
+        (kind::WAIT, false),
+        (kind::LABEL, false),
+        (kind::SCREEN_TEXT, true),
+    ] {
+        assert_eq!(k >= 0x80, from_server, "{k:#04x}");
+    }
+}
+
+#[test]
+fn a_write_is_one_list_of_text_and_keys_in_the_order_they_were_made() {
+    // Two keys of the block, each many times and mixed: the order is the order
+    // of the strokes, which the rule that the last entry of a key wins must not
+    // touch.
+    let strokes = vec![
+        Stroke::text("a"),
+        Stroke::key(key::TAB, 0),
+        Stroke::text(vec![0xff, 0x00, 0xfe]), // bytes, not text a reader may refuse
+        Stroke::text(""),
+        Stroke::key(u32::from('x'), key::mods::CTRL | key::mods::ALT),
+        Stroke::text("b"),
+        Stroke::key(key::ENTER, 0),
+    ];
+    let wire = |message: Message| {
+        let mut out = Vec::new();
+        write_packet(&mut out, &work(message)).unwrap();
+        out
+    };
+    let bytes = wire(Message::Write(strokes.clone()));
+    assert_eq!(
+        read_packet(&mut bytes.as_slice()).unwrap(),
+        Some(work(Message::Write(strokes)))
+    );
+
+    // Nothing to do is a block with nothing in it, and reads back as that.
+    let nothing = wire(Message::Write(Vec::new()));
+    assert_eq!(&nothing[3..7], [0, 0, 0, 0]);
+    assert_eq!(
+        read_packet(&mut nothing.as_slice()).unwrap(),
+        Some(work(Message::Write(Vec::new())))
+    );
+
+    // A key the reader does not know is skipped where it stands, and bytes after the
+    // five of a key press are for a later version.
+    let mut block = vec![0, 1, 0, 0, 0, 1, b'a'];
+    block.extend([0x0f, 0xff, 0, 0, 0, 2, 9, 9]); // from the future
+    block.extend([0, 2, 0, 0, 0, 7, 0, 0, 0, 13, 0, 0xde, 0xad]); // Enter, and more
+    block.extend([0, 1, 0, 0, 0, 1, b'b']);
+    let wire = raw(kind::WRITE, 0, "work", &block);
+    assert_eq!(
+        read_packet(&mut wire.as_slice()).unwrap(),
+        Some(work(Message::Write(vec![
+            Stroke::text("a"),
+            Stroke::key(key::ENTER, 0),
+            Stroke::text("b"),
+        ])))
+    );
+
+    // A key press cut short, and an entry cut short, are malformed and cost that
+    // message and nothing after it.
+    let mut stream = raw(kind::WRITE, 0, "work", &[0, 2, 0, 0, 0, 4, 0, 0, 0, 13]);
+    stream.extend(raw(kind::WRITE, 0, "work", &[0, 1, 0, 0, 0, 9, b'a']));
+    stream.extend(fixture("wait"));
+    let mut reader = stream.as_slice();
+    for n in 0..2 {
+        assert!(
+            read_packet(&mut reader).unwrap_err().is_recoverable(),
+            "message {n}"
+        );
+    }
+    assert_eq!(read_packet(&mut reader).unwrap(), Some(work(Message::Wait)));
+}
+
+#[test]
+fn a_read_is_the_rows_on_screen_unless_it_asks_for_more() {
+    // What is not asked is not written: the first request is the empty one.
+    let plain = Capture::default();
+    assert!(!plain.picture && plain.history == 0 && !plain.unwrap);
+    assert_eq!(plain.to_block(), Vec::<u8>::new());
+    assert_eq!(Capture::from_block(&[]).unwrap(), plain);
+
+    // Each key on its own, a key from the future skipped, and a flag byte read by
+    // its first bit alone.
+    let history = Capture::from_block(&[0, 2, 0, 0, 0, 4, 0, 0, 0, 7]).unwrap();
+    assert_eq!(
+        history,
+        with(Capture::default(), |c| {
+            c.history = 7;
+        })
+    );
+    let block = [
+        0x0f,
+        0xff,
+        0,
+        0,
+        0,
+        1,
+        9, // from the future
+        0,
+        1,
+        0,
+        0,
+        0,
+        1,
+        0b1111_1111, // picture, and bits nobody defined
+        0,
+        3,
+        0,
+        0,
+        0,
+        1,
+        0b1111_1110, // no unwrap: bit 0 is clear
+    ];
+    assert_eq!(
+        Capture::from_block(&block).unwrap(),
+        with(Capture::default(), |c| {
+            c.picture = true;
+        })
+    );
+    // A value of the wrong size is malformed.
+    for block in [
+        &[0, 1, 0, 0, 0, 2, 1, 1][..],
+        &[0, 2, 0, 0, 0, 2, 0, 1],
+        &[0, 3, 0, 0, 0, 0],
+    ] {
+        assert!(Capture::from_block(block).is_err(), "{block:?}");
+    }
+    // The request round-trips whole.
+    let all = with(Capture::default(), |c| {
+        c.picture = true;
+        c.history = u32::MAX;
+        c.unwrap = true;
+    });
+    assert_eq!(Capture::from_block(&all.to_block()).unwrap(), all);
+}
+
+#[test]
+fn a_label_is_sixty_four_bytes_at_most_and_an_empty_one_is_none() {
+    let label = |text: &str| work(Message::Label(text.into()));
+    let new = |text: &str| {
+        Packet::connection(Message::New(with(NewSession::default(), |n| {
+            n.label = Some(text.into());
+        })))
+    };
+    let too_long = "x".repeat(v1::MAX_LABEL + 1);
+    let longest = "x".repeat(v1::MAX_LABEL);
+    // Bytes, not characters: 32 two-byte characters fit, 33 do not.
+    let wide = "é".repeat(32);
+    for packet in [label(&longest), label(&wide), new(&longest), new(&wide)] {
+        let mut wire = Vec::new();
+        write_packet(&mut wire, &packet).unwrap();
+        assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(packet));
+    }
+    for packet in [label(&too_long), label(&"é".repeat(33)), new(&too_long)] {
+        assert!(
+            write_packet(&mut Vec::new(), &packet).is_err(),
+            "a sender cannot write {packet:?}"
+        );
+    }
+    // A receiver refuses what it is sent, and the frame after it is read.
+    let mut stream = raw(kind::LABEL, 0, "work", too_long.as_bytes());
+    stream.extend(raw(kind::LABEL, 0, "work", &[0xff, 0xfe])); // not UTF-8
+    let mut entry = vec![0, 7];
+    entry.extend((too_long.len() as u32).to_be_bytes());
+    entry.extend(too_long.as_bytes());
+    stream.extend(raw(kind::NEW, 0, "", &entry));
+    stream.extend(fixture("wait"));
+    let mut reader = stream.as_slice();
+    for n in 0..3 {
+        assert!(
+            read_packet(&mut reader).unwrap_err().is_recoverable(),
+            "message {n}"
+        );
+    }
+    assert_eq!(read_packet(&mut reader).unwrap(), Some(work(Message::Wait)));
+
+    // Empty clears: it is no bytes at all, and a new with an empty label is the
+    // new with none.
+    assert_eq!(&fixture("label_clear")[3..7], [0, 0, 0, 0]);
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &new("")).unwrap();
+    assert_eq!(
+        read_packet(&mut wire.as_slice()).unwrap(),
+        Some(Packet::connection(Message::New(NewSession::default())))
+    );
+    assert_eq!(wire, fixture("new_empty"));
+}
+
+#[test]
+fn a_status_and_a_new_are_read_with_a_label_or_without_one() {
+    // The statuses recorded before labels read as having none, and write the
+    // same bytes: the label is not in them.
+    let Some(Message::StatusReply(old)) = read_packet(&mut fixture("status_reply").as_slice())
+        .unwrap()
+        .map(|packet| packet.message)
+    else {
+        panic!("not a status reply");
+    };
+    assert_eq!(old.label, None);
+    let keys_of =
+        |block: &[u8]| -> Vec<u16> { tlv::entries(block).map(|entry| entry.unwrap().0).collect() };
+    assert!(!keys_of(&old.to_block()).contains(&16));
+
+    // The block with the key appended reads with the label, and one from before
+    // the key is the same as one with no label said.
+    let mut block = old.to_block();
+    block.extend_from_slice(&[0, 16, 0, 0, 0, 5]);
+    block.extend_from_slice(b"tests");
+    let labeled = with(old.clone(), |s| s.label = Some("tests".into()));
+    assert_eq!(Status::from_block(&block).unwrap(), labeled);
+    assert_eq!(Status::from_block(&labeled.to_block()).unwrap(), labeled);
+    // An empty label is none, written as nothing, and the last entry wins.
+    let empty = with(old.clone(), |s| s.label = Some(String::new()));
+    assert_eq!(empty.to_block(), old.to_block());
+    block.extend_from_slice(&[0, 16, 0, 0, 0, 0]);
+    assert_eq!(Status::from_block(&block).unwrap(), old);
+    // A status carries what the server says: a label longer than a client may set
+    // is read, not refused, so one file cannot make a `list` fail.
+    let long = with(old.clone(), |s| s.label = Some("y".repeat(200)));
+    assert_eq!(Status::from_block(&long.to_block()).unwrap(), long);
+    // A label that is not text is malformed.
+    let mut bad = old.to_block();
+    bad.extend_from_slice(&[0, 16, 0, 0, 0, 1, 0xff]);
+    assert!(Status::from_block(&bad).is_err());
+
+    // The same of a `new`: the recorded ones have no label.
+    for name in ["new_empty", "new_full", "new_history"] {
+        let Some(Message::New(new)) = read_packet(&mut fixture(name).as_slice())
+            .unwrap()
+            .map(|packet| packet.message)
+        else {
+            panic!("{name} is not a new");
+        };
+        assert_eq!(new.label, None, "{name}");
+    }
+    // And a list of statuses carries each one's label.
+    let list = Packet::connection(Message::ListReply(vec![
+        running_work(),
+        with(broken_build(), |s| s.label = Some("build".into())),
+    ]));
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &list).unwrap();
+    assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(list));
+}
+
+#[test]
+fn a_screen_text_piece_cannot_outgrow_a_frame_and_may_end_anywhere() {
+    let piece = |data: Vec<u8>| {
+        work(Message::ScreenText {
+            offset: 7,
+            cols: 80,
+            rows: 24,
+            more: true,
+            data,
+        })
+    };
+    let biggest = piece(vec![b'x'; v1::MAX_SCREEN_TEXT]);
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &biggest).unwrap();
+    assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(biggest));
+    assert!(write_packet(&mut Vec::new(), &piece(vec![b'x'; v1::MAX_SCREEN_TEXT + 1])).is_err());
+
+    // The text is the pieces put together; a piece may end in the middle of a
+    // character, so a piece is bytes and not text.
+    let whole = "héllo\nwörld\n".as_bytes();
+    let (first, second) = whole.split_at(2); // between the two bytes of é
+    assert!(std::str::from_utf8(first).is_err());
+    let mut wire = Vec::new();
+    for data in [first.to_vec(), second.to_vec()] {
+        write_packet(&mut wire, &piece(data)).unwrap();
+    }
+    let mut reader = wire.as_slice();
+    let mut text = Vec::new();
+    while let Some(Packet {
+        message: Message::ScreenText { data, .. },
+        ..
+    }) = read_packet(&mut reader).unwrap()
+    {
+        text.extend(data);
+    }
+    assert_eq!(text, whole);
+
+    // A piece with less than its header is malformed.
+    let wire = raw(kind::SCREEN_TEXT, 0, "work", &[0; 12]);
+    assert!(
+        read_packet(&mut wire.as_slice())
+            .unwrap_err()
+            .is_recoverable()
+    );
 }

@@ -1,0 +1,8 @@
+# error about "work": the write was refused because the program has ended
+84                                            # kind 0x84: error
+00                                            # channel 0: terminal session
+04                                            # session id length 4
+00 00 00 17                                   # payload length 23
+77 6f 72 6b                                   # session id "work"
+00 08                                         # code 8: the program has ended
+74 68 65 20 70 72 6f 67 72 61 6d 20 68 61 73 20 65 6e 64 65 64  # text

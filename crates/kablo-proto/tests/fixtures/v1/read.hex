@@ -1,0 +1,6 @@
+# read the rows on screen of "work" as text
+0f                                  # kind 0x0f: read
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 00                         # payload length 0: nothing asked beyond the rows on screen
+77 6f 72 6b                         # session id "work"

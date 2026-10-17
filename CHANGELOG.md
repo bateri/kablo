@@ -55,6 +55,40 @@ section is not released.
 
 ### For apps
 
+- **Protocol: driving a session without attaching.** An app, or a program on the
+  server, can type to a session, read its screen and wait for its program to end
+  from a connection that has not attached, without being counted as attached and
+  without the server stopping to answer the questions the program asks its
+  terminal (`docs/PROTOCOL.md`, section 5, Driving a session without attaching).
+  Added to version 1 and nothing else changed: on the session channel `write`
+  (0x0e: text and keys, a key being a number in the kitty keyboard protocol's
+  numbering with the modifiers held), `read` (0x0f: the screen as text, with
+  scrollback and wrapped rows joined if asked, or as a `picture`) and `wait`
+  (0x10: answered by `ended`, which is not delivery, so the session is kept for
+  the clients that have not been told) from the client, `label` (0x11: set or
+  clear the session's label; the bridge answers it, as it does `new`) and
+  `screen_text` (0x8e: the answer to a text `read`, in pieces with `more`) from
+  the server; in `new` key 7 and in `status` key 16 (`label`, at most 64 bytes of
+  UTF-8, written only when there is one); error code 8 (a `write` to a program that
+  has ended). `picture` can now also answer a `read`, with no `attached` before it.
+  A reader that does not know the kinds skips them, so a relay from before this
+  release answers none of them: an app finds out which relay it has from `status`'s
+  `version`, not from silence. A `status` and a `new` without a label are the bytes
+  they were.
+- **`kablo-proto`: the API for it.** `v1::Message` gains `Write(Vec<Stroke>)`,
+  `Read(Capture)`, `Wait`, `Label(String)` and `ScreenText { offset, cols, rows,
+  more, data }`; `v1::kind` gains `WRITE`, `READ`, `WAIT`, `LABEL` and
+  `SCREEN_TEXT`; `v1::ErrorCode` gains `ENDED`. `v1::Stroke` (not exhaustive: `text`
+  or `key`, made with `Stroke::text` and `Stroke::key`), `v1::Key` (not
+  exhaustive: `code` and `mods`, made with `Key::new`) and `v1::Capture` (not
+  exhaustive: `picture`, `history`, `unwrap`; `to_block` and `from_block`) are new,
+  as is `v1::key` with the numbers of the keys, `key::function(n)` for F1 to F35 and
+  `key::mods` for the modifiers' bits. `v1::Status` and `v1::NewSession` gain the
+  field `label` (`Option<String>`; both are built with their constructors, so this
+  breaks no one that builds them), and `v1::MAX_LABEL` (64) and
+  `v1::MAX_SCREEN_TEXT` are new. A label over `MAX_LABEL` is refused when it is
+  sent and when it is read, in a `label` and in a `new`; a `status` carries what the
+  server says and is read whole.
 - **Protocol: mail.** A program on the server can hand bytes to the app that is
   connected, and get bytes back, with kablo carrying them unread and saying which
   terminal they come from (`docs/PROTOCOL.md`, section 5, Mail). Added to

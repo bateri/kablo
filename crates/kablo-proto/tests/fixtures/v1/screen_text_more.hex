@@ -1,0 +1,10 @@
+# a piece of the text of the screen of "work", cut in the middle of a line, with more to come
+8e                                  # kind 0x8e: screen_text
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 15                         # payload length 21
+77 6f 72 6b                         # session id "work"
+00 00 00 00 00 00 10 00             # offset 4096
+00 50 00 18                         # read from 80 columns, 24 rows
+01                                  # flags: more pieces follow
+24 20 65 63 68 6f 20 68             # the bytes "$ echo h"

@@ -95,7 +95,8 @@ key: u16 | length: u32 | value: length bytes
   the 8-byte `size` and 5-byte `exit` values are fixed layouts and may gain
   bytes at their end.
 - A key may repeat. For a list (`argument`, `environment`) each element is one
-  entry, in order. For any other key the last entry wins.
+  entry, in order. For any other key the last entry wins. In a `write` two keys
+  are one list between them: the order of the entries is the order of the strokes.
 - An entry that runs past the end of the block makes the whole block malformed.
 
 ## 4. Messages
@@ -119,6 +120,10 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x0b | `features` | no | (empty), or a TLV block, below |
 | 0x0c | `ask` | optional | (empty) |
 | 0x0d | `decline` | no | `ticket: u32`, then UTF-8 text |
+| 0x0e | `write` | yes | TLV block, below |
+| 0x0f | `read` | yes | TLV block, below (empty: the rows on screen) |
+| 0x10 | `wait` | yes | (empty) |
+| 0x11 | `label` | yes | UTF-8 text of 0 to 64 bytes (empty clears) |
 | 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated), then optionally `answered: u64` |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
@@ -127,11 +132,12 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x86 | `status_reply` | yes | status TLV block, below |
 | 0x87 | `list_reply` | no | TLV block of `session` entries, below |
 | 0x88 | `created` | yes | status TLV block |
-| 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
+| 0x89 | `picture` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes; follows an `attached`, or answers a `read` |
 | 0x8a | `features_reply` | no | TLV block, below |
 | 0x8b | `state` | yes | TLV block, below |
 | 0x8c | `ask_reply` | optional | TLV block, below |
 | 0x8d | `ticket` | optional | `ticket: u32` |
+| 0x8e | `screen_text` | yes | `offset: u64, cols: u16, rows: u16, flags: u8` (bit 0: more), then the bytes |
 
 The first six client messages (`attach`, `detach`, `resize`, `terminate`,
 `upgrade`, `status`) are the core a relay must always understand.
@@ -149,11 +155,12 @@ at the server's default size.
 | 4 | 8 bytes | `size`: columns, rows, xpixel, ypixel as in `resize`; a size with a zero column or row count means the default (80 by 24) |
 | 5 | u64 | `journal`: the journal's capacity in bytes, from 16 KiB to 1 GiB; the default is 8 MiB |
 | 6 | u32 | `history`: how many rows of scrollback the session's screen keeps, from 0 to 100000; the default is 2000 |
+| 7 | text | `label`: the session's label, at most 64 bytes (below); empty is none |
 
 The command is an argument vector, **never a shell string**, and a server never
 builds a command line out of it. No argument, name, value or directory may
 contain a NUL; a name is not empty and has no `=`; a directory is not empty.
-A `new` that breaks this is malformed. A `journal` or a `history` outside its range is
+A `new` that breaks this, or has a `label` over 64 bytes or that is not UTF-8, is malformed. A `journal` or a `history` outside its range is
 answered with `error` (`BAD_REQUEST`) and starts nothing.
 
 The session id in the header is the name asked for; a header with no id lets
@@ -182,6 +189,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 13 | u8 | `secret`: as in `state`; written only when set |
 | 14 | bytes | `remote`: as in `state` |
 | 15 | u16 | `remote_port`: as in `state` |
+| 16 | text | `label`: the session's label, written only when it has one (below) |
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
 A status takes in what the session's connections had sent by the time the
@@ -289,6 +297,78 @@ with an `open` that carries the number (Stream messages, below) or with
 `decline`, which names the ticket it refuses and gives text in the client's own
 words, for a person, who sees it with control characters removed.
 
+### write, read, wait, label and screen_text
+
+The messages for driving a session from a connection that has not attached
+(section 5, Driving a session without attaching).
+
+**`write`** is a TLV block that is a list of strokes, an entry for each, in the
+order they are made:
+
+| key | value | meaning |
+|---|---|---|
+| 1 | bytes | `text`: typed as it is. A terminal takes it as UTF-8 text; a reader does not look inside it, and nothing in it is a key's name |
+| 2 | 5 bytes | `key`: `code: u32, modifiers: u8`, a key pressed. A reader reads the five and ignores bytes after them |
+
+A `key` is a number, not a name: the names (`enter`, `ctrl+c`) are for people and
+belong to the command that takes them. The numbers are those of the kitty keyboard
+protocol. A key that types a character is that character's Unicode code point as
+the key makes it with no modifier held (99 for the key that types `c`, which with
+the shift bit is `C`). A key that types none has the one number kitty gives it:
+
+| key | number |
+|---|---|
+| Tab, Enter, Escape, Backspace | 9, 13, 27, 127 |
+| Insert, Delete | 57348, 57349 |
+| Left, Right, Up, Down | 57350, 57351, 57352, 57353 |
+| Page up, Page down, Home, End | 57354, 57355, 57356, 57357 |
+| F1 to F35 | 57364 to 57398 (F1 is 57364, F13 is 57376) |
+
+The modifiers are bits, as kitty numbers them: 1 shift, 2 alt, 4 control, 8 super,
+16 hyper, 32 meta (64 and 128, the lock keys, are carried and not looked at).
+Every other control character is no key. A server turns each key into the bytes
+the terminal would send for it in the modes it is in when the `write` is served
+(arrow keys in the normal or the application form, the kitty keyboard flags the
+program has set), and the numbers it can press are its own: one it cannot is
+answered with `error` (`BAD_REQUEST`) and nothing of the `write` is typed. Keys
+and text in one `write` are typed in order, with nothing of any other connection's
+input between them. A `write` with no entries types nothing.
+
+**`read`** is a TLV block. Every key is optional and an absent one reads as zero,
+so an empty payload asks for the text of the rows on screen:
+
+| key | value | meaning |
+|---|---|---|
+| 1 | u8 | `picture`: bit 0 is set to ask for the screen as the bytes that build it (`picture` messages, as for an `attach` that asks for one) in place of text; `history` and `unwrap` then say nothing |
+| 2 | u32 | `history`: how many rows of scrollback to put above the rows on screen: the most recent this many, or all there are if fewer |
+| 3 | u8 | `unwrap`: bit 0 is set to join the rows the terminal wrapped into the line the program wrote |
+
+The answer is `screen_text`, or, for a `picture` read, a `picture`. Both carry
+the `offset` of the program's output the screen is of (what the program had
+written when the screen was read) and the size of the terminal it was read from.
+A `picture` that answers a `read` has no `attached` before it, and the stream does
+not go on from its offset: nothing is streamed to a connection that has not
+attached. The text is one or more `screen_text` pieces in order, all with the same
+`offset`, `cols` and `rows`; every one but the last has `more` set. Put together
+they are the lines, scrollback first, each ended by a line feed (so no text is no
+lines, and a blank row is a line feed alone). A piece may end anywhere, in the
+middle of a line or of a character: read the text when the last piece is in. The
+rows of an alternate screen are the ones on it, and a trailing run of blank rows is
+there like any other, which is for the reader to drop.
+
+**`wait`** has no payload. It is answered by `ended` (section 5).
+
+**`label`** carries the label as UTF-8 text and no more. A label is a name for a
+person to find a session by: free text of at most 64 bytes (bytes, not characters;
+a longer one, or one that is not UTF-8, is malformed), and an empty one clears
+it. A client that shows a label to a person removes control characters first. Like
+`new`, `label` is a request to the bridge, which keeps the label with the session
+and answers nothing when it is done (`error` when it could not be); a session's own
+socket answers it `BAD_REQUEST`. A session's label is in its `status` (key 16) and
+in `list_reply`, and in the `new` that makes the session (key 7); it is the
+session's for as long as the session is there, and a new session with the id of one
+that is gone does not have the old one's.
+
 ### error codes
 
 | code | meaning |
@@ -299,7 +379,8 @@ words, for a person, who sees it with control characters removed.
 | 4 | the connection is not attached to the session |
 | 5 | the relay could not be replaced; the old one keeps serving |
 | 6 | the session cannot be served right now |
-| 7 | an `input` was not written: the program is not taking what was typed before it |
+| 7 | an `input` or a `write` was not written: the program is not taking what was typed before it |
+| 8 | a `write` was not written: the program has ended |
 
 A code a reader has no name for is still a valid error. The text is for logs: a
 client that shows it to a person removes control characters first.
@@ -432,7 +513,8 @@ the bytes left the journal, or because of bit 1 of the view's flags. It says the
 bytes asked for are not coming and a picture is.
 
 A picture is one or more `picture` messages, in order, all with the same
-`offset`, `cols` and `rows`; every one but the last has `more` set. A client
+`offset`, `cols` and `rows`; every one but the last has `more` set. (A `read` can
+ask for one too, with no `attached`; the section on driving a session says how.) A client
 resets its terminal before the first piece and writes the bytes as they are.
 An `attached` that arrives before the last piece starts everything over: the
 connection the picture was coming over was replaced, and the picture is
@@ -584,7 +666,7 @@ once the program reads.
 **A session's socket.** Each session has a socket of its own and a connection
 to it speaks about that one session: a message naming another session is
 answered with `UNKNOWN_SESSION`, a `list` lists that session alone, and a
-`new` is `BAD_REQUEST`. A `session` field left empty on a message that takes
+`new` or a `label` is `BAD_REQUEST`. A `session` field left empty on a message that takes
 one means the session of the socket.
 
 **Through the bridge.** A client on another machine does not connect to a
@@ -595,8 +677,9 @@ once, each message naming its session in the frame header. The bridge
 what comes back to the client, and answers four things itself because they
 are about the connection: `ping` (a `pong` with the same bytes), `list` (it asks
 every session for its status and replies with the sessions that answered),
-`new` (it starts the session and replies `created` with its status) and
-`features` (a `features_reply`, at once).
+`new` (it starts the session and replies `created` with its status), `label` (it
+sets or clears the label of the session) and `features` (a `features_reply`, at
+once). `write`, `read` and `wait` it forwards to the session.
 
 - A `list` leaves out a socket nobody listens on (a session that was killed
   leaves its file behind) and reports a socket that takes connections but never
@@ -735,6 +818,41 @@ it lasts as long as the program does and no longer than the connection.
 - *The administrator.* The switch that turns streams off (section 5, Streams)
   does not touch commands: a person who can log in can run a program.
 
+**Driving a session without attaching.** A program or a person on the server can
+type to a session, read its screen and wait for its program to end without
+attaching to it: `write`, `read` and `wait` are served to a connection that has
+not sent `attach`, and a connection that sends them is not counted as attached (it
+is not in `clients` of `status`, it is sent no `output`, no `state`, and it does
+not stand in for a client's terminal). Nothing about the session changes because
+one is there: while no client is attached the server goes on answering the
+questions the program asks its terminal, whoever is driving it, and a client that
+attaches meanwhile answers its own as always (section 5, Questions nobody
+answers).
+
+- *Typing.* `write` types its strokes, in order, as one piece, under the limit of
+  `input` and in the same way: all of it is queued or, with `INPUT_FULL`, none of
+  it. A program that has ended is answered `ENDED`, not silently. Nothing is said
+  when it was taken. A sender that wants to know sends a `ping` after it, naming
+  the same session, and its `pong` comes after the `error` the `write` has, if it
+  has one: a `pong` with no `error` before it says the keys were queued for the
+  program. A `write` is sent **at most once**: a connection that is lost before
+  the `pong` leaves the sender not knowing whether it arrived, and sending it
+  again would press the keys twice, so the sender says that and does not.
+- *Reading.* `read` is a question like `status`, answered after everything the
+  program has written that the server has read so far, so the text is of the
+  screen as of the answer and the `offset` says which. It never changes the screen
+  or what the server tells a client.
+- *Waiting.* `wait` is answered with `ended` once the program has ended and the
+  last of what it wrote has reached the screen, so a `read` that follows sees the
+  end of the output; when the program ended already, at once. It is the same
+  `ended` that an attached client is sent, and hearing it is not delivery: the
+  session is kept for the clients that have not been told, as in Ending, so a
+  `wait` never ends a session and a terminal app showing the pane still learns the
+  program ended. A `wait` is held for as long as the program runs, takes one of the
+  session's 64 connections, and is not repeated by the server: a connection lost
+  while it waits (a relay replaced by `upgrade` is one) leaves the sender to ask
+  again, which the bridge does for the client that asked through it.
+
 **Mail.** A program on the server can hand bytes to the app that is connected
 to the server, and get bytes back; kablo carries them without looking at them and
 says which terminal they come from. What the bytes mean is between the program
@@ -804,6 +922,9 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
 | scrollback of the screen (`new`) | 0 to 100000 rows, 2000 by default |
 | terminal size (`new`, `resize`, an `attach` view) | at most 1000 columns by 1000 rows; more is `BAD_REQUEST` |
 | bytes in one `picture` | 1 MiB minus 13 bytes |
+| bytes in one `screen_text` | 1 MiB minus 13 bytes |
+| a `write` | one frame, 1 MiB; the bytes it comes to count against the input waiting for the program |
+| a label | 64 bytes |
 | connections to one session | 64 |
 | input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |

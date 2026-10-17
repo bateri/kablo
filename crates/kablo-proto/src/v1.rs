@@ -51,6 +51,17 @@ pub mod kind {
     pub const ASK: u8 = 0x0c;
     /// `decline`: refuse a ticket.
     pub const DECLINE: u8 = 0x0d;
+    /// `write`: text and keys for the program, from a connection that is not
+    /// attached.
+    pub const WRITE: u8 = 0x0e;
+    /// `read`: ask for the screen as text or as a picture, from a connection
+    /// that is not attached.
+    pub const READ: u8 = 0x0f;
+    /// `wait`: ask to be told when the program ends, from a connection that is
+    /// not attached.
+    pub const WAIT: u8 = 0x10;
+    /// `label`: set a session's label, or clear it.
+    pub const LABEL: u8 = 0x11;
     /// `attached`: the answer to `attach`.
     pub const ATTACHED: u8 = 0x81;
     /// `output`: bytes from the program.
@@ -77,6 +88,8 @@ pub mod kind {
     pub const ASK_REPLY: u8 = 0x8c;
     /// `ticket`: bytes are waiting for the client.
     pub const TICKET: u8 = 0x8d;
+    /// `screen_text`: a piece of the screen as text, the answer to `read`.
+    pub const SCREEN_TEXT: u8 = 0x8e;
 }
 
 /// The name of a message kind, for diagnostics (`"unknown"` for a kind this
@@ -96,6 +109,10 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::FEATURES => "features",
         kind::ASK => "ask",
         kind::DECLINE => "decline",
+        kind::WRITE => "write",
+        kind::READ => "read",
+        kind::WAIT => "wait",
+        kind::LABEL => "label",
         kind::ATTACHED => "attached",
         kind::OUTPUT => "output",
         kind::ENDED => "ended",
@@ -109,6 +126,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::STATE => "state",
         kind::ASK_REPLY => "ask_reply",
         kind::TICKET => "ticket",
+        kind::SCREEN_TEXT => "screen_text",
         _ => "unknown",
     }
 }
@@ -121,6 +139,12 @@ pub const MAX_OUTPUT: usize = MAX_PAYLOAD - 8;
 
 /// The most bytes of a screen's picture one `picture` message can carry.
 pub const MAX_PICTURE: usize = MAX_PAYLOAD - 13;
+
+/// The most bytes of a screen's text one `screen_text` message can carry.
+pub const MAX_SCREEN_TEXT: usize = MAX_PAYLOAD - 13;
+
+/// The longest label a session can be given, in bytes.
+pub const MAX_LABEL: usize = 64;
 
 /// The most columns and rows a session's terminal can be given. The relay's
 /// screen holds every cell of it twice (two screens), so a size is memory, and
@@ -303,11 +327,263 @@ impl ErrorCode {
     pub const UPGRADE_FAILED: ErrorCode = ErrorCode(5);
     /// The session cannot be served right now.
     pub const UNAVAILABLE: ErrorCode = ErrorCode(6);
-    /// An `input` was not written: the program is not reading what was typed
-    /// before it, and these bytes would go past what the session holds for it.
-    /// None of the message was taken; the connection and every other request
-    /// are unaffected.
+    /// An `input` or a `write` was not written: the program is not reading what
+    /// was typed before it, and these bytes would go past what the session holds
+    /// for it. None of the message was taken; the connection and every other
+    /// request are unaffected.
     pub const INPUT_FULL: ErrorCode = ErrorCode(7);
+    /// A `write` was not written because the program has ended: there is nothing
+    /// to type to.
+    pub const ENDED: ErrorCode = ErrorCode(8);
+}
+
+/// The numbers of the keys a `write` can press and of the modifiers held with
+/// them, in the numbering of the kitty keyboard protocol.
+///
+/// A key that types a character is that character's Unicode code point, as the
+/// key makes it with no modifier held (`a` for the key that types `a` and, with
+/// [`mods::SHIFT`], `A`). A key that types none has the number kitty gives it:
+/// the four whose number kitty's protocol writes in its sequences ([`TAB`],
+/// [`ENTER`], [`ESCAPE`], [`BACKSPACE`]) and, for the function keys and the
+/// others kitty writes in older forms (the arrows, [`HOME`], [`INSERT`], ...), the
+/// number kitty gives them in the private use area. Each key has the one number,
+/// and the other control characters are no keys. Which of the numbers a server
+/// can press is the server's: it answers `BAD_REQUEST` to one it cannot.
+pub mod key {
+    /// Tab.
+    pub const TAB: u32 = 9;
+    /// Enter (return).
+    pub const ENTER: u32 = 13;
+    /// Escape.
+    pub const ESCAPE: u32 = 27;
+    /// Backspace.
+    pub const BACKSPACE: u32 = 127;
+    /// Insert.
+    pub const INSERT: u32 = 0xe004;
+    /// Delete (forward).
+    pub const DELETE: u32 = 0xe005;
+    /// Left arrow.
+    pub const LEFT: u32 = 0xe006;
+    /// Right arrow.
+    pub const RIGHT: u32 = 0xe007;
+    /// Up arrow.
+    pub const UP: u32 = 0xe008;
+    /// Down arrow.
+    pub const DOWN: u32 = 0xe009;
+    /// Page up.
+    pub const PAGE_UP: u32 = 0xe00a;
+    /// Page down.
+    pub const PAGE_DOWN: u32 = 0xe00b;
+    /// Home.
+    pub const HOME: u32 = 0xe00c;
+    /// End.
+    pub const END: u32 = 0xe00d;
+
+    /// The number of function key `n`, from F1 to F35 (`None` for another `n`).
+    pub const fn function(n: u8) -> Option<u32> {
+        match n {
+            1..=35 => Some(0xe013 + n as u32),
+            _ => None,
+        }
+    }
+
+    /// The modifiers held with a key, one bit each, as the kitty protocol numbers
+    /// them. A server looks at these six; the bits kitty gives the lock keys
+    /// (64 and 128) are carried and not looked at.
+    pub mod mods {
+        /// Shift.
+        pub const SHIFT: u8 = 1;
+        /// Alt (option).
+        pub const ALT: u8 = 2;
+        /// Control.
+        pub const CTRL: u8 = 4;
+        /// Super (command, the logo key).
+        pub const SUPER: u8 = 8;
+        /// Hyper.
+        pub const HYPER: u8 = 16;
+        /// Meta.
+        pub const META: u8 = 32;
+    }
+}
+
+/// A key pressed, with the modifiers held: what a server turns into the bytes a
+/// terminal in its present modes would send for it (see [`key`] for the numbers).
+///
+/// Not exhaustive, so that a field can be added (the kitty protocol has more to
+/// say of a key press than this) without breaking whoever builds one: start from
+/// [`Key::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Key {
+    /// The key's number ([`key`]).
+    pub code: u32,
+    /// The modifiers held, as the bits of [`key::mods`] or-ed together.
+    pub mods: u8,
+}
+
+impl Key {
+    /// Bytes on the wire: the number and the modifiers.
+    const LEN: usize = 5;
+
+    /// The key of this number with these modifiers held.
+    pub fn new(code: u32, mods: u8) -> Key {
+        Key { code, mods }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.code.to_be_bytes());
+        out.push(self.mods);
+    }
+
+    fn read(fields: &mut Fields<'_>) -> Result<Key> {
+        Ok(Key {
+            code: fields.u32()?,
+            mods: fields.u8()?,
+        })
+    }
+}
+
+/// One thing a `write` does: type text, or press a key.
+///
+/// Not exhaustive, so that a way of typing can be added without breaking whoever
+/// matches on this: end a `match` with an arm for the ones it does not handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stroke {
+    /// Type these bytes as they are (text a terminal takes as UTF-8; nothing in
+    /// it is a key's name or is looked at).
+    Text(Vec<u8>),
+    /// Press this key.
+    Key(Key),
+}
+
+impl Stroke {
+    /// A stroke that types text.
+    pub fn text(text: impl Into<Vec<u8>>) -> Stroke {
+        Stroke::Text(text.into())
+    }
+
+    /// A stroke that presses the key of this number with these modifiers held.
+    pub fn key(code: u32, mods: u8) -> Stroke {
+        Stroke::Key(Key::new(code, mods))
+    }
+}
+
+mod write_key {
+    pub const TEXT: u16 = 1;
+    pub const KEY: u16 = 2;
+}
+
+/// The wire form of a `write`: a [`tlv`] block that is **one list**, an entry for
+/// each stroke in the order they are made, text under one key and a key press
+/// under the other.
+fn strokes_to_block(strokes: &[Stroke]) -> Vec<u8> {
+    let mut w = tlv::Writer::new();
+    for stroke in strokes {
+        match stroke {
+            Stroke::Text(text) => {
+                w.put(write_key::TEXT, text);
+            }
+            Stroke::Key(key) => {
+                let mut bytes = Vec::with_capacity(Key::LEN);
+                key.write(&mut bytes);
+                w.put(write_key::KEY, &bytes);
+            }
+        }
+    }
+    w.finish()
+}
+
+/// Reads the wire form of a `write`; an entry of a key this version does not
+/// know is skipped.
+fn strokes_from_block(block: &[u8]) -> Result<Vec<Stroke>> {
+    let mut strokes = Vec::new();
+    for entry in tlv::entries(block) {
+        let (key, value) = entry?;
+        match key {
+            write_key::TEXT => strokes.push(Stroke::Text(value.to_vec())),
+            write_key::KEY => strokes.push(Stroke::Key(Key::read(&mut Fields::new(
+                value,
+                "write key",
+            ))?)),
+            _ => {}
+        }
+    }
+    Ok(strokes)
+}
+
+/// What a `read` asks for. Every field is optional: an empty request asks for
+/// the text of the rows on screen.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from `Capture::default()` and set the fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Capture {
+    /// The screen as the bytes that build it (`picture` messages, as an `attach`
+    /// that asks for a picture is answered) in place of its text. `history` and
+    /// `unwrap` say nothing of it: a picture holds the scrollback the session
+    /// keeps.
+    pub picture: bool,
+    /// How many rows of scrollback to put above the rows on screen: the most
+    /// recent this many, or all there are if there are fewer. 0 is none.
+    pub history: u32,
+    /// Join the rows the terminal wrapped into the line the program wrote, so a
+    /// line ends where the program ended it and not at the terminal's width.
+    pub unwrap: bool,
+}
+
+mod capture_key {
+    pub const PICTURE: u16 = 1;
+    pub const HISTORY: u16 = 2;
+    pub const UNWRAP: u16 = 3;
+}
+
+impl Capture {
+    /// The wire form, a [`tlv`] block with the keys in ascending order; a field
+    /// at its zero is not written, so a request for the rows on screen is empty.
+    pub fn to_block(&self) -> Vec<u8> {
+        let mut w = tlv::Writer::new();
+        if self.picture {
+            w.put_u8(capture_key::PICTURE, 1);
+        }
+        if self.history != 0 {
+            w.put_u32(capture_key::HISTORY, self.history);
+        }
+        if self.unwrap {
+            w.put_u8(capture_key::UNWRAP, 1);
+        }
+        w.finish()
+    }
+
+    /// Reads the wire form. Every key is optional and reads as zero when absent;
+    /// one that is unknown is skipped.
+    pub fn from_block(block: &[u8]) -> Result<Capture> {
+        let mut capture = Capture::default();
+        for entry in tlv::entries(block) {
+            let (key, value) = entry?;
+            match key {
+                capture_key::PICTURE => {
+                    capture.picture = tlv::read_u8(value, "read picture")? & 1 != 0
+                }
+                capture_key::HISTORY => capture.history = tlv::read_u32(value, "read history")?,
+                capture_key::UNWRAP => {
+                    capture.unwrap = tlv::read_u8(value, "read unwrap")? & 1 != 0
+                }
+                _ => {}
+            }
+        }
+        Ok(capture)
+    }
+}
+
+/// A label is at most [`MAX_LABEL`] bytes: refused by whoever sends one longer and
+/// by whoever reads one, so a sender cannot produce what a receiver refuses.
+fn check_label(label: &str) -> Result<()> {
+    if label.len() > MAX_LABEL {
+        return Err(Error::Malformed("label"));
+    }
+    Ok(())
 }
 
 /// What a `new` asks for. Every field is optional: an empty request starts
@@ -332,6 +608,8 @@ pub struct NewSession {
     /// How many rows of scrollback the session's screen keeps, up to
     /// [`MAX_HISTORY`] ([`DEFAULT_HISTORY`] when not said).
     pub history: Option<u32>,
+    /// The session's label, at most [`MAX_LABEL`] bytes; an empty one is none.
+    pub label: Option<String>,
 }
 
 mod new_key {
@@ -341,12 +619,14 @@ mod new_key {
     pub const SIZE: u16 = 4;
     pub const JOURNAL_SIZE: u16 = 5;
     pub const HISTORY: u16 = 6;
+    pub const LABEL: u16 = 7;
 }
 
 impl NewSession {
     /// Nothing that ends up in a `CString` may hold a NUL, a variable's name
-    /// is non-empty and has no `=`, and a directory is not empty. Checked on
-    /// both ends, so a sender cannot even produce what a receiver refuses.
+    /// is non-empty and has no `=`, a directory is not empty and a label is
+    /// not longer than [`MAX_LABEL`]. Checked on both ends, so a sender cannot
+    /// even produce what a receiver refuses.
     fn check(&self) -> Result<()> {
         let clean = |b: &[u8]| !b.contains(&0);
         if !self.argv.iter().all(|a| clean(a)) {
@@ -361,6 +641,9 @@ impl NewSession {
         }
         if self.cwd.as_ref().is_some_and(|c| c.is_empty() || !clean(c)) {
             return Err(Error::Malformed("cwd"));
+        }
+        if let Some(label) = &self.label {
+            check_label(label)?;
         }
         Ok(())
     }
@@ -391,6 +674,9 @@ impl NewSession {
         if let Some(rows) = self.history {
             w.put_u32(new_key::HISTORY, rows);
         }
+        if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
+            w.put(new_key::LABEL, label.as_bytes());
+        }
         Ok(w.finish())
     }
 
@@ -410,6 +696,9 @@ impl NewSession {
                     new.journal_size = Some(tlv::read_u64(value, "journal size")?)
                 }
                 new_key::HISTORY => new.history = Some(tlv::read_u32(value, "history")?),
+                new_key::LABEL => {
+                    new.label = Some(tlv::read_text(value, "label")?).filter(|l| !l.is_empty())
+                }
                 _ => {}
             }
         }
@@ -462,6 +751,11 @@ pub struct Status {
     pub remote: Option<Vec<u8>>,
     /// What [`TerminalState::remote_port`] says.
     pub remote_port: Option<u16>,
+    /// The session's label: a name a person or a program gave it, that can be
+    /// changed (`None` when it has none, and for a server from before labels).
+    /// A server writes at most [`MAX_LABEL`] bytes of it; a client that shows it
+    /// to a person removes control characters first.
+    pub label: Option<String>,
 }
 
 mod status_key {
@@ -480,6 +774,7 @@ mod status_key {
     pub const SECRET: u16 = 13;
     pub const REMOTE: u16 = 14;
     pub const REMOTE_PORT: u16 = 15;
+    pub const LABEL: u16 = 16;
 }
 
 impl Status {
@@ -501,13 +796,14 @@ impl Status {
             secret: false,
             remote: None,
             remote_port: None,
+            label: None,
         }
     }
 
     /// The wire form, a [`tlv`] block with the keys in ascending order. What
-    /// the terminal's state adds (`secret`, `remote`, `remote_port`) is written
-    /// only when there is something to say, so a session with none of it and
-    /// a status from before the keys existed are the same bytes.
+    /// the terminal's state adds (`secret`, `remote`, `remote_port`) and the
+    /// label are written only when there is something to say, so a session with
+    /// none of it and a status from before the keys existed are the same bytes.
     pub fn to_block(&self) -> Vec<u8> {
         let mut w = tlv::Writer::new();
         w.put(status_key::ID, self.id.as_str().as_bytes());
@@ -542,6 +838,9 @@ impl Status {
         }
         if let Some(port) = self.remote_port {
             w.put_u16(status_key::REMOTE_PORT, port);
+        }
+        if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
+            w.put(status_key::LABEL, label.as_bytes());
         }
         w.finish()
     }
@@ -583,6 +882,10 @@ impl Status {
                 status_key::REMOTE => status.remote = Some(value.to_vec()),
                 status_key::REMOTE_PORT => {
                     status.remote_port = Some(tlv::read_u16(value, "status remote port")?)
+                }
+                status_key::LABEL => {
+                    status.label =
+                        Some(tlv::read_text(value, "status label")?).filter(|l| !l.is_empty())
                 }
                 _ => {}
             }
@@ -1025,6 +1328,28 @@ pub enum Message {
         /// characters removed.
         text: String,
     },
+    /// Client to server: type these strokes into the program, in order, from a
+    /// connection that has not attached and is not counted as attached. The
+    /// server turns each key into the bytes the terminal would send for it in its
+    /// modes now and queues everything as one piece, as an `input` (all of it or,
+    /// with `INPUT_FULL`, none; `ENDED` when the program has ended). Nothing is
+    /// said when it was taken: a `ping` sent after it is answered after its error,
+    /// if it has one.
+    Write(Vec<Stroke>),
+    /// Client to server: ask for the screen from a connection that has not
+    /// attached. Answered by one or more `ScreenText`, or by a `Picture` for one
+    /// that asks for it.
+    Read(Capture),
+    /// Client to server: ask to be told when the program ends, from a connection
+    /// that has not attached. Answered by `Ended` once the program has ended and
+    /// the last of what it wrote is on the screen (at once when it already has).
+    /// Hearing of the end this way is not the end having been told to the
+    /// session's clients: the session is kept for them as it always was.
+    Wait,
+    /// Client to server: the label of the session, replaced by this text, or
+    /// cleared when it is empty (at most [`MAX_LABEL`] bytes). The bridge answers
+    /// it, as it does `New`; nothing is said when it was done.
+    Label(String),
     /// Server to client: the stream starts at `offset`; `truncated` says the
     /// bytes the client asked for are not coming and a picture is, because they
     /// had left the journal or held a question the server answered (see
@@ -1094,8 +1419,9 @@ pub enum Message {
     /// from none.
     Ticket(u32),
     /// Server to client: a piece of the screen as the bytes that build it. A
-    /// picture follows an `Attached` and is one or more pieces in order, the
-    /// last without `more`; the `Output` after it starts at `offset`.
+    /// picture follows an `Attached` (or answers a `Read` that asks for one, with
+    /// no `Attached` before it) and is one or more pieces in order, the last
+    /// without `more`; the `Output` after it, if there is one, starts at `offset`.
     Picture {
         /// The offset of the program's output the picture is of: the stream
         /// goes on from it.
@@ -1107,6 +1433,24 @@ pub enum Message {
         /// More pieces of this picture follow.
         more: bool,
         /// The bytes, to be written to a freshly reset terminal in order.
+        data: Vec<u8>,
+    },
+    /// Server to client: a piece of the screen as text, the answer to a `Read`.
+    /// The text is one or more pieces in order, all with the same `offset`, `cols`
+    /// and `rows`, the last without `more`. Put together they are the lines, each
+    /// ended by a line feed, and a piece may end anywhere, in the middle of a
+    /// line or of a character: the text is read once it is all there.
+    ScreenText {
+        /// The offset of the program's output the text is of: what it has written
+        /// by the time the screen was read.
+        offset: u64,
+        /// The columns of the terminal the text was read from.
+        cols: u16,
+        /// The rows of the terminal the text was read from.
+        rows: u16,
+        /// More pieces of this text follow.
+        more: bool,
+        /// The bytes of this piece.
         data: Vec<u8>,
     },
 }
@@ -1135,6 +1479,10 @@ impl Message {
             Message::Features | Message::FeaturesWith(_) => kind::FEATURES,
             Message::Ask => kind::ASK,
             Message::Decline { .. } => kind::DECLINE,
+            Message::Write(_) => kind::WRITE,
+            Message::Read(_) => kind::READ,
+            Message::Wait => kind::WAIT,
+            Message::Label(_) => kind::LABEL,
             Message::Attached { .. } => kind::ATTACHED,
             Message::Output { .. } => kind::OUTPUT,
             Message::Ended(_) => kind::ENDED,
@@ -1148,6 +1496,7 @@ impl Message {
             Message::TerminalState(_) => kind::STATE,
             Message::AskReply(_) => kind::ASK_REPLY,
             Message::Ticket(_) => kind::TICKET,
+            Message::ScreenText { .. } => kind::SCREEN_TEXT,
         }
     }
 
@@ -1157,7 +1506,14 @@ impl Message {
             | Message::Status
             | Message::List
             | Message::Features
+            | Message::Wait
             | Message::Ask => Vec::new(),
+            Message::Write(strokes) => strokes_to_block(strokes),
+            Message::Read(capture) => capture.to_block(),
+            Message::Label(label) => {
+                check_label(label)?;
+                label.as_bytes().to_vec()
+            }
             Message::FeaturesWith(offers) => offers.to_block(),
             Message::Decline { ticket, text } => {
                 let mut out = ticket.to_be_bytes().to_vec();
@@ -1228,6 +1584,24 @@ impl Message {
                 out.extend_from_slice(data);
                 out
             }
+            Message::ScreenText {
+                offset,
+                cols,
+                rows,
+                more,
+                data,
+            } => {
+                if data.len() > MAX_SCREEN_TEXT {
+                    return Err(Error::Malformed("screen text"));
+                }
+                let mut out = Vec::with_capacity(13 + data.len());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out.extend_from_slice(&cols.to_be_bytes());
+                out.extend_from_slice(&rows.to_be_bytes());
+                out.push(u8::from(*more));
+                out.extend_from_slice(data);
+                out
+            }
             Message::StatusReply(status) | Message::Created(status) => status.to_block(),
             Message::FeaturesReply(features) => features.to_block(),
             Message::TerminalState(state) => state.to_block(),
@@ -1285,6 +1659,14 @@ impl Message {
                 _ => Message::Features,
             },
             kind::ASK => Message::Ask,
+            kind::WRITE => Message::Write(strokes_from_block(payload)?),
+            kind::READ => Message::Read(Capture::from_block(payload)?),
+            kind::WAIT => Message::Wait,
+            kind::LABEL => {
+                let label = tlv::read_text(payload, "label")?;
+                check_label(&label)?;
+                Message::Label(label)
+            }
             kind::DECLINE => Message::Decline {
                 ticket: f.u32()?,
                 text: String::from_utf8_lossy(f.rest()).into_owned(),
@@ -1332,6 +1714,13 @@ impl Message {
             kind::ASK_REPLY => Message::AskReply(Standing::from_block(payload)?),
             kind::TICKET => Message::Ticket(f.u32()?),
             kind::PICTURE => Message::Picture {
+                offset: f.u64()?,
+                cols: f.u16()?,
+                rows: f.u16()?,
+                more: f.u8()? & 1 != 0,
+                data: f.rest().to_vec(),
+            },
+            kind::SCREEN_TEXT => Message::ScreenText {
                 offset: f.u64()?,
                 cols: f.u16()?,
                 rows: f.u16()?,
