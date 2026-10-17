@@ -78,13 +78,13 @@ impl Watch {
             program = name_of(pid);
         }
         let remote = self.remote_of(pid, program.as_deref());
-        TerminalState {
-            cwd: cwd_of(pid),
-            secret: sys::hides_typing(master),
-            remote_port: remote.as_ref().and_then(|remote| remote.port),
-            remote: remote.map(|remote| remote.host),
-            program,
-        }
+        let mut state = TerminalState::default();
+        state.cwd = cwd_of(pid);
+        state.secret = sys::hides_typing(master);
+        state.remote_port = remote.as_ref().and_then(|remote| remote.port);
+        state.remote = remote.map(|remote| remote.host);
+        state.program = program;
+        state
     }
 
     /// The remote session process `pid`, named `name`, is, if it is one. What

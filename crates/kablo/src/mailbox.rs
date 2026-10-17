@@ -265,6 +265,9 @@ impl Sender {
                 })) => events.push(Event::Stream(packet)),
                 // Messages of the server's kind come from nobody here.
                 Ok(Some(Incoming::Stream { .. })) => {}
+                // A channel this version does not have: skipped, as the decoder
+                // skips a frame it cannot read.
+                Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) if e.is_recoverable() => {
                     self.send(&failure(None, ErrorCode::BAD_REQUEST, "malformed message"))

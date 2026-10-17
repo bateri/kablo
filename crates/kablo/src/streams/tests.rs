@@ -962,10 +962,7 @@ fn a_closed_stream_takes_its_queued_frames_with_it() {
 // --- programs ------------------------------------------------------------------
 
 fn command(argv: &[&str]) -> Command {
-    Command {
-        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-        ..Command::default()
-    }
+    Command::new(argv.iter().map(|a| a.as_bytes().to_vec()).collect())
 }
 
 fn sh(script: &str) -> Command {

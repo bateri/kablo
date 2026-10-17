@@ -179,7 +179,12 @@ impl Size {
 }
 
 /// How a client looks at the session it attaches to.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one (the wire form keeps room for more flags): start from [`View::new`] and
+/// set the fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct View {
     /// The client's terminal. The session's terminal takes this size before
     /// anything is sent, so a picture of the screen is made for it. A size
@@ -200,6 +205,15 @@ pub struct View {
 impl View {
     /// Bytes on the wire.
     const LEN: usize = Size::LEN + 1;
+
+    /// A view of a terminal of this `size` that asks for neither of the pictures.
+    pub fn new(size: Size) -> View {
+        View {
+            size,
+            picture: false,
+            picture_if_answered: false,
+        }
+    }
 
     /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
     /// picture if answered).
@@ -585,7 +599,11 @@ impl Status {
 /// Nothing in it comes from the program's arguments except the target of a
 /// remote session; the rest of a command line, and the environment, never
 /// leave the server.
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from `TerminalState::default()` and set the fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TerminalState {
     /// The name of the program in the terminal's foreground (as
     /// [`Status::program`]).
@@ -938,7 +956,14 @@ impl Standing {
 const LISTED: u16 = 1;
 
 /// A message, without the session it concerns (see [`Packet`]).
+///
+/// Not exhaustive, so that a message can be added without breaking whoever
+/// matches on this: end a `match` with an arm for the messages it does not
+/// handle. (A reader skips a message of a kind it does not know, so such an arm
+/// is reached by what a newer version of this crate adds, not by what a newer
+/// peer sends.)
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// Client to server: stream the session starting at `offset` (or
     /// [`OFFSET_END`]). Answered by `Attached`, then a picture of the screen

@@ -171,7 +171,11 @@ impl FailCode {
 /// will not run on that stream alone; the writer refuses what [`check`] does.
 ///
 /// [`check`]: Command::check
+///
+/// Not exhaustive, so that a field can be added without breaking whoever builds
+/// one: start from [`Command::new`] and set the fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Command {
     /// The program and its arguments, as an argument vector and never a shell
     /// string: the first is the program, looked up as `execvp` does.
@@ -184,6 +188,16 @@ pub struct Command {
 }
 
 impl Command {
+    /// A command that runs `argv` (the program first) with the server's own
+    /// environment, in the user's home.
+    pub fn new(argv: Vec<Vec<u8>>) -> Command {
+        Command {
+            argv,
+            env: Vec::new(),
+            cwd: None,
+        }
+    }
+
     /// Whether this is a command a server could start: a program, no NUL in
     /// anything that reaches `exec`, every variable named, a directory that is
     /// not empty, and the limits ([`MAX_ARGV`], [`MAX_ENV`],
@@ -241,7 +255,14 @@ impl Command {
 }
 
 /// A stream message, without the stream it concerns (see [`Packet`]).
+///
+/// Not exhaustive, so that a message can be added without breaking whoever
+/// matches on this: end a `match` with an arm for the messages it does not
+/// handle. (A reader skips a message of a kind it does not know, so such an arm
+/// is reached by what a newer version of this crate adds, not by what a newer
+/// peer sends.)
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// Client to server: connect to `host:port` and call the connection by
     /// this stream's number. `window` is how many bytes the client takes
@@ -581,7 +602,11 @@ pub fn write_packet<W: Write>(writer: &mut W, packet: &Packet, from: Side) -> Re
 }
 
 /// What one frame of either channel is.
+///
+/// Not exhaustive, so that a channel can be added without breaking whoever
+/// matches on this: end a `match` with an arm for the frames it does not handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Incoming {
     /// A message about a session or the connection.
     Session(super::Packet),

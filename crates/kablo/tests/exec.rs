@@ -467,10 +467,7 @@ fn against(kind: Kind) -> Result<kablo_proto::v1::Exit, End> {
             output: null(),
             errors: null(),
         };
-        let command = Command {
-            argv: vec![b"/bin/echo".to_vec()],
-            ..Command::default()
-        };
+        let command = Command::new(vec![b"/bin/echo".to_vec()]);
         let mut err = Vec::new();
         let end = client::serve(Wire { input, output }, command, local, None, &mut err);
         let _ = done.send(end);
@@ -535,10 +532,7 @@ fn a_carrier_that_is_gone_as_soon_as_it_has_answered_ends_the_command_and_does_n
             output: null(),
             errors: null(),
         };
-        let command = Command {
-            argv: vec![b"/bin/echo".to_vec()],
-            ..Command::default()
-        };
+        let command = Command::new(vec![b"/bin/echo".to_vec()]);
         let wire = Wire {
             input: client_in,
             output: client_out,
@@ -563,10 +557,7 @@ fn a_carrier_that_ends_in_the_middle_of_the_handshake_ends_the_command() {
         output: null(),
         errors: null(),
     };
-    let command = Command {
-        argv: vec![b"/bin/echo".to_vec()],
-        ..Command::default()
-    };
+    let command = Command::new(vec![b"/bin/echo".to_vec()]);
     let end = client::serve(
         Wire { input, output },
         command,

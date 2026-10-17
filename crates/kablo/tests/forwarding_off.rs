@@ -132,10 +132,7 @@ fn the_administrator_turns_streams_off_and_on_for_a_bridge_that_is_running() {
     // A program is not a connection: the switch is not about it, and the
     // bridge says so.
     assert!(bridge.features[1].commands);
-    let runs = Command {
-        argv: vec![b"/bin/echo".to_vec(), b"runs".to_vec()],
-        ..Command::default()
-    };
+    let runs = Command::new(vec![b"/bin/echo".to_vec(), b"runs".to_vec()]);
     let (ran, _) = bridge.run_command(runs, MAX_WINDOW).unwrap();
     bridge.until("the command's end", |b| b.flows[&ran].closed);
     assert_eq!(bridge.flows[&ran].data, b"runs\n");

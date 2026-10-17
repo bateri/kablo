@@ -383,6 +383,9 @@ impl Bridge {
             match self.decoder.next_incoming() {
                 Ok(Some(Incoming::Session(packet))) => self.handle(packet, now, outgoing),
                 Ok(Some(Incoming::Stream { from, packet })) => self.handle_stream(from, packet),
+                // A channel this version does not have: skipped, as the decoder
+                // skips a frame it cannot read.
+                Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(e) if e.is_recoverable() => {
                     outgoing.push(Packet::connection(Message::Error {

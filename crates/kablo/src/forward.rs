@@ -492,6 +492,9 @@ impl Forwarding<'_> {
                         let _ = writeln!(self.err, "kablo: the server said: {}", clean(&text));
                     }
                 }
+                // A channel this version does not have: skipped, as the decoder
+                // skips a frame it cannot read.
+                Ok(Some(_)) => {}
                 Ok(None) => return None,
                 Err(e) if e.is_recoverable() => {}
                 // The framing is broken: there is no telling where the next

@@ -368,6 +368,15 @@ impl Pic {
     }
 }
 
+/// A view of a terminal of `size`, with the two flags as given (the type cannot
+/// be written as a struct expression outside its crate).
+pub fn viewing(size: Size, picture: bool, picture_if_answered: bool) -> View {
+    let mut view = View::new(size);
+    view.picture = picture;
+    view.picture_if_answered = picture_if_answered;
+    view
+}
+
 /// What a terminal shows once it has the picture and the output after it. It
 /// keeps no scrollback, so what is compared is the screen and the state around
 /// it (modes, cursor, scrolling region, the other screen).
@@ -593,16 +602,16 @@ impl Conn {
         self.pictures.clear();
         self.send(Message::Attach {
             offset,
-            view: Some(View {
-                size: Size {
+            view: Some(viewing(
+                Size {
                     cols,
                     rows,
                     xpixel: 0,
                     ypixel: 0,
                 },
-                picture: true,
-                picture_if_answered: false,
-            }),
+                true,
+                false,
+            )),
         });
         self.until("attached and its picture", |c| {
             c.attached.is_some() && c.pictures.last().is_some_and(|p| p.complete)
@@ -619,16 +628,16 @@ impl Conn {
         self.pictures.clear();
         self.send(Message::Attach {
             offset,
-            view: Some(View {
-                size: Size {
+            view: Some(viewing(
+                Size {
                     cols,
                     rows,
                     xpixel: 0,
                     ypixel: 0,
                 },
-                picture: false,
-                picture_if_answered: true,
-            }),
+                false,
+                true,
+            )),
         });
         self.until("attached", |c| c.attached.is_some());
         if self.attached.is_some_and(|(_, truncated)| truncated) {
@@ -877,6 +886,7 @@ impl Bridge {
                     self.file_stream(packet, &mut credits);
                     continue;
                 }
+                other => panic!("the bridge sent {other:?}"),
             };
             let name = packet.session.as_ref().map(|s| s.as_str().to_owned());
             match packet.message {
@@ -970,11 +980,8 @@ impl Bridge {
                 flow.closed = true;
                 flow.ends.push("close");
             }
-            other @ (stream::Message::Open { .. }
-            | stream::Message::OpenCommand { .. }
-            | stream::Message::OpenTicket { .. }) => {
-                panic!("the bridge sent {other:?}")
-            }
+            // (The messages only a client sends, and any a later version adds.)
+            other => panic!("the bridge sent {other:?}"),
         }
     }
 

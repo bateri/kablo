@@ -94,13 +94,37 @@ fn running_work() -> Status {
 /// An ssh in the foreground, asking for a password: the state the `state`
 /// and `status_reply_terminal` fixtures hold.
 fn asking_for_a_password() -> TerminalState {
-    TerminalState {
-        program: Some(b"ssh".to_vec()),
-        cwd: Some(b"/home/u/src".to_vec()),
-        secret: true,
-        remote: Some(b"user@host".to_vec()),
-        remote_port: Some(2222),
-    }
+    terminal(|state| {
+        state.program = Some(b"ssh".to_vec());
+        state.cwd = Some(b"/home/u/src".to_vec());
+        state.secret = true;
+        state.remote = Some(b"user@host".to_vec());
+        state.remote_port = Some(2222);
+    })
+}
+
+/// A terminal state with nothing said, then what `set` says (the type cannot
+/// be written as a struct expression outside its crate).
+fn terminal(set: impl FnOnce(&mut TerminalState)) -> TerminalState {
+    let mut state = TerminalState::default();
+    set(&mut state);
+    state
+}
+
+/// A view of a terminal of `size`, with the two flags as given.
+fn viewing(size: Size, picture: bool, picture_if_answered: bool) -> View {
+    let mut view = View::new(size);
+    view.picture = picture;
+    view.picture_if_answered = picture_if_answered;
+    view
+}
+
+/// A command with all three parts said.
+fn whole_command(argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>, cwd: Option<Vec<u8>>) -> Command {
+    let mut command = Command::new(argv);
+    command.env = env;
+    command.cwd = cwd;
+    command
 }
 
 fn broken_build() -> Status {
@@ -143,32 +167,32 @@ fn messages() -> Vec<(&'static str, Packet)> {
             "attach_view",
             work(Message::Attach {
                 offset: 0x1000,
-                view: Some(View {
-                    size: Size {
+                view: Some(viewing(
+                    Size {
                         cols: 120,
                         rows: 40,
                         xpixel: 960,
                         ypixel: 800,
                     },
-                    picture: true,
-                    picture_if_answered: false,
-                }),
+                    true,
+                    false,
+                )),
             }),
         ),
         (
             "attach_view_answered",
             work(Message::Attach {
                 offset: 0x1000,
-                view: Some(View {
-                    size: Size {
+                view: Some(viewing(
+                    Size {
                         cols: 120,
                         rows: 40,
                         xpixel: 960,
                         ypixel: 800,
                     },
-                    picture: false,
-                    picture_if_answered: true,
-                }),
+                    false,
+                    true,
+                )),
             }),
         ),
         ("detach", work(Message::Detach)),
@@ -518,10 +542,7 @@ fn streams() -> Vec<(&'static str, Side, stream::Packet)> {
                 4,
                 S::OpenCommand {
                     window: 65_536,
-                    command: Command {
-                        argv: vec![b"true".to_vec()],
-                        ..Command::default()
-                    },
+                    command: Command::new(vec![b"true".to_vec()]),
                 },
             ),
         ),
@@ -586,13 +607,13 @@ fn streams() -> Vec<(&'static str, Side, stream::Packet)> {
 
 /// The command of the `stream_open_command` fixture.
 fn tar_command() -> Command {
-    Command {
-        argv: ["tar", "-cf", "-", "src"]
+    whole_command(
+        ["tar", "-cf", "-", "src"]
             .map(|a| a.as_bytes().to_vec())
             .to_vec(),
-        env: vec![b"LC_ALL=C".to_vec(), b"FOO=a=b".to_vec()],
-        cwd: Some(b"/home/u".to_vec()),
-    }
+        vec![b"LC_ALL=C".to_vec(), b"FOO=a=b".to_vec()],
+        Some(b"/home/u".to_vec()),
+    )
 }
 
 /// The fixtures that are not messages.
@@ -942,16 +963,12 @@ fn a_reader_ignores_what_a_later_version_adds() {
 
 #[test]
 fn an_attach_is_the_one_it_always_was_unless_it_carries_a_whole_view() {
-    let view = View {
-        size: Size {
-            cols: 80,
-            rows: 24,
-            xpixel: 0,
-            ypixel: 0,
-        },
-        picture: false,
-        picture_if_answered: false,
-    };
+    let view = View::new(Size {
+        cols: 80,
+        rows: 24,
+        xpixel: 0,
+        ypixel: 0,
+    });
     let offset = [0, 0, 0, 0, 0, 0, 0x10, 0];
     // The offset and nothing else, as the first clients sent it.
     let plain = raw(kind::ATTACH, 0, "work", &offset);
@@ -1100,24 +1117,16 @@ fn a_state_is_the_whole_of_it_and_a_field_with_nothing_to_say_is_not_written() {
         TerminalState::default()
     );
     let shapes = [
-        TerminalState {
-            program: Some(b"sleep".to_vec()),
-            ..TerminalState::default()
-        },
-        TerminalState {
-            secret: true,
-            ..TerminalState::default()
-        },
-        TerminalState {
-            program: Some(b"ssh".to_vec()),
-            remote: Some(b"prod".to_vec()),
-            ..TerminalState::default()
-        },
-        TerminalState {
-            cwd: Some(b"/".to_vec()),
-            remote_port: Some(22),
-            ..TerminalState::default()
-        },
+        terminal(|state| state.program = Some(b"sleep".to_vec())),
+        terminal(|state| state.secret = true),
+        terminal(|state| {
+            state.program = Some(b"ssh".to_vec());
+            state.remote = Some(b"prod".to_vec());
+        }),
+        terminal(|state| {
+            state.cwd = Some(b"/".to_vec());
+            state.remote_port = Some(22);
+        }),
         asking_for_a_password(),
     ];
     for state in shapes {
@@ -1127,10 +1136,7 @@ fn a_state_is_the_whole_of_it_and_a_field_with_nothing_to_say_is_not_written() {
         let has_secret = tlv::entries(&block).any(|entry| entry.unwrap().0 == 3);
         assert_eq!(has_secret, state.secret);
     }
-    let plain = TerminalState {
-        program: Some(b"vim".to_vec()),
-        ..TerminalState::default()
-    };
+    let plain = terminal(|state| state.program = Some(b"vim".to_vec()));
     assert_eq!(plain.to_block(), [0, 1, 0, 0, 0, 3, b'v', b'i', b'm']);
 }
 
@@ -1220,15 +1226,17 @@ fn an_attached_is_the_one_it_always_was_unless_it_carries_a_whole_answered_offse
 
 #[test]
 fn the_two_bits_of_a_views_flags_are_each_their_own() {
-    let view = |picture, picture_if_answered| View {
-        size: Size {
-            cols: 80,
-            rows: 24,
-            xpixel: 0,
-            ypixel: 0,
-        },
-        picture,
-        picture_if_answered,
+    let view = |picture, picture_if_answered| {
+        viewing(
+            Size {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            },
+            picture,
+            picture_if_answered,
+        )
     };
     for (picture, if_answered, flags) in [
         (false, false, 0u8),
@@ -1630,11 +1638,11 @@ fn a_reader_ignores_what_a_later_version_adds_to_a_stream_message() {
             7,
             S::OpenCommand {
                 window: 2,
-                command: Command {
-                    argv: vec![b"sh".to_vec(), Vec::new()],
-                    env: vec![b"A=1".to_vec(), b"B=2".to_vec()],
-                    cwd: Some(b"/b".to_vec()),
-                }
+                command: whole_command(
+                    vec![b"sh".to_vec(), Vec::new()],
+                    vec![b"A=1".to_vec(), b"B=2".to_vec()],
+                    Some(b"/b".to_vec()),
+                )
             }
         )
     );
@@ -1773,10 +1781,7 @@ fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
     );
 
     let run = |command: Command| S::OpenCommand { window: 1, command };
-    let args = |argv: &[&str]| Command {
-        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-        ..Command::default()
-    };
+    let args = |argv: &[&str]| Command::new(argv.iter().map(|a| a.as_bytes().to_vec()).collect());
     assert!(write(Side::Client, run(tar_command())).is_ok());
     assert!(write(Side::Client, run(args(&["sh", "-c", ""]))).is_ok());
     assert!(write(Side::Client, run(args(&[]))).is_err(), "no program");
@@ -1790,9 +1795,10 @@ fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
         write(Side::Server, run(tar_command())).is_err(),
         "from the server"
     );
-    let with_env = |entries: &[&str]| Command {
-        env: entries.iter().map(|e| e.as_bytes().to_vec()).collect(),
-        ..args(&["env"])
+    let with_env = |entries: &[&str]| {
+        let mut command = args(&["env"]);
+        command.env = entries.iter().map(|e| e.as_bytes().to_vec()).collect();
+        command
     };
     assert!(write(Side::Client, run(with_env(&["A=", "B=c=d"]))).is_ok());
     assert!(write(Side::Client, run(with_env(&["A"]))).is_err(), "no =");
@@ -1804,9 +1810,10 @@ fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
         write(Side::Client, run(with_env(&["A=\0"]))).is_err(),
         "a NUL"
     );
-    let with_cwd = |cwd: &str| Command {
-        cwd: Some(cwd.as_bytes().to_vec()),
-        ..args(&["pwd"])
+    let with_cwd = |cwd: &str| {
+        let mut command = args(&["pwd"]);
+        command.cwd = Some(cwd.as_bytes().to_vec());
+        command
     };
     assert!(write(Side::Client, run(with_cwd("/tmp"))).is_ok());
     assert!(
@@ -1817,26 +1824,24 @@ fn a_sender_cannot_produce_a_stream_message_no_conforming_end_sends() {
     let many = |n: usize| args(&vec!["x"; n]);
     assert!(write(Side::Client, run(many(stream::MAX_ARGV))).is_ok());
     assert!(write(Side::Client, run(many(stream::MAX_ARGV + 1))).is_err());
-    let vars = |n: usize| Command {
-        env: vec![b"A=1".to_vec(); n],
-        ..args(&["env"])
+    let vars = |n: usize| {
+        let mut command = args(&["env"]);
+        command.env = vec![b"A=1".to_vec(); n];
+        command
     };
     assert!(write(Side::Client, run(vars(stream::MAX_ENV))).is_ok());
     assert!(write(Side::Client, run(vars(stream::MAX_ENV + 1))).is_err());
-    let big = |len: usize| Command {
-        argv: vec![b"cat".to_vec(), vec![b'x'; len]],
-        ..Command::default()
-    };
+    let big = |len: usize| Command::new(vec![b"cat".to_vec(), vec![b'x'; len]]);
     assert!(write(Side::Client, run(big(stream::MAX_COMMAND_BYTES - 3))).is_ok());
     assert!(write(Side::Client, run(big(stream::MAX_COMMAND_BYTES - 2))).is_err());
     // Counted over everything a command carries, not each part alone: the
     // limit is over by two bytes here, though no part is near it.
     let half = stream::MAX_COMMAND_BYTES / 2;
-    let spread = Command {
-        argv: vec![b"cat".to_vec(), vec![b'x'; half]],
-        env: vec![[b"A=".to_vec(), vec![b'y'; half - 4]].concat()],
-        cwd: Some(b"/".to_vec()),
-    };
+    let spread = whole_command(
+        vec![b"cat".to_vec(), vec![b'x'; half]],
+        vec![[b"A=".to_vec(), vec![b'y'; half - 4]].concat()],
+        Some(b"/".to_vec()),
+    );
     assert!(write(Side::Client, run(spread)).is_err());
 
     // The two kinds only the server sends.

@@ -35,6 +35,7 @@ use kablo_proto::v1::{Message, Packet, Standing};
 use crate::carrier::{READ_CHUNK, clean, signal_in};
 use crate::handshake::{self, ClientStep};
 use crate::outbound::Outbound;
+use crate::peer;
 use crate::sockdir::{self, MailboxFile};
 use crate::streams::{self, Cause, Event, Local, Streams};
 use crate::sys;
@@ -249,14 +250,7 @@ impl Question {
     /// Whether anybody answers is for later: a connection that is made sits
     /// in the bridge's queue until it is accepted.
     fn to(mailbox: &MailboxFile) -> io::Result<Question> {
-        let sock = sys::connect_nonblocking(&mailbox.path)?;
-        let own = sys::effective_uid();
-        if !sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the mailbox is served by somebody else",
-            ));
-        }
+        let sock = peer::connect_ours(&mailbox.path)?;
         let mut out = Vec::new();
         WIRE.write_hello(&mut out).map_err(io::Error::other)?;
         Packet::connection(Message::Ask)
@@ -681,6 +675,9 @@ impl<'a> Conversing<'a> {
                         let _ = writeln!(self.err, "kablo: the bridge said: {}", clean(&text));
                     }
                 }
+                // A channel this version does not have: skipped, as the decoder
+                // skips a frame it cannot read.
+                Ok(Some(_)) => {}
                 Ok(None) => return None,
                 Err(e) if e.is_recoverable() => {}
                 // The framing is broken: there is no telling where the next

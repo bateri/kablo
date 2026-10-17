@@ -170,8 +170,9 @@ pub fn negotiate(
     loop {
         match decoder.next_incoming() {
             Ok(Some(Incoming::Session(packet))) => return verdict(&packet.message),
-            // Nothing has been opened: a stream message answers nothing.
-            Ok(Some(Incoming::Stream { .. })) => {}
+            // Nothing has been opened: a stream message answers nothing, nor
+            // does a frame of a channel this version does not have.
+            Ok(Some(_)) => {}
             Ok(None) => {
                 let mut more = Vec::new();
                 read_more(carrier.input.as_fd(), signals, &mut buf, &mut more)?;

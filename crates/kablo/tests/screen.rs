@@ -22,7 +22,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{Conn, Env, PATIENCE, rebuilt, same, whole};
+use common::{Conn, Env, PATIENCE, rebuilt, same, viewing, whole};
 use kablo::link::Link;
 use kablo_proto::v1::{ErrorCode, Message, OFFSET_END, Packet, PacketDecoder, Size, View};
 use kablo_proto::{SessionId, WIRE};
@@ -112,11 +112,7 @@ fn a_picture_is_made_for_the_size_the_client_says() {
     let mut quiet = env.connect(&id);
     quiet.send(Message::Attach {
         offset: OFFSET_END,
-        view: Some(View {
-            size: Size::default(),
-            picture: true,
-            picture_if_answered: false,
-        }),
+        view: Some(viewing(Size::default(), true, false)),
     });
     quiet.until("a picture", |c| {
         c.pictures.last().is_some_and(|p| p.complete)
@@ -605,15 +601,13 @@ fn a_picture_that_was_cut_short_by_a_new_relay_is_sent_again_from_the_start() {
     let now = Instant::now();
     let mut link = Link::open(&env.dir, id.clone(), now).unwrap();
     let mut got = Vec::new();
-    let view = |cols, rows| View {
-        size: Size {
+    let view = |cols, rows| {
+        View::new(Size {
             cols,
             rows,
             xpixel: 0,
             ypixel: 0,
-        },
-        picture: false,
-        picture_if_answered: false,
+        })
     };
     link.send(
         Packet::about(
@@ -685,10 +679,7 @@ fn a_picture_that_was_cut_short_by_a_new_relay_is_sent_again_from_the_start() {
         second,
         Message::Attach {
             offset: 100,
-            view: Some(View {
-                picture: true,
-                ..view(120, 40)
-            })
+            view: Some(viewing(view(120, 40).size, true, false))
         }
     );
 }
@@ -716,11 +707,7 @@ fn a_terminal_bigger_than_a_screen_may_be_is_refused_and_changes_nothing() {
     let mut other = env.connect(&id);
     other.send(Message::Attach {
         offset: OFFSET_END,
-        view: Some(View {
-            size: size(5000, 24),
-            picture: true,
-            picture_if_answered: false,
-        }),
+        view: Some(viewing(size(5000, 24), true, false)),
     });
     other.until("an error", |c| !c.errors.is_empty());
     assert_eq!(other.errors[0].0, ErrorCode::BAD_REQUEST);

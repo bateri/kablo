@@ -106,21 +106,25 @@ section is not released.
   one loses the stream: both are sent `close`). The client going away ends the
   bridge and with it every connection to the mailbox, with no `close` on the
   streams that were open.
-- **Changed, `kablo-proto`: breaking for code that matches `Message`, and for code
-  that builds `Features`, `Status` or `NewSession`.** `v1::Message` and
-  `v1::stream::Message` are not `#[non_exhaustive]` and have the variants above
-  now, so a `match` on them with no catch-all arm no longer compiles; and a
-  `features` that has a body reads as `FeaturesWith`, so a server that answers
-  only `Message::Features` does not answer it.
-- **Changed, `kablo-proto`: `Features`, `Status` and `NewSession` are
-  `#[non_exhaustive]`.** Code outside the crate could write them as struct
-  expressions in 0.1.0 (`Features { streams: true, ..Features::default() }`) and
-  can no longer. Make one with its constructor and set the fields, which stay
-  public: `Features::with_streams()`, `Features::streams_off(why)` or
-  `Features::default()`; `Status::new(id)`; `NewSession::default()`. Reading is
-  as before, except that a pattern naming the fields of one ends in `..`. This is
-  so that a field added to them later, as `Features::mailbox` is in this release,
-  breaks no app that builds them. The wire format is not touched.
+- **Changed, `kablo-proto`: breaking once, for code that matches `Message`.**
+  `v1::Message` and `v1::stream::Message` have the variants above now, and they
+  and `v1::stream::Incoming` are `#[non_exhaustive]`, so a `match` on one of
+  them with no catch-all arm no longer compiles: end it with an arm for the
+  messages it does not handle. That is the last time it breaks: a variant added
+  to them later breaks no app, and a message of a kind a reader does not know is
+  skipped as before. A `features` that has a body reads as `FeaturesWith`, so a
+  server that answers only `Message::Features` does not answer it.
+- **Changed, `kablo-proto`: `Features`, `Status`, `NewSession`, `TerminalState`,
+  `View` and `v1::stream::Command` are `#[non_exhaustive]`.** Code outside the
+  crate could write them as struct expressions in 0.1.0 (`Features { streams:
+  true, ..Features::default() }`) and can no longer. Make one with its
+  constructor and set the fields, which stay public: `Features::with_streams()`,
+  `Features::streams_off(why)` or `Features::default()`; `Status::new(id)`;
+  `NewSession::default()`; `TerminalState::default()`; `View::new(size)`;
+  `Command::new(argv)`. Reading is as before, except that a pattern naming the
+  fields of one ends in `..`. This is so that a field added to them later, as
+  `Features::mailbox` is in this release, breaks no app that builds them. The
+  wire format is not touched.
 
 ## [0.1.0] - 2026-10-15
 

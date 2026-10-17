@@ -158,10 +158,10 @@ fn serve(
         .ok()
         .filter(|size| size.cols > 0 && size.rows > 0);
     // (A view with no size leaves the session's terminal as it is.)
-    let view = (size.is_some() || answers_itself).then(|| View {
-        size: size.unwrap_or_default(),
-        picture: false,
-        picture_if_answered: answers_itself,
+    let view = (size.is_some() || answers_itself).then(|| {
+        let mut view = View::new(size.unwrap_or_default());
+        view.picture_if_answered = answers_itself;
+        view
     });
     link.send(
         Packet::about(id.clone(), Message::Attach { offset, view }),

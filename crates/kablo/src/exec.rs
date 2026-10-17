@@ -363,6 +363,9 @@ impl Executing<'_> {
                         let _ = writeln!(self.err, "kablo: the server said: {}", clean(&text));
                     }
                 }
+                // A channel this version does not have: skipped, as the decoder
+                // skips a frame it cannot read.
+                Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
                 Err(e) if e.is_recoverable() => {}
                 // The framing is broken: there is no telling where the next
@@ -541,10 +544,7 @@ mod tests {
 
     #[test]
     fn a_program_is_called_by_its_name_without_control_characters() {
-        let command = Command {
-            argv: argv(&["pro\u{1b}gram", "x"]),
-            ..Command::default()
-        };
+        let command = Command::new(argv(&["pro\u{1b}gram", "x"]));
         assert_eq!(name_of(&command), "program");
         assert_eq!(name_of(&Command::default()), "");
     }

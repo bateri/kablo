@@ -270,10 +270,7 @@ mod tests {
     const PATIENCE: Duration = Duration::from_secs(30);
 
     fn command(argv: &[&str]) -> Command {
-        Command {
-            argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-            ..Command::default()
-        }
+        Command::new(argv.iter().map(|a| a.as_bytes().to_vec()).collect())
     }
 
     /// Reads a pipe until it ends.

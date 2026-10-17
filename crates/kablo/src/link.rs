@@ -193,13 +193,10 @@ impl Link {
                 if let Some(attach) = self.attach.as_mut() {
                     // A resize changes the view's size and nothing else the
                     // client asked for: bit 1 is about the bytes, not the size.
-                    attach.view = Some(View {
-                        size: *size,
-                        picture: false,
-                        picture_if_answered: attach
-                            .view
-                            .is_some_and(|view| view.picture_if_answered),
-                    });
+                    let mut view = View::new(*size);
+                    view.picture_if_answered =
+                        attach.view.is_some_and(|view| view.picture_if_answered);
+                    attach.view = Some(view);
                 }
             }
             Message::Detach => self.attach = None,
@@ -358,15 +355,15 @@ impl Link {
                     // The picture is asked for again only while it is owed; the
                     // size is the client's latest.
                     let view = match (attach.view, attach.owed) {
-                        (Some(view), owed) => Some(View {
-                            picture: owed,
-                            ..view
-                        }),
-                        (None, true) => Some(View {
-                            size: Size::default(),
-                            picture: true,
-                            picture_if_answered: false,
-                        }),
+                        (Some(mut view), owed) => {
+                            view.picture = owed;
+                            Some(view)
+                        }
+                        (None, true) => {
+                            let mut view = View::new(Size::default());
+                            view.picture = true;
+                            Some(view)
+                        }
                         (None, false) => None,
                     };
                     peer.queue(&Packet::about(

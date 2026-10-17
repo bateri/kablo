@@ -28,10 +28,7 @@ use kablo_proto::v1::stream::{self, FailCode, MAX_WINDOW};
 use kablo_proto::v1::{Message, Offers};
 
 fn command(argv: &[&str]) -> stream::Command {
-    stream::Command {
-        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-        ..stream::Command::default()
-    }
+    stream::Command::new(argv.iter().map(|a| a.as_bytes().to_vec()).collect())
 }
 
 fn sh(script: &str) -> stream::Command {

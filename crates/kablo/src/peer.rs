@@ -13,7 +13,7 @@
 //! so a request does not wait for the reply to the handshake.
 
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -38,6 +38,22 @@ pub enum Gone {
     Broken(String),
 }
 
+/// Connects to the socket at `path` without blocking, and refuses it unless the
+/// process that listens on it is ours. Every connection this program makes to a
+/// socket of a session or of a bridge's mailbox goes through here, so that the
+/// check is made in one place.
+pub fn connect_ours(path: &Path) -> io::Result<OwnedFd> {
+    let sock = sys::connect_nonblocking(path)?;
+    let own = sys::effective_uid();
+    if !sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the socket is served by somebody else",
+        ));
+    }
+    Ok(sock)
+}
+
 /// A connection to a relay.
 #[derive(Debug)]
 pub struct Peer {
@@ -58,15 +74,7 @@ impl Peer {
     /// answers is for [`Peer::is_open`] to say, later. The process on the
     /// other end must be ours.
     pub fn connect(path: &Path) -> io::Result<Peer> {
-        let sock = UnixStream::from(sys::connect_nonblocking(path)?);
-        let own = sys::effective_uid();
-        let ours = sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own));
-        if !ours {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the socket is served by somebody else",
-            ));
-        }
+        let sock = UnixStream::from(connect_ours(path)?);
         let mut out = Vec::new();
         WIRE.write_hello(&mut out).map_err(io::Error::other)?;
         Ok(Peer {
