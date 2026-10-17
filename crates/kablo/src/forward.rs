@@ -552,8 +552,9 @@ impl Forwarding<'_> {
                 Event::Opened(id) => {
                     self.labels.remove(&id);
                 }
-                // Connections have neither: they are a command's.
-                Event::Exited { .. } | Event::Closed { .. } => {}
+                // Connections have none of these: they are a command's or a
+                // conversation's.
+                Event::Exited { .. } | Event::Over { .. } | Event::Closed { .. } => {}
                 Event::Failed { stream, text, .. } => {
                     let label = self
                         .labels

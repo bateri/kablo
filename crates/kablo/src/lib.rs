@@ -7,6 +7,7 @@
 //! The wire clients speak is the `kablo-proto` crate; the pieces here are the
 //! ones that are not for clients.
 
+pub mod app;
 pub mod bridge;
 pub mod carrier;
 pub mod cli;

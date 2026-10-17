@@ -33,6 +33,22 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`kablo app`: hand bytes to the app that is connected.** A program on a
+  server (an agent in a terminal, a script, a cron job) can send bytes to the
+  app that reaches that server through `kablo attach` and read bytes back:
+  `kablo app` joins its standard input and output to one conversation with the
+  app. kablo carries the bytes without reading them and tells the app which
+  session the program runs in, or that it runs in none; what they mean is
+  between the program and the app. It goes to the app that was last used at the
+  program's session, or else the one last used anywhere on the machine. It ends
+  with `0` when the conversation ended, `69` when no app that takes these
+  conversations is connected, `1` for anything else that went wrong (each says
+  what on standard error), and 128 plus the signal's number after a signal. A
+  bridge that is running when kablo is upgraded keeps no mailbox until its app
+  connects again, which the message for `69` says (README, Talking to the app).
+
 ### For apps
 
 - **Protocol: mail.** A program on the server can hand bytes to the app that is
@@ -44,7 +60,26 @@ section is not released.
   (the app declined); in `features` an optional body (key 1, `tickets`: the app
   takes tickets) and in `features_reply` key 7 (`mailbox`). A reader that does
   not know them skips them, so an older bridge or app is unaffected and an app
-  tells an older bridge from one with a mailbox by `mailbox` being absent.
+  tells an older bridge from one with a mailbox by `mailbox` being absent. The
+  sender's side is the command `kablo app` (below).
+- **`kablo app`: the sender, and what an app can rely on of it.** It asks the
+  mailbox of every bridge on the machine (`ask`), keeps the bridges whose client
+  takes tickets (`tickets` in `ask_reply`), and opens the conversation on the one
+  attached to the terminal it runs in that was used last (`idle` least), or else
+  the one used last of all; an app is `attached` to a terminal by attaching to it
+  and is used by attaching, typing or connecting, so the app that connected again
+  after a lost connection is chosen over the half-dead bridge it left. A
+  conversation is a stream: the sender's input is `data` and then `eof`, the
+  app's output is `data`, and the app's `close` ends it (what the app sent before
+  is still written out); both ending with `eof` ends it as well. The sender waits
+  5 seconds for a bridge to answer `ask` and 10 for the app to answer a ticket
+  (it then sends `close`), and nowhere else; a bridge that does not answer is
+  left out. Exit codes: `0` ended, `69` no app that takes tickets is connected
+  (no mailbox, no client that says `tickets`, or the bridge's `failed` code 2
+  with no client to give a ticket to), `1` the app declined (code 9), did not
+  answer, went away without `close` or the conversation could not be written, and
+  128 plus the signal's number when it was ended by `SIGINT`, `SIGTERM` or
+  `SIGHUP` (141 for `SIGPIPE`: whatever reads its output went away).
 - **`kablo-proto`: the API for it.** `v1::Message` gains `FeaturesWith(Offers)`
   (a `features` with a body; `Features` stays the one without, and is also what a
   body that cannot be read reads as), `Ask`, `Decline`, `AskReply(Standing)` and

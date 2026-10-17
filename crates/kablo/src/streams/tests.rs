@@ -1530,6 +1530,35 @@ impl Alone {
         alone
     }
 
+    /// A client with a conversation of mail open and answered with `window`.
+    fn mail(window: u32, local: Local) -> Alone {
+        let mut client = Streams::new(
+            Side::Client,
+            Config {
+                window,
+                ..Config::default()
+            },
+        );
+        let mut out = Vec::new();
+        client.open_mail(local, &mut out).unwrap();
+        assert!(
+            matches!(
+                out.first().map(|p| &p.message),
+                Some(Message::Open { port: 0, host, .. }) if host.is_empty()
+            ),
+            "a bare open, no target and no command: {out:?}"
+        );
+        out.clear();
+        let mut alone = Alone {
+            client,
+            out,
+            events: Vec::new(),
+        };
+        alone.hears(Message::Opened { window });
+        assert_eq!(alone.events, [Event::Opened(1)]);
+        alone
+    }
+
     fn hears(&mut self, message: Message) {
         self.client
             .handle(Side::Server, Packet::new(1, message), &mut self.out);
@@ -2235,4 +2264,105 @@ fn a_stream_starts_at_the_window_the_last_one_learned() {
         p.send(id, Message::Eof);
         p.finish(id);
     }
+}
+
+#[test]
+fn a_conversation_of_mail_is_over_when_the_app_closes_it_and_what_it_said_is_written() {
+    let (local, term) = terminal();
+    let mut alone = Alone::mail(1 << 20, local);
+    alone.hears(Message::Data(b"abc".to_vec()));
+    alone.hears(Message::Close);
+    assert_eq!(alone.events, [Event::Opened(1), Event::Over { stream: 1 }]);
+    assert_eq!(available(&term.shown), b"abc");
+    assert!(alone.client.is_empty());
+    assert!(!alone.closed(), "the app's close is not answered");
+}
+
+#[test]
+fn a_close_that_comes_behind_more_than_the_output_takes_loses_none_of_it() {
+    let (local, term) = terminal();
+    let mut alone = Alone::mail(1 << 20, local);
+    // Far more than a pipe holds (and within the window), and the close right
+    // behind it.
+    let said: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+    for piece in said.chunks(MAX_DATA) {
+        alone.hears(Message::Data(piece.to_vec()));
+    }
+    alone.hears(Message::Close);
+    assert_eq!(alone.events, [Event::Opened(1)], "not while bytes are held");
+    assert!(!alone.client.is_empty());
+    assert!(!alone.closed());
+    let mut shown = available(&term.shown);
+    let start = Instant::now();
+    while alone.events.len() < 2 {
+        alone.turn();
+        shown.extend(available(&term.shown));
+        assert!(start.elapsed() < PATIENCE, "the output was never written");
+    }
+    shown.extend(available(&term.shown));
+    assert!(shown == said, "{} of {} bytes", shown.len(), said.len());
+    assert_eq!(alone.events, [Event::Opened(1), Event::Over { stream: 1 }]);
+    assert!(alone.client.is_empty());
+}
+
+#[test]
+fn a_conversation_of_mail_is_over_when_both_ends_have_ended_their_side() {
+    let (local, mut term) = terminal();
+    let mut alone = Alone::mail(1 << 20, local);
+    alone.hears(Message::Data(b"last".to_vec()));
+    alone.hears(Message::Eof);
+    assert_eq!(alone.events, [Event::Opened(1)], "this end is not done");
+    assert_eq!(available(&term.shown), b"last");
+    // The program ends its input.
+    term.typed = None;
+    let start = Instant::now();
+    while alone.events.len() < 2 {
+        alone.turn();
+        assert!(start.elapsed() < PATIENCE, "the input never ended");
+    }
+    assert_eq!(alone.events, [Event::Opened(1), Event::Over { stream: 1 }]);
+    assert!(!alone.closed(), "both ended their side: nothing to close");
+}
+
+#[test]
+fn a_conversation_of_mail_has_no_errors_and_no_exit_status() {
+    for rule_breaker in [Message::Stderr(b"err".to_vec()), Message::Eof] {
+        let (local, _term) = terminal();
+        let mut alone = Alone::mail(1 << 20, local);
+        if rule_breaker == Message::Eof {
+            // After the app's `eof`, `exited` is not a thing that can come.
+            alone.hears(Message::Eof);
+            alone.hears(Message::Exited(Exit::Code(0)));
+        } else {
+            alone.hears(rule_breaker);
+        }
+        assert_eq!(
+            alone.events,
+            [
+                Event::Opened(1),
+                Event::Closed {
+                    stream: 1,
+                    cause: Cause::Server
+                }
+            ]
+        );
+        assert!(alone.closed(), "a stream that breaks the rules is closed");
+    }
+}
+
+#[test]
+fn a_conversation_of_mail_closed_before_the_app_took_it_is_closed() {
+    let (local, _term) = terminal();
+    let mut client = Streams::new(Side::Client, Config::default());
+    let mut out = Vec::new();
+    client.open_mail(local, &mut out).unwrap();
+    client.handle(Side::Server, Packet::new(1, Message::Close), &mut out);
+    assert_eq!(
+        client.take_events(),
+        [Event::Closed {
+            stream: 1,
+            cause: Cause::Server
+        }]
+    );
+    assert!(client.is_empty());
 }

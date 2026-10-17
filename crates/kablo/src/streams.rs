@@ -106,6 +106,14 @@
 //! reason to end it; one of its output is, since a program nobody hears is not
 //! worth running.
 //!
+//! **A conversation of mail, at the client** ([`Streams::open_mail`]) rides the
+//! same end: a program on the server hands bytes to the app at the other end of
+//! a bridge's mailbox. It has the input and output of [`Local`] and nothing
+//! else: no errors, no program, no exit status (what arrives for either ends
+//! the stream). It is over ([`Event::Over`]) when both ends have sent `eof`
+//! and everything received has been written, or when the app closes it, once
+//! what it said before has been written; the app's `close` is not an abort.
+//!
 //! A program lasts as long as its stream. A `close` (and a stream that breaks
 //! the rules) tells the program's whole process group to end and keeps the
 //! program for [`Config::kill_wait`]: it is collected the moment the group is
@@ -260,8 +268,15 @@ pub enum Event {
         /// How the program ended.
         exit: Exit,
     },
-    /// A command's stream was ended before its program's end was told. The
-    /// stream is gone.
+    /// A conversation of mail is over: the app closed it, or both ends have
+    /// said all they had, and everything the app said has been written to the
+    /// descriptors of [`Local`]. The stream is gone.
+    Over {
+        /// The stream.
+        stream: u32,
+    },
+    /// A command's (or a conversation's) stream was ended before its end was
+    /// told. The stream is gone.
     Closed {
         /// The stream.
         stream: u32,
@@ -310,6 +325,10 @@ struct Held {
     /// Whether the output and the errors are regular files, which take what
     /// they are given without being asked.
     files: [bool; 2],
+    /// A conversation of mail, not a command: the other end is an app that a
+    /// program on the server talks to. It has no errors and no exit status, and
+    /// is over when both ends have said all they had or the app closes it.
+    mail: bool,
 }
 
 impl Held {
@@ -355,6 +374,17 @@ enum Channel {
 }
 
 impl End {
+    /// Whether this is a command run for this end: the only stream that has
+    /// errors and an exit status.
+    fn is_command(&self) -> bool {
+        matches!(self, End::Local(held) if !held.mail)
+    }
+
+    /// Whether this is a conversation of mail.
+    fn is_mail(&self) -> bool {
+        matches!(self, End::Local(held) if held.mail)
+    }
+
     /// Writes toward the other end: the socket, the program's input (`channel`
     /// says which of the two outputs a client's own descriptors are written
     /// for). A program that has closed its input is a broken pipe, as a socket
@@ -455,6 +485,9 @@ struct Stream {
     sent_eof: bool,
     /// The other end has sent `eof`.
     got_eof: bool,
+    /// Mail: the app closed the conversation. What it said before is still to
+    /// be written here, and nothing more is sent to it.
+    peer_closed: bool,
     /// The writing half of the socket (the program's input) is shut.
     shut: bool,
     /// Writing to the socket failed for good (the other end of it is gone):
@@ -479,6 +512,7 @@ impl Stream {
             errors_dead: false,
             sent_eof: false,
             got_eof: false,
+            peer_closed: false,
             shut: false,
             write_dead: false,
         }
@@ -494,7 +528,11 @@ impl Stream {
     /// into, and its socket has not said it has nothing more.
     fn can_send(&self) -> bool {
         // (A command's program that has ended reads no more.)
-        !self.opening && !self.sent_eof && self.send_window > 0 && self.exited.is_none()
+        !self.opening
+            && !self.sent_eof
+            && self.send_window > 0
+            && self.exited.is_none()
+            && !self.peer_closed
     }
 }
 
@@ -774,11 +812,13 @@ impl Streams {
     }
 
     /// Client end of a command: whether the server has said how the program
-    /// ended. The stream is then over but for what the program wrote and is
-    /// still to be written here ([`Event::Exited`] tells when it is all
-    /// written).
+    /// ended; of a conversation of mail, whether the app has closed it. The
+    /// stream is then over but for what was said and is still to be written
+    /// here ([`Event::Exited`], [`Event::Over`] tell when it is all written).
     pub fn ended(&self, id: u32) -> bool {
-        self.streams.get(&id).is_some_and(|s| s.exited.is_some())
+        self.streams
+            .get(&id)
+            .is_some_and(|s| s.exited.is_some() || s.peer_closed)
     }
 
     /// What has happened to opened streams since this was last asked.
@@ -837,6 +877,38 @@ impl Streams {
         command: Command,
         out: &mut Vec<Packet>,
     ) -> io::Result<u32> {
+        let window = self.first_window();
+        self.open_local(
+            local,
+            window,
+            Message::OpenCommand { window, command },
+            false,
+            out,
+        )
+    }
+
+    /// Client end: opens a stream that hands bytes to the app at the other end
+    /// of a mailbox (a bridge's), with `local`'s input and output for what is
+    /// said each way; `local.errors` is not used (a conversation has none: what
+    /// arrives for it ends the stream). The input is not read until the bridge
+    /// has said `opened`, which it does when the app has taken the conversation.
+    /// Returns the stream's number; the `open` is in `out`.
+    pub fn open_mail(&mut self, local: Local, out: &mut Vec<Packet>) -> io::Result<u32> {
+        let window = self.first_window();
+        self.open_local(local, window, Message::open_mail(window), true, out)
+    }
+
+    /// The part of [`Streams::open_command`] and [`Streams::open_mail`] that is
+    /// the same: `open` is the message that asks (it gives `window`), and `mail`
+    /// says what the stream is.
+    fn open_local(
+        &mut self,
+        local: Local,
+        window: u32,
+        open: Message,
+        mail: bool,
+        out: &mut Vec<Packet>,
+    ) -> io::Result<u32> {
         if self.streams.len() >= self.config.max_streams {
             return Err(io::Error::other("too many streams"));
         }
@@ -844,8 +916,7 @@ impl Streams {
             .last_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("out of stream numbers"))?;
-        let window = self.first_window();
-        let packet = Packet::new(id, Message::OpenCommand { window, command });
+        let packet = Packet::new(id, open);
         // The writer refuses a command no server could run.
         packet
             .encode(self.side, &mut Vec::new())
@@ -865,6 +936,7 @@ impl Streams {
             output,
             errors,
             files,
+            mail,
         };
         self.streams
             .insert(id, Stream::new(End::Local(held), 0, window, true));
@@ -1133,9 +1205,9 @@ impl Streams {
             return;
         };
         let size = bytes.len();
-        // A connection has no errors of its own to speak of.
-        let errors_without_a_program =
-            channel == Channel::Err && !matches!(stream.end, End::Local(_));
+        // A connection has no errors of its own to speak of, and nor has a
+        // conversation of mail.
+        let errors_without_a_program = channel == Channel::Err && !stream.end.is_command();
         if stream.opening
             || errors_without_a_program
             || stream.got_eof
@@ -1169,10 +1241,7 @@ impl Streams {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        if !matches!(stream.end, End::Local(_))
-            || stream.opening
-            || !stream.got_eof
-            || stream.exited.is_some()
+        if !stream.end.is_command() || stream.opening || !stream.got_eof || stream.exited.is_some()
         {
             self.reset(id, out);
             return;
@@ -1211,6 +1280,18 @@ impl Streams {
         // The `close` that follows `exited` ends nothing that is not over: what
         // the program wrote is still being written here.
         if self.streams.get(&id).is_some_and(|s| s.exited.is_some()) {
+            return;
+        }
+        // The app closing a conversation ends it for both, but what it said
+        // before is still being written here: the conversation is over once it
+        // has been ([`Event::Over`]), and nothing more is sent to the app.
+        if let Some(stream) = self.streams.get_mut(&id)
+            && stream.end.is_mail()
+            && !stream.opening
+        {
+            stream.peer_closed = true;
+            stream.got_eof = true;
+            self.dirty.insert(id);
             return;
         }
         if self.forget(id) {
@@ -1423,7 +1504,8 @@ impl Streams {
         let due = window
             .saturating_sub(stream.held())
             .saturating_sub(stream.recv_window);
-        if due >= credit_step(window) {
+        // (An app that has closed its conversation has nothing to send.)
+        if due >= credit_step(window) && !stream.peer_closed {
             let limit = stream
                 .received
                 .saturating_add(u64::from(stream.recv_window));
@@ -1511,7 +1593,8 @@ impl Streams {
 
     /// A stream both ends have said all they have to say on, and whose socket
     /// has been told so, is over; so is a program's once it has said all it had
-    /// (the client's `eof` does not matter: the program is gone).
+    /// (the client's `eof` does not matter: the program is gone), and so is a
+    /// conversation of mail once both ends have, or the app has closed it.
     fn finish(&mut self, id: u32) {
         let over = self.streams.get(&id).is_some_and(|s| match &s.end {
             End::Socket(_) => s.sent_eof && s.got_eof && s.shut,
@@ -1519,6 +1602,9 @@ impl Streams {
             // Over once the server has said how the program ended and all it
             // wrote has been written; this end's own `eof` does not matter,
             // the program is gone.
+            End::Local(held) if held.mail => {
+                (s.peer_closed || (s.sent_eof && s.got_eof)) && s.inbox.is_empty()
+            }
             End::Local(_) => s.exited.is_some() && s.inbox.is_empty() && s.errors.is_empty(),
         });
         if !over {
@@ -1538,6 +1624,7 @@ impl Streams {
                     self.queue(id, Message::Close);
                 }
             }
+            End::Local(held) if held.mail => self.events.push(Event::Over { stream: id }),
             End::Local(_) => {
                 if let Some(exit) = stream.exited {
                     self.events.push(Event::Exited { stream: id, exit });

@@ -290,6 +290,58 @@ kablo exec [--cwd DIR] [--env NAME=VALUE]... -- COMMAND [ARGUMENT]... -- PROGRAM
   (above) turns off carrying connections; whoever can log in as the user can
   run a program, so commands are not touched by it.
 
+## Talking to the app
+
+```sh
+echo 'build finished' | kablo app
+```
+
+A program on a server can hand bytes to the app that is connected to that
+server, and get bytes back. `kablo app` does only that: it joins its standard
+input and output to one conversation with the app. kablo is the courier and does
+not read what it carries; what the bytes mean is between the program and the
+app (the app's own documentation says what it takes). It does say where they
+come from: if the program runs in one of kablo's sessions, the app is told which
+one, so that it can answer there. The session is what the system says of the
+process, not anything the program says about itself, and a program outside every
+session (a cron job, a service, `ssh host kablo app`) is from none, which the
+app is told too.
+
+```sh
+kablo app
+```
+
+- **It goes to one app.** Apps reach a server through `kablo attach`, and each
+  one's bridge can be asked where it stands. If the program is in a session, the
+  app that was last used at that session gets the conversation; if none is at
+  it, or the program is in no session, the one that was last used anywhere on the
+  machine. An app that was connected again after a lost connection has been used
+  more lately than the one it left behind. Only an app that has said it takes
+  these conversations is asked to; nothing is kept for an app that is not
+  connected.
+- **Input and output are the conversation.** What `kablo app` reads goes to the
+  app as it is, and what the app says is written to its standard output as it is
+  (with a terminal as standard input, what you type, a line at a time). Ending the
+  input tells the app there is no more; the app may go on answering. It ends
+  when the app closes the conversation, or when both sides have said all they
+  had.
+- **Exit status.** `0` when the conversation was had and it ended. `69` when no
+  app that takes these conversations is connected, or no bridge is running at all;
+  an app connected through a kablo from before this one has no mailbox to be
+  reached by, and `kablo upgrade` does not change a bridge that is running, so
+  such an app has to connect again (the message says so). `1` for everything
+  else, each with its own words on standard error: the connection to the app was
+  lost, the app declined (its words are shown with control characters removed),
+  the app did not take the conversation within 10 seconds, or what the app said
+  could not be written. After Ctrl-C, `SIGTERM` or `SIGHUP`, which end the
+  conversation, it is 128 plus the signal's number; if whatever reads standard output goes away
+  it ends quietly with 141, as `kablo exec` does.
+- Whatever the app does with the bytes is its own affair, and so is any status
+  it wants to give: that is in the bytes it sends back, and a script reads it
+  there.
+- It works for the same user only: it talks to the mailboxes in the socket
+  directory (see [Security](#security)) and to nothing else, and has no options.
+
 ## Replacing kablo under running sessions
 
 Each session is two processes: a *warden*, which is the shell's parent, and a
@@ -463,6 +515,15 @@ memory of where its relay comes from (see *Limits*).
   every message of every shipped version are kept as test fixtures.
   `kablo version` prints one line of `key=value` tokens
   (`version=… wire_min=… wire_max=…`): keys may be added to it, none removed.
+- **Mail from programs on the server** goes to the app through the bridge it
+  already runs: `kablo app` hands a program's bytes to the app that is connected
+  and carries the app's back, under a ticket that names the terminal the program
+  runs in, without reading either side (above, and section 5 of
+  [docs/PROTOCOL.md](docs/PROTOCOL.md)). An app says it takes tickets in its
+  `features`, and finds out whether a bridge has a mailbox by `mailbox` in the
+  answer. The exit status of `kablo app` is `0`, `69` (no app that takes mail:
+  the app has not said so, or the bridge is from a kablo that had no mailbox),
+  `1`, or 128 and a signal's number.
 - **The terminal's state and its answers** are told, not asked for. Every
   attached client is sent a `state` right after `attached` and again when it
   changes: the program in the foreground and its directory, whether the terminal

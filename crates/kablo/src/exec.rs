@@ -277,7 +277,8 @@ impl Executing<'_> {
     fn events(&mut self) -> Option<Result<Exit, End>> {
         for event in self.streams.take_events() {
             match event {
-                Event::Opened(_) => {}
+                // (A conversation of mail is not a command.)
+                Event::Opened(_) | Event::Over { .. } => {}
                 Event::Failed { code, text, .. } => {
                     let why = if code == wire::FailCode::START_FAILED {
                         format!("cannot run {}: {}", self.program, clean(&text))
