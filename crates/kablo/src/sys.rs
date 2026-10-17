@@ -148,9 +148,10 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The uid of the process at the other end of a Unix socket.
+/// What the kernel recorded of the process at the other end of a Unix
+/// socket when the connection was made.
 #[cfg(target_os = "linux")]
-pub fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<libc::ucred> {
     // SAFETY: an all-zero `ucred` is valid; the kernel fills it.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
@@ -164,7 +165,21 @@ pub fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
             &raw mut len,
         )
     })?;
-    Ok(cred.uid)
+    Ok(cred)
+}
+
+/// The uid of the process at the other end of a Unix socket.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    Ok(peer_credentials(fd)?.uid)
+}
+
+/// The process id of the process that made the connection at the other end of
+/// a Unix socket. Linux gives 0 for a peer outside this process's pid
+/// namespace; no process has that id, so a lookup of it finds nothing.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    u32::try_from(peer_credentials(fd)?.pid).map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
 /// The uid of the process at the other end of a Unix socket.
@@ -174,6 +189,98 @@ pub fn peer_uid(fd: BorrowedFd<'_>) -> io::Result<u32> {
     // SAFETY: both out-pointers belong to this frame.
     cvt(unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) })?;
     Ok(uid)
+}
+
+/// The process id of the process that made the connection at the other end of
+/// a Unix socket.
+#[cfg(not(target_os = "linux"))]
+pub fn peer_pid(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` belong to this frame and `len` is its size.
+    cvt(unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &raw mut len,
+        )
+    })?;
+    u32::try_from(pid).map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+/// Where a process stands in the process tree and on which terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    /// The process id of its parent; 0 when the kernel names none (or the
+    /// parent lives outside this process's pid namespace).
+    pub parent: u32,
+    /// The device number of its controlling terminal, as the platform spells
+    /// it (only comparable with another one read the same way); `None` for a
+    /// process with no controlling terminal. Linux says 0 for that and macOS
+    /// says `NODEV`; both come out as `None`.
+    pub terminal: Option<u64>,
+}
+
+/// The parent and the controlling terminal of the process `pid`, read from
+/// `/proc/<pid>/stat`. `None` when the process is gone or cannot be read.
+#[cfg(target_os = "linux")]
+pub fn lineage(pid: u32) -> Option<Lineage> {
+    parse_stat(&std::fs::read(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Reads the line `pid (comm) state ppid pgrp session tty_nr ...`. The name
+/// may hold spaces and parentheses, so the fields are counted from the last
+/// `)`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat(stat: &[u8]) -> Option<Lineage> {
+    fn number(field: &[u8]) -> Option<i64> {
+        std::str::from_utf8(field).ok()?.parse().ok()
+    }
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let mut fields = stat
+        .get(close + 1..)?
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let _state = fields.next()?;
+    let parent = u32::try_from(number(fields.next()?)?).ok()?;
+    let _group = fields.next()?;
+    let _session = fields.next()?;
+    let terminal = u64::try_from(number(fields.next()?)?).ok();
+    Some(Lineage {
+        parent,
+        terminal: terminal.filter(|&device| device != 0),
+    })
+}
+
+/// The parent and the controlling terminal of the process `pid`, from the
+/// kernel's BSD process record. `None` when the process is gone or is not the
+/// caller's to read.
+#[cfg(target_os = "macos")]
+pub fn lineage(pid: u32) -> Option<Lineage> {
+    // The device number a process with no controlling terminal has.
+    const NODEV: u32 = u32::MAX;
+    // SAFETY: an all-zero `proc_bsdinfo` is valid; the call fills it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of the size passed.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            libc::c_int::try_from(pid).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    Some(Lineage {
+        parent: info.pbi_ppid,
+        terminal: (info.e_tdev != NODEV).then_some(u64::from(info.e_tdev)),
+    })
 }
 
 /// Whether a peer with this uid may talk to a process that acts as `own`.
@@ -808,6 +915,83 @@ mod tests {
         assert!(!uid_allowed(0, 501));
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_uid(a.as_fd()).unwrap(), effective_uid());
+    }
+
+    #[test]
+    fn the_pid_of_the_connecting_process_is_read_off_the_socket() {
+        let dir = std::env::temp_dir().join(format!("kablo-peer-pid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Both ends are this process: the server end names the client, the
+        // client end names the server.
+        assert_eq!(peer_pid(served.as_fd()).unwrap(), std::process::id());
+        assert_eq!(peer_pid(client.as_fd()).unwrap(), std::process::id());
+    }
+
+    #[test]
+    fn a_process_is_asked_for_its_parent_and_its_terminal() {
+        let own = lineage(std::process::id()).unwrap();
+        // SAFETY: no arguments, cannot fail.
+        assert_eq!(own.parent, unsafe { libc::getppid() } as u32);
+        assert_eq!(lineage(u32::MAX - 1), None);
+
+        // A program started the way a session starts its shell has the pty
+        // as its controlling terminal, and so has everything it starts; one
+        // that made a session of its own has none.
+        let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
+        let request = kablo_proto::v1::NewSession {
+            argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
+            ..Default::default()
+        };
+        let mut on_terminal = crate::pty::spawn(&pty.slave, &request).unwrap();
+        let mut detached = {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("60");
+            // SAFETY: `setsid` is async-signal-safe.
+            unsafe {
+                command.pre_exec(|| cvt(libc::setsid()).map(drop));
+            }
+            command.spawn().unwrap()
+        };
+        let shell = lineage(on_terminal.id()).unwrap();
+        let loner = lineage(detached.id()).unwrap();
+        on_terminal.kill().unwrap();
+        detached.kill().unwrap();
+        on_terminal.wait().unwrap();
+        detached.wait().unwrap();
+        assert_eq!(shell.parent, std::process::id());
+        assert!(shell.terminal.is_some());
+        assert_eq!(loner.parent, std::process::id());
+        assert_eq!(loner.terminal, None);
+    }
+
+    #[test]
+    fn the_stat_line_is_read_from_the_last_parenthesis() {
+        let line = |name: &str, tty: &str| {
+            format!("4242 ({name}) S 77 4242 4242 {tty} 4242 4194560 1 0 0 0 0 0 0 0 20 0 1 0")
+                .into_bytes()
+        };
+        let at = |lineage: Option<Lineage>| lineage.map(|l| (l.parent, l.terminal));
+        assert_eq!(
+            at(parse_stat(&line("sh", "34816"))),
+            Some((77, Some(34816)))
+        );
+        // A name with spaces and parentheses in it does not shift the fields.
+        assert_eq!(
+            at(parse_stat(&line("a b) S 1 2 3 (c", "34817"))),
+            Some((77, Some(34817)))
+        );
+        // No controlling terminal.
+        assert_eq!(at(parse_stat(&line("cron", "0"))), Some((77, None)));
+        // Not a stat line.
+        assert_eq!(parse_stat(b""), None);
+        assert_eq!(parse_stat(b"4242 (sh) S 77"), None);
+        assert_eq!(parse_stat(b"4242 sh S 77 4242 4242 0"), None);
     }
 
     #[test]
