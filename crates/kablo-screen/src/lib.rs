@@ -39,13 +39,20 @@
 //! the sequences themselves still go to a client in the live stream, where a terminal
 //! that honours them does.
 //!
+//! **Reading a screen without writing it**: [`Screen::text`] is the text that is shown (the
+//! scrollback above it when asked, wrapped rows joined when asked), [`Screen::modes`] the
+//! modes the program set and [`Key::encode`] the bytes a key is in those modes; a key
+//! is typed to a program the way a terminal would, whether or not one is attached.
+//!
 //! The terminal answers some questions by itself (device attributes, the cursor position,
 //! mode reports); [`Screen::take_replies`] hands those bytes to whoever should write them
 //! to the program. Questions that need the terminal's owner (colours, the clipboard, the
 //! size in pixels) get no answer.
 
 mod image;
+mod keys;
 mod tail;
+mod text;
 
 #[cfg(test)]
 mod tests;
@@ -57,6 +64,8 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Processor, Timeout};
+
+pub use keys::{Key, Modes, Mods};
 
 use image::Size;
 use tail::Tail;
@@ -195,6 +204,26 @@ impl Screen {
     /// asked a question is waiting to read.
     pub fn take_replies(&mut self) -> Vec<u8> {
         self.heard.take_replies()
+    }
+
+    /// The text of the screen that is shown, one string per row with trailing spaces
+    /// taken off: `history` rows of scrollback above it (as many as there are, no more
+    /// than the screen keeps; the alternate screen has none), then every row of the
+    /// screen, blank rows at the bottom included. With `unwrap`, the rows the terminal
+    /// wrapped are one string again, so a line of 300 characters comes back as one on an
+    /// 80-column screen; a space at the end of a wrapped row is the text's own and stays.
+    /// A wide character is written once and a zero-width one behind its base.
+    ///
+    /// Only reads: neither the screen nor [`Screen::image`] is any different afterwards.
+    pub fn text(&self, history: usize, unwrap: bool) -> Vec<String> {
+        text::lines(self.term.grid(), history, unwrap)
+    }
+
+    /// The modes of the terminal that decide which bytes a key is: cursor keys, keypad
+    /// and the kitty keyboard flags the program set. They are only what the program's own
+    /// bytes made them; see [`Key::encode`].
+    pub fn modes(&self) -> Modes {
+        Modes::of(*self.term.mode())
     }
 
     /// The screen as VT bytes: a terminal of this size, fed the image and then the bytes
