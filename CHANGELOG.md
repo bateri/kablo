@@ -75,6 +75,21 @@ section is not released.
   release answers none of them: an app finds out which relay it has from `status`'s
   `version`, not from silence. A `status` and a `new` without a label are the bytes
   they were.
+- **`kablo attach` serves them.** The bridge carries `write`, `read` and `wait` to
+  the session's relay without attaching to it, and a `ping` that names a session
+  the client has sent requests to goes to that relay too, so its `pong` comes
+  after the `error` that a `write` before it has, if it has one (any other `ping`
+  is still the bridge's own). When the relay is replaced (`kablo upgrade`) a
+  `read` and a `wait` are asked again of the new one and the client notices
+  nothing; a `write` never is, because it would press the keys twice: one that
+  comes while the connection to the session is being made again is answered
+  `unavailable` and typed nowhere, and a `ping` whose connection is lost before
+  the `pong` comes is answered `unavailable` instead, which says the `write`
+  before it may or may not have been typed. The bridge answers `label` by writing the session's label to a file
+  in the socket directory, which the relay reads for `status` and removes when the
+  session is gone (`UNKNOWN_SESSION` when there is no such session); a `new` that
+  carries a label makes it, and a session made under the name of one that is gone
+  does not have its label.
 - **`kablo-proto`: the API for it.** `v1::Message` gains `Write(Vec<Stroke>)`,
   `Read(Capture)`, `Wait`, `Label(String)` and `ScreenText { offset, cols, rows,
   more, data }`; `v1::kind` gains `WRITE`, `READ`, `WAIT`, `LABEL` and

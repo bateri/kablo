@@ -19,18 +19,30 @@
 //! whole is asked for again by the next connection, whose `attached` is then
 //! passed on too: the client starts the picture over.
 //!
+//! What the client asks of a session without attaching to it is kept the same
+//! way, by what each asks for. A `read` and a `wait` are questions that may be
+//! asked again, so the link remembers them until they are answered and asks again
+//! of the next connection (a `wait` is how a client hears that a program ended,
+//! and a relay that is replaced by `upgrade` must not make it wait for ever). A
+//! `write` is not: typed twice, keys are pressed twice, so it goes on the
+//! connection there is and never again. One that finds the link without a
+//! connection is answered with an error and typed nowhere; one whose connection
+//! is lost before the `ping` that follows it was answered leaves the client with an
+//! error that says it cannot know ([`UNSURE`]).
+//!
 //! The link talks to its owner through packets: [`Link::send`] takes what the
 //! client sent, and everything that is to go back to the client is pushed to
 //! an `out` list, an `error` packet included when the link gives up. A link
 //! that has given up, or whose session is over, says so with
 //! [`Link::is_gone`] and the owner drops it.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{ErrorCode, Message, Packet, Size, View};
+use kablo_proto::v1::{Capture, ErrorCode, Message, Packet, Size, View};
 
 use crate::peer::{Gone, Peer};
 use crate::{sockdir, sys};
@@ -52,6 +64,17 @@ const BACKLOG: usize = 1 << 20;
 /// [`BACKLOG`] bytes of requests are waiting for the session. It passes: the
 /// session takes them, or the link gives up on it in [`WAIT`].
 pub const BUSY: &str = "too many requests are waiting";
+
+/// What the client is told when the connection to the session was lost while a
+/// `ping` after a `write` was not answered: the `write` was either typed or not,
+/// and sending it again would type it twice.
+pub const UNSURE: &str =
+    "the connection to the session was lost before it said whether what was written was typed";
+
+/// What the client is told of a `write` that came when there was no connection
+/// to the session to type it on.
+pub const NOT_CONNECTED: &str =
+    "the connection to the session is being made again; nothing was typed";
 
 /// What the client asked to be attached to.
 #[derive(Clone, Debug)]
@@ -81,6 +104,16 @@ pub struct Link {
     swallow: u32,
     /// `status` requests sent whose replies have not come.
     status_pending: u32,
+    /// `read` requests sent whose answers have not come, in the order they were
+    /// asked; asked again by the next connection.
+    reads: VecDeque<Capture>,
+    /// A `wait` was sent and the program's end has not come; asked again by the
+    /// next connection.
+    waiting: bool,
+    /// `ping`s that name the session, sent and not answered: they confirm what
+    /// was written before them, and a connection that ends before they come back
+    /// cannot say whether it was.
+    pings: u32,
     /// Requests that arrived while there was no connection to put them on.
     parked: Vec<Packet>,
     parked_bytes: usize,
@@ -110,6 +143,9 @@ impl Link {
                 attach: None,
                 swallow: 0,
                 status_pending: 0,
+                reads: VecDeque::new(),
+                waiting: false,
+                pings: 0,
                 parked: Vec::new(),
                 parked_bytes: 0,
                 give_up_at: Some(now + WAIT),
@@ -120,6 +156,11 @@ impl Link {
             }),
             Err(e) => Err(Box::new(refusal(&id, &e))),
         }
+    }
+
+    /// What to tell a client for a session whose socket could not be connected to.
+    pub fn refusal(id: &SessionId, error: &io::Error) -> Packet {
+        refusal(id, error)
     }
 
     /// The session this is a link to.
@@ -201,15 +242,22 @@ impl Link {
             }
             Message::Detach => self.attach = None,
             Message::Status => self.status_pending += 1,
+            Message::Read(capture) => self.reads.push_back(*capture),
+            Message::Wait => self.waiting = true,
+            Message::Ping(_) => self.pings += 1,
             _ => {}
         }
         let Some(peer) = self.peer.as_mut() else {
-            // Attaching, detaching and asking for the status are remembered
-            // above and acted on when a connection is made; the rest waits.
-            if !matches!(
-                packet.message,
-                Message::Attach { .. } | Message::Detach | Message::Status
-            ) {
+            // Typing is not put off until there is a connection: what is typed
+            // late is typed twice if the first try went through.
+            if matches!(packet.message, Message::Write(_)) {
+                out.push(unavailable(&self.id, NOT_CONNECTED));
+                return None;
+            }
+            // Attaching, detaching, asking for the status, reading and waiting
+            // are remembered above and acted on when a connection is made; the
+            // rest waits.
+            if !remembered(&packet.message) {
                 self.parked_bytes += parked_size(&packet);
                 self.parked.push(packet);
             }
@@ -227,10 +275,9 @@ impl Link {
         match &self.peer {
             Some(peer) => peer.pending() > BACKLOG,
             None => {
-                !matches!(
-                    packet.message,
-                    Message::Attach { .. } | Message::Detach | Message::Status
-                ) && self.parked_bytes + parked_size(packet) > BACKLOG
+                !remembered(&packet.message)
+                    && !matches!(packet.message, Message::Write(_))
+                    && self.parked_bytes + parked_size(packet) > BACKLOG
             }
         }
     }
@@ -290,10 +337,22 @@ impl Link {
                     }
                 }
                 Message::Picture { more, .. } => {
+                    // The picture of an attach, or the answer to a `read`: the
+                    // attach's is the one that is owed.
+                    let owed = self.attach.as_ref().is_some_and(|attach| attach.owed);
                     if let Some(attach) = self.attach.as_mut() {
                         attach.owed = *more;
                     }
+                    if !more && !owed {
+                        self.read_done(true);
+                    }
                 }
+                Message::ScreenText { more, .. } => {
+                    if !more {
+                        self.read_done(false);
+                    }
+                }
+                Message::Pong(_) => self.pings = self.pings.saturating_sub(1),
                 Message::Output { offset, data } => {
                     if let Some(attach) = self.attach.as_mut() {
                         attach.delivered = Some(offset + data.len() as u64);
@@ -302,7 +361,10 @@ impl Link {
                         attach.owed = false;
                     }
                 }
-                Message::Ended(_) => self.finished = true,
+                Message::Ended(_) => {
+                    self.finished = true;
+                    self.waiting = false;
+                }
                 Message::StatusReply(_) => {
                     self.status_pending = self.status_pending.saturating_sub(1);
                 }
@@ -310,6 +372,30 @@ impl Link {
             }
             out.push(packet);
         }
+        // A client that only waited has been told, and holds nothing else: the
+        // connection is of no more use to it. (One that attached is kept as it
+        // always was, until the session goes.)
+        if self.finished && !self.owes() {
+            self.peer = None;
+            self.gone = true;
+        }
+    }
+
+    /// A read was answered: the oldest asked of its kind is no longer owed.
+    fn read_done(&mut self, picture: bool) {
+        if let Some(at) = self.reads.iter().position(|c| c.picture == picture) {
+            self.reads.remove(at);
+        }
+    }
+
+    /// Whether the client is owed anything but the end of the program: it is
+    /// attached, or asked something that has not been answered.
+    fn owes(&self) -> bool {
+        self.attach.is_some()
+            || self.status_pending > 0
+            || !self.reads.is_empty()
+            || self.pings > 0
+            || self.waiting
     }
 
     /// Time has passed.
@@ -327,8 +413,15 @@ impl Link {
     fn lost(&mut self, now: Instant, out: &mut Vec<Packet>) {
         let answered = self.peer.as_ref().is_some_and(Peer::is_open);
         self.peer = None;
-        // Nothing owed to this client any more: let go.
-        if self.finished || (self.attach.is_none() && self.status_pending == 0) {
+        // What was written and not confirmed may or may not have been typed, and
+        // the confirmation was on the connection that is gone.
+        if self.pings > 0 {
+            self.pings = 0;
+            out.push(unavailable(&self.id, UNSURE));
+        }
+        // Nothing owed to this client any more: let go. The end of the program
+        // does not let go of one that is still owed an answer it can have.
+        if (self.finished && self.reads.is_empty()) || !self.owes() {
             self.gone = true;
             return;
         }
@@ -378,6 +471,12 @@ impl Link {
                 }
                 for _ in 0..self.status_pending {
                     peer.queue(&Packet::about(self.id.clone(), Message::Status));
+                }
+                for capture in &self.reads {
+                    peer.queue(&Packet::about(self.id.clone(), Message::Read(*capture)));
+                }
+                if self.waiting {
+                    peer.queue(&Packet::about(self.id.clone(), Message::Wait));
                 }
                 for packet in std::mem::take(&mut self.parked) {
                     peer.queue(&packet);
@@ -430,10 +529,25 @@ fn refusal(id: &SessionId, error: &io::Error) -> Packet {
     }
 }
 
+/// Whether the link keeps what a request asks for itself while there is no
+/// connection, and asks the next connection for it, instead of holding the
+/// request.
+fn remembered(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Attach { .. }
+            | Message::Detach
+            | Message::Status
+            | Message::Read(_)
+            | Message::Wait
+    )
+}
+
 /// What a request counts for against [`BACKLOG`] while it waits.
 fn parked_size(packet: &Packet) -> usize {
     match &packet.message {
         Message::Input(bytes) => bytes.len(),
+        Message::Write(_) => 0,
         _ => 64,
     }
 }
@@ -446,4 +560,94 @@ fn unavailable(id: &SessionId, text: &str) -> Packet {
             text: text.to_owned(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+
+    use kablo_proto::v1::{PacketDecoder, Stroke};
+    use kablo_proto::{SessionId as Id, WIRE};
+
+    /// A link whose connection has been lost and is waited for, to a session
+    /// that is a listening socket in a directory of its own.
+    fn link_between_connections(name: &str) -> (Link, UnixListener, PathBuf) {
+        let dir = PathBuf::from(format!("/tmp/kl{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        sockdir::ensure_dir(&dir).unwrap();
+        let id = Id::new("s").unwrap();
+        let listener = UnixListener::bind(sockdir::socket_path(&dir, &id)).unwrap();
+        let now = Instant::now();
+        let mut link = Link::open(&dir, id, now).unwrap();
+        link.peer = None;
+        link.retry_at = Some(now);
+        (link, listener, dir)
+    }
+
+    fn about(message: Message) -> Packet {
+        Packet::about(Id::new("s").unwrap(), message)
+    }
+
+    #[test]
+    fn a_write_between_connections_is_refused_and_the_rest_is_remembered() {
+        let (mut link, listener, dir) = link_between_connections("between");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let strokes = vec![Stroke::text("typed once")];
+        link.send(about(Message::Write(strokes)), now, &mut out);
+        // Typed nowhere, and said so: it is not kept for the next connection.
+        assert_eq!(out, [unavailable(&Id::new("s").unwrap(), NOT_CONNECTED)]);
+        assert!(link.parked.is_empty());
+        assert!(!link.is_gone());
+
+        let mut capture = Capture::default();
+        capture.history = 3;
+        for message in [
+            Message::Read(capture),
+            Message::Wait,
+            Message::Status,
+            Message::Ping(b"p".to_vec()),
+        ] {
+            link.send(about(message), now, &mut out);
+        }
+        assert_eq!(out.len(), 1, "nothing more was said");
+        assert_eq!(
+            (link.reads.len(), link.waiting, link.status_pending),
+            (1, true, 1)
+        );
+        // Only the ping waits as a request does; the others are asked again.
+        assert_eq!(link.parked.len(), 1);
+
+        // The next connection is asked what the link remembers, and then what
+        // waited.
+        link.tick(now + RETRY, &mut out);
+        assert!(link.peer.is_some());
+        let _ = listener.accept().unwrap(); // the one that was lost
+        let (mut sock, _) = listener.accept().unwrap();
+        WIRE.server(&mut sock.try_clone().unwrap(), &mut sock)
+            .unwrap();
+        let mut decoder = PacketDecoder::new();
+        let mut heard = Vec::new();
+        let mut buf = [0u8; 1024];
+        while heard.len() < 4 {
+            let n = sock.read(&mut buf).unwrap();
+            assert!(n > 0, "{heard:?}");
+            decoder.push(&buf[..n]);
+            while let Some(packet) = decoder.next_packet().unwrap() {
+                heard.push(packet.message);
+            }
+        }
+        assert_eq!(
+            heard,
+            [
+                Message::Status,
+                Message::Read(capture),
+                Message::Wait,
+                Message::Ping(b"p".to_vec())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

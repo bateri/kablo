@@ -42,6 +42,17 @@
 //! attached, nothing looked at, and no timer: an idle session waits in `poll`
 //! for ever.
 //!
+//! **A session can be driven without attaching.** A connection that has not
+//! attached may type (`write`), read the screen (`read`) and ask to be told when
+//! the program ends (`wait`), and is not a client for it: the relay goes on
+//! answering the program's questions as it does while nobody is there, a client
+//! that attaches meanwhile answers its own, and no look at the terminal or timer
+//! is started for it. A `read` is a question, answered at the end of the turn
+//! like `status`; a `wait` is answered once the last output is on the screen,
+//! and being told is not delivery, so the session is kept for the clients that
+//! have not been told. The label of a session is a file the relay reads when it
+//! says how the session stands and takes away when the session is over.
+//!
 //! **Nothing is closed by silence.** A client that goes away takes only its
 //! own state with it; the session ends only on an explicit `terminate`
 //! (forwarded to the warden, which owns the shell) or when the shell exits.
@@ -62,8 +73,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
 use kablo_proto::v1::{
-    DEFAULT_HISTORY, ErrorCode, Exit, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message, OFFSET_END, Packet,
-    PacketDecoder, Size, State, Status, TerminalState, View,
+    Capture, DEFAULT_HISTORY, ErrorCode, Exit, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message,
+    OFFSET_END, Packet, PacketDecoder, Size, State, Status, Stroke, TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -73,7 +84,9 @@ use crate::inner::{self, ADOPT_DESCRIPTORS, Decoder, INNER, ToRelay, ToWarden};
 use crate::journal::Journal;
 use crate::procinfo;
 use crate::pty;
+use crate::sockdir;
 use crate::sys;
+use crate::typing;
 
 /// Program bytes in one `output` frame.
 const OUT_CHUNK: usize = 64 * 1024;
@@ -211,6 +224,10 @@ struct Client {
     /// What it asked about the session and has not been answered yet; what
     /// it sent after the question waits for the answer.
     asked: Option<Question>,
+    /// It asked to be told when the program ends (`wait`) and has not been.
+    /// Telling it is not delivery: the session is kept for the clients that
+    /// were attached to it ([`Relay::drive`]).
+    waiting: bool,
 }
 
 /// A question about how the session stands. It is answered at the end of the
@@ -220,6 +237,8 @@ struct Client {
 enum Question {
     Status,
     List,
+    /// The screen, as text or as a picture.
+    Read(Capture),
 }
 
 struct Attach {
@@ -281,6 +300,9 @@ struct Relay {
     scratch: Vec<u8>,
     clients: Vec<Client>,
     delivered_sent: bool,
+    /// An upgrade was asked of the warden through this relay and has not failed:
+    /// if it is told to quit, it is being replaced and not ended.
+    replacing: bool,
     quit: bool,
     /// The listening socket is left out of the poll set because there is no
     /// descriptor for another client (or accepting failed): it stays readable
@@ -414,6 +436,7 @@ impl Relay {
             scratch: vec![0; SCREEN_CHUNK],
             clients: Vec::new(),
             delivered_sent: false,
+            replacing: false,
             quit: false,
             accept_paused: false,
             told: None,
@@ -516,6 +539,9 @@ impl Relay {
                 // The terminal is not read any more: what was typed and not
                 // yet taken is the last thing this relay does for it.
                 self.flush_input();
+                if self.leaving_for_good() {
+                    self.forget_label();
+                }
                 let offset = self.journal.total();
                 self.send_warden(&ToWarden::Released { offset });
                 return 0;
@@ -600,6 +626,7 @@ impl Relay {
     /// The upgrade a client asked for did not happen: every client that asked
     /// is told why.
     fn upgrade_failed(&mut self, why: &str) {
+        self.replacing = false;
         let asked: Vec<usize> = self
             .clients
             .iter()
@@ -874,11 +901,13 @@ impl Relay {
         if client.sent < client.out.len() {
             return true;
         }
-        client.attach.as_ref().is_some_and(|attach| {
-            attach.picture.is_some()
-                || attach.next < self.journal.total()
-                || (self.exit.is_some() && self.final_drained && !client.ended_queued)
-        })
+        let ended = self.exit.is_some() && self.final_drained;
+        (ended && client.waiting)
+            || client.attach.as_ref().is_some_and(|attach| {
+                attach.picture.is_some()
+                    || attach.next < self.journal.total()
+                    || (ended && !client.ended_queued)
+            })
     }
 
     /// Sets a descriptor aside for the next connection, if there is not one
@@ -947,6 +976,7 @@ impl Relay {
             dead: false,
             upgrading: false,
             asked: None,
+            waiting: false,
         });
     }
 
@@ -1085,6 +1115,21 @@ impl Relay {
             }
             Message::Resize(size) => self.resize(i, size),
             Message::Input(bytes) => self.type_input(i, &bytes),
+            // These three are served to a connection that has not attached and
+            // do not attach it: nothing about the session changes because one
+            // of them is asked.
+            Message::Write(strokes) => self.write(i, &strokes),
+            Message::Read(capture) => self.ask(i, Question::Read(capture)),
+            Message::Wait => {
+                if let Some(client) = self.clients.get_mut(i) {
+                    client.waiting = true;
+                }
+            }
+            Message::Label(_) => self.error(
+                i,
+                ErrorCode::BAD_REQUEST,
+                "a label is set through the bridge, or by the command that makes one",
+            ),
             Message::Terminate { force } => {
                 if self.chan_alive {
                     self.send_warden(&ToWarden::Terminate { force });
@@ -1099,6 +1144,7 @@ impl Relay {
                 if let Some(client) = self.clients.get_mut(i) {
                     client.upgrading = true;
                 }
+                self.replacing = true;
                 self.send_warden(&ToWarden::Upgrade { path });
             }
             _ => self.error(i, ErrorCode::BAD_REQUEST, "not a request"),
@@ -1210,6 +1256,29 @@ impl Relay {
         self.settle.arm(Instant::now());
     }
 
+    /// Types what a `write` says, as one piece, for a connection that has not
+    /// attached (and for one that has: who types it does not matter). A key is
+    /// the bytes the screen's modes make of it, so the screen is first given
+    /// everything the program has written.
+    fn write(&mut self, i: usize, strokes: &[Stroke]) {
+        if self.exit.is_some() {
+            return self.error(i, ErrorCode::ENDED, "the program has ended");
+        }
+        self.catch_up();
+        let typed = match typing::bytes(strokes, &self.screen.modes()) {
+            Ok(typed) => typed,
+            Err(why) => return self.error(i, ErrorCode::BAD_REQUEST, &why),
+        };
+        if !self.queue_input(&typed) {
+            return self.error(i, ErrorCode::INPUT_FULL, "the program is not taking input");
+        }
+        // What is typed may start a program that says nothing; there is a look
+        // to be made only for somebody who is shown the result.
+        if self.attached() > 0 {
+            self.settle.arm(Instant::now());
+        }
+    }
+
     /// Holds `bytes` for the program, which takes them when it reads. `false`
     /// when that would take what is waiting past [`INPUT_LIMIT`]: none of it is
     /// kept.
@@ -1256,20 +1325,132 @@ impl Relay {
             if asked.is_empty() {
                 return;
             }
-            let status = self.status();
+            // Looking at the terminal is for the ones that ask how the session
+            // stands, once for all of them.
+            let status = asked
+                .iter()
+                .any(|(_, question)| matches!(question, Question::Status | Question::List))
+                .then(|| self.status());
             for (i, question) in asked {
-                match question {
-                    Question::Status => self.queue(
+                match (question, &status) {
+                    (Question::Status, Some(status)) => self.queue(
                         i,
                         Some(self.id.clone()),
                         Message::StatusReply(status.clone()),
                     ),
-                    Question::List => {
+                    (Question::List, Some(status)) => {
                         self.queue(i, None, Message::ListReply(vec![status.clone()]));
                     }
+                    (Question::Read(capture), _) => self.answer_read(i, capture),
+                    _ => {}
                 }
                 self.take_packets(i);
             }
+        }
+    }
+
+    /// The screen as of now, for client `i`: the text of it, or the bytes that
+    /// build it, in pieces. It is asked at the end of a turn, so it is of
+    /// everything this relay has read from the program; the screen is given what
+    /// it has not had first, as the output is (`Live`, or `Held` for a relay that
+    /// was not reading yet), because a question in those bytes is still the
+    /// program's to have answered: a screen that took them as spent would mark
+    /// it answered and never answer it.
+    fn answer_read(&mut self, i: usize, capture: Capture) {
+        // A client that asks and does not read what it is sent is dropped, as
+        // for any other answer; one answer is as large as a screen is.
+        if self
+            .clients
+            .get(i)
+            .is_some_and(|client| client.out.len().saturating_sub(client.sent) > OUT_LIMIT)
+        {
+            return self.drop_client(i);
+        }
+        self.catch_up();
+        let (cols, rows) = self.screen.size();
+        let offset = self.screen_at;
+        let picture = capture.picture;
+        let bytes = if picture {
+            self.screen.image()
+        } else {
+            let history = usize::try_from(capture.history).unwrap_or(usize::MAX);
+            let mut text = String::new();
+            for line in self.screen.text(history, capture.unwrap) {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text.into_bytes()
+        };
+        let Some(client) = self.clients.get_mut(i) else {
+            return;
+        };
+        let mut pieces = bytes.chunks(OUT_CHUNK).peekable();
+        loop {
+            let data = pieces.next().unwrap_or_default().to_vec();
+            let more = pieces.peek().is_some();
+            let message = if picture {
+                Message::Picture {
+                    offset,
+                    cols,
+                    rows,
+                    more,
+                    data,
+                }
+            } else {
+                Message::ScreenText {
+                    offset,
+                    cols,
+                    rows,
+                    more,
+                    data,
+                }
+            };
+            if Packet::about(self.id.clone(), message)
+                .encode(&mut client.out)
+                .is_err()
+            {
+                client.dead = true;
+                return;
+            }
+            if !more {
+                return;
+            }
+        }
+    }
+
+    /// Gives the screen what it has not had of the journal.
+    fn catch_up(&mut self) {
+        self.feed_screen(if self.reading { Feed::Live } else { Feed::Held });
+    }
+
+    /// The session's label: what its file says (see [`sockdir::label_path`]).
+    /// The directory is the listening socket's, so that this does not depend on
+    /// where the relay was started from.
+    fn label(&self) -> Option<String> {
+        let address = self.listener.local_addr().ok()?;
+        let dir = address.as_pathname()?.parent()?;
+        sockdir::read_label(dir, &self.id)
+    }
+
+    /// Whether this relay going is the end of the session, and not its being
+    /// handed to another relay. The label is the session's and not this relay's:
+    /// a relay that is replaced leaves it, one that leaves a session that is over
+    /// takes it away. The warden only ends a session whose program has ended (its
+    /// end was delivered, or nobody came for it in a day), and refuses to replace
+    /// the relay of one, so a relay told to quit that knows the program ended is
+    /// the last, unless it is the one that asked to be replaced (the program may
+    /// end while the swap is under way). One whose warden is gone and whose
+    /// terminal is closed has nothing left to serve either.
+    fn leaving_for_good(&self) -> bool {
+        self.is_orphaned() || (self.exit.is_some() && !self.replacing)
+    }
+
+    /// Takes the label file away: the session is gone.
+    fn forget_label(&self) {
+        if let Some(address) = self.listener.local_addr().ok()
+            && let Some(dir) = address.as_pathname().and_then(std::path::Path::parent)
+        {
+            let _ = sockdir::remove_label(dir, &self.id);
         }
     }
 
@@ -1300,6 +1481,7 @@ impl Relay {
         status.exit = self.exit;
         status.version = crate::release();
         status.warden_version.clone_from(&self.warden_version);
+        status.label = self.label();
         status
     }
 
@@ -1320,6 +1502,17 @@ impl Relay {
                 return;
             }
             let Some(attach) = client.attach.as_mut() else {
+                // A connection that has not attached is owed the end of the
+                // program if it waits for it, and nothing else.
+                if let (true, Some(exit), true) = (ended_ready, self.exit, client.waiting) {
+                    let packet = Packet::about(self.id.clone(), Message::Ended(exit));
+                    if packet.encode(&mut client.out).is_err() {
+                        client.dead = true;
+                        return;
+                    }
+                    client.waiting = false;
+                    continue;
+                }
                 break;
             };
             if let Some(picture) = attach.picture.as_mut() {
@@ -1376,6 +1569,17 @@ impl Relay {
                     return;
                 }
                 client.ended_queued = true;
+                client.waiting = false;
+            } else if let (true, Some(exit), true) = (ended_ready, self.exit, client.waiting) {
+                // It asked to be told after it was (or without being attached,
+                // and then attached): told again, and the end it was told as
+                // an attached client stays the one that counts as delivered.
+                let packet = Packet::about(self.id.clone(), Message::Ended(exit));
+                if packet.encode(&mut client.out).is_err() {
+                    client.dead = true;
+                    return;
+                }
+                client.waiting = false;
             } else {
                 break;
             }
@@ -1472,6 +1676,28 @@ mod tests {
     /// As [`answers_after_taking_over`], and where the relay then says the last
     /// question it knows of was answered.
     fn take_over(journal: Journal) -> (Vec<u8>, u64) {
+        let (mut relay, slave) = relay_over(journal);
+        relay.on_warden(ToRelay::Go);
+        (typed_to_the_program(&slave), relay.last_reply)
+    }
+
+    /// What the program finds waiting to be read: what was typed to it.
+    fn typed_to_the_program(slave: &OwnedFd) -> Vec<u8> {
+        let mut set = [sys::want(slave.as_raw_fd(), libc::POLLIN)];
+        let mut got = Vec::new();
+        while sys::poll(&mut set, Some(std::time::Duration::from_millis(300))).unwrap() > 0 {
+            let mut buf = [0u8; 64];
+            match sys::read_fd(slave.as_fd(), &mut buf) {
+                Ok(n) if n > 0 => got.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                _ => break,
+            }
+        }
+        got
+    }
+
+    /// A relay over a terminal whose program reads what arrives as it is, and
+    /// the program's side of it; the relay has been told nothing yet.
+    fn relay_over(journal: Journal) -> (Relay, OwnedFd) {
         let pty = pty::open(pty::DEFAULT_SIZE).unwrap();
         // The program's side reads what arrives as it is.
         // SAFETY: `slave` is an open terminal and `raw` a termios the kernel fills.
@@ -1490,7 +1716,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kr{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let mut relay = Relay {
+        let relay = Relay {
             id: SessionId::new("held").unwrap(),
             chan,
             chan_alive: true,
@@ -1515,6 +1741,7 @@ mod tests {
             input_sent: 0,
             clients: Vec::new(),
             delivered_sent: false,
+            replacing: false,
             quit: false,
             accept_paused: false,
             told: None,
@@ -1524,18 +1751,66 @@ mod tests {
             spare: None,
             chunk: 4096,
         };
-        relay.on_warden(ToRelay::Go);
         let _ = std::fs::remove_file(&path);
-        let mut set = [sys::want(pty.slave.as_raw_fd(), libc::POLLIN)];
-        let mut got = Vec::new();
-        while sys::poll(&mut set, Some(std::time::Duration::from_millis(300))).unwrap() > 0 {
-            let mut buf = [0u8; 64];
-            match sys::read_fd(pty.slave.as_fd(), &mut buf) {
-                Ok(n) if n > 0 => got.extend_from_slice(buf.get(..n).unwrap_or_default()),
-                _ => break,
+        (relay, pty.slave)
+    }
+
+    #[test]
+    fn reading_the_screen_does_not_take_a_question_in_the_last_bytes_for_answered() {
+        // The program asked at the very end of what it wrote, and the screen has
+        // not had those bytes: a read gives them to it as the relay's own
+        // reading would, so the question is answered, once, and the read finds
+        // the cursor where the answer says it is. (Given as spent, they would
+        // be marked answered and never answered.)
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(b"text\x1b[6n");
+        let (mut relay, slave) = relay_over(journal);
+        relay.live = true;
+        relay.reading = true;
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        relay.seat(ours);
+        relay.answer_read(0, Capture::default());
+        assert_eq!(typed_to_the_program(&slave), b"\x1b[1;5R");
+        assert_eq!(relay.journal.answered(), Some(relay.journal.total()));
+        assert_eq!(relay.screen_at, relay.journal.total());
+        let answer = relay.clients.first().map(|client| client.out.clone());
+        let mut decoder = PacketDecoder::new();
+        decoder.push(&answer.unwrap());
+        let packet = decoder.next_packet().unwrap().unwrap();
+        assert!(matches!(
+            packet.message,
+            Message::ScreenText {
+                offset: 8,
+                more: false,
+                ..
             }
-        }
-        (got, relay.last_reply)
+        ));
+    }
+
+    #[test]
+    fn a_relay_leaves_the_label_when_it_is_replaced_and_takes_it_when_the_session_is_over() {
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
+        let (mut relay, _slave) = relay_over(journal);
+        let dir = std::env::temp_dir();
+        let id = relay.id.clone();
+        let label = sockdir::label_path(&dir, &id);
+        std::fs::write(&label, "mine").unwrap();
+        assert_eq!(relay.label().as_deref(), Some("mine"));
+        // The program lives: whatever tells this relay to quit, it is a swap.
+        assert!(!relay.leaving_for_good());
+        // It ended and nobody asked for a swap: the warden is ending the session
+        // (its end was delivered, or the day it is kept for is over).
+        relay.exit = Some(Exit::Code(0));
+        assert!(relay.leaving_for_good());
+        // It ended while this relay was being replaced.
+        relay.replacing = true;
+        assert!(!relay.leaving_for_good());
+        // The upgrade failed: it is not being replaced after all.
+        relay.upgrade_failed("no");
+        assert!(relay.leaving_for_good());
+        relay.forget_label();
+        assert_eq!(relay.label(), None);
+        assert!(!label.exists());
     }
 
     #[test]

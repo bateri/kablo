@@ -16,6 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use kablo_proto::SessionId;
+use kablo_proto::v1::MAX_LABEL;
 
 use crate::sys;
 
@@ -103,6 +104,82 @@ pub fn session_ids(dir: &Path) -> io::Result<Vec<SessionId>> {
     }
     ids.sort();
     Ok(ids)
+}
+
+/// The path of the file that holds the label of session `id` in `dir`.
+///
+/// The file is the whole truth about a label: the relay keeps none of its own
+/// and reads the file whenever it says how the session stands, so a label that
+/// is changed, or that is there when the relay is replaced, is seen at once and
+/// stays. It is made when a session is (see [`crate::launch::launch`]) and removed
+/// when the session goes (the relay's last act), and its name does not end in
+/// `.sock`, so [`session_ids`] does not take it for a session.
+pub fn label_path(dir: &Path, id: &SessionId) -> PathBuf {
+    dir.join(format!("{id}.label"))
+}
+
+/// The label of session `id` in `dir`: what the file says, cut at
+/// [`kablo_proto::v1::MAX_LABEL`] bytes where a character ends and with what is
+/// not UTF-8 replaced; `None` when there is no file, it cannot be read or it is
+/// empty. A label that is missing is not an error, and neither is one that cannot
+/// be read: the session is there all the same and `list` must show it.
+pub fn read_label(dir: &Path, id: &SessionId) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(label_path(dir, id)).ok()?;
+    // Longer than a label can be, whatever the file holds: it may have been
+    // made by anyone who can write to the directory, which is the user.
+    let mut bytes = Vec::new();
+    file.take(4 * MAX_LABEL as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut end = text.len().min(MAX_LABEL);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let label = text.get(..end).unwrap_or_default();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// Gives session `id` in `dir` this label, replacing the one it has; an empty
+/// label takes it away. The file is written under another name and renamed, so
+/// that a relay that reads it at any moment finds a whole label, the old or the
+/// new.
+pub fn write_label(dir: &Path, id: &SessionId, label: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if label.is_empty() {
+        return remove_label(dir, id);
+    }
+    if label.len() > MAX_LABEL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a label is at most {MAX_LABEL} bytes"),
+        ));
+    }
+    let path = label_path(dir, id);
+    let scratch = dir.join(format!(".{id}.label.{}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&scratch)
+        .and_then(|mut file| file.write_all(label.as_bytes()))
+        .and_then(|()| std::fs::rename(&scratch, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&scratch);
+    }
+    written
+}
+
+/// Takes away the label of session `id` in `dir`; one that is not there is
+/// taken away already.
+pub fn remove_label(dir: &Path, id: &SessionId) -> io::Result<()> {
+    match std::fs::remove_file(label_path(dir, id)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// The name every mailbox starts with. The rest is the pid of the bridge that
@@ -350,5 +427,52 @@ mod tests {
         let err = listen(&long).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("at most"));
+    }
+
+    #[test]
+    fn a_label_is_written_whole_read_back_and_taken_away() {
+        let dir = scratch("sd-label");
+        ensure_dir(&dir).unwrap();
+        let id = SessionId::new("build").unwrap();
+        assert_eq!(read_label(&dir, &id), None, "no file is no label");
+        write_label(&dir, &id, "the build").unwrap();
+        assert_eq!(read_label(&dir, &id).as_deref(), Some("the build"));
+        write_label(&dir, &id, "the tests").unwrap();
+        assert_eq!(read_label(&dir, &id).as_deref(), Some("the tests"));
+        assert_eq!(
+            std::fs::metadata(label_path(&dir, &id)).unwrap().mode() & 0o777,
+            0o600
+        );
+        // Only the file is left: the scratch name it was written under is gone.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["build.label"]);
+        assert!(session_ids(&dir).unwrap().is_empty(), "not a session");
+        write_label(&dir, &id, "").unwrap();
+        assert_eq!(read_label(&dir, &id), None);
+        assert!(!label_path(&dir, &id).exists());
+        remove_label(&dir, &id).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_label_file_that_is_too_long_or_not_text_is_cut_to_what_a_label_can_be() {
+        let dir = scratch("sd-label-cut");
+        ensure_dir(&dir).unwrap();
+        let id = SessionId::new("odd").unwrap();
+        // Two bytes a character: the 64th byte is the middle of one.
+        std::fs::write(label_path(&dir, &id), "é".repeat(40)).unwrap();
+        assert_eq!(read_label(&dir, &id), Some("é".repeat(32)));
+        std::fs::write(label_path(&dir, &id), vec![b'x'; 10_000]).unwrap();
+        assert_eq!(read_label(&dir, &id), Some("x".repeat(MAX_LABEL)));
+        std::fs::write(label_path(&dir, &id), b"a\xffb").unwrap();
+        assert_eq!(read_label(&dir, &id).as_deref(), Some("a\u{fffd}b"));
+        std::fs::write(label_path(&dir, &id), b"").unwrap();
+        assert_eq!(read_label(&dir, &id), None, "an empty file is no label");
+        let too_long = "x".repeat(MAX_LABEL + 1);
+        assert!(write_label(&dir, &id, &too_long).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

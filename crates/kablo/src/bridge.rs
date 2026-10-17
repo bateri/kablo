@@ -11,10 +11,12 @@
 //! session's relay over the relay's own socket; what the relay sends comes back
 //! to the client as it is. The program's bytes are not looked at, and the bridge
 //! keeps no copy of them: a client that comes back asks for its offset again.
-//! Three things it answers itself, because they are about the connection and
-//! not a session: `ping`; `list`, by asking every relay for its status; and
+//! Four things it answers itself, because they are about the connection and
+//! not a session: `ping`, unless it names a session the client has a link to (the
+//! relay answers that one, after what was written to it: it is how a client
+//! learns that keys were typed); `list`, by asking every relay for its status;
 //! `new`, by starting the session as `kablo new` does and answering with the
-//! new session's status.
+//! new session's status; and `label`, by writing the session's label file.
 //!
 //! A relay that dies or is replaced while a client is attached does not show:
 //! see [`crate::link`]. A client that goes away (the standard input ends) ends
@@ -67,6 +69,7 @@ use crate::launch::{self, Failure};
 use crate::link::Link;
 use crate::mailbox::{self, Mailbox};
 use crate::outbound::{self, Outbound};
+use crate::peer;
 use crate::scan::{self, Scan};
 use crate::streams::{self, Streams};
 use crate::{journal, sockdir, sys};
@@ -406,6 +409,12 @@ impl Bridge {
     fn handle(&mut self, packet: Packet, now: Instant, outgoing: &mut Vec<Packet>) {
         let Packet { session, message } = packet;
         match (session, message) {
+            // A ping that names a session the client is using goes the way its
+            // requests do, so that its answer comes after theirs: after the
+            // error a `write` has, if it has one.
+            (Some(id), Message::Ping(bytes)) if self.is_linked(&id) => {
+                self.route(id, Message::Ping(bytes), now, outgoing);
+            }
             (session, Message::Ping(bytes)) => outgoing.push(Packet {
                 session,
                 message: Message::Pong(bytes),
@@ -427,6 +436,12 @@ impl Bridge {
                 Err(e) => outgoing.push(failure(None, ErrorCode::UNAVAILABLE, &e.to_string())),
             },
             (session, Message::New(request)) => self.create(session, &request, outgoing),
+            (Some(id), Message::Label(label)) => self.label(id, &label, outgoing),
+            (None, Message::Label(_)) => outgoing.push(failure(
+                None,
+                ErrorCode::BAD_REQUEST,
+                "this request needs a session id",
+            )),
             (Some(id), message) if is_request(&message) => {
                 self.route(id, message, now, outgoing);
             }
@@ -505,11 +520,38 @@ impl Bridge {
         };
         if let Some(link) = self.links.get_mut(index) {
             // Attaching and typing are what using a session is.
-            if matches!(message, Message::Attach { .. } | Message::Input(_)) {
+            if matches!(
+                message,
+                Message::Attach { .. } | Message::Input(_) | Message::Write(_)
+            ) {
                 link.touch(now);
                 self.used = now;
             }
             link.send(Packet::about(id, message), now, outgoing);
+        }
+    }
+
+    /// Whether the client has a link to session `id` that is there.
+    fn is_linked(&self, id: &SessionId) -> bool {
+        self.links
+            .iter()
+            .any(|link| link.id() == id && !link.is_gone())
+    }
+
+    /// Gives session `id` this label, or none if it is empty; says nothing when
+    /// it is done. The label is a file the session's relay reads when it is asked
+    /// how the session stands, so there is nothing to tell the relay.
+    fn label(&mut self, id: SessionId, label: &str, outgoing: &mut Vec<Packet>) {
+        // A label for a session that is not there would be a file nobody reads.
+        if let Err(e) = peer::connect_ours(&sockdir::socket_path(&self.dir, &id)) {
+            return outgoing.push(Link::refusal(&id, &e));
+        }
+        if let Err(e) = sockdir::write_label(&self.dir, &id, label) {
+            outgoing.push(failure(
+                Some(id),
+                ErrorCode::UNAVAILABLE,
+                &format!("the label cannot be written: {e}"),
+            ));
         }
     }
 
@@ -691,6 +733,9 @@ fn is_request(message: &Message) -> bool {
             | Message::Upgrade { .. }
             | Message::Status
             | Message::Input(_)
+            | Message::Write(_)
+            | Message::Read(_)
+            | Message::Wait
     )
 }
 

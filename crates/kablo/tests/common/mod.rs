@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    ErrorCode, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size, Status,
-    TerminalState, View,
+    Capture, ErrorCode, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size,
+    Status, Stroke, TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -669,6 +669,61 @@ impl Conn {
         unreachable!()
     }
 
+    /// Types `strokes` with a `write` and a `ping` after it, the way a sender
+    /// that wants to know sends them; what the server said of the `write` is the
+    /// error that came before the `pong`, if one did.
+    pub fn write(&mut self, strokes: Vec<Stroke>) -> Result<(), (ErrorCode, String)> {
+        self.errors.clear();
+        self.replies.clear();
+        self.send(Message::Write(strokes));
+        self.send(Message::Ping(b"w".to_vec()));
+        self.until("the pong after a write", |c| {
+            c.replies
+                .iter()
+                .any(|p| matches!(p.message, Message::Pong(_)))
+        });
+        match self.errors.first() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Asks to read the screen and returns what answered, put together: the
+    /// offset, the size of the terminal and the text.
+    pub fn read_text(&mut self, capture: Capture) -> (u64, (u16, u16), String) {
+        self.replies.clear();
+        self.send(Message::Read(capture));
+        self.until("the screen text", |c| {
+            c.replies
+                .iter()
+                .any(|p| matches!(p.message, Message::ScreenText { more: false, .. }))
+        });
+        let mut whole = (0, (0, 0), Vec::new());
+        for (i, packet) in self.replies.drain(..).enumerate() {
+            if let Message::ScreenText {
+                offset,
+                cols,
+                rows,
+                data,
+                ..
+            } = packet.message
+            {
+                if i == 0 {
+                    whole.0 = offset;
+                    whole.1 = (cols, rows);
+                }
+                assert_eq!(offset, whole.0, "the pieces are of one screen");
+                assert_eq!((cols, rows), whole.1, "the pieces are of one screen");
+                whole.2.extend_from_slice(&data);
+            }
+        }
+        (
+            whole.0,
+            whole.1,
+            String::from_utf8(whole.2).expect("the text is UTF-8"),
+        )
+    }
+
     /// Reads until the server closes the connection.
     pub fn until_closed(&mut self) {
         let start = Instant::now();
@@ -697,6 +752,11 @@ pub struct Seen {
     /// Whether the program's bytes are left out of `data` (a test that lets a
     /// session run flat out has no use for them).
     pub discard: bool,
+    /// Every screen text received, put together: the offset, the size of the
+    /// terminal and the text.
+    pub texts: Vec<(u64, (u16, u16), String)>,
+    /// The pieces of a text that is not whole yet.
+    partial: Vec<u8>,
 }
 
 /// What a client of a bridge has seen of one stream.
@@ -915,6 +975,21 @@ impl Bridge {
                         seen.data.extend_from_slice(&data);
                     }
                 }
+                Message::ScreenText {
+                    offset,
+                    cols,
+                    rows,
+                    more,
+                    data,
+                } => {
+                    let seen = self.sessions.entry(name.unwrap()).or_default();
+                    seen.partial.extend_from_slice(&data);
+                    if !more {
+                        let text = String::from_utf8(std::mem::take(&mut seen.partial))
+                            .expect("the text is UTF-8");
+                        seen.texts.push((offset, (cols, rows), text));
+                    }
+                }
                 Message::Ended(exit) => {
                     self.sessions.entry(name.unwrap()).or_default().ended = Some(exit)
                 }
@@ -1080,6 +1155,38 @@ impl Bridge {
                     .is_some_and(|s| s.data.windows(needle.len()).any(|w| w == needle.as_slice()))
             },
         );
+    }
+
+    /// Types `strokes` to session `id` with a `write` and a `ping` that names it
+    /// after it; what was said of the `write` is the error that came before the
+    /// `pong`.
+    pub fn write(&mut self, id: &str, strokes: Vec<Stroke>) -> Result<(), (ErrorCode, String)> {
+        let (pongs, errors) = (self.pongs.len(), self.errors.len());
+        self.send(Some(id), Message::Write(strokes));
+        self.send(Some(id), Message::Ping(b"w".to_vec()));
+        self.until("the pong after a write", |b| {
+            b.pongs.len() > pongs
+                || b.errors.len() > errors
+                    && b.errors
+                        .last()
+                        .is_some_and(|e| e.1 == ErrorCode::UNAVAILABLE)
+        });
+        // The error that came before the pong is the write's; an `unavailable`
+        // with no pong after it is the link saying it cannot know.
+        match self.errors.get(errors) {
+            Some((_, code, text)) => Err((*code, text.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Reads the screen of session `id` as text.
+    pub fn read_text(&mut self, id: &str, capture: Capture) -> (u64, (u16, u16), String) {
+        let before = self.seen(id).texts.len();
+        self.send(Some(id), Message::Read(capture));
+        self.until("the screen text", |b| {
+            b.sessions.get(id).is_some_and(|s| s.texts.len() > before)
+        });
+        self.seen(id).texts[before].clone()
     }
 
     pub fn list(&mut self) -> Vec<Status> {

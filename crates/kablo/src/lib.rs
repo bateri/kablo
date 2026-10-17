@@ -35,6 +35,7 @@ pub mod sockdir;
 pub mod streams;
 pub mod sys;
 pub mod tune;
+pub mod typing;
 pub mod upgrade;
 pub mod warden;
 

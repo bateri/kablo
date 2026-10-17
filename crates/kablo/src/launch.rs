@@ -97,8 +97,24 @@ enum Try {
 }
 
 /// Starts session `id` in socket directory `dir`. `Ok` means the session is
-/// up and its socket answers.
+/// up and its socket answers, with the label the request asked for.
 pub fn launch(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Failure> {
+    start(dir, id, request)?;
+    // The session is new, which is what only this knows: the file of a label
+    // that an earlier session of the same name left behind (a relay that was
+    // killed does not remove its own) is not this one's, and what the request
+    // asks is. It cannot be done sooner, since a session with this name that is
+    // there refuses to start and its label is its own; the moment between the
+    // relay answering and this is the one in which that file can be read as this
+    // session's. A label that cannot be written does not undo a session that is
+    // up: it is seen in its `status`, which says none.
+    let label = request.label.as_deref().unwrap_or_default();
+    let _ = sockdir::write_label(dir, id, label);
+    Ok(())
+}
+
+/// Starts the warden of session `id`; the label is not looked at.
+fn start(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Failure> {
     sockdir::ensure_dir(dir).map_err(|e| Failure::Other(e.to_string()))?;
     let exe =
         std::env::current_exe().map_err(|e| Failure::Other(format!("cannot find myself: {e}")))?;
