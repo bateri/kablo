@@ -9,7 +9,7 @@ every dependent resolves to the fork without knowing it.
 
 The files are the `alacritty_terminal` 0.26.0 package from crates.io (Apache-2.0), without
 `.cargo-ok` and `Cargo.toml.orig`, and with a `.gitignore` of ours (`target`). The diff between the package and this
-directory is the list of changes below: there are none yet. The license is Apache-2.0 only,
+directory is the list of changes below. The license is Apache-2.0 only,
 so section 4(b) applies — every file a change touches says so in a notice at its top, and the
 list below names the file.
 
@@ -29,7 +29,15 @@ shipped with it and with its default features, so upstream's reference tests run
 
 ## Changes
 
-None yet.
+- **The primary screen can be read while the alternate screen covers it.**
+  `Term::hidden_primary_grid() -> Option<&Grid<Cell>>` returns the grid of the primary
+  screen, read only, when a program has taken the alternate screen (`ALT_SCREEN`), and `None`
+  otherwise. Upstream keeps that grid in the private `inactive_grid` and gives no way to look
+  at it, so what the shell printed before a full screen program started (the rows and the
+  history behind them) could not be read until the program ended. Nothing else changes: the
+  grid is not copied, swapped or touched, and the accessor is a plain borrow. Touches
+  `src/term/mod.rs`, which carries the §4(b) notice. Test:
+  `the_primary_screen_stays_readable_behind_the_alternate_one` in the same file.
 
 ## When this directory changes
 

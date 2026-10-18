@@ -33,6 +33,15 @@ section is not released.
 
 ## [Unreleased]
 
+### For apps
+
+- **The terminal emulator is a fork too, as the parser is: `vendor/alacritty_terminal`.**
+  Upstream 0.26.0 with one addition, `Term::hidden_primary_grid()`, which lets the screen
+  behind a full screen program be read (`vendor/alacritty_terminal/FORK.md`). Same name and
+  version as upstream, so a dependent resolves to it through `[patch.crates-io]`; bateri takes
+  it from this repository by a pinned commit, next to `vendor/vte`. Nothing of the relay's
+  behavior changes.
+
 ## [0.1.0] - 2026-10-15
 
 The first release. kablo holds the terminal of a shell so the programs in it

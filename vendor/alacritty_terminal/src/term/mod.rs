@@ -1,3 +1,7 @@
+// Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
+// `Term::hidden_primary_grid` was added, and a test for it. Nothing else in this file differs
+// from the release; FORK.md lists the changes of the whole package.
+
 //! Exports the `Term` type which is a high-level API for the Grid.
 
 use std::ops::{Index, IndexMut, Range};
@@ -649,6 +653,18 @@ impl<T> Term<T> {
     /// Mutable access to the raw grid data structure.
     pub fn grid_mut(&mut self) -> &mut Grid<Cell> {
         &mut self.grid
+    }
+
+    /// The primary screen's grid, read only, while the alternate screen is the one in use.
+    ///
+    /// A program that takes the alternate screen (a pager, an editor) leaves the primary screen
+    /// where it was: its rows and its history stay in the grid that [`Term::grid`] no longer
+    /// returns, unchanged until the program gives the screen back, and only a resize touches them.
+    /// This is that grid, so what the shell printed before the program started can still be read.
+    ///
+    /// `None` when the primary screen is the one in use: it is [`Term::grid`] then.
+    pub fn hidden_primary_grid(&self) -> Option<&Grid<Cell>> {
+        self.mode.contains(TermMode::ALT_SCREEN).then_some(&self.inactive_grid)
     }
 
     /// Resize terminal to new dimensions.
@@ -3289,6 +3305,45 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn the_primary_screen_stays_readable_behind_the_alternate_one() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        assert!(term.hidden_primary_grid().is_none());
+
+        // Four lines on a three-line screen: one of them is in the history.
+        for text in ["one", "two", "three", "four"] {
+            text.chars().for_each(|c| term.input(c));
+            term.carriage_return();
+            term.linefeed();
+        }
+        let history = term.history_size();
+        assert_eq!(history, 2);
+        let letters = |grid: &Grid<Cell>, line: i32| -> String {
+            let row: String = grid[Line(line)].into_iter().map(|cell| cell.c).collect();
+            row.trim_end().to_owned()
+        };
+        assert_eq!(letters(term.grid(), -(history as i32)), "one");
+
+        // A program takes the alternate screen and draws on it.
+        term.swap_alt();
+        term.input('x');
+        let hidden = term.hidden_primary_grid().expect("alternate screen is in use");
+        assert_eq!(hidden.history_size(), history);
+        assert_eq!(letters(hidden, -(history as i32)), "one");
+        assert_eq!(letters(hidden, -1), "two");
+        assert_eq!(letters(hidden, 0), "three");
+        assert_eq!(letters(hidden, 1), "four");
+        // What is drawn now is on the grid in use, at the cursor the alternate screen inherited,
+        // not on the hidden one.
+        assert_eq!(term.grid()[Point::new(Line(2), Column(0))].c, 'x');
+
+        // The program gives the screen back: the primary grid is the one in use again.
+        term.swap_alt();
+        assert!(term.hidden_primary_grid().is_none());
+        assert_eq!(letters(term.grid(), 1), "four");
     }
 
     #[test]
