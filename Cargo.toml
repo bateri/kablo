@@ -1,12 +1,12 @@
 [workspace]
 members = ["crates/kablo-proto", "crates/kablo-screen", "crates/kablo"]
 resolver = "3"
-# The fork of the terminal parser (`[patch.crates-io]` below) is upstream's code in
-# upstream's style: not a member, so `fmt` and `clippy` leave it alone. Its tests run from
-# the Makefile. `exclude` is also what lets cargo find it inside a git dependency:
-# without it cargo takes `vendor/vte` for a member of this workspace and refuses to
-# load it from a checkout of this repository.
-exclude = ["vendor/vte"]
+# The forks of the terminal parser and of the terminal emulator (`[patch.crates-io]` below)
+# are upstream's code in upstream's style: not members, so `fmt` and `clippy` leave them
+# alone. Their tests run from the Makefile. `exclude` is also what lets cargo find them
+# inside a git dependency: without it cargo takes `vendor/vte` or `vendor/alacritty_terminal`
+# for a member of this workspace and refuses to load it from a checkout of this repository.
+exclude = ["vendor/vte", "vendor/alacritty_terminal"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,5 +34,9 @@ alacritty_terminal = { version = "=0.26.0", default-features = false }
 # source, and bateri takes it from this repository by a pinned commit. Same name and
 # version, so `alacritty_terminal` resolves to it unchanged. When it stops applying
 # (a newer `vte` asked for) cargo only warns and builds the registry's one.
+#
+# `alacritty_terminal` itself is a fork too, kept in `vendor/alacritty_terminal` (upstream
+# 0.26.0 plus the changes in its `FORK.md`), for the same reason and in the same way.
 [patch.crates-io]
 vte = { path = "vendor/vte" }
+alacritty_terminal = { path = "vendor/alacritty_terminal" }

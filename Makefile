@@ -27,9 +27,17 @@ clippy:
 # testing them: look for the 77 tests of its lib target in the output).
 VTE_TEST = test -p vte --all-targets
 
+# The same for the emulator's fork (`vendor/alacritty_terminal`), whose tests are upstream's
+# and ours. It has dev-dependencies and is not a member, so cargo will not test it as `-p` of
+# this workspace: it is tested as the package it is, on the Cargo.lock upstream shipped with
+# it (`--locked`: the versions upstream tested), with its default features, which is also how
+# upstream's reference tests (they need `serde`) run.
+ALACRITTY_TEST = test --manifest-path vendor/alacritty_terminal/Cargo.toml --all-targets --locked
+
 test:
 	$(CARGO) test --workspace --all-targets
 	$(CARGO) $(VTE_TEST)
+	$(CARGO) $(ALACRITTY_TEST)
 
 # The same gate on Linux, in the image from `tools/linux/Dockerfile`, with
 # `--locked` (a run that would change Cargo.lock fails), then the release build
@@ -69,6 +77,7 @@ linux:
 		cargo clippy --workspace --all-targets --locked -- -D warnings; \
 		cargo test --workspace --all-targets --locked; \
 		cargo $(VTE_TEST) --locked; \
+		cargo $(ALACRITTY_TEST); \
 		t="$$(uname -m)-unknown-linux-musl"; \
 		cargo build --release --locked -p kablo --target "$$t"; \
 		bin="target/linux/$$t/release/kablo"; \
