@@ -1,6 +1,8 @@
 // Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
-// `Term::hidden_primary_grid` was added, and a test for it. Nothing else in this file differs
-// from the release; FORK.md lists the changes of the whole package.
+// `Term::hidden_primary_grid` was added, and a test for it; a full keyboard mode stack drops
+// its own bottom entry, not the title stack's (upstream's later fix), and a test for it.
+// Nothing else in this file differs from the release; FORK.md lists the changes of the whole
+// package.
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
@@ -1309,7 +1311,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -3305,6 +3307,28 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn a_full_keyboard_mode_stack_drops_its_own_bottom_entry() {
+        let size = TermSize::new(10, 3);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        // The bottom entry is the one to go, and the title stack is not touched: it is empty
+        // here, so taking from it would panic, and a title kept on it would be lost.
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
+            term.push_keyboard_mode(KeyboardModes::REPORT_EVENT_TYPES);
+        }
+        assert!(term.title_stack.is_empty());
+        assert_eq!(term.keyboard_mode_stack.len(), KEYBOARD_MODE_STACK_MAX_DEPTH);
+        assert!(!term.keyboard_mode_stack.contains(&KeyboardModes::DISAMBIGUATE_ESC_CODES));
+
+        term.push_title();
+        term.push_keyboard_mode(KeyboardModes::REPORT_ALTERNATE_KEYS);
+        assert_eq!(term.title_stack.len(), 1);
+        assert_eq!(term.keyboard_mode_stack.len(), KEYBOARD_MODE_STACK_MAX_DEPTH);
+        assert!(term.mode.contains(TermMode::REPORT_ALTERNATE_KEYS));
     }
 
     #[test]

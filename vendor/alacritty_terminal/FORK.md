@@ -13,7 +13,8 @@ directory is the list of changes below. The license is Apache-2.0 only,
 so section 4(b) applies — every file a change touches says so in a notice at its top, and the
 list below names the file.
 
-The fork stays a soft one: it only **adds**. It does not touch the cell, the grid's storage
+The fork stays a soft one: it only **adds** (one fix upstream made after the release aside,
+listed below). It does not touch the cell, the grid's storage
 or the parser's behavior, and `alacritty_terminal`'s public API keeps its shape, so moving to
 a newer upstream release is a merge of additions and not a port. Something that would change
 those (a cell of our own, a different storage) is a different decision, and a different
@@ -38,6 +39,18 @@ shipped with it and with its default features, so upstream's reference tests run
   grid is not copied, swapped or touched, and the accessor is a plain borrow. Touches
   `src/term/mod.rs`, which carries the §4(b) notice. Test:
   `the_primary_screen_stays_readable_behind_the_alternate_one` in the same file.
+
+- **A full keyboard mode stack drops its own bottom entry.** In 0.26.0 the push that finds
+  the kitty keyboard mode stack at its limit (`KEYBOARD_MODE_STACK_MAX_DEPTH`, 4096) removes
+  the bottom entry of the **title** stack instead: with no title pushed that is a panic on
+  the thread that parses the program's output, so any program could end the terminal by
+  pushing a mode 4097 times; with titles pushed one is lost and the keyboard stack grows
+  without limit. Upstream fixed it after the release with the same one-word change
+  (alacritty `542147067d`, "Fix Kitty keyboard mode stack size limit"), so the next release's
+  merge drops this entry. It is the one change here that is not an addition, taken because
+  the bug sits in a path every dependent runs once `Config::kitty_keyboard` is on. Touches
+  `src/term/mod.rs`. Test: `a_full_keyboard_mode_stack_drops_its_own_bottom_entry` in the
+  same file.
 
 ## When this directory changes
 
