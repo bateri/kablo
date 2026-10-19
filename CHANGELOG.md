@@ -220,6 +220,14 @@ section is not released.
   fields of one ends in `..`. This is so that a field added to them later, as
   `Features::mailbox` is in this release, breaks no app that builds them. The
   wire format is not touched.
+- **The terminal emulator is a fork too, as the parser is: `vendor/alacritty_terminal`.**
+  Upstream 0.26.0 with one addition, `Term::hidden_primary_grid()`, which lets the screen
+  behind a full screen program be read, and one fix upstream made after the release: a full
+  kitty keyboard mode stack drops its own bottom entry instead of the title stack's, which
+  panicked when no title was pushed (`vendor/alacritty_terminal/FORK.md`). Same name and
+  version as upstream, so a dependent resolves to it through `[patch.crates-io]`; bateri takes
+  it from this repository by a pinned commit, next to `vendor/vte`. Nothing of the relay's
+  behavior changes.
 
 ## [0.1.0] - 2026-10-15
 
