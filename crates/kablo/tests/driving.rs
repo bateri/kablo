@@ -1,6 +1,6 @@
 //! The commands that drive a session without attaching to it (`send`,
-//! `send-key`, `capture`, `wait`, `label`, `new --wait`), run as the real
-//! binary against real sessions.
+//! `send-key`, `capture`, `wait`, `label`, `end`, `new --wait`) and `here`, run
+//! as the real binary against real sessions.
 
 // Test support: a failure here is a failed test.
 #![allow(
@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{Env, PATIENCE};
-use kablo_proto::v1::Capture;
+use kablo_proto::v1::{Capture, State};
 
 const KABLO: &str = env!("CARGO_BIN_EXE_kablo");
 
@@ -445,4 +445,125 @@ fn with_no_session_named_a_command_means_the_terminal_it_runs_in() {
         json.out.contains(&format!("\"id\":\"{id}\"")) && json.out.contains("\"label\":\"inside\""),
         "{json:?}"
     );
+}
+
+// --- ending a session, and saying which one this is ------------------------------
+
+#[test]
+fn end_hangs_up_on_the_program_and_leaves_the_session_to_be_read() {
+    let mut env = Env::new();
+    let id = env.start(
+        "end",
+        &[
+            "--label",
+            "Doomed",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo last words; exec sleep 600",
+        ],
+    );
+    capture_until(&env, &id, |text| has_line(text, "last words"));
+
+    // By its label, whatever the case; it prints nothing and ends with 0 once
+    // the program has gone.
+    let ran = kablo(&env, &["end", "doomed"]);
+    assert_eq!((ran.code, ran.out.as_str(), ran.err.as_str()), (0, "", ""));
+
+    // The end was seen through a wait, which is not delivery: nobody was told
+    // and the session is kept as it is, to be read and waited for. The program
+    // was hung up on (128 and SIGHUP's number).
+    assert_eq!(env.connect(&id).status().state, State::ENDED);
+    assert_eq!(kablo(&env, &["wait", &id]).code, 129);
+    let screen = kablo(&env, &["capture", &id, "--trim"]);
+    assert!(has_line(&screen.out, "last words"), "{screen:?}");
+}
+
+#[test]
+fn a_program_that_ignores_the_hang_up_is_ended_by_force() {
+    let mut env = Env::new();
+    // The signal's disposition is the program's: `sleep` inherits the ignoring.
+    let id = env.start(
+        "stubborn",
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' HUP; echo ready; exec sleep 600",
+        ],
+    );
+    capture_until(&env, &id, |text| has_line(text, "ready"));
+
+    let ran = kablo(&env, &["end", &id]);
+    assert_eq!(ran.code, 1, "{ran:?}");
+    assert_eq!(ran.out, "");
+    assert!(
+        ran.err.contains(&format!("kablo end --force {id}")),
+        "{ran:?}"
+    );
+    assert_eq!(env.connect(&id).status().state, State::RUNNING);
+
+    let ran = kablo(&env, &["end", "--force", &id]);
+    assert_eq!((ran.code, ran.err.as_str()), (0, ""), "{ran:?}");
+    assert_eq!(env.connect(&id).status().state, State::ENDED);
+    // Killed (128 and SIGKILL's number).
+    assert_eq!(kablo(&env, &["wait", &id]).code, 137);
+}
+
+#[test]
+fn ending_a_session_that_has_ended_is_nothing_to_do() {
+    let mut env = Env::new();
+    let id = env.start("over", &["--", "/bin/sh", "-c", "echo done; exit 3"]);
+    assert_eq!(kablo(&env, &["wait", &id]).code, 3);
+    for args in [&["end", id.as_str()][..], &["end", "--force", id.as_str()]] {
+        let ran = kablo(&env, args);
+        assert_eq!((ran.code, ran.out.as_str(), ran.err.as_str()), (0, "", ""));
+    }
+    // Still there to be read.
+    let screen = kablo(&env, &["capture", &id, "--trim"]);
+    assert!(has_line(&screen.out, "done"), "{screen:?}");
+}
+
+#[test]
+fn end_always_names_its_session() {
+    let env = Env::new();
+    // Not guessed from where it runs, which is the usage mistake.
+    for args in [&["end"][..], &["end", "--force"], &["end", "a", "b"]] {
+        let ran = kablo(&env, args);
+        assert_eq!(ran.code, 64, "{args:?}: {ran:?}");
+    }
+    let ran = kablo(&env, &["end", "nobody-called-this"]);
+    assert_eq!(ran.code, 1, "{ran:?}");
+    assert!(ran.err.contains("no session"), "{ran:?}");
+}
+
+#[test]
+fn here_says_the_session_it_runs_in_from_the_system_and_none_from_outside() {
+    let mut env = Env::new();
+    // Outside every session it is no usage mistake: the answer is "none".
+    let ran = kablo(&env, &["here"]);
+    assert_eq!((ran.code, ran.out.as_str()), (1, ""), "{ran:?}");
+    assert!(
+        ran.err.contains("not run in a terminal of a session"),
+        "{ran:?}"
+    );
+    assert_eq!(kablo(&env, &["here", "x"]).code, 64);
+
+    // Inside one: its id. Another session beside it, labelled `here`, changes
+    // nothing: the answer is the system's, not a lookup of a name.
+    let said = env.dir.join("here.txt");
+    let script = format!("'{KABLO}' here > '{}'; sleep 60", said.display());
+    let other = env.start("other", &["--label", "here", "--", "/bin/sh"]);
+    let id = env.start("inside", &["--", "/bin/sh", "-c", &script]);
+    let start = Instant::now();
+    let text = loop {
+        let text = std::fs::read_to_string(&said).unwrap_or_default();
+        if text.ends_with('\n') {
+            break text;
+        }
+        assert!(start.elapsed() < PATIENCE, "it said {text:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(text, format!("{id}\n"));
+    assert_ne!(id, other);
 }

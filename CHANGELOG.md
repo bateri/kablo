@@ -83,6 +83,21 @@ section is not released.
   prints the id, waits for the program to end, ends with its status and takes
   the session over, so it is not kept for a day. `kablo list` has a `LABEL`
   column at the end, and `kablo list --json` the key `label`.
+- **`kablo end ID [--force]` ends a session's program, and `kablo here` says which
+  session a program runs in.** `kablo end` hangs up on the program (the shell and
+  the programs in front of it, as a closing terminal window would; `--force` kills
+  them) and waits up to 5 seconds for it to end, so it works with no app attached
+  and from a script or an agent. It ends with `0` once the program has ended, or
+  had; with `1` when it had not ended in time, saying to try `--force`, or when
+  kablo could not (no such session, a name that fits several, a relay that is too
+  old, a `broken` session); `64` without a session, which is always named. As with
+  `wait`, the end is kept for the clients that have not been told, so `capture`
+  still reads the last output. `kablo here` prints the id of the session it runs in
+  and ends with `0`, with `1` and the reason run outside every session, with `64`
+  given an argument; the answer is the system's, not a variable the process could
+  set, and works with any relay (README, Driving a session). A program that
+  ignores `--force` too, or a `broken` session, is still ended with `kill`
+  (README, Limits).
 
 - **`kablo list` shows how long a session has been open and how long it has
   been quiet.** The new columns `AGE` and `QUIET` come before `LABEL`: the time
@@ -166,6 +181,19 @@ section is not released.
   `v1::MAX_SCREEN_TEXT` are new. A label over `MAX_LABEL` is refused when it is
   sent and when it is read, in a `label` and in a `new`; a `status` carries what the
   server says and is read whole.
+- **`kablo end` and `kablo here`, and what an app can rely on of them.** `kablo end
+  ID [--force]` sends the protocol's `terminate` (`force`: `--force`) to the session
+  and, on the same connection, a `wait` for 5 seconds; it ends with `0` when `ended`
+  came (or the session's `status` already said `ended`, in which case nothing is
+  sent), `1` when it did not come in time or kablo could not (the session cannot
+  take a `terminate` when its warden is gone: `unavailable`, which it reports), and
+  `64` when no session is named. The `wait` is not delivery, so the session is kept
+  for the clients that have not been told, and a relay from before 0.2.0 is refused
+  as the other commands do. `kablo here` prints the session's id and a newline,
+  asking every running session's `status` and no more, and ends with `0`; outside
+  every session with `1` and the reason, and with `64` for an argument. Both end
+  as `send`, `send-key`, `capture` and `label` do: `0`, `1` for kablo's own
+  trouble, `64` for a command line that does not parse.
 - **The commands that drive a session, and what an app can rely on of them.** A
   relay from kablo 0.2.0 on takes the messages above and a label; a session's
   `status` says which release serves it (`version`), and a program or an app that

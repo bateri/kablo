@@ -1,6 +1,7 @@
 //! Driving a session from the machine it runs on, without attaching to it:
-//! `kablo send`, `send-key`, `capture`, `wait` and `label`, and the waiting
-//! half of `kablo new --wait`.
+//! `kablo send`, `send-key`, `capture`, `wait`, `label` and `end`, `kablo here`
+//! (which asks the process table and no relay), and the waiting half of
+//! `kablo new --wait`.
 //!
 //! These are the programs' commands (an agent, a script) and they are not
 //! clients in the sense of `kablo connect`: they never attach, so the relay
@@ -71,6 +72,11 @@ const MAX_TEXT: usize = kablo_proto::MAX_PAYLOAD - 64;
 /// How long `new --wait` waits, once it has seen the program end, for the
 /// session to go; the program's status is the answer either way.
 const DELIVERY_WAIT: Duration = Duration::from_secs(5);
+
+/// How long `kablo end` waits, once it has asked the program to end, for it to
+/// do so: a program that has not by then is not going to for a hang-up, and the
+/// person is told what else there is.
+const END_WAIT: Duration = Duration::from_secs(5);
 
 /// Which kind of status a command ends with when kablo itself fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +379,37 @@ pub fn duration(text: &str) -> Result<Duration, String> {
         .ok_or_else(wrong)
 }
 
+/// What `kablo end` ends.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EndArgs {
+    target: String,
+    /// Kill the program rather than hang up on it.
+    force: bool,
+}
+
+/// Reads the arguments after `kablo end`: `ID [--force]`. The session is always
+/// named: a command that ends a terminal does not guess it from where it runs.
+pub fn parse_end(args: &[OsString]) -> Result<EndArgs, String> {
+    let mut force = false;
+    let words = positionals(args, |name, _| {
+        if name != "--force" {
+            return Ok(false);
+        }
+        force = true;
+        Ok(true)
+    })?;
+    match words.as_slice() {
+        [word] => Ok(EndArgs {
+            target: name_of(word)?,
+            force,
+        }),
+        [] => Err(
+            "end needs the session to end (it does not guess the terminal it runs in)".to_owned(),
+        ),
+        _ => Err("end takes one session".to_owned()),
+    }
+}
+
 /// What `kablo label` shows or sets.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LabelArgs {
@@ -582,10 +619,14 @@ struct Aim {
     status: Status,
 }
 
-/// Finds the session a command was pointed at (or the one it runs in) and
-/// checks its relay. On failure the words are written and the status is the
-/// command's to end with.
-fn aim(name: Option<&str>, usage: &str, family: Family, err: &mut dyn Write) -> Result<Aim, u8> {
+/// The socket directory and the status of every session a command about `name`
+/// may be about (every running session, with no name). On failure the words are
+/// written and the status is the command's to end with.
+fn statuses_of(
+    name: Option<&str>,
+    family: Family,
+    err: &mut dyn Write,
+) -> Result<(PathBuf, Vec<Status>), u8> {
     let dir = match sockdir::socket_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -602,13 +643,20 @@ fn aim(name: Option<&str>, usage: &str, family: Family, err: &mut dyn Write) -> 
         Some(name) => fitting(&dir, name).map(|ids| scan::Scan::of(&dir, ids, scan::WAIT)),
         None => scan::Scan::start(&dir, scan::WAIT),
     };
-    let statuses = match asked {
-        Ok(scan) => scan.run(),
+    match asked {
+        Ok(scan) => Ok((dir, scan.run())),
         Err(e) => {
             let _ = writeln!(err, "kablo: {e}");
-            return Err(family.trouble());
+            Err(family.trouble())
         }
-    };
+    }
+}
+
+/// Finds the session a command was pointed at (or the one it runs in) and
+/// checks its relay. On failure the words are written and the status is the
+/// command's to end with.
+fn aim(name: Option<&str>, usage: &str, family: Family, err: &mut dyn Write) -> Result<Aim, u8> {
+    let (dir, statuses) = statuses_of(name, family, err)?;
     let status = match find(&statuses, name, usage, own_session) {
         Ok(status) => status.clone(),
         Err(Miss::Usage(why)) => return Err(usage_error(err, &why)),
@@ -1090,6 +1138,99 @@ pub fn label(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 
     }
 }
 
+/// `kablo end ID [--force]`: hangs up on the session's program (`--force`: kills
+/// it) and waits for it to end. The end is seen through a `wait`, which is not
+/// delivery, so the session is kept as it is for any program that ends: a
+/// `capture` after this reads its last output.
+pub fn end(args: &[OsString], err: &mut dyn Write) -> u8 {
+    let parsed = match parse_end(args) {
+        Ok(parsed) => parsed,
+        Err(why) => return usage_error(err, &why),
+    };
+    let aim = match aim(Some(&parsed.target), "kablo end ID", Family::Quick, err) {
+        Ok(aim) => aim,
+        Err(status) => return status,
+    };
+    // Nothing is left to end, and the warden may be gone with the program.
+    if aim.status.state == State::ENDED {
+        return 0;
+    }
+    let mut talk = match open(&aim, Family::Quick, err) {
+        Ok(talk) => talk,
+        Err(status) => return status,
+    };
+    // The request is not answered; a session that cannot take it says so, and
+    // the wait that follows hears that as well as the end.
+    talk.say(Message::Terminate {
+        force: parsed.force,
+    });
+    let until = Instant::now().checked_add(END_WAIT);
+    match end_of(&mut talk, until) {
+        Ended::Program(_) => 0,
+        Ended::Timeout => {
+            let id = &aim.status.id;
+            let seconds = END_WAIT.as_secs();
+            let _ = if parsed.force {
+                writeln!(
+                    err,
+                    "kablo: the program in session {id} had not ended {seconds} seconds after it \
+                     was killed; it may be stuck, and then the session is ended with `kill` \
+                     (README, Limits)"
+                )
+            } else {
+                writeln!(
+                    err,
+                    "kablo: the program in session {id} had not ended {seconds} seconds after it \
+                     was asked to; try `kablo end --force {id}`"
+                )
+            };
+            EXIT_TROUBLE
+        }
+        Ended::Trouble(why) => {
+            let _ = writeln!(err, "kablo: {why}");
+            EXIT_TROUBLE
+        }
+    }
+}
+
+/// The session a process runs in, among `statuses`, or why it can be said to run
+/// in none. `own` finds it, from the process table.
+fn here_of(
+    statuses: &[Status],
+    own: impl FnOnce(&[Status]) -> Origin,
+) -> Result<SessionId, String> {
+    match find(statuses, None, "", own) {
+        Ok(status) => Ok(status.id.clone()),
+        Err(Miss::Usage(_)) => Err("this is not run in a terminal of a session".to_owned()),
+        Err(Miss::Trouble(why)) => Err(why),
+    }
+}
+
+/// `kablo here`: prints the id of the session this runs in. The answer is the
+/// system's (which session's shell this process descends from), not a variable
+/// the process could set, so a program may rely on it to say where it is. No
+/// relay is asked to do anything, so a session whose relay is older than the
+/// other commands needs is answered all the same.
+pub fn here(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    if !args.is_empty() {
+        return usage_error(err, "here takes no arguments");
+    }
+    let (_, statuses) = match statuses_of(None, Family::Quick, err) {
+        Ok(found) => found,
+        Err(status) => return status,
+    };
+    match here_of(&statuses, own_session) {
+        Ok(id) => {
+            let _ = writeln!(out, "{id}");
+            0
+        }
+        Err(why) => {
+            let _ = writeln!(err, "kablo: {why}");
+            EXIT_TROUBLE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,6 +1436,42 @@ mod tests {
             find(&all, Some("one"), "usage", inside).map(|s| s.id.to_string()),
             Ok("one".to_owned())
         );
+    }
+
+    #[test]
+    fn end_needs_a_session_and_takes_force() {
+        let plain = parse_end(&words(&["x"])).unwrap();
+        assert_eq!((plain.target.as_str(), plain.force), ("x", false));
+        for args in [&["x", "--force"][..], &["--force", "x"]] {
+            let forced = parse_end(&words(args)).unwrap();
+            assert_eq!(
+                (forced.target.as_str(), forced.force),
+                ("x", true),
+                "{args:?}"
+            );
+        }
+        // The session is named: it is not the terminal this runs in.
+        assert!(parse_end(&[]).is_err());
+        assert!(parse_end(&words(&["--force"])).is_err());
+        assert!(parse_end(&words(&["x", "y"])).is_err());
+        assert!(parse_end(&words(&["x", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn here_is_the_session_this_runs_in_and_says_why_when_there_is_none() {
+        let all = [status("one", Some("two")), status("two", None)];
+        let inside = |_: &[Status]| Origin::Terminal(SessionId::new("two").unwrap());
+        // The label of another session does not matter: it is not asked for.
+        assert_eq!(here_of(&all, inside), Ok(SessionId::new("two").unwrap()));
+        let outside = |_: &[Status]| Origin::None;
+        let Err(why) = here_of(&all, outside) else {
+            panic!("outside every session it names none");
+        };
+        assert!(why.contains("not run in a terminal of a session"), "{why}");
+        // Not a usage mistake and not an instruction to name a session.
+        assert!(!why.contains("say which"), "{why}");
+        // A session the scan did not find names nothing.
+        assert!(here_of(&[], inside).is_err());
     }
 
     #[test]

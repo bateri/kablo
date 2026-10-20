@@ -92,6 +92,7 @@ kablo new                  # start a session; prints its id
 kablo new --id build -- make -j8
 kablo list                 # the sessions on this machine
 kablo connect build        # use one from this terminal
+kablo end build            # end its program
 ```
 
 `kablo new` starts your login shell, or the program you give after `--`, in a
@@ -150,11 +151,12 @@ kablo send tests 'cargo test'
 kablo send-key tests enter
 kablo wait tests --for 10m      # ends with 124 if the program is still running
 kablo capture tests --trim      # what the screen shows
+kablo end tests                 # hang up on its program
 ```
 
 A program on the same machine (an agent, a script, you from another terminal)
-can type into a session, press keys in it, read its screen and wait for its
-program to end, all without attaching to it. Nothing here counts as a client:
+can type into a session, press keys in it, read its screen, wait for its
+program to end and end it, all without attaching to it. Nothing here counts as a client:
 the session goes on answering what its program asks its terminal (where the
 cursor is, what the terminal is), and an app that shows the session is neither
 disturbed nor told.
@@ -165,8 +167,9 @@ disturbed nor told.
   command ends with 1 (255 for `wait`), so that nothing is typed into the wrong
   terminal. With no name, a command means the terminal it runs in, which is
   what the system says of the process, never anything it claims; run outside
-  every session it ends with 64 and tells you to name one. `wait` always names
-  its session, since it cannot wait for itself.
+  every session it ends with 64 and tells you to name one. `wait` and `end` always
+  name theirs: `wait` cannot wait for itself, and a command that ends a terminal
+  does not guess which.
 - **`kablo send [ID] [TEXT | -]`** types text and does not press Enter. One word
   is the text, for the terminal it runs in; two are the session and the text;
   none, or a lone `-`, types what is read from the input (at most about 1 MiB).
@@ -204,13 +207,31 @@ disturbed nor told.
   runs in, so an agent names its own terminal with `kablo label build`; two are
   the session and the text; none prints the label of the terminal it runs in.
   `kablo list` shows every session's label.
+- **`kablo end ID [--force]`** hangs up on the session's program (the shell and
+  the programs in front of it get the hang-up a closing terminal window would
+  give them; `--force` kills them instead) and waits up to 5 seconds for it to
+  end. It ends with `0` when the program has ended, and when it had already;
+  with `1` when it had not ended in time, saying to try `--force`, or for
+  kablo's own trouble (no such session, a name that fits several, a relay that is
+  too old, a session that is `broken`, a connection that was lost); `64` when no
+  session is named. Like `wait`, it does not close the session: the end is kept
+  for the clients that have not been told, so `capture` still reads the program's
+  last output and `wait` gives its status (128 and the number of the signal, here
+  1 for the hang-up or 9 for the kill).
+- **`kablo here`** prints the id of the session it runs in, a line, and ends with
+  `0`. Run outside every session it says so and ends with `1`; given an argument,
+  `64`. What it prints is what the system says of the process (which session's
+  shell it descends from), never a variable the process could set, so a program
+  may rely on it to say where it is. No relay is asked to do anything, so a
+  session started by 0.1.0 is told as well.
 - **`kablo new --wait`** starts the session, prints its id, waits for the program
   to end and ends with its status, and then takes the session over: it is not
   kept for a day, as a session nobody was told about is, so a script that runs a
   hundred programs this way leaves nothing behind.
 - **Sessions started by kablo 0.1.0** have a relay that does not know these
-  commands, and would let a `wait` wait for ever. Each command asks the session
-  which release serves it and stops, saying so, if it is from before 0.2.0:
+  commands, and would let a `wait` wait for ever. Each command (but `here`, which
+  asks no relay) asks the session which release serves it and stops, saying so,
+  if it is from before 0.2.0:
   `kablo upgrade ID PATH` with a newer `kablo` replaces the relay without
   disturbing the session.
 
@@ -558,11 +579,11 @@ memory of where its relay comes from (see *Limits*).
   already waiting are for.
 - **A label is a file in the socket directory.** A system that clears `/tmp` by
   age can remove it; the session then has no label, which is not an error.
-- **There is no command to end a session by force.** Apps do it with the
-  protocol's `terminate`, which hangs up the shell; a program that ignores the
-  hang-up, a stuck one, or a `broken` session is ended with `kill`: find the
-  keeper in `ps` (`kablo warden --id ID`) and stop it and the program under
-  it.
+- **A program that ignores the hang-up** is ended by `kablo end --force`, which
+  kills it. One that even that does not end (stuck in the kernel, say), or a
+  `broken` session, is ended with `kill`: find the keeper in `ps` (`kablo warden
+  --id ID`) and stop it and the program under it. Apps end a session with the
+  protocol's `terminate`, which is what `kablo end` sends.
 - **Input typed at the instant a relay is replaced** (`kablo upgrade`) can be
   lost; output is not.
 - **The journal is bounded** (8 MiB by default). Output the program writes

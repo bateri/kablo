@@ -28,6 +28,9 @@ commands:
   capture   print what a session's screen shows
   wait      wait for the program in a session to end; ends with its status
   label     show or set a session's label
+  end       hang up on the program in a session and wait for it to end
+            (--force: kill it)
+  here      print the id of the session this runs in
   attach    carry every session over this program's input and output; for
             programs (`ssh host kablo attach`), not for people
   forward   carry connections to local ports to ports the server reaches, as
@@ -51,6 +54,8 @@ kablo send-key [ID] KEY...
 kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]
 kablo wait ID [--for TIME]
 kablo label [ID] [TEXT]
+kablo end ID [--force]
+kablo here
 kablo attach
 kablo forward [--bind ADDRESS] (PORT | LOCAL:HOST:PORT)... -- COMMAND [ARGUMENT]...
 kablo exec [--cwd DIR] [--env NAME=VALUE]... -- COMMAND [ARGUMENT]... -- PROGRAM [ARGUMENT]...
@@ -87,6 +92,8 @@ where
             Some("capture") => return drive::capture(rest, out, err),
             Some("wait") => return drive::wait(rest, err),
             Some("label") => return drive::label(rest, out, err),
+            Some("end") => return drive::end(rest, err),
+            Some("here") => return drive::here(rest, out, err),
             Some("attach") => return command_attach(rest, err),
             Some("forward") => return command_forward(rest, out, err),
             Some("exec") => return command_exec(rest, err),
