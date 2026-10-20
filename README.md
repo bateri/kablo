@@ -135,7 +135,13 @@ which a replaced relay is too). In the JSON, `started`, `front_started` and
 `output_at` are Unix seconds (or `null`), and `front_is_own` says whether what
 is in front is the session's own program (a shell at its prompt, waiting for a
 command) or another one. A session whose shell lives but whose relay keeps
-failing is listed as `broken`.
+failing is listed as `broken`. `CLIENTS` is how many are attached, or, for the
+clients that gave themselves a name when they attached (a terminal app says which
+computer it runs on), who: `MacBook,iMac`, and `MacBook+1` for one named and one
+not. When no one is named, or the session's relay is from before the names, it is
+the number. In the JSON `clients` is always the number and `clients_named` the
+names in the order the clients attached, `""` for one with none; it is left out
+when the relay does not say who.
 
 Over ssh the same commands work from a terminal: `ssh -t host kablo connect
 build`.

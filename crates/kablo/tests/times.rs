@@ -183,7 +183,7 @@ fn list_tells_the_times_in_its_table_and_in_its_json() {
     assert!(json.contains("\"started\":1"), "{json}");
     assert!(json.contains("\"front_started\":1"), "{json}");
     assert!(
-        json.contains("\"front_is_own\":true,\"output_at\":null}"),
+        json.contains("\"front_is_own\":true,\"output_at\":null,"),
         "{json}"
     );
 }

@@ -146,6 +146,13 @@ pub const MAX_SCREEN_TEXT: usize = MAX_PAYLOAD - 13;
 /// The longest label a session can be given, in bytes.
 pub const MAX_LABEL: usize = 64;
 
+/// The longest name a client can give itself when it attaches, in bytes.
+pub const MAX_CLIENT_NAME: usize = 63;
+
+/// The most connections a session serves at once, attached or not. A `status`
+/// names no more attached clients than this.
+pub const MAX_CLIENTS: usize = 64;
+
 /// The most columns and rows a session's terminal can be given. The relay's
 /// screen holds every cell of it twice (two screens), so a size is memory, and
 /// no terminal a person has comes near these.
@@ -202,6 +209,80 @@ impl Size {
     }
 }
 
+/// What a client calls itself when it attaches ("MacBook"): text for a person
+/// to read in a list of who is attached, not an identity. Two clients may give
+/// the same name, and the server does nothing with it but pass it on.
+///
+/// At most [`MAX_CLIENT_NAME`] bytes of UTF-8, never empty (a client with no
+/// name has none: `None` where a name goes). A name can hold control
+/// characters; whoever shows one to a person removes them first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientName {
+    len: u8,
+    /// Zero past `len`, so that two equal names are equal in every byte.
+    bytes: [u8; MAX_CLIENT_NAME],
+}
+
+impl ClientName {
+    /// The name `name`, or `None` when it is empty or longer than
+    /// [`MAX_CLIENT_NAME`] bytes.
+    pub fn new(name: &str) -> Option<ClientName> {
+        if name.is_empty() || name.len() > MAX_CLIENT_NAME {
+            return None;
+        }
+        let mut bytes = [0; MAX_CLIENT_NAME];
+        bytes
+            .get_mut(..name.len())?
+            .copy_from_slice(name.as_bytes());
+        Some(ClientName {
+            len: u8::try_from(name.len()).ok()?,
+            bytes,
+        })
+    }
+
+    /// The name `name` cut to [`MAX_CLIENT_NAME`] bytes where a character ends
+    /// (a computer's name is whatever its owner typed), or `None` when it is
+    /// empty.
+    pub fn clipped(name: &str) -> Option<ClientName> {
+        let mut end = name.len().min(MAX_CLIENT_NAME);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        ClientName::new(name.get(..end)?)
+    }
+
+    /// The name.
+    pub fn as_str(&self) -> &str {
+        self.bytes
+            .get(..usize::from(self.len))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Reads the name of `bytes` as it is on the wire, the name alone: no bytes
+    /// is no name, as is an empty one; more than [`MAX_CLIENT_NAME`] bytes or
+    /// bytes that are not UTF-8 are malformed.
+    fn from_bytes(bytes: &[u8], what: &'static str) -> Result<Option<ClientName>> {
+        if bytes.len() > MAX_CLIENT_NAME {
+            return Err(Error::Malformed(what));
+        }
+        let name = std::str::from_utf8(bytes).map_err(|_| Error::Malformed(what))?;
+        Ok(ClientName::new(name))
+    }
+}
+
+impl std::fmt::Debug for ClientName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientName({:?})", self.as_str())
+    }
+}
+
+impl std::fmt::Display for ClientName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How a client looks at the session it attaches to.
 ///
 /// Not exhaustive, so that a field can be added without breaking whoever builds
@@ -233,6 +314,11 @@ pub struct View {
     /// refused and an `input` is dropped, as for any ended session). A server
     /// from before the bit ignores it and removes the session as it always did.
     pub keep_after_end: bool,
+    /// What the client calls itself, for the list of who is attached that
+    /// `status` answers with. `None` says no name, as a client from before the
+    /// name does. It is a property of the view, so a client that attaches again
+    /// with the view it had (a bridge that reconnects) keeps its name.
+    pub name: Option<ClientName>,
 }
 
 impl View {
@@ -246,11 +332,14 @@ impl View {
             picture: false,
             picture_if_answered: false,
             keep_after_end: false,
+            name: None,
         }
     }
 
     /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
-    /// picture if answered, bit 2: keep after the end).
+    /// picture if answered, bit 2: keep after the end), then, if the client has
+    /// a name, its length as a byte and its bytes. A view with no name ends at
+    /// the flags, as it did before names.
     fn write(&self, out: &mut Vec<u8>) {
         self.size.write(out);
         out.push(
@@ -258,16 +347,32 @@ impl View {
                 | (u8::from(self.picture_if_answered) << 1)
                 | (u8::from(self.keep_after_end) << 2),
         );
+        if let Some(name) = &self.name {
+            out.push(name.len);
+            out.extend_from_slice(name.as_str().as_bytes());
+        }
     }
 
+    /// Reads a view whose fixed part is whole. What follows it is the name, if
+    /// the client sent one: a name too long for its bytes to be there, longer
+    /// than [`MAX_CLIENT_NAME`] or not UTF-8 is malformed (the attach is
+    /// refused, not read as one without a name). Bytes after the name are
+    /// ignored.
     fn read(fields: &mut Fields<'_>) -> Result<View> {
         let size = Size::read(fields)?;
         let flags = fields.u8()?;
+        let name = if fields.len() == 0 {
+            None
+        } else {
+            let len = usize::from(fields.u8()?);
+            ClientName::from_bytes(fields.bytes(len)?, fields.what)?
+        };
         Ok(View {
             size,
             picture: flags & 1 != 0,
             picture_if_answered: flags & 2 != 0,
             keep_after_end: flags & 4 != 0,
+            name,
         })
     }
 }
@@ -747,6 +852,14 @@ pub struct Status {
     pub size: Size,
     /// How many clients are attached.
     pub clients: u32,
+    /// Who is attached, one entry per attached client in the order they
+    /// attached: the name the client gave itself, or `None` for one that gave
+    /// none. A server that says names says one per client counted in `clients`
+    /// (both are taken in the same moment); one from before the names leaves
+    /// this empty, so a list shorter than `clients` is names the server did not
+    /// say, not clients without one. A client that shows a name to a person
+    /// removes control characters first.
+    pub clients_named: Vec<Option<ClientName>>,
     /// Where the session is in its life.
     pub state: State,
     /// Total bytes the program has written so far.
@@ -812,6 +925,8 @@ mod status_key {
     pub const FRONT_STARTED: u16 = 18;
     pub const FRONT_IS_OWN: u16 = 19;
     pub const OUTPUT_AT: u16 = 20;
+    /// Repeated: one entry per attached client, empty for one with no name.
+    pub const CLIENT_NAME: u16 = 21;
 }
 
 impl Status {
@@ -824,6 +939,7 @@ impl Status {
             cwd: None,
             size: Size::default(),
             clients: 0,
+            clients_named: Vec::new(),
             state: State::RUNNING,
             offset: 0,
             retained_from: 0,
@@ -842,10 +958,10 @@ impl Status {
     }
 
     /// The wire form, a [`tlv`] block with the keys in ascending order. What
-    /// the terminal's state adds (`secret`, `remote`, `remote_port`), the label
-    /// and the times are written only when there is something to say, so a
-    /// session with none of it and a status from before the keys existed are
-    /// the same bytes.
+    /// the terminal's state adds (`secret`, `remote`, `remote_port`), the label,
+    /// the times and the names of the clients are written only when there is
+    /// something to say, so a session with none of it and a status from before
+    /// the keys existed are the same bytes.
     pub fn to_block(&self) -> Vec<u8> {
         let mut w = tlv::Writer::new();
         w.put(status_key::ID, self.id.as_str().as_bytes());
@@ -895,6 +1011,10 @@ impl Status {
         }
         if let Some(at) = self.output_at {
             w.put_u64(status_key::OUTPUT_AT, at);
+        }
+        for name in &self.clients_named {
+            let name = name.as_ref().map_or("", ClientName::as_str);
+            w.put(status_key::CLIENT_NAME, name.as_bytes());
         }
         w.finish()
     }
@@ -952,6 +1072,14 @@ impl Status {
                 }
                 status_key::OUTPUT_AT => {
                     status.output_at = Some(tlv::read_u64(value, "status output at")?)
+                }
+                status_key::CLIENT_NAME => {
+                    if status.clients_named.len() == MAX_CLIENTS {
+                        return Err(Error::Malformed("status client names"));
+                    }
+                    status
+                        .clients_named
+                        .push(ClientName::from_bytes(value, "status client name")?)
                 }
                 _ => {}
             }
@@ -1691,7 +1819,8 @@ impl Message {
                 // Appended after the offset by a client that has more to say; an
                 // `attach` without it, or with less than a whole view after the
                 // offset, is the one that was always there (what follows a fixed
-                // layout is ignored).
+                // layout is ignored). The view carries the client's name, if it
+                // has one, after its flags.
                 let view = if f.len() < View::LEN {
                     None
                 } else {
@@ -1922,6 +2051,15 @@ impl<'a> Fields<'a> {
             .ok_or(Error::Malformed(self.what))?;
         self.rest = tail;
         Ok(*head)
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let (head, tail) = self
+            .rest
+            .split_at_checked(len)
+            .ok_or(Error::Malformed(self.what))?;
+        self.rest = tail;
+        Ok(head)
     }
 
     fn u8(&mut self) -> Result<u8> {

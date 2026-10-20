@@ -108,7 +108,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end) |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end), then optionally the client's name: `length: u8` and that many bytes of UTF-8, at most 63 |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -195,6 +195,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 18 | u64 | `front_started`: when the program in the terminal's foreground started, on the same clock; only while the session runs |
 | 19 | u8 | `front_is_own`: 1 when the program in the foreground is the session's own (for a session opened with a shell, the shell waiting for a command), 0 when another is; only while the session runs |
 | 20 | u64 | `output_at`: when the relay last read output from the terminal, in whole seconds on the same clock; absent until it has read some |
+| 21 | bytes | `client`: the name of one attached client, empty for one that gave none; repeated, one entry per client counted in `clients`, in the order they attached; at most 64 entries of at most 63 bytes of UTF-8 each |
 
 Keys 17 to 20 are written only when known. They come from the process table
 and from the relay's own clock, never from what the program wrote, so a
@@ -204,6 +205,15 @@ relay began, and what an earlier relay read, are not counted), and a session
 that ended before the relay started has no `started`. A client compares
 them with its own clock only after taking the difference of the server's clock
 from its own (the times are seconds on the server).
+
+Key 21 is written only when the server says who is attached, and then once per
+client counted in key 6 (taken in the same moment as the count), so the list
+and the count agree. A list shorter than the count is a server from before the
+names, which counted its clients and named none: a reader must not take it for
+clients that have no name, which a server that names its clients says with an
+empty entry. A name is text a client chose and can hold control characters; a
+client that shows one to a person removes them first. Two clients may have the
+same name, and no one is told apart by it: it is for a person to read.
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
 A status takes in what the session's connections had sent by the time the
@@ -499,6 +509,20 @@ has seen the program end (a terminal app, whose pane an agent on the server read
 a moment after the app shows that the program ended). It changes nothing about
 the attach itself and is described under Ending. A server from before the bit
 ignores it.
+
+**The client's name.** A view may end with a name: a length byte and that many
+bytes of UTF-8, at most 63, which the client calls itself ("MacBook"). The
+server shows it to whoever asks who is attached (`status`, key 21) and does
+nothing else with it: it is not an identity, and two clients can have the same
+one. An `attach` with no view, a view that ends at its flags, and a name of
+length 0 are all a client with no name. The name belongs to the attach: a client
+that attaches again on the same connection is named by the new view, and one
+that detaches is no longer listed. A name longer than 63 bytes, one whose bytes
+are not all there and one that is not UTF-8 make the `attach` malformed: the
+server answers `error` (`BAD_REQUEST`), attaches nothing, and the connection
+goes on. Bytes after the name are ignored. A server from before the name reads
+the view and ignores the rest, so a client may always send one; it does not tell
+who is attached.
 
 The `attach` of a client that knows its terminal carries a **view**: the
 terminal's size, whether it wants a picture whatever the offset (bit 0), and

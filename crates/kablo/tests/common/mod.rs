@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 
 use kablo_proto::v1::stream::{self, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{
-    Capture, ErrorCode, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size,
-    Status, Stroke, TerminalState, View,
+    Capture, ClientName, ErrorCode, Exit, Features, Message, NewSession, Offers, Packet,
+    PacketDecoder, Size, Status, Stroke, TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -490,6 +490,23 @@ impl Conn {
         }
     }
 
+    /// Sends a frame of `kind` about this session with `payload` as it is, for
+    /// a message the types will not make (one that is not well formed).
+    pub fn send_raw(&mut self, kind: u8, payload: &[u8]) {
+        let mut bytes = Vec::new();
+        kablo_proto::frame::encode_frame(
+            &mut bytes,
+            &kablo_proto::frame::RawFrame {
+                kind,
+                channel: kablo_proto::CHANNEL_SESSION,
+                session: self.id.as_str().as_bytes().to_vec(),
+                payload: payload.to_vec(),
+            },
+        )
+        .unwrap();
+        let _ = self.sock.write_all(&bytes);
+    }
+
     pub fn send(&mut self, message: Message) {
         let packet = Packet::about(self.id.clone(), message);
         let mut bytes = Vec::new();
@@ -679,6 +696,25 @@ impl Conn {
                 xpixel: 0,
                 ypixel: 0,
             })),
+        });
+        self.until("attached", |c| c.attached.is_some());
+        self.attached.unwrap()
+    }
+
+    /// Attaches as a client that calls itself `name`; returns where the stream
+    /// starts and whether it was cut.
+    pub fn attach_named(&mut self, offset: u64, name: &str) -> (u64, bool) {
+        self.attached = None;
+        let mut view = View::new(Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        view.name = Some(ClientName::new(name).expect("a name that fits"));
+        self.send(Message::Attach {
+            offset,
+            view: Some(view),
         });
         self.until("attached", |c| c.attached.is_some());
         self.attached.unwrap()
@@ -1168,6 +1204,31 @@ impl Bridge {
     pub fn attach(&mut self, id: &str, offset: u64) -> (u64, bool) {
         let before = self.seen(id).attached.len();
         self.send(Some(id), Message::attach(offset));
+        self.until("attached", |b| {
+            b.sessions
+                .get(id)
+                .is_some_and(|s| s.attached.len() > before)
+        });
+        *self.seen(id).attached.last().unwrap()
+    }
+
+    /// Attaches as a client that calls itself `name`.
+    pub fn attach_named(&mut self, id: &str, offset: u64, name: &str) -> (u64, bool) {
+        let before = self.seen(id).attached.len();
+        let mut view = View::new(Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        view.name = ClientName::new(name);
+        self.send(
+            Some(id),
+            Message::Attach {
+                offset,
+                view: Some(view),
+            },
+        );
         self.until("attached", |b| {
             b.sessions
                 .get(id)

@@ -108,7 +108,39 @@ section is not released.
   list --json` has the keys `started`, `front_started`, `front_is_own` and
   `output_at` (README, `kablo list`).
 
+- **`kablo list` says who is attached.** An app that attaches under a name (the
+  Mac it runs on, say) is listed by that name in the `CLIENTS` column:
+  `MacBook,iMac` for two, `MacBook+1` for one named and one not. A session whose
+  clients have no name (`kablo attach` and `kablo connect` give none) shows how many
+  there are, as before, and so does one served by a relay from before the names.
+  `kablo list --json` has the key `clients_named`, the names in the order the
+  clients attached, `""` for one with none; it is left out when the relay does not
+  say (README, `kablo list`).
+
 ### For apps
+
+- **Protocol: an attached client has a name, and `status` tells whose.** The view
+  of an `attach` (`docs/PROTOCOL.md`, attach) may end with a name after its flags
+  byte: a length byte and that many bytes of UTF-8, at most 63. A view that ends at
+  its flags, an `attach` with no view and a name of length 0 are a client with no
+  name, so every `attach` from before is the bytes it was; a name too long, not all
+  there or not UTF-8 makes the `attach` malformed (`BAD_REQUEST`, nothing attached,
+  the connection goes on). A relay from before this release reads the view and
+  ignores the name. `status` (and so `list_reply` and `created`) gains key 21, one
+  entry per attached client in the order they attached, empty for one with no name,
+  as many as `clients`: a reader that does not know it skips it, and a list shorter
+  than `clients` is a relay from before the names, not clients without them. The
+  name is for a person to read, not an identity: two clients may have the same one,
+  and one that is shown is stripped of control characters first. `kablo-proto`:
+  `v1::ClientName` (at most `v1::MAX_CLIENT_NAME` bytes, made with `ClientName::new`,
+  or `ClientName::clipped` for a name that may be longer), `v1::View` gains the field
+  `name` (`Option<ClientName>`) and `v1::Status` gains `clients_named`
+  (`Vec<Option<ClientName>>`); both are built with their constructors, so this breaks
+  no one that builds them, and `Message::Attach` is unchanged. `v1::MAX_CLIENTS` (64)
+  is the most connections a session serves, named now because a `status` lists no
+  more clients than that. The bridge keeps the name across a resize and a new
+  connection to the session, as it does the flags. `kablo list --json` gains
+  `clients_named`, absent when the relay does not say.
 
 - **Protocol: an ended terminal can be kept for a program that comes after the
   app.** The view of an `attach` (`docs/PROTOCOL.md`, attach) gains bit 2 of its

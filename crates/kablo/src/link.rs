@@ -612,7 +612,7 @@ mod tests {
     use std::io::Read as _;
     use std::os::unix::net::UnixListener;
 
-    use kablo_proto::v1::{PacketDecoder, Stroke};
+    use kablo_proto::v1::{ClientName, PacketDecoder, Stroke};
     use kablo_proto::{SessionId as Id, WIRE};
 
     /// A link whose connection has been lost and is waited for, to a session
@@ -691,6 +691,7 @@ mod tests {
         let mut view = View::new(size(80));
         view.picture_if_answered = true;
         view.keep_after_end = true;
+        view.name = ClientName::new("MacBook");
         link.send(
             about(Message::Attach {
                 offset: 0x10,
@@ -700,7 +701,7 @@ mod tests {
             &mut out,
         );
         // The terminal is resized while the connection is down: the size is the
-        // latest and the flags are the ones that were asked for.
+        // latest and the flags and the name are the ones that were asked for.
         link.send(about(Message::Resize(size(100))), now, &mut out);
 
         link.tick(now + RETRY, &mut out);
@@ -729,6 +730,7 @@ mod tests {
         assert_eq!(offset, 0x10);
         assert_eq!(view.size, size(100));
         assert!(view.keep_after_end && view.picture_if_answered && !view.picture);
+        assert_eq!(view.name, ClientName::new("MacBook"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

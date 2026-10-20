@@ -4,8 +4,10 @@
 //! A session's program name and directory are bytes some other program chose,
 //! and the table goes to a terminal: control characters are replaced before
 //! anything is printed, or a directory named after an escape sequence would
-//! write to the screen of whoever ran `kablo list`. The JSON is written by
-//! hand (the keys are fixed and flat); keys may be added to it, none removed.
+//! write to the screen of whoever ran `kablo list`. So are the names the
+//! attached clients gave themselves. The JSON is written by
+//! hand (the keys are fixed and flat, but for the list of who is attached);
+//! keys may be added to it, none removed.
 
 use std::fmt::Write as _;
 
@@ -61,6 +63,34 @@ fn ago(from: Option<u64>, now: u64) -> String {
     }
 }
 
+/// Whether the relay told who is attached: it names every client it counts. A
+/// relay from before the names counts and names no one.
+fn says_who(status: &Status) -> bool {
+    u32::try_from(status.clients_named.len()).is_ok_and(|named| named == status.clients)
+}
+
+/// The CLIENTS cell: the names the clients gave themselves, joined by commas,
+/// then `+N` for the N that gave none (`MacBook,iMac`, `MacBook+1`). The count
+/// when no one is named: no one is attached, or only clients with no name are
+/// (`kablo attach` is one), or the relay does not say.
+fn clients_cell(status: &Status) -> String {
+    let names: Vec<String> = status
+        .clients_named
+        .iter()
+        .flatten()
+        .map(|name| printable(name.as_str().as_bytes()))
+        .collect();
+    if !says_who(status) || names.is_empty() {
+        return status.clients.to_string();
+    }
+    let mut cell = names.join(",");
+    let unnamed = status.clients_named.len() - names.len();
+    if unnamed > 0 {
+        let _ = write!(cell, "+{unnamed}");
+    }
+    cell
+}
+
 /// The table: a header, then a row per session; empty when there is none.
 /// `now` (seconds since the Unix epoch, on the clock the sessions' times were
 /// read on) is what `AGE` and `QUIET` count back from.
@@ -102,7 +132,7 @@ pub fn table(statuses: &[Status], now: u64) -> String {
             if unknown {
                 dash()
             } else {
-                status.clients.to_string()
+                clients_cell(status)
             },
             // How long the session has been open, and how long since the
             // program last wrote.
@@ -240,6 +270,23 @@ pub fn json(statuses: &[Status]) -> String {
         });
         out.push_str(",\"output_at\":");
         json_number(&mut out, status.output_at);
+        // Who is attached: a name per client in `clients`, in the order they
+        // attached, `""` for one with no name. Left out when the relay does not
+        // say (a relay from before the names), so that its absence is not
+        // taken for clients without names.
+        if says_who(status) {
+            out.push_str(",\"clients_named\":[");
+            for (i, name) in status.clients_named.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json_string(
+                    &mut out,
+                    name.as_ref().map_or("", |n| n.as_str()).as_bytes(),
+                );
+            }
+            out.push(']');
+        }
         out.push('}');
     }
     out.push_str(if statuses.is_empty() { "]\n" } else { "\n]\n" });
@@ -323,6 +370,63 @@ mod tests {
                 .ends_with("  1        -    -      build ?[2J"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_clients_column_names_who_is_attached_when_the_relay_says() {
+        use kablo_proto::v1::ClientName;
+        let name = |text: &str| ClientName::new(text);
+        let cell = |clients: u32, named: Vec<Option<ClientName>>| {
+            let mut s = status("a");
+            s.clients = clients;
+            s.clients_named = named;
+            clients_cell(&s)
+        };
+        assert_eq!(cell(0, vec![]), "0");
+        assert_eq!(cell(1, vec![name("MacBook")]), "MacBook");
+        assert_eq!(cell(2, vec![name("MacBook"), name("iMac")]), "MacBook,iMac");
+        assert_eq!(cell(2, vec![name("MacBook"), None]), "MacBook+1");
+        assert_eq!(cell(2, vec![None, name("iMac")]), "iMac+1");
+        // Clients with no name are counted, as they were before the names.
+        assert_eq!(cell(2, vec![None, None]), "2");
+        // A relay from before the names counts and names no one.
+        assert_eq!(cell(2, vec![]), "2");
+        // What a client chose cannot write to the screen of whoever lists.
+        assert_eq!(cell(1, vec![name("a\u{1b}[2Jb")]), "a?[2Jb");
+        // In the table, in the column, and the label still last.
+        let mut s = status("n");
+        s.clients = 2;
+        s.clients_named = vec![name("MacBook"), name("iMac")];
+        s.label = Some("dev".to_owned());
+        let text = table(&[s], NOW);
+        assert!(
+            text.lines().nth(1).unwrap().contains("  MacBook,iMac  "),
+            "{text}"
+        );
+        assert!(text.lines().nth(1).unwrap().ends_with("  dev"), "{text}");
+    }
+
+    #[test]
+    fn the_json_lists_who_is_attached_only_when_the_relay_says() {
+        use kablo_proto::v1::ClientName;
+        let mut s = status("a");
+        s.clients = 2;
+        // A relay from before the names: the count, and no list to mistake for
+        // clients without names.
+        let text = json(&[s.clone()]);
+        assert!(text.contains("\"clients\":2,"), "{text}");
+        assert!(!text.contains("clients_named"), "{text}");
+        s.clients_named = vec![ClientName::new("Mac\"Book"), None];
+        let text = json(&[s.clone()]);
+        assert!(text.contains("\"clients\":2,"), "{text}");
+        assert!(
+            text.ends_with("\"clients_named\":[\"Mac\\\"Book\",\"\"]}\n]\n"),
+            "{text}"
+        );
+        // Nobody attached, and a relay that names them: an empty list.
+        s.clients = 0;
+        s.clients_named.clear();
+        assert!(json(&[s]).ends_with("\"clients_named\":[]}\n]\n"));
     }
 
     #[test]

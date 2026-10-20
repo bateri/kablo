@@ -83,8 +83,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
 use kablo_proto::v1::{
-    Capture, DEFAULT_HISTORY, ErrorCode, Exit, MAX_COLS, MAX_HISTORY, MAX_ROWS, Message,
-    OFFSET_END, Packet, PacketDecoder, Size, State, Status, Stroke, TerminalState, View,
+    Capture, ClientName, DEFAULT_HISTORY, ErrorCode, Exit, MAX_CLIENTS, MAX_COLS, MAX_HISTORY,
+    MAX_ROWS, Message, OFFSET_END, Packet, PacketDecoder, Size, State, Status, Stroke,
+    TerminalState, View,
 };
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
@@ -244,9 +245,6 @@ const REPLAY_LIMIT: u64 = 64 << 20;
 /// the next picture is the best there is.
 const SCREEN_RESTARTS: u32 = 8;
 
-/// Connections at once. Past it the listening socket is left alone.
-const MAX_CLIENTS: usize = 64;
-
 /// Terminal reads in one turn before the other descriptors get a look.
 const READ_BUDGET: usize = 16;
 
@@ -323,6 +321,10 @@ struct Attach {
     /// The client asked for the session to be kept for a while once it has been
     /// told the program ended (`keep_after_end` in its view).
     keep_after_end: bool,
+    /// What the client called itself in its view, for `status` to tell who is
+    /// attached. It goes with the attach: a client that attaches again with no
+    /// name has none, and one that detached is not listed.
+    name: Option<ClientName>,
     /// The picture of the screen that goes before it, while it is being sent.
     picture: Option<Picture>,
 }
@@ -1301,6 +1303,7 @@ impl Relay {
             client.attach = Some(Attach {
                 next: start,
                 keep_after_end: view.is_some_and(|view| view.keep_after_end),
+                name: view.and_then(|view| view.name),
                 picture,
             });
             client.ended_queued = false;
@@ -1588,11 +1591,17 @@ impl Relay {
         }
         status.started = self.started;
         status.size = sys::window_size(self.master.as_fd()).unwrap_or_default();
-        status.clients = self
+        // The count and the names are one pass over the clients, so a client
+        // that is counted is named (or said to have no name) in the same answer.
+        status.clients_named = self
             .clients
             .iter()
-            .filter(|client| !client.dead && client.attach.is_some())
-            .count() as u32;
+            .filter(|client| !client.dead)
+            .filter_map(|client| client.attach.as_ref())
+            .take(MAX_CLIENTS)
+            .map(|attach| attach.name)
+            .collect();
+        status.clients = status.clients_named.len() as u32;
         status.state = if self.exit.is_some() {
             State::ENDED
         } else {
@@ -2171,6 +2180,7 @@ mod tests {
             attach: Some(Attach {
                 next: 0,
                 keep_after_end: keeps,
+                name: None,
                 picture: None,
             }),
             ended_queued: false,

@@ -25,8 +25,9 @@ use kablo_proto::v1::stream::{
     self, Command, FailCode, Incoming, IncomingDecoder, Side, read_incoming,
 };
 use kablo_proto::v1::{
-    self, Capture, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder, Size,
-    Standing, State, Status, Stroke, TerminalState, View, key, kind, read_packet, write_packet,
+    self, Capture, ClientName, Exit, Features, Message, NewSession, Offers, Packet, PacketDecoder,
+    Size, Standing, State, Status, Stroke, TerminalState, View, key, kind, read_packet,
+    write_packet,
 };
 use kablo_proto::{CHANNEL_SESSION, CHANNEL_STREAM, Error, SessionId, WIRE, tlv};
 
@@ -128,6 +129,13 @@ fn keeping(size: Size) -> View {
     view
 }
 
+/// A view of a terminal of `size` whose client calls itself `name`.
+fn named(size: Size, name: &str) -> View {
+    let mut view = View::new(size);
+    view.name = ClientName::new(name);
+    view
+}
+
 /// A command with all three parts said.
 fn whole_command(argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>, cwd: Option<Vec<u8>>) -> Command {
     let mut command = Command::new(argv);
@@ -214,6 +222,21 @@ fn messages() -> Vec<(&'static str, Packet)> {
                     xpixel: 960,
                     ypixel: 800,
                 })),
+            }),
+        ),
+        (
+            "attach_view_named",
+            work(Message::Attach {
+                offset: 0x1000,
+                view: Some(named(
+                    Size {
+                        cols: 120,
+                        rows: 40,
+                        xpixel: 960,
+                        ypixel: 800,
+                    },
+                    "MacBook",
+                )),
             }),
         ),
         ("detach", work(Message::Detach)),
@@ -474,6 +497,21 @@ fn messages() -> Vec<(&'static str, Packet)> {
             }))),
         ),
         ("status_reply", work(Message::StatusReply(running_work()))),
+        (
+            "status_reply_clients",
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.size = Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                };
+                s.clients = 2;
+                s.offset = 5000;
+                s.clients_named = vec![ClientName::new("MacBook"), None];
+            }))),
+        ),
         (
             "status_reply_terminal",
             work(Message::StatusReply(with(Status::new(id("work")), |s| {
@@ -1112,9 +1150,10 @@ fn an_attach_is_the_one_it_always_was_unless_it_carries_a_whole_view() {
             "{cut} bytes after the offset"
         );
     }
-    // A whole view, and whatever a later version appends after it.
+    // A whole view with nothing after it is the view of a client from before
+    // the name.
     let mut payload = offset.to_vec();
-    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0, 0xde, 0xad]);
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0]);
     let bytes = raw(kind::ATTACH, 0, "work", &payload);
     assert_eq!(
         read_packet(&mut bytes.as_slice()).unwrap(),
@@ -1123,6 +1162,173 @@ fn an_attach_is_the_one_it_always_was_unless_it_carries_a_whole_view() {
             view: Some(view)
         }))
     );
+    // After the view comes the name: a length of nothing says there is none,
+    // and whatever a later version appends after that is ignored.
+    payload.extend([0, 0xde, 0xad]);
+    let bytes = raw(kind::ATTACH, 0, "work", &payload);
+    assert_eq!(
+        read_packet(&mut bytes.as_slice()).unwrap(),
+        Some(work(Message::Attach {
+            offset: 0x1000,
+            view: Some(view)
+        }))
+    );
+}
+
+/// An `attach` of "work" from 0x1000 with a whole view of 80 x 24 and no flags,
+/// then `tail`.
+fn attach_with_tail(tail: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0, 0, 0, 0, 0, 0, 0x10, 0];
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0]);
+    payload.extend(tail);
+    raw(kind::ATTACH, 0, "work", &payload)
+}
+
+/// The name in the view of the `attach` in `bytes`.
+fn attach_name(bytes: &[u8]) -> Result<Option<ClientName>, Error> {
+    match read_packet(&mut &*bytes)? {
+        Some(Packet {
+            message: Message::Attach { view, .. },
+            ..
+        }) => Ok(view.unwrap().name),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_client_names_itself_after_the_flags_of_its_view_in_at_most_63_bytes() {
+    let name = |text: &str| Some(ClientName::new(text).unwrap());
+    // A name, and whatever follows it, which is ignored.
+    let mut tail = vec![7];
+    tail.extend(b"MacBook");
+    assert_eq!(
+        attach_name(&attach_with_tail(&tail)).unwrap(),
+        name("MacBook")
+    );
+    tail.extend([0xde, 0xad]);
+    assert_eq!(
+        attach_name(&attach_with_tail(&tail)).unwrap(),
+        name("MacBook")
+    );
+    // The longest name, and a name with a character of more than one byte.
+    let longest = "m".repeat(63);
+    let mut tail = vec![63];
+    tail.extend(longest.as_bytes());
+    assert_eq!(
+        attach_name(&attach_with_tail(&tail)).unwrap(),
+        name(&longest)
+    );
+    let mut tail = vec![8];
+    tail.extend("Ömer'in".as_bytes());
+    assert_eq!(
+        attach_name(&attach_with_tail(&tail))
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "Ömer'in"
+    );
+    // A name of no bytes is none.
+    assert_eq!(attach_name(&attach_with_tail(&[0])).unwrap(), None);
+    // Longer than 63 bytes is not read as a name that is cut, or as none: the
+    // attach is malformed, and the connection can say so and go on.
+    for len in [64u8, 200] {
+        let mut tail = vec![len];
+        tail.extend(std::iter::repeat_n(b'm', usize::from(len)));
+        let error = attach_name(&attach_with_tail(&tail)).unwrap_err();
+        assert!(error.is_recoverable(), "{len}: {error}");
+    }
+    // So is a name that is not all there, and one that is not UTF-8.
+    for tail in [&[7, b'M', b'a'][..], &[2, 0xff, 0xfe][..]] {
+        let error = attach_name(&attach_with_tail(tail)).unwrap_err();
+        assert!(error.is_recoverable(), "{tail:?}: {error}");
+    }
+    // Writing: a name is written once, after the flags; none is not written at
+    // all, so the view is the one a client from before the name sent.
+    let view = named(
+        Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        },
+        "iMac",
+    );
+    let packet = work(Message::Attach {
+        offset: 0x1000,
+        view: Some(view),
+    });
+    let frame = packet.to_frame().unwrap();
+    assert_eq!(&frame.payload[17..], &[4, b'i', b'M', b'a', b'c']);
+    assert_eq!(Packet::from_frame(frame).unwrap(), Some(packet));
+    let mut view = view;
+    view.name = None;
+    let frame = work(Message::Attach {
+        offset: 0x1000,
+        view: Some(view),
+    })
+    .to_frame()
+    .unwrap();
+    assert_eq!(frame.payload.len(), 17);
+}
+
+#[test]
+fn a_name_is_at_most_63_bytes_of_text_and_cut_where_a_character_ends() {
+    assert!(ClientName::new("").is_none());
+    assert!(ClientName::new(&"m".repeat(63)).is_some());
+    assert!(ClientName::new(&"m".repeat(64)).is_none());
+    assert_eq!(ClientName::clipped(""), None);
+    assert_eq!(
+        ClientName::clipped(&"m".repeat(100)).unwrap().as_str(),
+        "m".repeat(63)
+    );
+    // 62 bytes, then a two-byte character that would end at 64.
+    let text = format!("{}ö", "m".repeat(62));
+    assert_eq!(ClientName::clipped(&text).unwrap().as_str(), "m".repeat(62));
+    // Equal names are equal in every byte they hold.
+    assert_eq!(ClientName::new("a"), ClientName::clipped("a"));
+    assert_ne!(ClientName::new("a"), ClientName::new("b"));
+    assert_eq!(
+        format!("{:?}", ClientName::new("a").unwrap()),
+        "ClientName(\"a\")"
+    );
+}
+
+#[test]
+fn a_status_names_the_clients_one_entry_each_in_at_most_63_bytes() {
+    let plain = running_work().to_block();
+    assert_eq!(Status::from_block(&plain).unwrap().clients_named, vec![]);
+    // Two entries, the second of no bytes: a list, in order.
+    let mut block = plain.clone();
+    block.extend([0, 21, 0, 0, 0, 3, b'i', b'M', b'c']);
+    block.extend([0, 21, 0, 0, 0, 0]);
+    let read = Status::from_block(&block).unwrap();
+    assert_eq!(read.clients, 2);
+    assert_eq!(read.clients_named, vec![ClientName::new("iMc"), None]);
+    assert_eq!(read.to_block(), block);
+    // The most a session serves; one more is not a status.
+    let many = |n: usize| {
+        let mut block = plain.clone();
+        for _ in 0..n {
+            block.extend([0, 21, 0, 0, 0, 0]);
+        }
+        block
+    };
+    assert_eq!(
+        Status::from_block(&many(v1::MAX_CLIENTS))
+            .unwrap()
+            .clients_named
+            .len(),
+        v1::MAX_CLIENTS
+    );
+    assert!(Status::from_block(&many(v1::MAX_CLIENTS + 1)).is_err());
+    // A name of 64 bytes, and one that is not UTF-8, are not a status either.
+    let mut long = plain.clone();
+    long.extend([0, 21, 0, 0, 0, 64]);
+    long.extend([b'm'; 64]);
+    assert!(Status::from_block(&long).is_err());
+    let mut bad = plain.clone();
+    bad.extend([0, 21, 0, 0, 0, 1, 0xff]);
+    assert!(Status::from_block(&bad).is_err());
 }
 
 #[test]
@@ -1272,9 +1478,9 @@ fn a_status_from_before_the_times_reads_them_as_unknown() {
     let own = with(old.clone(), |s| s.front_is_own = Some(true));
     assert_eq!(Status::from_block(&own.to_block()).unwrap(), own);
     // A reader that knows none of the keys skips them (this one does not know
-    // key 21 either) and reads what it does know.
+    // key 22 either) and reads what it does know.
     let mut future = newer.to_block();
-    future.extend_from_slice(&[0, 21, 0, 0, 0, 2, 1, 2]);
+    future.extend_from_slice(&[0, 22, 0, 0, 0, 2, 1, 2]);
     assert_eq!(Status::from_block(&future).unwrap(), newer);
     // A value of the wrong length is not read as another.
     for entry in [
