@@ -756,6 +756,24 @@ pub struct Status {
     /// A server writes at most [`MAX_LABEL`] bytes of it; a client that shows it
     /// to a person removes control characters first.
     pub label: Option<String>,
+    /// When the session's own program (the shell, or the program `new` was
+    /// given) started, in seconds since the Unix epoch of the clock of the
+    /// machine the session is on. `None` when the server could not tell: a
+    /// relay from before the key, or a process it could not read. Kept for as
+    /// long as the relay lives, so a session that has ended still says it.
+    pub started: Option<u64>,
+    /// When the program in the foreground of the terminal started, on the same
+    /// clock. Only while the session runs; `None` when it could not be read.
+    pub front_started: Option<u64>,
+    /// Whether the program in the foreground is the session's own: for a
+    /// session opened with a shell, the shell is in front, waiting for a
+    /// command. `None` when it is not known (the session has ended, or the
+    /// relay is from before the key).
+    pub front_is_own: Option<bool>,
+    /// When the relay last read output from the terminal, on the same clock, in
+    /// whole seconds. `None` before it has read any: a relay that has not
+    /// heard from the program since it started, or one from before the key.
+    pub output_at: Option<u64>,
 }
 
 mod status_key {
@@ -775,6 +793,10 @@ mod status_key {
     pub const REMOTE: u16 = 14;
     pub const REMOTE_PORT: u16 = 15;
     pub const LABEL: u16 = 16;
+    pub const STARTED: u16 = 17;
+    pub const FRONT_STARTED: u16 = 18;
+    pub const FRONT_IS_OWN: u16 = 19;
+    pub const OUTPUT_AT: u16 = 20;
 }
 
 impl Status {
@@ -797,13 +819,18 @@ impl Status {
             remote: None,
             remote_port: None,
             label: None,
+            started: None,
+            front_started: None,
+            front_is_own: None,
+            output_at: None,
         }
     }
 
     /// The wire form, a [`tlv`] block with the keys in ascending order. What
-    /// the terminal's state adds (`secret`, `remote`, `remote_port`) and the
-    /// label are written only when there is something to say, so a session with
-    /// none of it and a status from before the keys existed are the same bytes.
+    /// the terminal's state adds (`secret`, `remote`, `remote_port`), the label
+    /// and the times are written only when there is something to say, so a
+    /// session with none of it and a status from before the keys existed are
+    /// the same bytes.
     pub fn to_block(&self) -> Vec<u8> {
         let mut w = tlv::Writer::new();
         w.put(status_key::ID, self.id.as_str().as_bytes());
@@ -841,6 +868,18 @@ impl Status {
         }
         if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
             w.put(status_key::LABEL, label.as_bytes());
+        }
+        if let Some(at) = self.started {
+            w.put_u64(status_key::STARTED, at);
+        }
+        if let Some(at) = self.front_started {
+            w.put_u64(status_key::FRONT_STARTED, at);
+        }
+        if let Some(own) = self.front_is_own {
+            w.put_u8(status_key::FRONT_IS_OWN, u8::from(own));
+        }
+        if let Some(at) = self.output_at {
+            w.put_u64(status_key::OUTPUT_AT, at);
         }
         w.finish()
     }
@@ -886,6 +925,18 @@ impl Status {
                 status_key::LABEL => {
                     status.label =
                         Some(tlv::read_text(value, "status label")?).filter(|l| !l.is_empty())
+                }
+                status_key::STARTED => {
+                    status.started = Some(tlv::read_u64(value, "status started")?)
+                }
+                status_key::FRONT_STARTED => {
+                    status.front_started = Some(tlv::read_u64(value, "status front started")?)
+                }
+                status_key::FRONT_IS_OWN => {
+                    status.front_is_own = Some(tlv::read_u8(value, "status front is own")? & 1 != 0)
+                }
+                status_key::OUTPUT_AT => {
+                    status.output_at = Some(tlv::read_u64(value, "status output at")?)
                 }
                 _ => {}
             }

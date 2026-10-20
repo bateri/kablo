@@ -261,6 +261,17 @@ fn parse_stat(stat: &[u8]) -> Option<Lineage> {
 pub fn lineage(pid: u32) -> Option<Lineage> {
     // The device number a process with no controlling terminal has.
     const NODEV: u32 = u32::MAX;
+    let info = bsd_info(pid)?;
+    Some(Lineage {
+        parent: info.pbi_ppid,
+        terminal: (info.e_tdev != NODEV).then_some(u64::from(info.e_tdev)),
+    })
+}
+
+/// The kernel's BSD process record of `pid`; `None` when the process is gone
+/// or is not the caller's to read.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     // SAFETY: an all-zero `proc_bsdinfo` is valid; the call fills it.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -274,13 +285,62 @@ pub fn lineage(pid: u32) -> Option<Lineage> {
             size,
         )
     };
-    if got != size {
-        return None;
-    }
-    Some(Lineage {
-        parent: info.pbi_ppid,
-        terminal: (info.e_tdev != NODEV).then_some(u64::from(info.e_tdev)),
-    })
+    (got == size).then_some(info)
+}
+
+/// When the process `pid` started, in seconds since the Unix epoch of this
+/// machine's clock; `None` when the process is gone or cannot be read.
+#[cfg(target_os = "macos")]
+pub fn started_at(pid: u32) -> Option<u64> {
+    bsd_info(pid).map(|info| info.pbi_start_tvsec)
+}
+
+/// When the process `pid` started, in seconds since the Unix epoch of this
+/// machine's clock: the boot time (`btime` in `/proc/stat`) plus the start
+/// time `/proc/<pid>/stat` counts in clock ticks after boot. `None` when the
+/// process is gone or any of the three cannot be read.
+#[cfg(target_os = "linux")]
+pub fn started_at(pid: u32) -> Option<u64> {
+    // SAFETY: `sysconf` takes a number and reads no memory of ours.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(ticks).ok()?;
+    let boot = boot_time(&std::fs::read("/proc/stat").ok()?)?;
+    start_time(&std::fs::read(format!("/proc/{pid}/stat")).ok()?, boot, hz)
+}
+
+/// The `btime` line of `/proc/stat`: the machine's boot, in seconds since the
+/// Unix epoch.
+#[cfg(any(target_os = "linux", test))]
+fn boot_time(stat: &[u8]) -> Option<u64> {
+    let line = stat
+        .split(|&b| b == b'\n')
+        .find_map(|line| line.strip_prefix(b"btime "))?;
+    std::str::from_utf8(line).ok()?.trim().parse().ok()
+}
+
+/// The start time in a `/proc/<pid>/stat` line, in seconds since the Unix
+/// epoch, given the boot time and the clock ticks in a second. It is the 22nd
+/// field and the name before it may hold spaces and parentheses, so the fields
+/// are counted from the last `)` (the 3rd, the state, comes first after it).
+#[cfg(any(target_os = "linux", test))]
+fn start_time(stat: &[u8], boot: u64, hz: u64) -> Option<u64> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let field = stat
+        .get(close + 1..)?
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)?;
+    let ticks: u64 = std::str::from_utf8(field).ok()?.parse().ok()?;
+    boot.checked_add(ticks.checked_div(hz)?)
+}
+
+/// Now, in whole seconds since the Unix epoch; `None` when the clock is set
+/// before it.
+pub fn unix_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
 }
 
 /// Whether a peer with this uid may talk to a process that acts as `own`.
@@ -1019,6 +1079,60 @@ mod tests {
         assert_eq!(parse_stat(b""), None);
         assert_eq!(parse_stat(b"4242 (sh) S 77"), None);
         assert_eq!(parse_stat(b"4242 sh S 77 4242 4242 0"), None);
+    }
+
+    #[test]
+    fn the_start_of_a_process_is_the_boot_plus_its_ticks() {
+        // Field 22 of the line, counted from the last `)`: the name may hold
+        // spaces and parentheses.
+        let line = |name: &str, ticks: &str| {
+            format!(
+                "4242 ({name}) S 77 4242 4242 34816 4242 4194304 100 0 0 0 1 2 0 0 20 0 1 0 \
+                 {ticks} 1000 10 18446744073709551615 0 0 0 0 0"
+            )
+            .into_bytes()
+        };
+        assert_eq!(start_time(&line("sh", "250"), 1_000, 100), Some(1_002));
+        assert_eq!(start_time(&line("sh", "99"), 1_000, 100), Some(1_000));
+        assert_eq!(
+            start_time(&line("a b) S 1 2 3 (c", "12345"), 1_000, 100),
+            Some(1_123)
+        );
+        // Nothing to divide by, no such field, not a stat line, a start time
+        // that is not a number.
+        assert_eq!(start_time(&line("sh", "250"), 1_000, 0), None);
+        assert_eq!(start_time(b"4242 (sh) S 77 4242", 1_000, 100), None);
+        assert_eq!(start_time(b"4242 sh S 77", 1_000, 100), None);
+        assert_eq!(start_time(&line("sh", "soon"), 1_000, 100), None);
+        // The boot is the `btime` line, wherever it is.
+        let stat = b"cpu  1 2 3\nintr 5 6\nbtime 1760000000\nprocesses 99\n";
+        assert_eq!(boot_time(stat), Some(1_760_000_000));
+        assert_eq!(boot_time(b"cpu  1 2 3\n"), None);
+        assert_eq!(boot_time(b"btime soon\n"), None);
+    }
+
+    #[test]
+    fn a_process_says_when_it_started() {
+        let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
+        let mut request = kablo_proto::v1::NewSession::default();
+        request.argv = vec![b"/bin/sleep".to_vec(), b"60".to_vec()];
+        let before = unix_now().unwrap();
+        let mut child = crate::pty::spawn(&pty.slave, &request).unwrap();
+        let started = started_at(child.id());
+        let own = started_at(std::process::id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // To the second: the clocks the start and `unix_now` are read on may
+        // differ by one, whichever way the second is cut.
+        let after = unix_now().unwrap();
+        let started = started.expect("a running child has a start time");
+        assert!(
+            started + 2 >= before && started <= after + 1,
+            "{before} <= {started} <= {after}"
+        );
+        // This process started before its child did.
+        assert!(own.expect("this process has one") <= started);
+        assert_eq!(started_at(u32::MAX - 1), None);
     }
 
     #[test]

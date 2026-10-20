@@ -490,6 +490,23 @@ fn messages() -> Vec<(&'static str, Packet)> {
             }))),
         ),
         (
+            "status_reply_times",
+            work(Message::StatusReply(with(Status::new(id("work")), |s| {
+                s.pid = 4242;
+                s.size = Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                };
+                s.offset = 5000;
+                s.started = Some(1_760_000_000);
+                s.front_started = Some(1_760_007_260);
+                s.front_is_own = Some(false);
+                s.output_at = Some(1_760_009_000);
+            }))),
+        ),
+        (
             "status_reply_ended",
             work(Message::StatusReply(with(Status::new(id("work")), |s| {
                 s.pid = 4242;
@@ -1190,6 +1207,59 @@ fn a_status_from_before_the_terminal_keys_reads_them_as_nothing() {
     for entry in [
         [0, 13, 0, 0, 0, 2, 1, 1].as_slice(),
         [0, 15, 0, 0, 0, 1, 22].as_slice(),
+    ] {
+        let mut bad = old.to_block();
+        bad.extend_from_slice(entry);
+        assert!(Status::from_block(&bad).is_err(), "{entry:?}");
+    }
+}
+
+#[test]
+fn a_status_from_before_the_times_reads_them_as_unknown() {
+    // The recorded `status_reply` has none of keys 17 to 20, and a status that
+    // does not know a time writes none of them: it is the same bytes.
+    let Some(Message::StatusReply(old)) = read_packet(&mut fixture("status_reply").as_slice())
+        .unwrap()
+        .map(|packet| packet.message)
+    else {
+        panic!("not a status reply");
+    };
+    assert_eq!(
+        (
+            old.started,
+            old.front_started,
+            old.front_is_own,
+            old.output_at
+        ),
+        (None, None, None, None)
+    );
+    let mut block = old.to_block();
+    assert!(!block.windows(2).any(|w| matches!(w, [0, 17..=20])));
+    // The same block with the keys appended reads with them. A flag that says
+    // no is not a flag that is missing.
+    block.extend_from_slice(&[0, 17, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 5]);
+    block.extend_from_slice(&[0, 18, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 7]);
+    block.extend_from_slice(&[0, 19, 0, 0, 0, 1, 0]);
+    block.extend_from_slice(&[0, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 9]);
+    let newer = with(old.clone(), |s| {
+        s.started = Some(5);
+        s.front_started = Some(7);
+        s.front_is_own = Some(false);
+        s.output_at = Some(9);
+    });
+    assert_eq!(Status::from_block(&block).unwrap(), newer);
+    assert_eq!(Status::from_block(&newer.to_block()).unwrap(), newer);
+    let own = with(old.clone(), |s| s.front_is_own = Some(true));
+    assert_eq!(Status::from_block(&own.to_block()).unwrap(), own);
+    // A reader that knows none of the keys skips them (this one does not know
+    // key 21 either) and reads what it does know.
+    let mut future = newer.to_block();
+    future.extend_from_slice(&[0, 21, 0, 0, 0, 2, 1, 2]);
+    assert_eq!(Status::from_block(&future).unwrap(), newer);
+    // A value of the wrong length is not read as another.
+    for entry in [
+        [0, 17, 0, 0, 0, 4, 0, 0, 0, 5].as_slice(),
+        [0, 19, 0, 0, 0, 2, 0, 1].as_slice(),
     ] {
         let mut bad = old.to_block();
         bad.extend_from_slice(entry);

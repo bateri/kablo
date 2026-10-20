@@ -607,6 +607,11 @@ pub fn write_packet<W: Write>(writer: &mut W, packet: &Packet, from: Side) -> Re
 /// matches on this: end a `match` with an arm for the frames it does not handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a value lives for the one frame it was read from, and boxing the \
+              session packet would change the type an app matches on"
+)]
 pub enum Incoming {
     /// A message about a session or the connection.
     Session(super::Packet),

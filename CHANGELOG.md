@@ -84,8 +84,37 @@ section is not released.
   the session over, so it is not kept for a day. `kablo list` has a `LABEL`
   column at the end, and `kablo list --json` the key `label`.
 
+- **`kablo list` shows how long a session has been open and how long it has
+  been quiet.** The new columns `AGE` and `QUIET` come before `LABEL`: the time
+  since the session's program started and since it last wrote, from the process
+  table and the relay's clock, without anyone attached and without reading what
+  the program wrote. `-` stands for a time that is not known (a program that has
+  not written since the relay began, which a replaced relay is too). `kablo
+  list --json` has the keys `started`, `front_started`, `front_is_own` and
+  `output_at` (README, `kablo list`).
+
 ### For apps
 
+- **Protocol: when things happened to a session.** `status` (and so `list_reply`
+  and `created`) gains the keys 17 `started` (u64: when the session's own
+  program started, in seconds since the Unix epoch of the server's clock), 18
+  `front_started` (u64: when the program in the foreground did), 19
+  `front_is_own` (u8: 1 when the foreground is the session's own program, which
+  for a session opened with a shell is the shell waiting for a command) and 20
+  `output_at` (u64: when the relay last read output, in whole seconds)
+  (`docs/PROTOCOL.md`, status). They are written only when known and a reader
+  that does not know them skips them, so every `status` from before is the bytes
+  it was; `started` is kept after the program has ended, the others are not
+  there once it has. `output_at` is the relay's clock at the read, so a relay
+  does not know it until it has read output itself: not for what the program
+  wrote before the relay began, nor after a relay was replaced, until the
+  program writes again. An app
+  reads `version` before relying on them, as with the rest.
+  `kablo list --json` gains `started`, `front_started` and `output_at` (a number,
+  or `null`) and `front_is_own` (`true`, `false` or `null`); nothing else of it
+  changes. `kablo-proto`: `v1::Status` gains `started`, `front_started`,
+  `output_at` (`Option<u64>`) and `front_is_own` (`Option<bool>`); like `label`,
+  it is built with its constructor, so this breaks no one that builds it.
 - **Protocol: driving a session without attaching.** An app, or a program on the
   server, can type to a session, read its screen and wait for its program to end
   from a connection that has not attached, without being counted as attached and

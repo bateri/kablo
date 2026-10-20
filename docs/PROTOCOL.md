@@ -191,6 +191,19 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 14 | bytes | `remote`: as in `state` |
 | 15 | u16 | `remote_port`: as in `state` |
 | 16 | text | `label`: the session's label, written only when it has one (below) |
+| 17 | u64 | `started`: when the session's own program (the shell, or the program `new` was given) started, in seconds since the Unix epoch of the server's clock; kept after the program has ended |
+| 18 | u64 | `front_started`: when the program in the terminal's foreground started, on the same clock; only while the session runs |
+| 19 | u8 | `front_is_own`: 1 when the program in the foreground is the session's own (for a session opened with a shell, the shell waiting for a command), 0 when another is; only while the session runs |
+| 20 | u64 | `output_at`: when the relay last read output from the terminal, in whole seconds on the same clock; absent until it has read some |
+
+Keys 17 to 20 are written only when known. They come from the process table
+and from the relay's own clock, never from what the program wrote, so a
+status answers them for a session nobody is attached to; a relay does not know
+`output_at` until it has read output itself (what the program wrote before the
+relay began, and what an earlier relay read, are not counted), and a session
+that ended before the relay started has no `started`. A client compares
+them with its own clock only after taking the difference of the server's clock
+from its own (the times are seconds on the server).
 
 Only `id` is required; a reader treats an absent key as zero (or nothing).
 A status takes in what the session's connections had sent by the time the

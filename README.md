@@ -126,8 +126,15 @@ keys that were refused and `connect` stays, so Ctrl-\ still works.
 
 `kablo list` is a table for people and `kablo list --json` is JSON for
 programs (keys are added to it, never removed; `label` is the session's label
-or `null`). A session whose shell lives but whose relay keeps failing is listed
-as `broken`.
+or `null`). `AGE` is how long the session has been open and `QUIET` how long
+since its program last wrote, both from the process table and the relay's
+clock, so nothing has to be attached and nothing is read; a `-` is a time that
+is not known (a session whose program has not written since its relay began,
+which a replaced relay is too). In the JSON, `started`, `front_started` and
+`output_at` are Unix seconds (or `null`), and `front_is_own` says whether what
+is in front is the session's own program (a shell at its prompt, waiting for a
+command) or another one. A session whose shell lives but whose relay keeps
+failing is listed as `broken`.
 
 Over ssh the same commands work from a terminal: `ssh -t host kablo connect
 build`.
@@ -617,10 +624,12 @@ memory of where its relay comes from (see *Limits*).
   [docs/PROTOCOL.md](docs/PROTOCOL.md)). A relay from kablo 0.2.0 on takes them;
   an older one skips what it does not know, so an app reads `version` in
   `status` before it relies on them. `status` and `new` carry the label, and
-  `list --json` has the key `label`. `kablo wait` and `kablo new --wait` end with
-  the program's status, 124 when `--for` ran out and 255 for kablo's own trouble;
-  the other commands end with `0`, `1` for kablo's own trouble and `64` for a
-  command line that does not parse.
+  `list --json` has the key `label`; `status` and `list --json` also carry when
+  the session started, when the program in front did, whether that program is
+  the session's own and when the program last wrote. `kablo wait` and `kablo
+  new --wait` end with the program's status, 124 when `--for` ran out and 255
+  for kablo's own trouble; the other commands end with `0`, `1` for kablo's own
+  trouble and `64` for a command line that does not parse.
 - **Mail from programs on the server** goes to the app through the bridge it
   already runs: `kablo app` hands a program's bytes to the app that is connected
   and carries the app's back, under a ticket that names the terminal the program

@@ -269,6 +269,13 @@ struct Relay {
     journal: Journal,
     listener: UnixListener,
     child_pid: u32,
+    /// When the program `child_pid` is started (Unix seconds), read while it
+    /// lived: it cannot be read once the program has ended. `None` when it
+    /// could not be.
+    started: Option<u64>,
+    /// When this relay last read output from the terminal (Unix seconds);
+    /// `None` until it has. A relay that takes over starts without it.
+    output_at: Option<u64>,
     exit: Option<Exit>,
     /// The version of the warden that keeps the session; empty if it did not
     /// say.
@@ -421,6 +428,12 @@ impl Relay {
             journal,
             listener,
             child_pid: adopt.child_pid,
+            started: if adopt.exit.is_none() {
+                sys::started_at(adopt.child_pid)
+            } else {
+                None
+            },
+            output_at: None,
             exit: adopt.exit,
             warden_version: adopt.warden_version.unwrap_or_default(),
             live: false,
@@ -682,6 +695,8 @@ impl Relay {
                 Ok(_) => {
                     self.feed_screen(Feed::Live);
                     self.output_read = true;
+                    // The only clock this takes; what was read is not looked at.
+                    self.output_at = sys::unix_now();
                     self.settle.arm(Instant::now());
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
@@ -1458,13 +1473,29 @@ impl Relay {
         let mut status = Status::new(self.id.clone());
         status.pid = self.child_pid;
         if self.exit.is_none() {
-            let terminal = self.watch.look(self.master.as_fd(), self.child_pid);
+            // Read late if it could not be read at the start: it is lost once
+            // the program has ended.
+            if self.started.is_none() {
+                self.started = sys::started_at(self.child_pid);
+            }
+            let (terminal, front) = self
+                .watch
+                .look_with_pid(self.master.as_fd(), self.child_pid);
             status.program = terminal.program;
             status.cwd = terminal.cwd;
             status.secret = terminal.secret;
             status.remote = terminal.remote;
             status.remote_port = terminal.remote_port;
+            let own = front == self.child_pid;
+            status.front_is_own = Some(own);
+            status.front_started = if own {
+                self.started
+            } else {
+                sys::started_at(front)
+            };
+            status.output_at = self.output_at;
         }
+        status.started = self.started;
         status.size = sys::window_size(self.master.as_fd()).unwrap_or_default();
         status.clients = self
             .clients
@@ -1731,6 +1762,8 @@ mod tests {
             journal,
             listener,
             child_pid: 1,
+            started: None,
+            output_at: None,
             exit: None,
             warden_version: String::new(),
             live: false,

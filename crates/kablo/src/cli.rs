@@ -336,7 +336,7 @@ fn command_list(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> 
     let text = if json {
         listing::json(&statuses)
     } else {
-        listing::table(&statuses)
+        listing::table(&statuses, sys::unix_now().unwrap_or(0))
     };
     let _ = out.write_all(text.as_bytes());
     0

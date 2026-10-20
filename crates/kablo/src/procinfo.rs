@@ -66,6 +66,18 @@ impl Watch {
     /// The state of the terminal `master` belongs to; the shell `shell_pid`
     /// stands for the foreground when the terminal names no group.
     pub fn look(&mut self, master: BorrowedFd<'_>, shell_pid: u32) -> TerminalState {
+        self.look_with_pid(master, shell_pid).0
+    }
+
+    /// What [`Watch::look`] says, and the process id of the foreground it is
+    /// about: the leader of the foreground group, or `shell_pid` when the
+    /// terminal names none or the leader is gone. One decision for both, so
+    /// that the name and the process it names cannot come apart.
+    pub fn look_with_pid(
+        &mut self,
+        master: BorrowedFd<'_>,
+        shell_pid: u32,
+    ) -> (TerminalState, u32) {
         let group = sys::foreground_group(master).and_then(|group| u32::try_from(group).ok());
         let mut pid = group.unwrap_or(shell_pid);
         let mut program = name_of(pid);
@@ -84,7 +96,7 @@ impl Watch {
         state.remote_port = remote.as_ref().and_then(|remote| remote.port);
         state.remote = remote.map(|remote| remote.host);
         state.program = program;
-        state
+        (state, pid)
     }
 
     /// The remote session process `pid`, named `name`, is, if it is one. What
@@ -569,6 +581,25 @@ mod tests {
             (state.remote, state.remote_port, state.secret),
             (None, None, false)
         );
+    }
+
+    #[test]
+    fn the_foreground_is_told_with_the_process_it_is() {
+        let pty = crate::pty::open(crate::pty::DEFAULT_SIZE).unwrap();
+        let mut request = kablo_proto::v1::NewSession::default();
+        request.argv = vec![b"/bin/sleep".to_vec(), b"5".to_vec()];
+        let mut child = crate::pty::spawn(&pty.slave, &request).unwrap();
+        let (state, pid) = Watch::default().look_with_pid(pty.master.as_fd(), child.id());
+        // A program started on a terminal leads the group that has it.
+        assert_eq!(pid, child.id());
+        assert_eq!(state.program.as_deref(), Some(&b"sleep"[..]));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The leader is gone and the terminal names it still: the shell the
+        // look was given stands in, and so does its number.
+        let shell = std::process::id();
+        let (_, pid) = Watch::default().look_with_pid(pty.master.as_fd(), shell);
+        assert_eq!(pid, shell);
     }
 
     fn argv(line: &str) -> Vec<String> {
