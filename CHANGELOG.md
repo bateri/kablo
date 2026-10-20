@@ -110,6 +110,27 @@ section is not released.
 
 ### For apps
 
+- **Protocol: an ended terminal can be kept for a program that comes after the
+  app.** The view of an `attach` (`docs/PROTOCOL.md`, attach) gains bit 2 of its
+  flags byte, `keep after the end`. An app that sets it and is attached when the
+  program ends, or attaches after, is told `ended` as before, and from that moment
+  the session is kept for ten minutes more whoever else is told, whether or not the
+  app stays attached: `status`, `list`, `read` and `wait` answer as they do for any
+  ended session, so a program on the server that was waiting for the end of a
+  terminal the app opened can still read its last screen and take its status
+  (`kablo capture`, `kablo wait`); a `write` is refused and an `input` is dropped.
+  The ten minutes start once, when the first such client is told (or another is,
+  while such a client is attached and behind), and a session whose relay dies and
+  is started again meanwhile is kept as long as before: until a client that asks is
+  told again, or the day. A client that does not set the bit, and `kablo connect`
+  and `kablo wait`, are as they were; `kablo new --wait` on a session an app keeps
+  ends up to five seconds after the program does, because the session it would
+  take over stays. A relay from before this release ignores the bit and removes the
+  session as it always did: an app reads `version` in `status` before it relies on
+  it. `kablo-proto`: `v1::View`
+  gains the field `keep_after_end` (`bool`; it is built with `View::new`, so this
+  breaks no one that builds it). The bridge keeps the bit across a resize and a new
+  connection to the session, as it does the others.
 - **Protocol: when things happened to a session.** `status` (and so `list_reply`
   and `created`) gains the keys 17 `started` (u64: when the session's own
   program started, in seconds since the Unix epoch of the server's clock), 18

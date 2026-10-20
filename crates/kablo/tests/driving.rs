@@ -173,6 +173,45 @@ fn a_program_that_has_ended_cannot_be_typed_to_and_can_still_be_read() {
 }
 
 #[test]
+fn a_session_kept_for_a_client_that_asked_is_read_and_waited_for_after_that_client_was_told() {
+    let mut env = Env::new();
+    env.set_var(kablo::ENV_TEST_END_KEEP, "8000");
+    let id = env.start(
+        "kept",
+        &["--", "/bin/sh", "-c", "sleep 1; echo last words; exit 4"],
+    );
+    // An app showing the terminal: it hears the end and goes on to say so.
+    let mut app = env.connect(&id);
+    app.attach_keeping(0);
+    app.until("the end", |c| c.ended.is_some());
+    let told = Instant::now();
+    drop(app);
+
+    // The program that watches it comes a moment later. A `wait` that starts
+    // after the end was told used to find no session.
+    let waited = kablo(&env, &["wait", &id]);
+    assert_eq!(waited.code, 4, "{waited:?}");
+    let screen = kablo(&env, &["capture", &id, "--trim"]);
+    assert_eq!(screen.code, 0, "{screen:?}");
+    assert!(has_line(&screen.out, "last words"), "{screen:?}");
+    let said = kablo(&env, &["send", &id, "x"]);
+    assert_eq!(said.code, 1, "{said:?}");
+    let listed = kablo(&env, &["list"]);
+    assert!(
+        listed.out.contains(&id) && listed.out.contains("ended"),
+        "{listed:?}"
+    );
+    assert!(
+        told.elapsed() < Duration::from_millis(7000),
+        "too slow to say anything"
+    );
+
+    // Then it goes, with nobody here.
+    env.wait_gone(&id);
+    assert!(!kablo(&env, &["list"]).out.contains(&id));
+}
+
+#[test]
 fn wait_ends_with_the_programs_status_and_new_wait_takes_the_session_with_it() {
     let mut env = Env::new();
     let id = env.name("new-wait");

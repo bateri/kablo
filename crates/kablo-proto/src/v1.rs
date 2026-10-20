@@ -224,26 +224,40 @@ pub struct View {
     /// answered, send a picture instead of them: the program must not be
     /// answered twice.
     pub picture_if_answered: bool,
+    /// Keep the session for a while once this client has been told that the
+    /// program ended. A session is otherwise removed as soon as a client that
+    /// was attached has been told, which leaves a program that comes to read the
+    /// screen afterwards with nothing; with this set the server holds it for ten
+    /// minutes from the moment the first client that asked for it was told
+    /// (`capture`, `read`, `wait` and `status` answer meanwhile, a `write` is
+    /// refused and an `input` is dropped, as for any ended session). A server
+    /// from before the bit ignores it and removes the session as it always did.
+    pub keep_after_end: bool,
 }
 
 impl View {
     /// Bytes on the wire.
     const LEN: usize = Size::LEN + 1;
 
-    /// A view of a terminal of this `size` that asks for neither of the pictures.
+    /// A view of a terminal of this `size` that asks for none of the flags.
     pub fn new(size: Size) -> View {
         View {
             size,
             picture: false,
             picture_if_answered: false,
+            keep_after_end: false,
         }
     }
 
     /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
-    /// picture if answered).
+    /// picture if answered, bit 2: keep after the end).
     fn write(&self, out: &mut Vec<u8>) {
         self.size.write(out);
-        out.push(u8::from(self.picture) | (u8::from(self.picture_if_answered) << 1));
+        out.push(
+            u8::from(self.picture)
+                | (u8::from(self.picture_if_answered) << 1)
+                | (u8::from(self.keep_after_end) << 2),
+        );
     }
 
     fn read(fields: &mut Fields<'_>) -> Result<View> {
@@ -253,6 +267,7 @@ impl View {
             size,
             picture: flags & 1 != 0,
             picture_if_answered: flags & 2 != 0,
+            keep_after_end: flags & 4 != 0,
         })
     }
 }

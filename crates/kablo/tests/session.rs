@@ -250,6 +250,125 @@ fn a_shell_that_exits_while_attached_is_reported_at_once() {
     env.wait_gone(&id);
 }
 
+/// How long an ended session is kept for a client that asked, in a test.
+const KEPT: Duration = Duration::from_millis(3000);
+
+/// Starts a session whose program writes, waits a moment and ends with 5, in a
+/// directory where the wait after the end is [`KEPT`].
+fn ending_in_a_second(env: &mut Env, label: &str) -> String {
+    env.set_var(kablo::ENV_TEST_END_KEEP, &KEPT.as_millis().to_string());
+    env.start(
+        label,
+        &[
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo before; sleep 1; echo bye; exit 5",
+        ],
+    )
+}
+
+#[test]
+fn a_client_that_asks_leaves_the_ended_session_to_be_read_for_a_while_and_then_it_goes() {
+    let mut env = Env::new();
+    let id = ending_in_a_second(&mut env, "kept");
+    let mut a = env.connect(&id);
+    a.attach_keeping(0);
+    a.until("the end", |c| c.ended.is_some());
+    let told = Instant::now();
+    assert_eq!(a.ended, Some(Exit::Code(5)));
+    // It reads it and goes: nobody is here, and the session is not removed, as
+    // it is for a client that did not ask.
+    drop(a);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(env.socket(&id).exists());
+    assert!(env.find("warden", &id).is_some());
+
+    // Whoever comes finds it ended, with its last output, and cannot type to
+    // it; being told, as a client that did not ask is, does not take it away.
+    let mut b = env.connect(&id);
+    let status = b.status();
+    assert_eq!(
+        (status.state, status.exit),
+        (State::ENDED, Some(Exit::Code(5)))
+    );
+    b.attach(0);
+    b.until("the end", |c| c.ended.is_some());
+    assert!(String::from_utf8_lossy(&b.data).ends_with("bye\r\n"));
+    assert!(b.write(vec![kablo_proto::v1::Stroke::text("x")]).is_err());
+    drop(b);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        told.elapsed() < KEPT,
+        "the test was too slow to say anything"
+    );
+    assert!(env.socket(&id).exists(), "kept until its time is up");
+
+    // Its time is up with no client here to be told anything: it goes.
+    env.wait_gone(&id);
+    assert!(
+        told.elapsed() >= KEPT - Duration::from_millis(300),
+        "gone after {:?}",
+        told.elapsed()
+    );
+}
+
+#[test]
+fn a_client_that_did_not_ask_does_not_shorten_what_one_that_did_is_owed() {
+    let mut env = Env::new();
+    let id = ending_in_a_second(&mut env, "both");
+    let mut keeper = env.connect(&id);
+    keeper.attach_keeping(0);
+    let mut plain = env.connect(&id);
+    plain.attach(0);
+    // Both are attached when the program ends.
+    keeper.until("the end", |c| c.ended.is_some());
+    plain.until("the end", |c| c.ended.is_some());
+    let told = Instant::now();
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        told.elapsed() < KEPT,
+        "the test was too slow to say anything"
+    );
+    assert!(
+        env.socket(&id).exists(),
+        "the plain one was told, and it is kept"
+    );
+    // Each can still be asked, and the one that asked is not forgotten when the
+    // other leaves.
+    drop(plain);
+    assert_eq!(keeper.status().exit, Some(Exit::Code(5)));
+    env.wait_gone(&id);
+    assert!(told.elapsed() >= KEPT - Duration::from_millis(300));
+}
+
+#[test]
+fn a_client_that_asks_after_the_end_is_kept_for_and_asking_again_does_not_start_the_wait_again() {
+    let mut env = Env::new();
+    let id = ending_in_a_second(&mut env, "late");
+    // The end comes with nobody attached: the session waits as it always did
+    // (for the day, which is not what this tests).
+    std::thread::sleep(Duration::from_millis(1700));
+    let mut a = env.connect(&id);
+    assert_eq!(a.status().exit, Some(Exit::Code(5)));
+    a.attach_keeping(0);
+    a.until("the end", |c| c.ended.is_some());
+    let first = Instant::now();
+    std::thread::sleep(Duration::from_millis(2000));
+    // Told again, it does not start the wait again.
+    a.ended = None;
+    a.attach_keeping(0);
+    a.until("the end again", |c| c.ended.is_some());
+    drop(a);
+    env.wait_gone(&id);
+    assert!(
+        first.elapsed() < KEPT + Duration::from_millis(1200),
+        "gone after {:?}",
+        first.elapsed()
+    );
+    assert!(first.elapsed() >= KEPT - Duration::from_millis(300));
+}
+
 #[test]
 fn a_signal_death_is_a_signal_not_a_code() {
     let mut env = Env::new();

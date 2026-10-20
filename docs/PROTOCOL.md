@@ -108,7 +108,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered) |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end) |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -493,6 +493,13 @@ attached are answered with `error` (`NOT_ATTACHED`) and do nothing; `detach`
 ends the stream and keeps the connection. An `attach` offset past the end of
 the stream is `BAD_REQUEST`.
 
+Bit 2 of the view's flags, keep after the end, is for a client whose output is
+shown to a program or a person that may come back for the screen after the client
+has seen the program end (a terminal app, whose pane an agent on the server reads
+a moment after the app shows that the program ended). It changes nothing about
+the attach itself and is described under Ending. A server from before the bit
+ignores it.
+
 The `attach` of a client that knows its terminal carries a **view**: the
 terminal's size, whether it wants a picture whatever the offset (bit 0), and
 whether it needs a picture rather than bytes that hold a question the server has
@@ -613,6 +620,24 @@ answer too.
 **Ending.** When the program exits, the server sends the rest of its output,
 then `ended` with how it exited. The session is kept until a client has been
 told, and removed after a day at most.
+
+A client that set bit 2 of its view's flags (Attach) has the session kept for
+ten minutes more: counted from the moment the first such client has been sent
+`ended` (a second one, or the same one attaching again, does not start it
+again), the session is not removed by the telling of any client, and it is
+removed when the ten minutes are over, whether or not any client is attached
+then. Meanwhile it is what it is for any ended session: `status`, `list`,
+`read` (the screen as the program left it) and `wait` (answered at once) work, a
+`write` is refused with `ENDED` (an `input` is dropped) and a new `attach` is
+told `ended` again. The
+time is the server's own and is not announced; a relay that is started again
+meanwhile (after it died; an ended session is not replaced by `upgrade`) forgets
+it, and the client that attaches again to the new one starts it afresh, so a
+session is kept a day at most all the same. A client of this kind that is
+attached but has not yet been sent `ended` (its connection is behind) when
+another client is told starts the wait at that moment, so it is not left with
+nothing and does not hold the session for longer than the wait. A server from
+before the bit removes the session as soon as any client was told.
 
 **Closing.** A connection that closes, for any reason, ends no session. Only
 `terminate` does: a hang-up to the shell and its foreground process group, or
@@ -866,7 +891,8 @@ answers).
   `ended` that an attached client is sent, and hearing it is not delivery: the
   session is kept for the clients that have not been told, as in Ending, so a
   `wait` never ends a session and a terminal app showing the pane still learns the
-  program ended. A `wait` is held for as long as the program runs, takes one of the
+  program ended. (A `wait` that is made after an attached client was told, and
+  that client set bit 2, is still answered: the session is kept for ten minutes.) A `wait` is held for as long as the program runs, takes one of the
   session's 64 connections, and is not repeated by the server: a connection lost
   while it waits (a relay replaced by `upgrade` is one) leaves the sender to ask
   again, which the bridge does for the client that asked through it.

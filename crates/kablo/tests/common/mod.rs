@@ -88,6 +88,8 @@ pub struct Env {
     pub dir: PathBuf,
     tag: String,
     sessions: Vec<String>,
+    /// Variables every `kablo` of this test runs with.
+    vars: Vec<(String, String)>,
 }
 
 impl Env {
@@ -106,13 +108,21 @@ impl Env {
             dir,
             tag,
             sessions: Vec::new(),
+            vars: Vec::new(),
         }
+    }
+
+    /// Makes every `kablo` of this test (and so the sessions it starts) run
+    /// with this variable.
+    pub fn set_var(&mut self, name: &str, value: &str) {
+        self.vars.push((name.to_owned(), value.to_owned()));
     }
 
     /// A `kablo` command in this test's directory.
     pub fn kablo(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kablo"));
         command.env("KABLO_DIR", &self.dir);
+        command.envs(self.vars.iter().map(|(n, v)| (n, v)));
         command
     }
 
@@ -374,6 +384,14 @@ pub fn viewing(size: Size, picture: bool, picture_if_answered: bool) -> View {
     let mut view = View::new(size);
     view.picture = picture;
     view.picture_if_answered = picture_if_answered;
+    view
+}
+
+/// A view of a terminal of `size` that asks for the session to be kept for a
+/// while after it has been told the program ended, and for nothing else.
+pub fn keeping(size: Size) -> View {
+    let mut view = View::new(size);
+    view.keep_after_end = true;
     view
 }
 
@@ -645,6 +663,24 @@ impl Conn {
                 c.pictures.last().is_some_and(|p| p.complete)
             });
         }
+        self.attached.unwrap()
+    }
+
+    /// Attaches as a terminal that wants the session kept for a while once it
+    /// has been told how the program ended; returns where the stream starts and
+    /// whether it was cut.
+    pub fn attach_keeping(&mut self, offset: u64) -> (u64, bool) {
+        self.attached = None;
+        self.send(Message::Attach {
+            offset,
+            view: Some(keeping(Size {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            })),
+        });
+        self.until("attached", |c| c.attached.is_some());
         self.attached.unwrap()
     }
 
@@ -1132,6 +1168,30 @@ impl Bridge {
     pub fn attach(&mut self, id: &str, offset: u64) -> (u64, bool) {
         let before = self.seen(id).attached.len();
         self.send(Some(id), Message::attach(offset));
+        self.until("attached", |b| {
+            b.sessions
+                .get(id)
+                .is_some_and(|s| s.attached.len() > before)
+        });
+        *self.seen(id).attached.last().unwrap()
+    }
+
+    /// Attaches as a terminal that wants the session kept for a while once it
+    /// has been told how the program ended.
+    pub fn attach_keeping(&mut self, id: &str, offset: u64) -> (u64, bool) {
+        let before = self.seen(id).attached.len();
+        self.send(
+            Some(id),
+            Message::Attach {
+                offset,
+                view: Some(keeping(Size {
+                    cols: 80,
+                    rows: 24,
+                    xpixel: 0,
+                    ypixel: 0,
+                })),
+            },
+        );
         self.until("attached", |b| {
             b.sessions
                 .get(id)

@@ -227,7 +227,9 @@ disturbed nor told.
 - **`kablo new --wait`** starts the session, prints its id, waits for the program
   to end and ends with its status, and then takes the session over: it is not
   kept for a day, as a session nobody was told about is, so a script that runs a
-  hundred programs this way leaves nothing behind.
+  hundred programs this way leaves nothing behind. (A session that an app shows,
+  and that asked to keep it, stays its ten minutes all the same, and the command
+  then ends up to five seconds after the program.)
 - **Sessions started by kablo 0.1.0** have a relay that does not know these
   commands, and would let a `wait` wait for ever. Each command (but `here`, which
   asks no relay) asks the session which release serves it and stops, saying so,
@@ -576,7 +578,9 @@ memory of where its relay comes from (see *Limits*).
 - **A `wait` that starts after a client has been told the program ended** can
   find no session (255): that client took the session over and it is gone. Getting
   the program's status for certain is what `new --wait` and a `wait` that was
-  already waiting are for.
+  already waiting are for. An app can ask for the session to be kept for ten
+  minutes after it has been told (below, For apps), and a `wait` or a `capture`
+  that comes in that time finds it.
 - **A label is a file in the socket directory.** A system that clears `/tmp` by
   age can remove it; the session then has no label, which is not an error.
 - **A program that ignores the hang-up** is ended by `kablo end --force`, which
@@ -589,7 +593,11 @@ memory of where its relay comes from (see *Limits*).
 - **The journal is bounded** (8 MiB by default). Output the program writes
   while nobody is attached is kept only as far as that.
 - **An ended session** is kept until a client has been told how it ended, a
-  day at most, and then removed.
+  day at most, and then removed; for ten minutes more, counted from the telling,
+  when that client asked for it (an app does, so that a program on the server can
+  still read the terminal that the app shows as ended). Those ten minutes are not
+  kept if the session's relay dies and is started again meanwhile: the session is
+  then kept until an app that asks is told again, or for the day.
 - **A binary overwritten in place.** On Linux, a running warden that was
   started from a file which has since been replaced reads its own path as
   `… (deleted)`. If its relay dies before you run `kablo upgrade` for that
@@ -651,6 +659,15 @@ memory of where its relay comes from (see *Limits*).
   new --wait` end with the program's status, 124 when `--for` ran out and 255
   for kablo's own trouble; the other commands end with `0`, `1` for kablo's own
   trouble and `64` for a command line that does not parse.
+- **A terminal that ended stays readable for a while** when the app that shows it
+  asks: bit 2 of the view it attaches with (`keep_after_end` in `kablo-proto`).
+  Once the app has been told the program ended, `capture`, `wait`, `status` and
+  `list` go on answering for ten minutes, for a program on the server that comes
+  after the app (an agent that closes or reads the terminal the app opened for
+  it); a `write` is refused and an `input` is dropped, as for any ended session.
+  The app does not need to stay attached. A relay
+  from before kablo 0.2.0 ignores the bit and removes the session when the app
+  is told, as it always did.
 - **Mail from programs on the server** goes to the app through the bridge it
   already runs: `kablo app` hands a program's bytes to the app that is connected
   and carries the app's back, under a ticket that names the terminal the program

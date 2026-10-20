@@ -53,6 +53,16 @@
 //! have not been told. The label of a session is a file the relay reads when it
 //! says how the session stands and takes away when the session is over.
 //!
+//! **An ended session is kept for the clients that have not been told, and for
+//! a while longer for the ones that asked.** The warden removes the session
+//! once a client that was attached has been told how the program ended. A client
+//! whose view sets `keep_after_end` is a program's reader on its way: what it
+//! shows may be read by another program a moment after it was told (`capture`,
+//! `wait`), so when such a client has been told (or another has, while it is
+//! attached and behind), delivery waits [`END_KEEP`] (counted from that moment,
+//! once) whoever else was told, and the warden's day is the most it can wait. The wait is a timer with a stop condition, it fires
+//! once and delivers, and without a client that asked it does not exist.
+//!
 //! **Nothing is closed by silence.** A client that goes away takes only its
 //! own state with it; the session ends only on an explicit `terminate`
 //! (forwarded to the warden, which owns the shell) or when the shell exits.
@@ -154,6 +164,57 @@ impl Settle {
     }
 }
 
+/// How long an ended session is kept for a program to read, from the moment a
+/// client that asked for it (`keep_after_end`) was told how the program ended.
+/// Long enough for the program that watches a terminal's end to come back and
+/// read what was on the screen, short enough that a script that opens a hundred
+/// terminals does not leave a hundred behind.
+const END_KEEP: Duration = Duration::from_secs(10 * 60);
+
+/// The window of [`END_KEEP`] in this process (a test may shorten it with
+/// [`crate::ENV_TEST_END_KEEP`]).
+fn end_keep() -> Duration {
+    std::env::var(crate::ENV_TEST_END_KEEP)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(END_KEEP, Duration::from_millis)
+}
+
+/// The wait that follows the telling of the end to a client that asked for the
+/// session to be kept.
+///
+/// The relay's second timer, with a stop condition of its own: it starts once,
+/// when the first such client has been told (a client that is told later does
+/// not push it back), it fires once, at its end, and delivery follows; a session
+/// no such client was told about has none, and neither does a relay that is
+/// replaced (the client that is told again after it starts a new one).
+#[derive(Default)]
+struct EndKeep {
+    until: Option<Instant>,
+}
+
+impl EndKeep {
+    /// A client that asked was told at `now`; the first one starts the wait.
+    fn begin(&mut self, now: Instant, window: Duration) {
+        self.until.get_or_insert(now + window);
+    }
+
+    /// Whether a wait has been started, over or not.
+    fn started(&self) -> bool {
+        self.until.is_some()
+    }
+
+    /// Whether the wait is over at `now`.
+    fn over(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| until <= now)
+    }
+
+    /// How long a `poll` may wait at `now` for the wait to end, if one runs.
+    fn timeout(&self, now: Instant) -> Option<Duration> {
+        self.until.map(|until| until.saturating_duration_since(now))
+    }
+}
+
 /// Whose questions the bytes given to the screen may hold.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
@@ -230,6 +291,21 @@ struct Client {
     waiting: bool,
 }
 
+impl Client {
+    /// The end of the program was queued for it and has left: it has been told.
+    fn told(&self) -> bool {
+        self.ended_queued && self.out.is_empty()
+    }
+
+    /// It is attached as a client that asked for the session to be kept for a
+    /// while after it was told the program ended.
+    fn keeps(&self) -> bool {
+        self.attach
+            .as_ref()
+            .is_some_and(|attach| attach.keep_after_end)
+    }
+}
+
 /// A question about how the session stands. It is answered at the end of the
 /// turn it was read in ([`Relay::answer_questions`]), after everything the
 /// relay found on every connection in that turn.
@@ -244,6 +320,9 @@ enum Question {
 struct Attach {
     /// The offset of the next byte owed.
     next: u64,
+    /// The client asked for the session to be kept for a while once it has been
+    /// told the program ended (`keep_after_end` in its view).
+    keep_after_end: bool,
     /// The picture of the screen that goes before it, while it is being sent.
     picture: Option<Picture>,
 }
@@ -306,6 +385,13 @@ struct Relay {
     /// Reused to carry journal bytes to the screen.
     scratch: Vec<u8>,
     clients: Vec<Client>,
+    /// The end of the program has reached a client, so the warden may be told
+    /// it can remove the session (when no wait stands in the way).
+    ended_told: bool,
+    /// The wait for the clients that asked to have the session kept.
+    keep: EndKeep,
+    /// How long that wait is.
+    keep_for: Duration,
     delivered_sent: bool,
     /// An upgrade was asked of the warden through this relay and has not failed:
     /// if it is told to quit, it is being replaced and not ended.
@@ -448,6 +534,9 @@ impl Relay {
             history,
             scratch: vec![0; SCREEN_CHUNK],
             clients: Vec::new(),
+            ended_told: false,
+            keep: EndKeep::default(),
+            keep_for: end_keep(),
             delivered_sent: false,
             replacing: false,
             quit: false,
@@ -509,7 +598,7 @@ impl Relay {
             if self.exit.is_some() || self.attached() == 0 {
                 self.settle.cancel();
             }
-            if sys::poll(&mut set, self.settle.timeout(Instant::now())).is_err() {
+            if sys::poll(&mut set, self.wake_in(Instant::now())).is_err() {
                 return 1;
             }
             for (fd, source) in set.iter().zip(&sources) {
@@ -545,6 +634,7 @@ impl Relay {
                 self.hold_spare();
                 self.accept_paused = false;
             }
+            self.deliver_if_due(Instant::now());
             if self.is_orphaned() {
                 self.quit = true;
             }
@@ -1210,6 +1300,7 @@ impl Relay {
         if let Some(client) = self.clients.get_mut(i) {
             client.attach = Some(Attach {
                 next: start,
+                keep_after_end: view.is_some_and(|view| view.keep_after_end),
                 picture,
             });
             client.ended_queued = false;
@@ -1630,12 +1721,62 @@ impl Relay {
             client.dead = true;
             return;
         }
-        if client.ended_queued && client.out.is_empty() {
-            // The end of the shell has reached a client: the session may go.
-            if !self.delivered_sent {
-                self.delivered_sent = true;
-                self.send_warden(&ToWarden::Delivered);
+        if client.told() {
+            // The end of the shell has reached a client. Whether the session
+            // may go now is `deliver_if_due`'s to say; a client that asked for
+            // it to be kept starts the wait that holds it.
+            let keeps = client.keeps();
+            self.ended_told = true;
+            if keeps {
+                self.keep.begin(Instant::now(), self.keep_for);
             }
+        }
+    }
+
+    /// How long a `poll` may wait at `now`: for ever unless a look at the
+    /// terminal or the end of a session's wait is due.
+    fn wake_in(&self, now: Instant) -> Option<Duration> {
+        let keep = if self.delivered_sent {
+            None
+        } else {
+            self.keep.timeout(now)
+        };
+        match (self.settle.timeout(now), keep) {
+            (Some(look), Some(keep)) => Some(look.min(keep)),
+            (look, keep) => look.or(keep),
+        }
+    }
+
+    /// Tells the warden the session may be removed, once, when it is time.
+    ///
+    /// The end has to have reached a client. If one that asked for the session
+    /// to be kept has been told, the time is the end of the wait it started,
+    /// whoever else has been told and whether or not that client is still here:
+    /// the program it was for comes later. A client that asked and is attached
+    /// but has not been told yet (the program ended while its socket was full)
+    /// is not left with nothing to read when another is told first: that
+    /// telling starts the wait as well, so a connection that is behind holds the
+    /// session for the wait and no longer.
+    fn deliver_if_due(&mut self, now: Instant) {
+        if self.delivered_sent || !self.ended_told {
+            return;
+        }
+        if !self.keep.started()
+            && self
+                .clients
+                .iter()
+                .any(|client| !client.dead && !client.told() && client.keeps())
+        {
+            self.keep.begin(now, self.keep_for);
+        }
+        let due = if self.keep.started() {
+            self.keep.over(now)
+        } else {
+            true
+        };
+        if due {
+            self.delivered_sent = true;
+            self.send_warden(&ToWarden::Delivered);
         }
     }
 
@@ -1773,6 +1914,9 @@ mod tests {
             input: Vec::new(),
             input_sent: 0,
             clients: Vec::new(),
+            ended_told: false,
+            keep: EndKeep::default(),
+            keep_for: end_keep(),
             delivered_sent: false,
             replacing: false,
             quit: false,
@@ -1988,5 +2132,162 @@ mod tests {
         settle.arm(start);
         settle.cancel();
         assert_eq!(settle.timeout(start), None);
+    }
+
+    #[test]
+    fn the_wait_after_the_end_is_a_timer_that_starts_once_and_fires_once() {
+        let start = Instant::now();
+        let window = Duration::from_secs(600);
+        let mut keep = EndKeep::default();
+        // Not started: the relay's `poll` waits for ever.
+        assert!(!keep.started());
+        assert_eq!(keep.timeout(start), None);
+        assert!(!keep.over(start + window * 10));
+
+        keep.begin(start, window);
+        assert!(keep.started());
+        assert_eq!(keep.timeout(start), Some(window));
+        assert!(!keep.over(start + window - Duration::from_millis(1)));
+        assert!(keep.over(start + window));
+        assert_eq!(keep.timeout(start + window * 2), Some(Duration::ZERO));
+        // A client that is told later does not push the end back.
+        keep.begin(start + window / 2, window);
+        assert_eq!(keep.timeout(start), Some(window));
+    }
+
+    /// A client over a socket whose far end is returned (it must outlive the
+    /// test, or the relay's writes find it closed), attached as one that asks
+    /// for the session to be kept or as one that does not, and not yet told.
+    fn client_of(keeps: bool) -> (Client, UnixStream) {
+        let (sock, far) = UnixStream::pair().unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let client = Client {
+            sock,
+            open: true,
+            hello: Vec::new(),
+            decoder: PacketDecoder::new(),
+            out: Vec::new(),
+            sent: 0,
+            attach: Some(Attach {
+                next: 0,
+                keep_after_end: keeps,
+                picture: None,
+            }),
+            ended_queued: false,
+            closing: false,
+            dead: false,
+            upgrading: false,
+            asked: None,
+            waiting: false,
+        };
+        (client, far)
+    }
+
+    /// A relay whose program has ended, with no client yet and a wait of ten
+    /// minutes for the ones that ask.
+    fn ended_relay() -> (Relay, OwnedFd) {
+        let (mut relay, slave) = relay_over(Journal::create(MIN_CAPACITY).unwrap());
+        relay.exit = Some(Exit::Code(0));
+        relay.final_drained = true;
+        relay.keep_for = END_KEEP;
+        (relay, slave)
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_is_delivered_to_at_once() {
+        let (mut relay, _slave) = ended_relay();
+        let (client, _far) = client_of(false);
+        relay.clients.push(client);
+        let now = Instant::now();
+        // Nothing to tell yet: nothing is delivered and the relay waits for ever.
+        relay.deliver_if_due(now);
+        assert!(!relay.delivered_sent);
+        assert_eq!(relay.wake_in(now), None);
+
+        relay.drive(0);
+        relay.deliver_if_due(now);
+        assert!(relay.delivered_sent, "told, so the session may go");
+        assert_eq!(relay.wake_in(now), None);
+    }
+
+    #[test]
+    fn a_client_that_asked_keeps_the_session_for_the_wait_whoever_else_is_told() {
+        let (mut relay, _slave) = ended_relay();
+        let (keeper, _far_keeper) = client_of(true);
+        let (plain, _far_plain) = client_of(false);
+        relay.clients.push(plain);
+        relay.clients.push(keeper);
+        relay.drive(0);
+        relay.drive(1);
+        let now = Instant::now();
+        relay.deliver_if_due(now);
+        assert!(!relay.delivered_sent, "told, but one of them asked");
+        let due = relay.wake_in(now).unwrap();
+        assert!(
+            due > END_KEEP - Duration::from_secs(5) && due <= END_KEEP,
+            "{due:?}"
+        );
+
+        // Nobody is here any more: the end of the wait is what delivers.
+        relay.clients.clear();
+        relay.deliver_if_due(now + END_KEEP - Duration::from_secs(5));
+        assert!(!relay.delivered_sent);
+        relay.deliver_if_due(now + END_KEEP + Duration::from_secs(1));
+        assert!(relay.delivered_sent);
+        assert_eq!(relay.wake_in(now), None, "it fired once");
+    }
+
+    #[test]
+    fn a_client_that_asked_and_has_not_been_told_is_not_left_with_nothing_by_the_others() {
+        let (mut relay, _slave) = ended_relay();
+        let (plain, _far_plain) = client_of(false);
+        let (keeper, _far_keeper) = client_of(true);
+        relay.clients.push(plain);
+        relay.clients.push(keeper);
+        // The plain one has been told; the other's socket was full.
+        relay.drive(0);
+        let now = Instant::now();
+        relay.deliver_if_due(now);
+        assert!(!relay.delivered_sent, "one that asked is still to be told");
+        // The wait started with the telling of the other, so a connection that
+        // is behind holds the session for it and no longer.
+        let due = relay.wake_in(now).unwrap();
+        assert!(due <= END_KEEP, "{due:?}");
+
+        // Told in time, the one that asked has what is left of it.
+        relay.drive(1);
+        relay.deliver_if_due(now);
+        assert!(!relay.delivered_sent);
+        relay.deliver_if_due(now + END_KEEP + Duration::from_secs(1));
+        assert!(relay.delivered_sent);
+    }
+
+    #[test]
+    fn a_client_that_asked_and_never_reads_holds_the_session_for_the_wait_and_no_longer() {
+        let (mut relay, _slave) = ended_relay();
+        let (plain, _far_plain) = client_of(false);
+        let (keeper, _far_keeper) = client_of(true);
+        relay.clients.push(plain);
+        relay.clients.push(keeper);
+        relay.drive(0);
+        let now = Instant::now();
+        relay.deliver_if_due(now);
+        assert!(!relay.delivered_sent);
+        // It is still attached and still has not been told.
+        relay.deliver_if_due(now + END_KEEP + Duration::from_secs(1));
+        assert!(relay.delivered_sent);
+    }
+
+    #[test]
+    fn a_client_that_asked_and_went_before_it_was_told_does_not_hold_the_others() {
+        let (mut relay, _slave) = ended_relay();
+        let (plain, _far_plain) = client_of(false);
+        let (mut keeper, _far_keeper) = client_of(true);
+        keeper.dead = true;
+        relay.clients.push(plain);
+        relay.clients.push(keeper);
+        relay.drive(0);
+        relay.deliver_if_due(Instant::now());
+        assert!(relay.delivered_sent);
     }
 }

@@ -257,10 +257,13 @@ impl Link {
             Message::Resize(size) => {
                 if let Some(attach) = self.attach.as_mut() {
                     // A resize changes the view's size and nothing else the
-                    // client asked for: bit 1 is about the bytes, not the size.
-                    let mut view = View::new(*size);
-                    view.picture_if_answered =
-                        attach.view.is_some_and(|view| view.picture_if_answered);
+                    // client asked for: its flags are about the bytes and the
+                    // session's keeping, not the size, and the ones a later
+                    // version adds are not ours to drop. (The picture is
+                    // asked for again only while it is owed, below.)
+                    let mut view = attach.view.unwrap_or_else(|| View::new(*size));
+                    view.size = *size;
+                    view.picture = false;
                     attach.view = Some(view);
                 }
             }
@@ -671,6 +674,61 @@ mod tests {
         link.lost(now, &mut out);
         assert_eq!(out, [unavailable(&id, UNSURE)]);
         assert!(!link.awaits_confirmation());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_a_client_asked_of_its_view_is_asked_again_of_the_next_connection_after_a_resize() {
+        let (mut link, listener, dir) = link_between_connections("view");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let size = |cols| Size {
+            cols,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let mut view = View::new(size(80));
+        view.picture_if_answered = true;
+        view.keep_after_end = true;
+        link.send(
+            about(Message::Attach {
+                offset: 0x10,
+                view: Some(view),
+            }),
+            now,
+            &mut out,
+        );
+        // The terminal is resized while the connection is down: the size is the
+        // latest and the flags are the ones that were asked for.
+        link.send(about(Message::Resize(size(100))), now, &mut out);
+
+        link.tick(now + RETRY, &mut out);
+        assert!(link.peer.is_some());
+        let _ = listener.accept().unwrap(); // the one that was lost
+        let (mut sock, _) = listener.accept().unwrap();
+        WIRE.server(&mut sock.try_clone().unwrap(), &mut sock)
+            .unwrap();
+        let mut decoder = PacketDecoder::new();
+        let mut buf = [0u8; 1024];
+        let heard = loop {
+            let n = sock.read(&mut buf).unwrap();
+            assert!(n > 0, "the attach never came");
+            decoder.push(&buf[..n]);
+            if let Some(packet) = decoder.next_packet().unwrap() {
+                break packet.message;
+            }
+        };
+        let Message::Attach {
+            offset,
+            view: Some(view),
+        } = heard
+        else {
+            panic!("not an attach with a view: {heard:?}");
+        };
+        assert_eq!(offset, 0x10);
+        assert_eq!(view.size, size(100));
+        assert!(view.keep_after_end && view.picture_if_answered && !view.picture);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

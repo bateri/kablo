@@ -44,6 +44,10 @@ pub mod warden;
 /// run a "newer" build of the same code.
 pub const ENV_TEST_VERSION: &str = "KABLO_TEST_VERSION";
 
+/// The variable that stands in for the ten minutes an ended session is kept for
+/// a client that asked (in milliseconds), so that a test does not wait that long.
+pub const ENV_TEST_END_KEEP: &str = "KABLO_TEST_END_KEEP_MS";
+
 /// The release this build says it is, to the clients that ask (`status`) and
 /// to the relay a warden serves.
 pub fn release() -> String {

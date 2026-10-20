@@ -332,6 +332,53 @@ fn sessions_live_when_every_ssh_session_of_the_user_is_closed() {
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
+fn a_session_an_app_asked_to_have_kept_is_read_after_the_app_was_told_and_then_goes() {
+    let server = server();
+    let prefix = prefix("kept");
+    let id = format!("{prefix}-0");
+    // The wait after the end is made short for the sessions of this login: the
+    // bridge starts them with its own environment.
+    let (mut app, _) = Bridge::over(server.ssh("KABLO_TEST_END_KEEP_MS=6000 kablo attach"));
+    app.try_new(
+        Some(&id),
+        &["/bin/sh", "-c", "sleep 1; echo last words; exit 4"],
+    )
+    .expect("a session");
+    // The view travels through ssh and the bridge as the app sent it.
+    app.attach_keeping(&id, 0);
+    app.until("the end", |b| {
+        b.sessions.get(&id).is_some_and(|s| s.ended.is_some())
+    });
+    let told = Instant::now();
+    drop(app);
+
+    // A program on the server comes after the app was told, from a login of
+    // its own: it waits for the end and reads the screen.
+    let waited = server.ssh(&format!("kablo wait {id}")).output().unwrap();
+    assert_eq!(waited.status.code(), Some(4), "{}", said(&waited.stderr));
+    let screen = server
+        .ssh(&format!("kablo capture {id} --trim"))
+        .output()
+        .unwrap();
+    assert_eq!(screen.status.code(), Some(0), "{}", said(&screen.stderr));
+    assert!(said(&screen.stdout).contains("last words"));
+    assert!(
+        told.elapsed() < Duration::from_secs(5),
+        "too slow to say anything"
+    );
+
+    // Then the wait ends and nobody is left.
+    let start = Instant::now();
+    while server.count(&format!("kablo warden --id {id}")) > 0 {
+        assert!(start.elapsed() < PATIENCE, "the session is still there");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(told.elapsed() >= Duration::from_secs(5));
+    server.clean_up(&prefix);
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
 fn a_session_the_server_does_not_have_is_an_answer_not_a_hang() {
     let server = server();
     let (mut bridge, _) = server.bridge();

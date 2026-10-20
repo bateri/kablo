@@ -112,11 +112,19 @@ fn terminal(set: impl FnOnce(&mut TerminalState)) -> TerminalState {
     state
 }
 
-/// A view of a terminal of `size`, with the two flags as given.
+/// A view of a terminal of `size`, with the two pictures' flags as given.
 fn viewing(size: Size, picture: bool, picture_if_answered: bool) -> View {
     let mut view = View::new(size);
     view.picture = picture;
     view.picture_if_answered = picture_if_answered;
+    view
+}
+
+/// A view of a terminal of `size` that asks for the session to be kept after
+/// its end is told, and for nothing else.
+fn keeping(size: Size) -> View {
+    let mut view = View::new(size);
+    view.keep_after_end = true;
     view
 }
 
@@ -194,6 +202,18 @@ fn messages() -> Vec<(&'static str, Packet)> {
                     false,
                     true,
                 )),
+            }),
+        ),
+        (
+            "attach_view_keep",
+            work(Message::Attach {
+                offset: 0x1000,
+                view: Some(keeping(Size {
+                    cols: 120,
+                    rows: 40,
+                    xpixel: 960,
+                    ypixel: 800,
+                })),
             }),
         ),
         ("detach", work(Message::Detach)),
@@ -1383,28 +1403,23 @@ fn an_attached_is_the_one_it_always_was_unless_it_carries_a_whole_answered_offse
 }
 
 #[test]
-fn the_two_bits_of_a_views_flags_are_each_their_own() {
-    let view = |picture, picture_if_answered| {
-        viewing(
-            Size {
-                cols: 80,
-                rows: 24,
-                xpixel: 0,
-                ypixel: 0,
-            },
-            picture,
-            picture_if_answered,
-        )
+fn the_three_bits_of_a_views_flags_are_each_their_own() {
+    let size = Size {
+        cols: 80,
+        rows: 24,
+        xpixel: 0,
+        ypixel: 0,
     };
-    for (picture, if_answered, flags) in [
-        (false, false, 0u8),
-        (true, false, 1),
-        (false, true, 2),
-        (true, true, 3),
-    ] {
+    let view = |picture, picture_if_answered, keep| {
+        let mut view = viewing(size, picture, picture_if_answered);
+        view.keep_after_end = keep;
+        view
+    };
+    for flags in 0u8..8 {
+        let (picture, if_answered, keep) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
         let packet = work(Message::Attach {
             offset: 0,
-            view: Some(view(picture, if_answered)),
+            view: Some(view(picture, if_answered, keep)),
         });
         let frame = packet.to_frame().unwrap();
         assert_eq!(frame.payload.last(), Some(&flags));
@@ -1412,13 +1427,13 @@ fn the_two_bits_of_a_views_flags_are_each_their_own() {
     }
     // The bits it does not define are not its business.
     let mut payload = vec![0; 8];
-    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_1100]);
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_1000]);
     let bytes = raw(kind::ATTACH, 0, "work", &payload);
     assert_eq!(
         read_packet(&mut bytes.as_slice()).unwrap(),
         Some(work(Message::Attach {
             offset: 0,
-            view: Some(view(false, false))
+            view: Some(view(false, false, false))
         }))
     );
 }
