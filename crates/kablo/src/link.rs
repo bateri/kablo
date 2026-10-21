@@ -109,6 +109,11 @@ pub struct Link {
     attach: Option<Attach>,
     /// `attached` replies still owed to attaches the link made itself.
     swallow: u32,
+    /// `attach`es the client sent whose `attached` has not come. The session
+    /// answers a connection's requests in the order they came, so an `attached`
+    /// or a `TAKEN` that arrives while more than the one it answers are waiting
+    /// is about an attach the client has since replaced.
+    unanswered: u32,
     /// `status` requests sent whose replies have not come.
     status_pending: u32,
     /// `read` requests sent whose answers have not come, in the order they were
@@ -153,6 +158,7 @@ impl Link {
                 peer: Some(peer),
                 attach: None,
                 swallow: 0,
+                unanswered: 0,
                 status_pending: 0,
                 reads: VecDeque::new(),
                 waiting: false,
@@ -250,6 +256,7 @@ impl Link {
         }
         match &packet.message {
             Message::Attach { offset, view } => {
+                self.unanswered += 1;
                 self.attach = Some(Attach {
                     requested: *offset,
                     view: *view,
@@ -368,13 +375,20 @@ impl Link {
                 Message::Attached {
                     offset, truncated, ..
                 } => {
+                    // Whether this answers the attach the client has now, and
+                    // not one it has replaced since: only then is the attach
+                    // answered, and its take done.
+                    let mut latest = true;
                     if self.swallow > 0 {
                         self.swallow -= 1;
                         if !truncated {
                             continue;
                         }
+                    } else {
+                        self.unanswered = self.unanswered.saturating_sub(1);
+                        latest = self.unanswered == 0;
                     }
-                    if let Some(attach) = self.attach.as_mut() {
+                    if let Some(attach) = self.attach.as_mut().filter(|_| latest) {
                         attach.announced = true;
                         attach.delivered = Some(*offset);
                         // Taking the terminal was done: the next connection
@@ -408,9 +422,14 @@ impl Link {
                 // Another client took the terminal: this one is no longer
                 // attached to it, and a new connection must not put it back (the
                 // one that took would find it listed again after the relay
-                // restarts). The client is told, whatever it does with it.
+                // restarts). The client is told, whatever it does with it. One
+                // that comes before the answer to the attach the client has now
+                // is about the attach before it: the client took the terminal
+                // back since, and that attach is the one that stands.
                 Message::Error { code, .. } if *code == ErrorCode::TAKEN => {
-                    self.attach = None;
+                    if self.attach.as_ref().is_some_and(|attach| attach.announced) {
+                        self.attach = None;
+                    }
                 }
                 Message::Output { offset, data } => {
                     if let Some(attach) = self.attach.as_mut() {
@@ -530,6 +549,7 @@ impl Link {
                         self.swallow = 1;
                     }
                 }
+                self.unanswered = u32::from(self.attach.is_some() && self.swallow == 0);
                 for _ in 0..self.status_pending {
                     peer.queue(&Packet::about(self.id.clone(), Message::Status));
                 }
@@ -857,6 +877,62 @@ mod tests {
         link.send(about(Message::Status), now, &mut out);
         let heard = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out);
         assert!(matches!(heard, Message::Status), "{heard:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn taken_by(name: &str) -> Packet {
+        about(Message::Error {
+            code: ErrorCode::TAKEN,
+            text: name.to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_taken_for_an_attach_the_client_has_replaced_leaves_the_new_one_standing() {
+        // Two computers take the terminal at nearly the same moment: the session
+        // lets this one go for the other's take, then hears this one's own
+        // (sent before it knew), so the `TAKEN` comes first and the `attached`
+        // of the attach that stands after it.
+        let (mut link, listener, dir) = link_between_connections("replaced");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        link.send(about(Message::attach(0)), now, &mut out);
+        link.accept(vec![attached()], &mut out);
+        link.send(about(taking("MacBook")), now, &mut out);
+        out.clear();
+        let taken = taken_by("iMac");
+        link.accept(vec![taken.clone()], &mut out);
+        // The client is told, and the attach it has now stands.
+        assert_eq!(out, vec![taken]);
+        assert!(link.is_attached());
+        link.accept(vec![attached()], &mut out);
+        assert!(link.is_attached());
+
+        // It is answered now, so a `TAKEN` from here on is about it.
+        link.accept(vec![taken_by("iMac")], &mut out);
+        assert!(!link.is_attached());
+        link.send(about(Message::Status), now, &mut out);
+        let heard = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out);
+        assert!(matches!(heard, Message::Status), "{heard:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_answer_to_an_attach_the_client_has_replaced_does_not_end_the_take_of_the_new_one() {
+        let (mut link, listener, dir) = link_between_connections("replaced-take");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        link.send(about(Message::attach(0)), now, &mut out);
+        link.send(about(taking("MacBook")), now, &mut out);
+        // The first attach is answered; the take is not done yet.
+        link.accept(vec![attached()], &mut out);
+        let Message::Attach {
+            view: Some(view), ..
+        } = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out)
+        else {
+            panic!("not an attach with a view");
+        };
+        assert!(view.take, "a take that was not answered is asked for again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

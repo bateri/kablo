@@ -283,6 +283,63 @@ fn what_a_wrapper_was_given_on_its_command_line_is_never_looked_at() {
     }
 }
 
+/// A release as a coding agent keeps it: a program that is a file named after
+/// its version, in a directory of versions. The kernel calls a process by its
+/// file (`2.1.296`), the person knows it by the name they start it with. The
+/// program is a copy of `kablo` that waits for a session to end, because it is
+/// quiet while it waits and, unlike a copy of a system binary, runs on macOS
+/// wherever it is put.
+fn a_release(env: &Env) -> std::path::PathBuf {
+    let versions = env.dir.join("versions");
+    std::fs::create_dir(&versions).unwrap();
+    let release = versions.join("2.1.296");
+    std::fs::copy(env!("CARGO_BIN_EXE_kablo"), &release).unwrap();
+    release
+}
+
+#[test]
+fn a_release_kept_under_its_version_is_told_by_the_name_it_was_started_by() {
+    let mut env = Env::new();
+    let release = a_release(&env);
+    // What the releases wait for.
+    let awaited = env.start("awaited", &["--", "/bin/sleep", "600"]);
+
+    // Started under another name than the file's own: the one scene in which
+    // the kernel's name is the version on both systems. The shell says
+    // something before it becomes the release, as the program that says
+    // nothing afterwards is found by the look that follows that output.
+    let command = format!(
+        "echo ready; exec -a claude {} wait {awaited}",
+        release.display()
+    );
+    let id = env.start("named", &["--", "/bin/bash", "-c", &command]);
+    let mut a = env.connect(&id);
+    a.attach(0);
+    a.until("claude", |c| program(c).as_deref() == Some("claude"));
+    assert_eq!(a.status().program.as_deref(), Some(&b"claude"[..]));
+    // The name is all of the command line that is told.
+    for told in [format!("{:?}", a.states), format!("{:?}", a.status())] {
+        assert!(!told.contains("wait"), "{told}");
+        assert!(!told.contains("versions"), "{told}");
+    }
+
+    // Started through a link of the name the person knows: the kernel's name
+    // for the process is the file's on macOS and the link's on Linux, and the
+    // answer is the link's on both.
+    let link = env.dir.join("claude");
+    std::os::unix::fs::symlink(&release, &link).unwrap();
+    let id = env.start("linked", &["--", link.to_str().unwrap(), "wait", &awaited]);
+    let mut b = env.connect(&id);
+    b.attach(0);
+    b.until("claude", |c| program(c).as_deref() == Some("claude"));
+
+    // Started by the file itself, version and all: nothing else to call it.
+    let id = env.start("bare", &["--", release.to_str().unwrap(), "wait", &awaited]);
+    let mut c = env.connect(&id);
+    c.attach(0);
+    c.until("the version", |c| program(c).as_deref() == Some("2.1.296"));
+}
+
 #[test]
 fn a_state_is_told_when_it_changes_and_a_quiet_session_is_left_alone() {
     let mut env = Env::new();

@@ -111,11 +111,12 @@ section is not released.
 - **`kablo list` says who is attached.** An app that attaches under a name (the
   Mac it runs on, say) is listed by that name in the `CLIENTS` column:
   `MacBook,iMac` for two, `MacBook+1` for one named and one not. A session whose
-  clients have no name (`kablo attach` and `kablo connect` give none) shows how many
-  there are, as before, and so does one served by a relay from before the names.
-  `kablo list --json` has the key `clients_named`, the names in the order the
-  clients attached, `""` for one with none; it is left out when the relay does not
-  say (README, `kablo list`).
+  clients have no name (`kablo connect` without `--name`, an app that gives none)
+  shows how many there are, as before, and so does one served by a relay from before
+  the names. `kablo list --json` has the key `clients_named`, the names in the order
+  the clients' connections were made, `""` for one with none; it is left out when
+  the relay does not say, except that a session nobody is attached to has `[]`
+  whichever relay serves it (README, `kablo list`).
 
 - **`kablo connect --take`: use a session from this terminal only.** The other
   clients attached to it are let go, each told which computer took it, and the
@@ -126,6 +127,16 @@ section is not released.
   Ctrl-\: the session goes on, it is just not on that terminal any more (README,
   Use).
 
+### Fixed
+
+- **A program kept under its version number is named by the name you started it
+  with.** Claude Code, installed as a file named `2.1.296` and started as `claude`,
+  was listed in `kablo list` (`PROGRAM`, `--json`'s `program`) and told to the apps
+  that show the terminal as `2.1.296`; it is now `claude`. Only a program the system
+  names with digits and dots alone is looked at, and only the first word of its
+  command line is read for it; everything else keeps the system's name (README,
+  `kablo list`).
+
 ### For apps
 
 - **Protocol: an attached client has a name, and `status` tells whose.** The view
@@ -135,7 +146,8 @@ section is not released.
   name, so every `attach` from before is the bytes it was; a name too long, not all
   there or not UTF-8 makes the `attach` malformed (`BAD_REQUEST`, nothing attached,
   the connection goes on). A relay from before this release reads the view and
-  ignores the name. `status` (and so `list_reply` and `created`) gains key 21, one
+  ignores the name, and so does a bridge from before it (a `kablo attach` that was
+  running when kablo was upgraded): it does not carry the name on. `status` (and so `list_reply` and `created`) gains key 21, one
   entry per attached client in the order their connections were made, empty for one with no name,
   as many as `clients`: a reader that does not know it skips it, and a list shorter
   than `clients` is a relay from before the names, not clients without them. The
@@ -172,6 +184,21 @@ section is not released.
   when the `attached` comes, so a connection it makes again (the relay was replaced)
   attaches as the client it is and does not let go of whoever attached since, and
   forgets the attach for a session it was told `TAKEN` about.
+
+- **Protocol: `program` is the name a versioned release was started by.** The `program`
+  of `status` (key 3, and so `list_reply` and `created`) and of `state` (key 1) is
+  the name the system gives the foreground process, as before, unless that name is
+  only digits and dots (a release kept as the file `2.1.296` and started through a
+  link or under a name of its own): then it is the last part of the process's first
+  argument (`claude`). The key, its type and its meaning, the name of the program, are
+  unchanged; what changes is the value for such a program, which was the version
+  number. That first word is the only part of a command line read for a program that
+  is not an ssh or mosh session, the environment is still never read, and the name
+  is kept as the system's when the word is empty, longer than 255 bytes or more than
+  one word (a space or a control character in it). A client that shows the name to a
+  person removes control characters first, as before. `docs/PROTOCOL.md` (status,
+  state) and the docs of `v1::Status::program` and `v1::TerminalState` say so; the
+  protocol version and the Rust API are unchanged.
 
 - **Protocol: an ended terminal can be kept for a program that comes after the
   app.** The view of an `attach` (`docs/PROTOCOL.md`, attach) gains bit 2 of its

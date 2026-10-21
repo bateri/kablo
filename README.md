@@ -142,13 +142,17 @@ which a replaced relay is too). In the JSON, `started`, `front_started` and
 `output_at` are Unix seconds (or `null`), and `front_is_own` says whether what
 is in front is the session's own program (a shell at its prompt, waiting for a
 command) or another one. A session whose shell lives but whose relay keeps
-failing is listed as `broken`. `CLIENTS` is how many are attached, or, for the
+failing is listed as `broken`. `PROGRAM` is what is in front of the terminal, by the
+name the system gives it; a program kept as a file named after its version
+(`2.1.296`, started as `claude`) is shown by the name it was started with. `CLIENTS`
+is how many are attached, or, for the
 clients that gave themselves a name when they attached (a terminal app says which
 computer it runs on), who: `MacBook,iMac`, and `MacBook+1` for one named and one
 not. When no one is named, or the session's relay is from before the names, it is
 the number. In the JSON `clients` is always the number and `clients_named` the
 names in the order the clients' connections were made, `""` for one with none; it is left out
-when the relay does not say who.
+when the relay does not say who, except that a session nobody is attached to has `[]`
+whichever relay serves it.
 
 Over ssh the same commands work from a terminal: `ssh -t host kablo connect
 build`.
@@ -609,8 +613,14 @@ memory of where its relay comes from (see *Limits*).
   when kablo was upgraded, or one of an older kablo on a server whose sessions
   were upgraded) passes the `TAKEN` error on to its client but remembers the
   client's attach, so when its relay is replaced or restarted it attaches the
-  client again beside the one that took it. Starting the bridge again (the app
-  connecting anew) ends this.
+  client again beside the one that took it. It does not carry the name or the take
+  bit of an attach on either: an app attaching through it is neither named in
+  `status` nor takes the terminal. Starting the bridge again (the app connecting
+  anew) ends this.
+- **A take is done by the relay that hears it.** If that relay is replaced or dies
+  at that moment, a client that was to be let go may be attached again beside the
+  one that took, and not be told. An app that needs the terminal to be its own reads
+  `status` (key 21) after a reconnect.
 - **An ended session** is kept until a client has been told how it ended, a
   day at most, and then removed; for ten minutes more, counted from the telling,
   when that client asked for it (an app does, so that a program on the server can

@@ -177,7 +177,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 |---|---|---|
 | 1 | text | `id` (required) |
 | 2 | u32 | `pid`: the shell's process id |
-| 3 | bytes | `program`: the name of the program in the terminal's foreground |
+| 3 | bytes | `program`: the name of the program in the terminal's foreground (see `state`) |
 | 4 | bytes | `directory`: the foreground program's working directory |
 | 5 | 8 bytes | `size`: columns, rows, xpixel, ypixel |
 | 6 | u32 | `clients`: how many are attached |
@@ -231,7 +231,7 @@ Every key is optional and an absent one reads as nothing.
 
 | key | value | meaning |
 |---|---|---|
-| 1 | bytes | `program`: the name of the program in the terminal's foreground, as in `status` |
+| 1 | bytes | `program`: the name of the program in the terminal's foreground: the name the system gives the process, unless that is only digits and dots (a release kept as a file named after its version, `2.1.296`, and started through a link or under a name of its own, `claude`), and then the last part of the process's first argument; a client that shows it to a person removes control characters first |
 | 2 | bytes | `directory`: the foreground program's working directory, as in `status` |
 | 3 | u8 | `secret`: bit 0 is set when the terminal does not show what is typed and takes it a line at a time, which is what `sudo`, `read -s` and ssh set to ask for a password (a program that wants single keys, an editor, turns the display of what is typed off but not the line mode, and is not a secret); written only when set |
 | 4 | bytes | `remote`: the target of the interactive ssh or mosh session in the foreground, as the user typed it (`user@host`, `host`, a name from ssh's configuration); an `ssh://user@host:2222` target is told as `user@host`, without its scheme and port (the port is `remote_port`); a client that shows it to a person removes control characters first |
@@ -253,10 +253,13 @@ for, or an ssh session, is over with it.
 The server tells a client what it needs to show the program and to know when a
 password is being asked for, and no more. `remote` is a target and nothing of
 the rest of the command line (options, the command run on the other side, what
-a wrapper was given), and the environment is never read; a command that is not
-an interactive ssh or mosh session, or whose target cannot be told, has no
-`remote`. An ssh that runs a command (`ssh host uptime`) is not an interactive
-session.
+a wrapper was given), and the environment is never read. The one other word of
+a command line that is read is the first, and only for a process the system
+names with a version number, to give `program` the name the person started it
+by; it is left as the system's name when that word is longer than a file name or
+is more than one word. A command that is not an interactive ssh or mosh session,
+or whose target cannot be told, has no `remote`. An ssh that runs a command
+(`ssh host uptime`) is not an interactive session.
 
 ### features
 
@@ -532,7 +535,10 @@ broke attaches again as the client it is, not as one that takes again (a take
 that was not answered before the connection broke is asked again, because it
 did not happen). A server from before the bit ignores it and attaches the client
 beside the others, and a client that needs to know the terminal is its own reads
-`status` (key 21) for who is attached.
+`status` (key 21) for who is attached, as it also does after a relay was replaced
+or restarted: the take is done by the relay that hears it, and a client that
+reconnects across such a moment may be attached beside the one that took, without
+being told.
 
 **The client's name.** A view may end with a name: a length byte and that many
 bytes of UTF-8, at most 63, which the client calls itself ("MacBook"). The
@@ -1048,7 +1054,8 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   since 0.1.0 (it leaves the terminal with the text). The bridge of `kablo attach` from
   before the code passes the error on to its client but keeps the attach it
   remembers for a relay that starts anew, so for that bridge the client is listed
-  again as attached when the relay is replaced or restarted (README, Limits).
+  again as attached when the relay is replaced or restarted (README, Limits). That
+  bridge does not carry the name or the bit of a view on either.
 - Anything else is a new version. The bytes of every message of every shipped
   version are kept as fixtures that a test reads and compares in both
   directions; a fixture is never edited.

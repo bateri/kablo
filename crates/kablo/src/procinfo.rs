@@ -15,6 +15,14 @@
 //! where the target is and dropped. The environment is never read. A wrapper
 //! that was handed a password on its command line (`sshpass -p …`) is not a
 //! candidate and its arguments are not looked at.
+//!
+//! **The one other thing read is the first word of a command line, and only
+//! for a program the kernel names with a version number** (see
+//! [`shown_name`]). A release kept in a directory of versions and started
+//! through a link of the name the user knows (`claude`, which is the file
+//! `2.1.296`) is called by the kernel after the file, and the name the user
+//! knows is the one they started it by: the last part of `argv[0]`. Nothing
+//! else of the line is looked at, and the environment still is not.
 
 use std::os::fd::BorrowedFd;
 
@@ -30,6 +38,17 @@ const MAX_TARGET: usize = 255;
 /// hides nothing the target needs: it comes before the arguments that are long.
 #[cfg(target_os = "linux")]
 const ARGV_LIMIT: u64 = 64 * 1024;
+
+/// The longest name a program is shown by when it is called after its first
+/// argument and not what the kernel calls it: a file name is at most 255
+/// bytes, and something longer is not the name of a program.
+const MAX_LAUNCH_NAME: usize = 255;
+
+/// The most of a command line read to find its first word on Linux. The word
+/// is cut at its NUL and the rest of what was read is dropped on the spot; a
+/// first word that fills the buffer is longer than any name and is not one.
+#[cfg(target_os = "linux")]
+const ARG0_LIMIT: usize = 1024;
 
 /// The target of an interactive ssh or mosh session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +72,7 @@ pub fn look(master: BorrowedFd<'_>, shell_pid: u32) -> TerminalState {
 #[derive(Default)]
 pub struct Watch {
     seen: Option<Seen>,
+    called: Option<Called>,
 }
 
 /// The command line of a candidate and what it said.
@@ -60,6 +80,15 @@ struct Seen {
     pid: u32,
     name: Vec<u8>,
     remote: Option<Remote>,
+}
+
+/// The name a program is shown by when the kernel names it with a version: it
+/// stays in front while it streams output (a coding agent) and is looked at
+/// after every burst of it, so its first word is read once.
+struct Called {
+    pid: u32,
+    kernel: Vec<u8>,
+    shown: Vec<u8>,
 }
 
 impl Watch {
@@ -80,23 +109,54 @@ impl Watch {
     ) -> (TerminalState, u32) {
         let group = sys::foreground_group(master).and_then(|group| u32::try_from(group).ok());
         let mut pid = group.unwrap_or(shell_pid);
-        let mut program = name_of(pid);
+        let mut kernel = name_of(pid);
         // The leader of the group is gone and the shell has not yet taken the
         // terminal back (a program that was interrupted): the shell is what
         // the person will find, and a state with nothing in it would only
         // flash.
-        if program.is_none() && pid != shell_pid {
+        if kernel.is_none() && pid != shell_pid {
             pid = shell_pid;
-            program = name_of(pid);
+            kernel = name_of(pid);
         }
-        let remote = self.remote_of(pid, program.as_deref());
+        // Whether a command line is worth reading is told by the name the
+        // kernel gives, never by the one the person is shown.
+        let remote = self.remote_of(pid, kernel.as_deref());
         let mut state = TerminalState::default();
         state.cwd = cwd_of(pid);
         state.secret = sys::hides_typing(master);
         state.remote_port = remote.as_ref().and_then(|remote| remote.port);
         state.remote = remote.map(|remote| remote.host);
-        state.program = program;
+        state.program = kernel.map(|kernel| self.called(pid, kernel));
         (state, pid)
+    }
+
+    /// The name process `pid` is shown by, given what the kernel calls it: the
+    /// same unless that is a version number (see [`shown_name`]). The first
+    /// word of its command line is read only then, once for the same process
+    /// under the same name, and again at the next look when it could not be
+    /// read.
+    fn called(&mut self, pid: u32, kernel: Vec<u8>) -> Vec<u8> {
+        if !is_version(&kernel) {
+            self.called = None;
+            return kernel;
+        }
+        if let Some(called) = self
+            .called
+            .as_ref()
+            .filter(|called| called.pid == pid && called.kernel == kernel)
+        {
+            return called.shown.clone();
+        }
+        let Some(first) = arg0_of(pid) else {
+            return kernel;
+        };
+        let shown = shown_name(&kernel, Some(&first));
+        self.called = Some(Called {
+            pid,
+            kernel,
+            shown: shown.clone(),
+        });
+        shown
     }
 
     /// The remote session process `pid`, named `name`, is, if it is one. What
@@ -122,6 +182,39 @@ impl Watch {
         });
         remote
     }
+}
+
+/// Whether the kernel's name for a program is a version number: digits and
+/// dots, with a digit among them (`2.1.296`). A release kept in a directory of
+/// versions is a file with such a name.
+fn is_version(name: &[u8]) -> bool {
+    name.iter().any(u8::is_ascii_digit) && name.iter().all(|&b| b.is_ascii_digit() || b == b'.')
+}
+
+/// The name a person is shown for the program the kernel calls `kernel`. That
+/// name, unless it is a version number, and then the name the program was
+/// started by, the last part of its first argument (`claude` for the file
+/// `2.1.296` started through a link `~/.local/bin/claude`): what the person
+/// knows it as. When the first argument is not known, has no last part, is
+/// longer than a file name, or is not one word (it holds a space or a control
+/// character: a process that sets its own title writes it over its arguments,
+/// and what stands there then is a command line, not a name), the kernel's name
+/// stands.
+fn shown_name(kernel: &[u8], arg0: Option<&[u8]>) -> Vec<u8> {
+    let name = arg0
+        .filter(|_| is_version(kernel))
+        .and_then(|arg0| arg0.rsplit(|&b| b == b'/').next())
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= MAX_LAUNCH_NAME
+                && name.iter().all(|&b| b > b' ' && b != 0x7f)
+                // Text is judged by its characters, so the controls of the
+                // second block (U+0080 to U+009F) are refused with the rest;
+                // what is not text is bytes, as the kernel's own name may be.
+                && std::str::from_utf8(name)
+                    .map_or(true, |text| !text.chars().any(|c| c.is_control() || c.is_whitespace()))
+        });
+    name.unwrap_or(kernel).to_vec()
 }
 
 /// A name whose command line is worth reading: ssh, mosh's client, the mosh
@@ -430,6 +523,21 @@ fn args_of(pid: u32) -> Option<Vec<String>> {
     (!raw.is_empty()).then(|| words(&raw))
 }
 
+/// The first word of the command line of `pid`, and nothing after it: one read
+/// of at most [`ARG0_LIMIT`] bytes, cut at the first NUL, and whatever the read
+/// brought of the next arguments is dropped with the buffer.
+#[cfg(target_os = "linux")]
+fn arg0_of(pid: u32) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = [0u8; ARG0_LIMIT];
+    let len = std::fs::File::open(format!("/proc/{pid}/cmdline"))
+        .ok()?
+        .read(&mut buf)
+        .ok()?;
+    let word = buf.get(..len)?.split(|&b| b == 0).next()?;
+    (!word.is_empty() && word.len() < ARG0_LIMIT).then(|| word.to_vec())
+}
+
 #[cfg(target_os = "linux")]
 fn name_of(pid: u32) -> Option<Vec<u8>> {
     let mut name = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
@@ -450,6 +558,22 @@ fn cwd_of(pid: u32) -> Option<Vec<u8>> {
 /// `sysctl(KERN_PROCARGS2)`: the arguments of a process of the same user.
 #[cfg(target_os = "macos")]
 fn args_of(pid: u32) -> Option<Vec<String>> {
+    parse_procargs(&procargs(pid)?)
+}
+
+/// The first argument of a process of the same user, and nothing after it: the
+/// block the kernel gives holds the arguments and the environment, and only the
+/// first word is copied out of it before the block is dropped.
+#[cfg(target_os = "macos")]
+fn arg0_of(pid: u32) -> Option<Vec<u8>> {
+    parse_arg0(&procargs(pid)?).map(<[u8]>::to_vec)
+}
+
+/// The block `sysctl(KERN_PROCARGS2)` gives for a process: `argc`, the path of
+/// the executable, the arguments **and the environment**. Whoever asks for it
+/// walks only the part it needs.
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<Vec<u8>> {
     let pid = libc::c_int::try_from(pid).ok()?;
     // The buffer is `kern.argmax` long: a query with an empty buffer gives
     // this ceiling, not the real size. It does not change while the system
@@ -491,27 +615,50 @@ fn args_of(pid: u32) -> Option<Vec<String>> {
     if status != 0 {
         return None;
     }
-    parse_procargs(buf.get(..len)?)
+    if len > buf.len() {
+        return None;
+    }
+    buf.truncate(len);
+    Some(buf)
 }
 
-/// The pure half of [`args_of`] on macOS: the layout is `argc` (4 bytes), the
-/// executable's path, NUL padding and `argc` arguments each ended by a NUL.
-/// **The environment follows the arguments in the same buffer, and the walk
-/// stops at the last argument**: nothing past it is looked at, let alone kept.
+/// The layout of a [`procargs`] block up to the arguments: `argc` (4 bytes),
+/// the executable's path and NUL padding, then `argc` arguments each ended by
+/// a NUL, and the environment after them. Gives `argc` and the block from the
+/// first argument on.
 #[cfg(any(target_os = "macos", test))]
-fn parse_procargs(buf: &[u8]) -> Option<Vec<String>> {
+fn procargs_head(buf: &[u8]) -> Option<(usize, &[u8])> {
     let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
     let rest = buf.get(4..)?;
     // The path, then padding: argv[0] cannot be empty, so the first byte that
     // is not NUL after the path is where the arguments start.
     let path_end = rest.iter().position(|&b| b == 0)?;
     let start = path_end + rest.get(path_end..)?.iter().position(|&b| b != 0)?;
-    let mut fields = rest.get(start..)?.split(|&b| b == 0);
+    Some((argc, rest.get(start..)?))
+}
+
+/// The pure half of [`args_of`] on macOS. **The environment follows the
+/// arguments in the same buffer, and the walk stops at the last argument**:
+/// nothing past it is looked at, let alone kept.
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs(buf: &[u8]) -> Option<Vec<String>> {
+    let (argc, args) = procargs_head(buf)?;
+    let mut fields = args.split(|&b| b == 0);
     let mut args = Vec::new();
     for _ in 0..argc {
         args.push(String::from_utf8_lossy(fields.next()?).into_owned());
     }
     (!args.is_empty()).then_some(args)
+}
+
+/// The pure half of [`arg0_of`] on macOS: the first argument and nothing after
+/// it. The walk stops at its NUL, so the rest of the arguments and the
+/// environment are not looked at.
+#[cfg(any(target_os = "macos", test))]
+fn parse_arg0(buf: &[u8]) -> Option<&[u8]> {
+    let (argc, args) = procargs_head(buf)?;
+    let word = args.split(|&b| b == 0).next()?;
+    (argc > 0 && !word.is_empty()).then_some(word)
 }
 
 #[cfg(target_os = "macos")]
@@ -563,6 +710,7 @@ fn cwd_of(pid: u32) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn the_foreground_of_a_terminal_is_named() {
@@ -858,6 +1006,163 @@ mod tests {
     fn a_command_line_is_read_back_as_it_was_started() {
         let args = args_of(std::process::id()).expect("the test's own command line");
         assert_eq!(args, std::env::args().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_kernel_name_that_is_a_version_is_told_by_the_name_the_program_was_started_by() {
+        let shown = |kernel: &str, arg0: Option<&str>| {
+            String::from_utf8(shown_name(kernel.as_bytes(), arg0.map(str::as_bytes))).unwrap()
+        };
+        // A release kept under its version and started through a link.
+        assert_eq!(
+            shown("2.1.296", Some("/home/u/.local/bin/claude")),
+            "claude"
+        );
+        assert_eq!(shown("2.1.296", Some("claude")), "claude");
+        assert_eq!(shown("2", Some("./bin/tool")), "tool");
+        // Any other name is the kernel's, and the first word does not change it.
+        assert_eq!(shown("npm", Some("/usr/bin/other")), "npm");
+        assert_eq!(shown("node", Some("claude")), "node");
+        assert_eq!(shown("v2.1", Some("claude")), "v2.1");
+        assert_eq!(shown("1.2a", Some("claude")), "1.2a");
+        assert_eq!(shown("...", Some("claude")), "...");
+        assert_eq!(shown("2.1.296-beta", Some("claude")), "2.1.296-beta");
+        // The first word cannot be read, or says no name.
+        assert_eq!(shown("2.1.296", None), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/home/u/bin/")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/")), "2.1.296");
+        // Longer than a file name, or not one word: a command line a process
+        // wrote over its arguments, or text with a control character in it.
+        let long = format!("/bin/{}", "c".repeat(MAX_LAUNCH_NAME + 1));
+        assert_eq!(shown("2.1.296", Some(&long)), "2.1.296");
+        let longest = format!("/bin/{}", "c".repeat(MAX_LAUNCH_NAME));
+        assert_eq!(shown("2.1.296", Some(&longest)), &longest[5..]);
+        assert_eq!(shown("2.1.296", Some("claude --resume x")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/clau de")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/claude\u{1b}[2J")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/claude\u{7f}")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/claude\u{9b}31m")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/clau\u{a0}de")), "2.1.296");
+        assert_eq!(shown("2.1.296", Some("/bin/cl\u{e4}ude")), "cl\u{e4}ude");
+        // Not text either: the name is bytes, as the kernel's is.
+        assert_eq!(
+            shown_name(b"2.1.296", Some(b"/bin/cl\xffaude")),
+            b"cl\xffaude"
+        );
+    }
+
+    #[test]
+    fn a_version_is_digits_and_dots_with_a_digit_among_them() {
+        for name in ["2.1.296", "7", "0.0.1", "10.15", ".5", "1."] {
+            assert!(is_version(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "...",
+            "v2",
+            "1.2a",
+            "2-1",
+            "node",
+            "python3.12",
+            "1 2",
+        ] {
+            assert!(!is_version(name.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_first_word_is_read_only_for_a_version_and_only_once() {
+        let own = std::process::id();
+        let mut watch = Watch::default();
+        // Not a version: the first word is not looked at, nor remembered.
+        assert_eq!(watch.called(own, b"npm".to_vec()), b"npm");
+        assert!(watch.called.is_none());
+        // A version: the name the test binary was started by.
+        let started = std::env::args().next().unwrap();
+        let name = started.rsplit('/').next().unwrap().as_bytes().to_vec();
+        assert_eq!(watch.called(own, b"2.1.296".to_vec()), name);
+        assert!(watch.called.is_some());
+        // What was read is told again without reading it: another process of
+        // the same name is a new look.
+        watch.called.as_mut().unwrap().shown = b"remembered".to_vec();
+        assert_eq!(watch.called(own, b"2.1.296".to_vec()), b"remembered");
+        // No process has this number (it is past the largest a system gives).
+        assert_eq!(
+            watch.called(2_147_483_647, b"2.1.296".to_vec()),
+            b"2.1.296",
+            "its first word cannot be read, so the kernel's name stands"
+        );
+        // A look that could not read stored nothing over what was there.
+        assert_eq!(watch.called.as_ref().unwrap().pid, own);
+        // A foreground that is not a version forgets it.
+        assert_eq!(watch.called(own, b"sleep".to_vec()), b"sleep");
+        assert!(watch.called.is_none());
+    }
+
+    #[test]
+    fn the_first_word_of_a_command_line_is_the_one_it_was_started_with_and_no_more() {
+        let own = arg0_of(std::process::id()).expect("the test's own first word");
+        assert_eq!(own, std::env::args().next().unwrap().into_bytes());
+
+        // A program given a name of its own and arguments that are not names.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("claude")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let got = arg0_of(child.id());
+        let as_shown = {
+            let mut watch = Watch::default();
+            watch.called(child.id(), b"2.1.296".to_vec())
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(got.as_deref(), Some(&b"claude"[..]));
+        assert_eq!(as_shown, b"claude");
+    }
+
+    #[test]
+    fn a_first_word_too_long_for_a_name_is_not_told() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("x".repeat(3000))
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let got = arg0_of(child.id());
+        let shown = {
+            let mut watch = Watch::default();
+            watch.called(child.id(), b"2.1.296".to_vec())
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Linux does not read so far; macOS does and the name is refused.
+        assert!(got.is_none_or(|word| word.len() > MAX_LAUNCH_NAME));
+        assert_eq!(shown, b"2.1.296");
+    }
+
+    #[test]
+    fn the_first_argument_comes_out_of_a_procargs_buffer_and_nothing_after_it() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/bin/ssh\0\0\0\0");
+        buf.extend_from_slice(b"ssh\0-p\0\x32\0");
+        buf.extend_from_slice(b"PASSWORD=hunter2\0HOME=/home/u\0");
+        assert_eq!(parse_arg0(&buf), Some(&b"ssh"[..]));
+        // The path the kernel ran is not the name the program was started by.
+        let mut linked = 1i32.to_ne_bytes().to_vec();
+        linked.extend_from_slice(b"/opt/claude/versions/2.1.296\0\0\0");
+        linked.extend_from_slice(b"claude\0HOME=/home/u\0");
+        assert_eq!(parse_arg0(&linked), Some(&b"claude"[..]));
+        // No arguments, a buffer cut short, an empty first one.
+        assert_eq!(parse_arg0(&0i32.to_ne_bytes()), None);
+        assert_eq!(parse_arg0(&[1, 0]), None);
+        let mut none = 0i32.to_ne_bytes().to_vec();
+        none.extend_from_slice(b"/bin/ls\0\0HOME=/home/u\0");
+        assert_eq!(parse_arg0(&none), None);
+        // What the whole walk reads and the narrow one does not is the same
+        // first word.
+        assert_eq!(parse_procargs(&buf).unwrap().first().unwrap(), "ssh");
     }
 
     #[cfg(target_os = "linux")]

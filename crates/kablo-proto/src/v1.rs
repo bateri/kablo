@@ -860,7 +860,10 @@ pub struct Status {
     pub id: SessionId,
     /// The shell's process id.
     pub pid: u32,
-    /// The name of the program in the foreground of the terminal.
+    /// The name of the program in the foreground of the terminal: what the
+    /// system calls it, unless that is only a version number (a release kept as
+    /// the file `2.1.296` and started as `claude`), and then the name it was
+    /// started by.
     pub program: Option<Vec<u8>>,
     /// The foreground program's working directory.
     pub cwd: Option<Vec<u8>>,
@@ -1110,8 +1113,9 @@ impl Status {
 /// now is nothing now, not "as before".
 ///
 /// Nothing in it comes from the program's arguments except the target of a
-/// remote session; the rest of a command line, and the environment, never
-/// leave the server.
+/// remote session and, for a program the system names with a version number,
+/// the last part of its first argument as its name; the rest of a command line,
+/// and the environment, never leave the server.
 ///
 /// Not exhaustive, so that a field can be added without breaking whoever builds
 /// one: start from `TerminalState::default()` and set the fields.
