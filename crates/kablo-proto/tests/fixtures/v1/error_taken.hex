@@ -1,0 +1,8 @@
+# error about "work": another client took the terminal, and the text is its name
+84                                            # kind 0x84: error
+00                                            # channel 0: terminal session
+04                                            # session id length 4
+00 00 00 09                                   # payload length 9
+77 6f 72 6b                                   # session id "work"
+00 09                                         # code 9: taken by another client
+4d 61 63 42 6f 6f 6b                          # text "MacBook"

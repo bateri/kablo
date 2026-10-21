@@ -117,6 +117,15 @@ section is not released.
   clients attached, `""` for one with none; it is left out when the relay does not
   say (README, `kablo list`).
 
+- **`kablo connect --take`: use a session from this terminal only.** The other
+  clients attached to it are let go, each told which computer took it, and the
+  session's terminal takes this window's size. `--name NAME` (1 to 63 bytes) is what
+  this connection calls itself, to them and in `kablo list`. A `connect` whose
+  session is taken says `kablo: taken by NAME; the session keeps running` (`taken by
+  another client` when the one that took gave no name) and ends with `0`, as after
+  Ctrl-\: the session goes on, it is just not on that terminal any more (README,
+  Use).
+
 ### For apps
 
 - **Protocol: an attached client has a name, and `status` tells whose.** The view
@@ -127,7 +136,7 @@ section is not released.
   there or not UTF-8 makes the `attach` malformed (`BAD_REQUEST`, nothing attached,
   the connection goes on). A relay from before this release reads the view and
   ignores the name. `status` (and so `list_reply` and `created`) gains key 21, one
-  entry per attached client in the order they attached, empty for one with no name,
+  entry per attached client in the order their connections were made, empty for one with no name,
   as many as `clients`: a reader that does not know it skips it, and a list shorter
   than `clients` is a relay from before the names, not clients without them. The
   name is for a person to read, not an identity: two clients may have the same one,
@@ -141,6 +150,28 @@ section is not released.
   more clients than that. The bridge keeps the name across a resize and a new
   connection to the session, as it does the flags. `kablo list --json` gains
   `clients_named`, absent when the relay does not say.
+
+- **Protocol: a client can take the terminal from the others.** The view of an
+  `attach` gains bit 3 of its flags byte, `take`. When the server has attached the
+  client, every other client attached to the session is let go: each is sent an
+  `error` with the new code `TAKEN` (9) whose text is the name the client that took
+  gave itself (empty if it gave none), is no longer attached, and gets no more of the
+  stream; its connection stays, so a bridge goes on serving the app's other
+  terminals, and the client may attach again. `input` and `resize` from it are
+  answered `NOT_ATTACHED`; a connection that only waits or asks is not told. The
+  terminal takes the size of the taking client's view. A server from before the bit
+  ignores it and attaches the client beside the others, so an app that needs to be
+  the only one reads who is attached from `status`. An error code a reader has no
+  name for stays a valid `error` (`docs/PROTOCOL.md`, Compatibility): a client from
+  before `TAKEN` reads it as an error about a session it is attached to, which
+  `kablo connect` takes as the end of its attachment; a bridge from before it passes
+  the error on but keeps the attach it remembers for a relay that starts anew, so it
+  attaches the client again if its relay is replaced meanwhile (README, Limits).
+  `kablo-proto`: `v1::View` gains the field `take` (`bool`) and `v1::ErrorCode` the
+  constant `TAKEN`. The bridge sends a view with `take` once: it forgets the bit
+  when the `attached` comes, so a connection it makes again (the relay was replaced)
+  attaches as the client it is and does not let go of whoever attached since, and
+  forgets the attach for a session it was told `TAKEN` about.
 
 - **Protocol: an ended terminal can be kept for a program that comes after the
   app.** The view of an `attach` (`docs/PROTOCOL.md`, attach) gains bit 2 of its

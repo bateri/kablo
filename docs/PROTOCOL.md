@@ -108,7 +108,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end), then optionally the client's name: `length: u8` and that many bytes of UTF-8, at most 63 |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end, bit 3: take), then optionally the client's name: `length: u8` and that many bytes of UTF-8, at most 63 |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -195,7 +195,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 18 | u64 | `front_started`: when the program in the terminal's foreground started, on the same clock; only while the session runs |
 | 19 | u8 | `front_is_own`: 1 when the program in the foreground is the session's own (for a session opened with a shell, the shell waiting for a command), 0 when another is; only while the session runs |
 | 20 | u64 | `output_at`: when the relay last read output from the terminal, in whole seconds on the same clock; absent until it has read some |
-| 21 | bytes | `client`: the name of one attached client, empty for one that gave none; repeated, one entry per client counted in `clients`, in the order they attached; at most 64 entries of at most 63 bytes of UTF-8 each |
+| 21 | bytes | `client`: the name of one attached client, empty for one that gave none; repeated, one entry per client counted in `clients`, in the order their connections were made; at most 64 entries of at most 63 bytes of UTF-8 each |
 
 Keys 17 to 20 are written only when known. They come from the process table
 and from the relay's own clock, never from what the program wrote, so a
@@ -405,6 +405,7 @@ that is gone does not have the old one's.
 | 6 | the session cannot be served right now |
 | 7 | an `input` or a `write` was not written: the program is not taking what was typed before it |
 | 8 | a `write` was not written: the program has ended |
+| 9 | taken: another client attached with the `take` bit and this connection is no longer attached to the session; the text is the name that client gave itself, empty if it gave none |
 
 A code a reader has no name for is still a valid error. The text is for logs: a
 client that shows it to a person removes control characters first.
@@ -498,7 +499,7 @@ previous one's plus its length. The
 `output` data is the program's bytes as written, and an `output` never carries
 more than 1 MiB minus 8 bytes. Several clients may attach to one session: all of
 them receive the output, input from any of them reaches the terminal, and the
-size is the last `resize`. `input` and `resize` from a connection that is not
+size is the last `resize`, unless one of them takes the terminal (below). `input` and `resize` from a connection that is not
 attached are answered with `error` (`NOT_ATTACHED`) and do nothing; `detach`
 ends the stream and keeps the connection. An `attach` offset past the end of
 the stream is `BAD_REQUEST`.
@@ -509,6 +510,29 @@ has seen the program end (a terminal app, whose pane an agent on the server read
 a moment after the app shows that the program ended). It changes nothing about
 the attach itself and is described under Ending. A server from before the bit
 ignores it.
+
+**Taking the terminal.** Bit 3 of the view's flags, take, makes the `attach` an
+act and not only a way to look: when the server has attached the client, every
+other client attached to the session is let go, each with an `error`
+(`TAKEN`, code 9) whose text is the name the client that took gave itself (empty
+if it gave none). The terminal takes the size of the taking client's view as it
+does for any `attach` with one. A client that is let go is not attached any more
+and gets no more of the stream (what was queued for it before comes first, and a
+picture half sent is not finished); its connection stays open, and it may ask
+what a connection that is not attached may (`status`, `read`, `wait`), attach
+again, and go on using the session's other terminals if it is a bridge. Its
+`input` and `resize` are answered `NOT_ATTACHED` like any other connection's.
+A connection that is not attached to the session (one that only waits or asks) is
+not a client of the terminal and is not told. The client that took is not told
+anything, and an `attach` the server refuses (an offset past the end, a size that
+is too big) takes nothing. Taking is not a state: a client that attaches again on
+the same connection without the bit, or another client without it, attaches
+beside the others as before, and a client that reconnects after its connection
+broke attaches again as the client it is, not as one that takes again (a take
+that was not answered before the connection broke is asked again, because it
+did not happen). A server from before the bit ignores it and attaches the client
+beside the others, and a client that needs to know the terminal is its own reads
+`status` (key 21) for who is attached.
 
 **The client's name.** A view may end with a name: a length byte and that many
 bytes of UTF-8, at most 63, which the client calls itself ("MacBook"). The
@@ -1015,6 +1039,16 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   channel 1, one without `features` skips that kind), new TLV keys (skipped),
   fields appended to a fixed layout (ignored), new bits in a flag byte
   (ignored), new error codes, failure codes and states (carried as numbers).
+- An error code a reader has no name for is still an `error` with its number and
+  text, and a new code may say that something the client had was ended: `TAKEN`
+  ends the client's attachment, and the server has ended it already when it sends
+  the code. A client from before the code reads it as an error about a session it
+  is attached to that it has no request of its own to answer, and the safe reading
+  of that is that the attachment is over, which `kablo connect` does and has
+  since 0.1.0 (it leaves the terminal with the text). The bridge of `kablo attach` from
+  before the code passes the error on to its client but keeps the attach it
+  remembers for a relay that starts anew, so for that bridge the client is listed
+  again as attached when the relay is replaced or restarted (README, Limits).
 - Anything else is a new version. The bytes of every message of every shipped
   version are kept as fixtures that a test reads and compares in both
   directions; a fixture is never edited.

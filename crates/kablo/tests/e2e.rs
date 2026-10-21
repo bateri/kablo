@@ -26,7 +26,7 @@ use common::{
     Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, signal,
     whole,
 };
-use kablo_proto::v1::{ErrorCode, Message, NewSession, State};
+use kablo_proto::v1::{ErrorCode, Message, NewSession, Size, State};
 
 /// The port of the TCP echo server inside the container (tests/e2e/Dockerfile),
 /// which only the server's own `127.0.0.1` reaches.
@@ -374,6 +374,59 @@ fn a_session_an_app_asked_to_have_kept_is_read_after_the_app_was_told_and_then_g
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(told.elapsed() >= Duration::from_secs(5));
+    server.clean_up(&prefix);
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn an_app_over_ssh_that_takes_a_terminal_lets_the_other_app_go_and_that_one_keeps_its_others() {
+    let server = server();
+    let prefix = prefix("take");
+    let (one, two) = (format!("{prefix}-0"), format!("{prefix}-1"));
+    // The app of one computer holds two terminals over one ssh connection.
+    let (mut imac, _) = server.bridge();
+    for id in [&one, &two] {
+        imac.try_new(Some(id), &["/bin/sh"]).expect("a session");
+        imac.attach_named(id, 0, "iMac");
+    }
+    // The app of another computer, over an ssh connection of its own, takes the
+    // first.
+    let (mut macbook, _) = server.bridge();
+    let size = Size {
+        cols: 100,
+        rows: 30,
+        xpixel: 0,
+        ypixel: 0,
+    };
+    macbook.attach_taking(&one, 0, size, Some("MacBook"));
+
+    // The first app is told which computer took it, through ssh and its bridge.
+    let (session, code, text) = imac.next_error();
+    assert_eq!(
+        (session.as_deref(), code, text.as_str()),
+        (Some(one.as_str()), ErrorCode::TAKEN, "MacBook")
+    );
+    // Its other terminal is as it was, on the same connection.
+    imac.type_in(&two, "echo here-$((3+4))\n");
+    imac.wait_for(&two, "here-7\r\n");
+    // The one it lost is the other app's now.
+    macbook.type_in(&one, "echo mine-$((6*7))\n");
+    macbook.wait_for(&one, "mine-42\r\n");
+    imac.type_in(&one, "echo not-mine\n");
+    let (session, code, _) = imac.next_error();
+    assert_eq!(
+        (session.as_deref(), code),
+        (Some(one.as_str()), ErrorCode::NOT_ATTACHED)
+    );
+    let status = macbook.status(&one);
+    assert_eq!(status.clients, 1);
+    assert_eq!(
+        status.clients_named[0].map(|name| name.as_str().to_owned()),
+        Some("MacBook".to_owned())
+    );
+    assert_eq!((status.size.cols, status.size.rows), (100, 30));
+    assert_eq!(imac.status(&two).clients, 1);
+    drop((imac, macbook));
     server.clean_up(&prefix);
 }
 

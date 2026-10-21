@@ -85,7 +85,11 @@ struct Attach {
     /// The offset the client asked for.
     requested: u64,
     /// What the client said of its terminal, kept as current as its resizes
-    /// make it: a relay that takes over does not know it.
+    /// make it: a relay that takes over does not know it. Taking the terminal
+    /// (`View::take`) is something the attach does and not something the client
+    /// is, so it is kept only until the first `attached` answers: a connection
+    /// made again after that attaches without it, or the relay that was started
+    /// anew would let go of whoever attached since.
     view: Option<View>,
     /// The client is owed a picture of the screen it has not got whole.
     owed: bool,
@@ -373,6 +377,12 @@ impl Link {
                     if let Some(attach) = self.attach.as_mut() {
                         attach.announced = true;
                         attach.delivered = Some(*offset);
+                        // Taking the terminal was done: the next connection
+                        // attaches as the client it is, not as one that takes
+                        // again (see `Attach::view`).
+                        if let Some(view) = attach.view.as_mut() {
+                            view.take = false;
+                        }
                         // A cut stream is followed by a picture; so is a
                         // stream that was asked to be.
                         attach.owed |= *truncated;
@@ -395,6 +405,13 @@ impl Link {
                     }
                 }
                 Message::Pong(_) => self.pings = self.pings.saturating_sub(1),
+                // Another client took the terminal: this one is no longer
+                // attached to it, and a new connection must not put it back (the
+                // one that took would find it listed again after the relay
+                // restarts). The client is told, whatever it does with it.
+                Message::Error { code, .. } if *code == ErrorCode::TAKEN => {
+                    self.attach = None;
+                }
                 Message::Output { offset, data } => {
                     if let Some(attach) = self.attach.as_mut() {
                         attach.delivered = Some(offset + data.len() as u64);
@@ -731,6 +748,115 @@ mod tests {
         assert_eq!(view.size, size(100));
         assert!(view.keep_after_end && view.picture_if_answered && !view.picture);
         assert_eq!(view.name, ClientName::new("MacBook"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first message the link sends on the connection it makes next (the
+    /// one after the connection that `link_between_connections` lost).
+    fn first_sent_on_the_next_connection(
+        link: &mut Link,
+        listener: &UnixListener,
+        now: Instant,
+        out: &mut Vec<Packet>,
+    ) -> Message {
+        link.tick(now + RETRY, out);
+        assert!(link.peer.is_some());
+        let _ = listener.accept().unwrap(); // the one that was lost
+        let (mut sock, _) = listener.accept().unwrap();
+        WIRE.server(&mut sock.try_clone().unwrap(), &mut sock)
+            .unwrap();
+        let mut decoder = PacketDecoder::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut buf).unwrap();
+            assert!(n > 0, "nothing was sent");
+            decoder.push(&buf[..n]);
+            if let Some(packet) = decoder.next_packet().unwrap() {
+                return packet.message;
+            }
+        }
+    }
+
+    fn taking(name: &str) -> Message {
+        let mut view = View::new(Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        view.take = true;
+        view.name = ClientName::new(name);
+        Message::Attach {
+            offset: 0,
+            view: Some(view),
+        }
+    }
+
+    fn attached() -> Packet {
+        about(Message::Attached {
+            offset: 0,
+            truncated: false,
+            answered: 0,
+        })
+    }
+
+    #[test]
+    fn taking_the_terminal_is_asked_again_only_until_the_session_has_answered() {
+        // Answered: the take was done. A relay that starts anew, with clients
+        // that attached since, is not made to let go of them by this client
+        // coming back as the one it is.
+        let (mut link, listener, dir) = link_between_connections("took");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        link.send(about(taking("MacBook")), now, &mut out);
+        link.accept(vec![attached()], &mut out);
+        let Message::Attach {
+            view: Some(view), ..
+        } = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out)
+        else {
+            panic!("not an attach with a view");
+        };
+        assert!(!view.take);
+        assert_eq!(view.name, ClientName::new("MacBook"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Not answered: a take that did not happen is still asked for, or a
+        // connection that broke in the middle of it would turn it into a plain
+        // attach without anyone saying.
+        let (mut link, listener, dir) = link_between_connections("took-not-yet");
+        link.send(about(taking("MacBook")), now, &mut out);
+        let Message::Attach {
+            view: Some(view), ..
+        } = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out)
+        else {
+            panic!("not an attach with a view");
+        };
+        assert!(view.take);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_that_was_taken_from_is_not_attached_again_by_a_new_connection() {
+        let (mut link, listener, dir) = link_between_connections("taken");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        link.send(about(Message::attach(0)), now, &mut out);
+        link.accept(vec![attached()], &mut out);
+        assert!(link.is_attached());
+        let taken = about(Message::Error {
+            code: ErrorCode::TAKEN,
+            text: "iMac".to_owned(),
+        });
+        out.clear();
+        link.accept(vec![taken.clone()], &mut out);
+        // The client is told, and the link no longer holds the attach.
+        assert_eq!(out, vec![taken]);
+        assert!(!link.is_attached());
+        // What comes first on the connection made next is what was asked after:
+        // not the attach that the other client took the terminal from.
+        link.send(about(Message::Status), now, &mut out);
+        let heard = first_sent_on_the_next_connection(&mut link, &listener, now, &mut out);
+        assert!(matches!(heard, Message::Status), "{heard:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

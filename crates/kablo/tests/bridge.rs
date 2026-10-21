@@ -763,6 +763,68 @@ fn connect_ends_with_the_programs_own_status_when_it_ends() {
 }
 
 #[test]
+fn connect_can_take_the_terminal_and_is_told_when_it_is_taken() {
+    use common::Conn;
+    let mut env = Env::new();
+    let id = env.start("taken-tty", &SH);
+    let mut observer = env.connect(&id);
+    let mut imac = Tty::run(&env, &["connect", "--name", "iMac", &id]);
+    imac.prompt();
+
+    // `--take` attaches as the client that takes the terminal; `--name` is what
+    // the one let go is told.
+    let mut macbook = Tty::run(&env, &["connect", "--take", "--name", "MacBook", &id]);
+    imac.show("taken by MacBook; the session keeps running");
+    assert_eq!(imac.wait().code(), Some(0));
+    let status = observer.status();
+    assert_eq!(status.clients, 1);
+    assert_eq!(
+        status.clients_named[0].map(|name| name.as_str().to_owned()),
+        Some("MacBook".to_owned())
+    );
+    // The session is the one that took's, and it goes on.
+    macbook.prompt();
+    macbook.type_in(b"echo mine-$((6*7))\n");
+    macbook.show("mine-42\r\n");
+
+    // A client that gives no name takes it from there; the person is told that
+    // it was another client.
+    let mut other = Conn::open(env.socket(&id), &id);
+    other.attach_taking(
+        kablo_proto::v1::OFFSET_END,
+        Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        },
+        None,
+    );
+    macbook.show("taken by another client; the session keeps running");
+    assert_eq!(macbook.wait().code(), Some(0));
+    assert!(env.find("warden", &id).is_some());
+}
+
+#[test]
+fn connect_takes_a_name_of_a_length_a_session_will_read() {
+    let env = Env::new();
+    let long = "m".repeat(64);
+    for args in [
+        &["connect", "--name"][..],
+        &["connect", "--name", "", "x"],
+        &["connect", "--name", &long, "x"],
+        &["connect", "--take", "--bogus", "x"],
+    ] {
+        let said = env.kablo().args(args).output().unwrap();
+        assert_eq!(said.status.code(), Some(64), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&said.stderr).starts_with("kablo: "),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn connect_to_a_session_that_is_not_there_says_so() {
     let env = Env::new();
     let mut tty = Tty::run(&env, &["connect", "nothing-here"]);

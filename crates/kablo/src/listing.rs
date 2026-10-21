@@ -270,8 +270,8 @@ pub fn json(statuses: &[Status]) -> String {
         });
         out.push_str(",\"output_at\":");
         json_number(&mut out, status.output_at);
-        // Who is attached: a name per client in `clients`, in the order they
-        // attached, `""` for one with no name. Left out when the relay does not
+        // Who is attached: a name per client in `clients`, in the order their
+        // connections were made, `""` for one with no name. Left out when the relay does not
         // say (a relay from before the names), so that its absence is not
         // taken for clients without names.
         if says_who(status) {

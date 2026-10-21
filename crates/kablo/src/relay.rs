@@ -1325,6 +1325,34 @@ impl Relay {
         let now = self.terminal_now();
         self.tell_the_others(&now, i);
         self.queue(i, Some(self.id.clone()), Message::TerminalState(now));
+        if let Some(view) = view
+            && view.take
+        {
+            self.let_the_others_go(i, view.name);
+        }
+    }
+
+    /// Client `i` took the terminal: every other client that is attached is told
+    /// so, with the name `i` gave itself (empty if it gave none), and is no longer
+    /// attached. Their connections stay: they may ask what they could before
+    /// (`status`, `read`, a `wait`), attach again, and the same connection of a
+    /// bridge goes on serving its other sessions. What was queued for them stays
+    /// queued and comes first; nothing more of the stream follows, a picture that
+    /// was half sent is not finished, and what they type or resize is refused as
+    /// from any connection that is not attached. A connection that is not attached
+    /// (one that only waits or asks) is not a client of the terminal and is left
+    /// alone.
+    fn let_the_others_go(&mut self, i: usize, name: Option<ClientName>) {
+        let text = name.map_or_else(String::new, |name| name.as_str().to_owned());
+        for other in 0..self.clients.len() {
+            if other == i || !self.is_attached(other) {
+                continue;
+            }
+            if let Some(client) = self.clients.get_mut(other) {
+                client.attach = None;
+            }
+            self.error(other, ErrorCode::TAKEN, &text);
+        }
     }
 
     fn resize(&mut self, i: usize, size: Size) {

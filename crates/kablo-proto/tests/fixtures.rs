@@ -129,6 +129,14 @@ fn keeping(size: Size) -> View {
     view
 }
 
+/// A view of a terminal of `size` that takes the terminal, from a client that
+/// calls itself `name`.
+fn taking(size: Size, name: &str) -> View {
+    let mut view = named(size, name);
+    view.take = true;
+    view
+}
+
 /// A view of a terminal of `size` whose client calls itself `name`.
 fn named(size: Size, name: &str) -> View {
     let mut view = View::new(size);
@@ -229,6 +237,21 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Attach {
                 offset: 0x1000,
                 view: Some(named(
+                    Size {
+                        cols: 120,
+                        rows: 40,
+                        xpixel: 960,
+                        ypixel: 800,
+                    },
+                    "MacBook",
+                )),
+            }),
+        ),
+        (
+            "attach_view_take",
+            work(Message::Attach {
+                offset: 0x1000,
+                view: Some(taking(
                     Size {
                         cols: 120,
                         rows: 40,
@@ -357,6 +380,13 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Error {
                 code: v1::ErrorCode::ENDED,
                 text: "the program has ended".into(),
+            }),
+        ),
+        (
+            "error_taken",
+            work(Message::Error {
+                code: v1::ErrorCode::TAKEN,
+                text: "MacBook".into(),
             }),
         ),
         (
@@ -1609,23 +1639,29 @@ fn an_attached_is_the_one_it_always_was_unless_it_carries_a_whole_answered_offse
 }
 
 #[test]
-fn the_three_bits_of_a_views_flags_are_each_their_own() {
+fn the_four_bits_of_a_views_flags_are_each_their_own() {
     let size = Size {
         cols: 80,
         rows: 24,
         xpixel: 0,
         ypixel: 0,
     };
-    let view = |picture, picture_if_answered, keep| {
+    let view = |picture, picture_if_answered, keep, take| {
         let mut view = viewing(size, picture, picture_if_answered);
         view.keep_after_end = keep;
+        view.take = take;
         view
     };
-    for flags in 0u8..8 {
-        let (picture, if_answered, keep) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+    for flags in 0u8..16 {
+        let (picture, if_answered, keep, take) = (
+            flags & 1 != 0,
+            flags & 2 != 0,
+            flags & 4 != 0,
+            flags & 8 != 0,
+        );
         let packet = work(Message::Attach {
             offset: 0,
-            view: Some(view(picture, if_answered, keep)),
+            view: Some(view(picture, if_answered, keep, take)),
         });
         let frame = packet.to_frame().unwrap();
         assert_eq!(frame.payload.last(), Some(&flags));
@@ -1633,15 +1669,37 @@ fn the_three_bits_of_a_views_flags_are_each_their_own() {
     }
     // The bits it does not define are not its business.
     let mut payload = vec![0; 8];
-    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_1000]);
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_0000]);
     let bytes = raw(kind::ATTACH, 0, "work", &payload);
     assert_eq!(
         read_packet(&mut bytes.as_slice()).unwrap(),
         Some(work(Message::Attach {
             offset: 0,
-            view: Some(view(false, false, false))
+            view: Some(view(false, false, false, false))
         }))
     );
+}
+
+#[test]
+fn an_error_code_a_reader_has_no_name_for_is_read_as_the_number_it_is() {
+    // What a client from before `TAKEN` (code 9) reads when a server sends it,
+    // and what any client reads of a code that comes later: an `error` about the
+    // session with the number and the text, not a malformed message. The reader
+    // has no table of codes to refuse one by.
+    for code in [9u16, 10, 999, u16::MAX] {
+        let mut payload = code.to_be_bytes().to_vec();
+        payload.extend(b"MacBook");
+        let bytes = raw(kind::ERROR, 0, "work", &payload);
+        assert_eq!(
+            read_packet(&mut bytes.as_slice()).unwrap(),
+            Some(work(Message::Error {
+                code: v1::ErrorCode(code),
+                text: "MacBook".into(),
+            })),
+            "code {code}"
+        );
+    }
+    assert_eq!(v1::ErrorCode::TAKEN, v1::ErrorCode(9));
 }
 
 #[test]

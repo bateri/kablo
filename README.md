@@ -120,6 +120,13 @@ earlier (where the cursor is, what the terminal is): your terminal would answer
 it again and the second answer would be typed into the program, as `^[[12;1R`
 at the prompt.
 `--fresh` skips the past and shows only what comes next.
+Several terminals can be connected to a session at once, and all of them show
+what it writes. `--take` makes this one the only one: the others are let go, each
+told which computer took the session, and the terminal takes this window's size.
+`--name NAME` (1 to 63 bytes) is what this connection calls itself, to them and
+in `kablo list`. A `connect` whose session is taken says so (`kablo: taken by NAME;
+the session keeps running`) and ends with `0`, as it does after Ctrl-\: the
+session is still there, it is just not on this terminal any more.
 When the session cannot take what you type for a moment, `connect` holds it
 and tries again (a few seconds at most, then it says why and exits); when the
 program is not reading its input at all, the terminal rings its bell for the
@@ -140,7 +147,7 @@ clients that gave themselves a name when they attached (a terminal app says whic
 computer it runs on), who: `MacBook,iMac`, and `MacBook+1` for one named and one
 not. When no one is named, or the session's relay is from before the names, it is
 the number. In the JSON `clients` is always the number and `clients_named` the
-names in the order the clients attached, `""` for one with none; it is left out
+names in the order the clients' connections were made, `""` for one with none; it is left out
 when the relay does not say who.
 
 Over ssh the same commands work from a terminal: `ssh -t host kablo connect
@@ -598,6 +605,12 @@ memory of where its relay comes from (see *Limits*).
   lost; output is not.
 - **The journal is bounded** (8 MiB by default). Output the program writes
   while nobody is attached is kept only as far as that.
+- **A bridge from before taking the terminal** (a `kablo attach` that was running
+  when kablo was upgraded, or one of an older kablo on a server whose sessions
+  were upgraded) passes the `TAKEN` error on to its client but remembers the
+  client's attach, so when its relay is replaced or restarted it attaches the
+  client again beside the one that took it. Starting the bridge again (the app
+  connecting anew) ends this.
 - **An ended session** is kept until a client has been told how it ended, a
   day at most, and then removed; for ten minutes more, counted from the telling,
   when that client asked for it (an app does, so that a program on the server can
@@ -683,6 +696,14 @@ memory of where its relay comes from (see *Limits*).
   answer. The exit status of `kablo app` is `0`, `69` (no app that takes mail:
   the app has not said so, or the bridge is from a kablo that had no mailbox),
   `1`, or 128 and a signal's number.
+- **Taking a terminal** is bit 3 of the view an app attaches with (`take` in
+  `kablo-proto`): the other clients attached to the session are let go, each with
+  the error `TAKEN` (code 9) whose text is the name the app gave itself in its
+  view, and nothing more of the session comes to them; their connections stay, and
+  a bridge goes on serving the app's other terminals. An app that is let go shows
+  its terminal as no longer its own and may attach again, with the bit or without
+  it. `status` says who is attached (the names, key 21) before and after. A relay
+  from before the bit attaches the app beside the others, which `status` shows.
 - **The terminal's state and its answers** are told, not asked for. Every
   attached client is sent a `state` right after `attached` and again when it
   changes: the program in the foreground and its directory, whether the terminal

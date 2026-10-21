@@ -395,6 +395,15 @@ pub fn keeping(size: Size) -> View {
     view
 }
 
+/// A view of a terminal of `size` that takes the terminal from whoever else is
+/// attached, from a client that calls itself `name` (or none).
+pub fn taking(size: Size, name: Option<&str>) -> View {
+    let mut view = View::new(size);
+    view.take = true;
+    view.name = name.map(|name| ClientName::new(name).expect("a name that fits"));
+    view
+}
+
 /// What a terminal shows once it has the picture and the output after it. It
 /// keeps no scrollback, so what is compared is the screen and the state around
 /// it (modes, cursor, scrolling region, the other screen).
@@ -715,6 +724,19 @@ impl Conn {
         self.send(Message::Attach {
             offset,
             view: Some(view),
+        });
+        self.until("attached", |c| c.attached.is_some());
+        self.attached.unwrap()
+    }
+
+    /// Attaches as a terminal of `size` that takes the terminal from the other
+    /// clients, calling itself `name`; returns where the stream starts and
+    /// whether it was cut.
+    pub fn attach_taking(&mut self, offset: u64, size: Size, name: Option<&str>) -> (u64, bool) {
+        self.attached = None;
+        self.send(Message::Attach {
+            offset,
+            view: Some(taking(size, name)),
         });
         self.until("attached", |c| c.attached.is_some());
         self.attached.unwrap()
@@ -1227,6 +1249,31 @@ impl Bridge {
             Message::Attach {
                 offset,
                 view: Some(view),
+            },
+        );
+        self.until("attached", |b| {
+            b.sessions
+                .get(id)
+                .is_some_and(|s| s.attached.len() > before)
+        });
+        *self.seen(id).attached.last().unwrap()
+    }
+
+    /// Attaches as a terminal of `size` that takes the terminal from the other
+    /// clients, calling itself `name`.
+    pub fn attach_taking(
+        &mut self,
+        id: &str,
+        offset: u64,
+        size: Size,
+        name: Option<&str>,
+    ) -> (u64, bool) {
+        let before = self.seen(id).attached.len();
+        self.send(
+            Some(id),
+            Message::Attach {
+                offset,
+                view: Some(taking(size, name)),
             },
         );
         self.until("attached", |b| {

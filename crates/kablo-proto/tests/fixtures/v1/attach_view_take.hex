@@ -1,0 +1,11 @@
+# attach "work" from offset 0x1000 as a 120x40 terminal that calls itself "MacBook" and takes the terminal from whoever else is attached
+01                       # kind 0x01: attach
+00                       # channel 0: terminal session
+04                       # session id length 4
+00 00 00 19              # payload length 25
+77 6f 72 6b              # session id "work"
+00 00 00 00 00 00 10 00  # offset 4096
+00 78 00 28 03 c0 03 20  # view: 120 columns, 40 rows, 960 x 800 pixels
+08                       # view flags: take
+07                       # name length 7
+4d 61 63 42 6f 6f 6b     # name "MacBook"

@@ -314,6 +314,14 @@ pub struct View {
     /// refused and an `input` is dropped, as for any ended session). A server
     /// from before the bit ignores it and removes the session as it always did.
     pub keep_after_end: bool,
+    /// Take the terminal: every other client attached to the session is let go,
+    /// each told with `TAKEN` and this client's name, and this client is the one
+    /// attached. The size is this view's. It is something the `attach` does, not
+    /// something the client is: a bridge that attaches again after its connection
+    /// broke does not send it again (a second take would let go whoever came after
+    /// the first). A server from before the bit ignores it and attaches the client
+    /// beside the others.
+    pub take: bool,
     /// What the client calls itself, for the list of who is attached that
     /// `status` answers with. `None` says no name, as a client from before the
     /// name does. It is a property of the view, so a client that attaches again
@@ -332,12 +340,13 @@ impl View {
             picture: false,
             picture_if_answered: false,
             keep_after_end: false,
+            take: false,
             name: None,
         }
     }
 
     /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
-    /// picture if answered, bit 2: keep after the end), then, if the client has
+    /// picture if answered, bit 2: keep after the end, bit 3: take), then, if the client has
     /// a name, its length as a byte and its bytes. A view with no name ends at
     /// the flags, as it did before names.
     fn write(&self, out: &mut Vec<u8>) {
@@ -345,7 +354,8 @@ impl View {
         out.push(
             u8::from(self.picture)
                 | (u8::from(self.picture_if_answered) << 1)
-                | (u8::from(self.keep_after_end) << 2),
+                | (u8::from(self.keep_after_end) << 2)
+                | (u8::from(self.take) << 3),
         );
         if let Some(name) = &self.name {
             out.push(name.len);
@@ -372,6 +382,7 @@ impl View {
             picture: flags & 1 != 0,
             picture_if_answered: flags & 2 != 0,
             keep_after_end: flags & 4 != 0,
+            take: flags & 8 != 0,
             name,
         })
     }
@@ -455,6 +466,11 @@ impl ErrorCode {
     /// A `write` was not written because the program has ended: there is nothing
     /// to type to.
     pub const ENDED: ErrorCode = ErrorCode(8);
+    /// Another client took the terminal (an `attach` whose view has the `take`
+    /// bit): this connection is no longer attached to the session, and the text
+    /// is the name that client gave itself, empty if it gave none. The
+    /// connection and its other sessions are unaffected.
+    pub const TAKEN: ErrorCode = ErrorCode(9);
 }
 
 /// The numbers of the keys a `write` can press and of the modifiers held with
@@ -852,8 +868,8 @@ pub struct Status {
     pub size: Size,
     /// How many clients are attached.
     pub clients: u32,
-    /// Who is attached, one entry per attached client in the order they
-    /// attached: the name the client gave itself, or `None` for one that gave
+    /// Who is attached, one entry per attached client in the order their
+    /// connections were made: the name the client gave itself, or `None` for one that gave
     /// none. A server that says names says one per client counted in `clients`
     /// (both are taken in the same moment); one from before the names leaves
     /// this empty, so a list shorter than `clients` is names the server did not

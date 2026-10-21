@@ -17,6 +17,13 @@
 //! into the program (the view says so, and the session decides).
 //! `--fresh` attaches at the end instead and shows only what comes next.
 //!
+//! A session can be used from one terminal at a time when the clients agree on
+//! it: `--take` attaches as the client that takes the terminal, and every other
+//! client attached is let go and told by whom (`--name` is what this one calls
+//! itself, for them to tell their person). When another client takes this one's
+//! terminal the person is told by whom and the command ends: the session keeps
+//! running, it is just no longer here.
+//!
 //! The connection is a [`Link`], so a relay that is replaced while a person is
 //! connected does not show. Neither does a moment of crowding: when the link
 //! has too many requests waiting for the session, typing and resizes are held
@@ -34,7 +41,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{ErrorCode, Exit, Message, OFFSET_END, Packet, View};
+use kablo_proto::v1::{ClientName, ErrorCode, Exit, Message, OFFSET_END, Packet, View};
 
 use crate::link::{self, Link};
 use crate::sys;
@@ -65,10 +72,24 @@ const BUSY_PATIENCE: Duration = Duration::from_secs(5);
 /// patience.
 const HELD_LIMIT: usize = 1 << 20;
 
+/// How the person asked to be attached.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// Show only what comes next, not what was missed.
+    pub fresh: bool,
+    /// Take the terminal from the other clients attached.
+    pub take: bool,
+    /// What this client calls itself to the session.
+    pub name: Option<ClientName>,
+}
+
 /// How a connection ended.
 enum End {
     /// The person detached.
     Detached,
+    /// Another client took the terminal; it called itself this (nothing, if it
+    /// gave no name).
+    Taken(String),
     /// The program ended.
     Ended(Exit),
     /// The terminal was closed or the process was told to stop.
@@ -78,8 +99,9 @@ enum End {
 }
 
 /// Connects the terminal to session `id` in `dir`. Returns the exit status:
-/// the program's own when it ends, 0 for a detach.
-pub fn run(dir: &Path, id: SessionId, fresh: bool, err: &mut dyn Write) -> u8 {
+/// the program's own when it ends, 0 for a detach and 0 when another client
+/// took the terminal (the session goes on, as it does after a detach).
+pub fn run(dir: &Path, id: SessionId, options: Options, err: &mut dyn Write) -> u8 {
     // SAFETY: descriptors 0 and 1 are open for the life of the process.
     let (input, output) = unsafe { (BorrowedFd::borrow_raw(0), BorrowedFd::borrow_raw(1)) };
     if !sys::is_tty(input) || !sys::is_tty(output) {
@@ -114,11 +136,22 @@ pub fn run(dir: &Path, id: SessionId, fresh: bool, err: &mut dyn Write) -> u8 {
                 return 1;
             }
         };
-        serve(link, id, fresh, input, output, &signals)
+        serve(link, id, options, input, output, &signals)
     };
     match end {
         End::Detached => {
             let _ = writeln!(err, "\r\nkablo: detached; the session keeps running");
+            0
+        }
+        End::Taken(by) => {
+            let _ = if by.is_empty() {
+                writeln!(
+                    err,
+                    "\r\nkablo: taken by another client; the session keeps running"
+                )
+            } else {
+                writeln!(err, "\r\nkablo: taken by {by}; the session keeps running")
+            };
             0
         }
         End::Ended(exit) => {
@@ -140,7 +173,7 @@ pub fn run(dir: &Path, id: SessionId, fresh: bool, err: &mut dyn Write) -> u8 {
 fn serve(
     mut link: Link,
     id: SessionId,
-    fresh: bool,
+    options: Options,
     input: BorrowedFd<'_>,
     output: BorrowedFd<'_>,
     signals: &std::os::fd::OwnedFd,
@@ -148,7 +181,7 @@ fn serve(
     let mut outgoing = Vec::new();
     let mut held = Held::default();
     let now = Instant::now();
-    let offset = if fresh { OFFSET_END } else { 0 };
+    let offset = if options.fresh { OFFSET_END } else { 0 };
     // The terminal's size goes with the attach, so that a picture of the screen
     // is made for it; the resize after it is for a session that predates views.
     // The bytes are written to this terminal as they are, and it answers the
@@ -161,6 +194,8 @@ fn serve(
     let view = (size.is_some() || answers_itself).then(|| {
         let mut view = View::new(size.unwrap_or_default());
         view.picture_if_answered = answers_itself;
+        view.take = options.take;
+        view.name = options.name;
         view
     });
     link.send(
@@ -406,6 +441,9 @@ fn show(packets: &[Packet], output: BorrowedFd<'_>, picturing: &mut bool) -> Opt
                 if write_all(output, b"\x07").is_err() {
                     return Some(End::Stopped);
                 }
+            }
+            Message::Error { code, text } if *code == ErrorCode::TAKEN => {
+                return Some(End::Taken(crate::listing::printable(text.as_bytes())));
             }
             Message::Error { .. } => return Some(End::Failed(describe(packet))),
             _ => {}
@@ -657,6 +695,47 @@ mod tests {
                 answered: 0,
             },
         )
+    }
+
+    fn error(code: u16, text: &str) -> Packet {
+        Packet::about(
+            id(),
+            Message::Error {
+                code: ErrorCode(code),
+                text: text.to_owned(),
+            },
+        )
+    }
+
+    /// What `show` makes of the packets: how the connection ended, if it did.
+    fn ended_by(packets: &[Packet]) -> Option<End> {
+        use std::os::fd::AsFd;
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        show(packets, ours.as_fd(), &mut false)
+    }
+
+    #[test]
+    fn a_connection_whose_terminal_is_taken_says_by_whom_and_one_that_fails_does_not() {
+        // The name another client gave itself, which is shown without the control
+        // characters it may carry.
+        let Some(End::Taken(by)) = ended_by(&[error(ErrorCode::TAKEN.0, "Mac\x1b[2JBook")]) else {
+            panic!("taking did not end the connection");
+        };
+        assert_eq!(by, "Mac?[2JBook");
+        let Some(End::Taken(by)) = ended_by(&[error(ErrorCode::TAKEN.0, "")]) else {
+            panic!("taking did not end the connection");
+        };
+        assert_eq!(by, "");
+        // A code this client has no name for ends the connection as any error
+        // does, so that a client built before `TAKEN` leaves the terminal rather
+        // than sit on it; the bell is for the one refusal that is not an end.
+        for code in [10, 999] {
+            assert!(
+                matches!(ended_by(&[error(code, "x")]), Some(End::Failed(_))),
+                "{code}"
+            );
+        }
+        assert!(ended_by(&[error(ErrorCode::INPUT_FULL.0, "x")]).is_none());
     }
 
     #[test]

@@ -7,7 +7,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size};
+use kablo_proto::v1::{
+    ClientName, MAX_CLIENT_NAME, MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size,
+};
 
 use crate::{
     app, bridge, connect, drive, exec, forward, inner, journal, launch, listing, relay, scan,
@@ -48,7 +50,7 @@ kablo new [--id ID] [--label TEXT] [--wait] [--cols N] [--rows N] [--cwd DIR]
           [--env NAME=VALUE]... [--journal-size BYTES[K|M|G]] [--history ROWS]
           [-- PROGRAM [ARGUMENT]...]
 kablo list [--json]
-kablo connect [--fresh] ID
+kablo connect [--fresh] [--take] [--name NAME] ID
 kablo send [ID] [TEXT | -]
 kablo send-key [ID] KEY...
 kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]
@@ -350,16 +352,37 @@ fn command_list(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> 
 }
 
 fn command_connect(args: &[OsString], err: &mut dyn Write) -> u8 {
-    let mut fresh = false;
+    let mut options = connect::Options::default();
     let mut id = None;
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--fresh") => fresh = true,
+            Some("--fresh") => options.fresh = true,
+            Some("--take") => options.take = true,
+            Some("--name") => {
+                let Some(name) = args.next().and_then(|name| name.to_str()) else {
+                    return usage_error(err, "--name needs a name");
+                };
+                match ClientName::new(name) {
+                    Some(name) => options.name = Some(name),
+                    None => {
+                        return usage_error(
+                            err,
+                            &format!("a name is from 1 to {MAX_CLIENT_NAME} bytes"),
+                        );
+                    }
+                }
+            }
             Some(text) if id.is_none() && !text.starts_with('-') => match SessionId::new(text) {
                 Ok(parsed) => id = Some(parsed),
                 Err(_) => return usage_error(err, "that is not a session id"),
             },
-            _ => return usage_error(err, "connect takes a session id and --fresh"),
+            _ => {
+                return usage_error(
+                    err,
+                    "connect takes a session id, --fresh, --take and --name NAME",
+                );
+            }
         }
     }
     let Some(id) = id else {
@@ -368,7 +391,7 @@ fn command_connect(args: &[OsString], err: &mut dyn Write) -> u8 {
     let Some(dir) = directory(err) else {
         return 1;
     };
-    connect::run(&dir, id, fresh, err)
+    connect::run(&dir, id, options, err)
 }
 
 fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
