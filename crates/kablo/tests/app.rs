@@ -38,10 +38,15 @@ fn spawn(env: &Env) -> Child {
         .unwrap()
 }
 
-/// What `kablo app` did, run to its end with `input` as its input.
+/// What `kablo app` did, run to its end with `input` as its input. With no app
+/// to talk to it ends without reading its input, and it may be gone before the
+/// input is written: the broken pipe is then the input it never wanted.
 fn run_app(env: &Env, input: &[u8]) -> Output {
     let mut child = spawn(env);
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    match child.stdin.take().unwrap().write_all(input) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        written => written.unwrap(),
+    }
     child.wait_with_output().unwrap()
 }
 
