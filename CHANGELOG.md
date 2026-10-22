@@ -33,6 +33,13 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-22
+
+Programs on a server can now work with the sessions there and with the app
+that reaches the server: type into a session and read its screen without
+attaching, name and end sessions, see who is attached, and hand bytes to the
+connected app with `kablo app`.
+
 ### Added
 
 - **`kablo app`: hand bytes to the app that is connected.** A program on a
