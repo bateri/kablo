@@ -14,7 +14,9 @@
 //!  32   history  u32: scrollback rows the relay's screen keeps, plus one (0: not said)
 //!  40   answered u64: the offset up to which the terminal's questions were answered,
 //!                plus one (0: nobody keeps track)
-//!  48   reserved up to 64
+//!  48   floor    u64: the offset a client was told it may not go back past (0: none),
+//!                see below
+//!  56   reserved up to 64
 //!  64   the ring: byte `n` of the stream is at `64 + n % capacity`
 //! ```
 //!
@@ -32,6 +34,16 @@
 //! versioned and a header that does not match is refused. A field that was
 //! reserved is read as zero by a journal an older warden made, and zero is what
 //! every such field says "not said" with.
+//!
+//! **Two starts.** The ring holds the last `capacity` bytes ([`Journal::ring_from`]), and a
+//! client may ask to forget the past (`forget`): the journal then keeps a *floor*, the
+//! offset it was asked at, and [`Journal::retained_from`] is the later of the two. The floor
+//! decides what may be replayed to a client that comes (back): one that wants bytes before it
+//! is told they are gone and gets a picture of the screen. It does not take bytes away from
+//! a client that is attached and is owed some: they are in the ring, and what a client was
+//! owed it gets, so the one that asks to forget is not dropped for the output that was on its
+//! way. The floor lives in the header so that a relay that comes after (a restart, an
+//! upgrade) forgets the same past; a journal an older warden made reads it as zero.
 //!
 //! The header is also where a session's settings live that every relay of it
 //! needs and no relay can be told by anyone else (the offset the terminal's
@@ -56,6 +68,7 @@ const OFFSET_CAPACITY: usize = 16;
 const OFFSET_TOTAL: usize = 24;
 const OFFSET_HISTORY: usize = 32;
 const OFFSET_ANSWERED: usize = 40;
+const OFFSET_FLOOR: usize = 48;
 
 /// The smallest ring a session may ask for.
 pub const MIN_CAPACITY: u64 = 16 * 1024;
@@ -237,9 +250,32 @@ impl Journal {
         self.total_cell().load(Ordering::Acquire)
     }
 
-    /// The oldest offset the ring still holds.
-    pub fn retained_from(&self) -> u64 {
+    /// The oldest offset the ring still holds: the bytes before it were written over.
+    pub fn ring_from(&self) -> u64 {
         self.total().saturating_sub(self.capacity)
+    }
+
+    /// The oldest offset a client is given without a picture: the ring's start, or the
+    /// floor if a client asked to forget the past after that. Bytes between the two are
+    /// still in the ring ([`Journal::copy_out`] reads them, for a client that is owed
+    /// them) but are not replayed to one that comes for them.
+    pub fn retained_from(&self) -> u64 {
+        self.ring_from().max(self.floor())
+    }
+
+    /// The offset the past was last forgotten at (0: it never was).
+    pub fn floor(&self) -> u64 {
+        self.floor_cell().load(Ordering::Acquire)
+    }
+
+    /// Forgets the past before `offset`: from now on [`Journal::retained_from`] is no
+    /// earlier. A floor only moves forward, and not past what has been written (the single
+    /// writer).
+    pub fn set_floor(&mut self, offset: u64) {
+        let offset = offset.min(self.total());
+        if offset > self.floor() {
+            self.floor_cell().store(offset, Ordering::Release);
+        }
     }
 
     /// Appends `data` (the single writer).
@@ -325,7 +361,7 @@ impl Journal {
         }
         // A writer that lapped the reader while it copied has overwritten
         // the start of what it copied.
-        if offset < self.retained_from() {
+        if offset < self.ring_from() {
             return None;
         }
         Some(wanted)
@@ -334,7 +370,8 @@ impl Journal {
     /// The offset of the byte after the first newline in the ring: where a
     /// stream may start when the beginning of it is gone, so that it does not
     /// start inside a line (an escape sequence is rarely longer than one).
-    /// With no newline in the ring, the ring's start.
+    /// With no newline in the ring, the ring's start. (The ring's, not the
+    /// floor's: what a screen is built from is whatever is still written.)
     pub fn line_start(&self) -> u64 {
         self.line_start_from(0)
     }
@@ -343,7 +380,7 @@ impl Journal {
     /// ring's start, if that is later). With no newline after it, the offset
     /// looked from.
     pub fn line_start_from(&self, from: u64) -> u64 {
-        let first = |journal: &Journal| from.max(journal.retained_from());
+        let first = |journal: &Journal| from.max(journal.ring_from());
         let mut at = first(self);
         let mut lapped = 0;
         let mut chunk = [0u8; 4096];
@@ -376,6 +413,11 @@ impl Journal {
     fn answered_cell(&self) -> &AtomicU64 {
         // SAFETY: as in `total_cell`; `OFFSET_ANSWERED` is 8-byte aligned too.
         unsafe { &*self.base.as_ptr().add(OFFSET_ANSWERED).cast::<AtomicU64>() }
+    }
+
+    fn floor_cell(&self) -> &AtomicU64 {
+        // SAFETY: as in `total_cell`; `OFFSET_FLOOR` is 8-byte aligned too.
+        unsafe { &*self.base.as_ptr().add(OFFSET_FLOOR).cast::<AtomicU64>() }
     }
 
     fn total_cell(&self) -> &AtomicU64 {
@@ -628,6 +670,73 @@ mod tests {
         let again = Journal::open(dup_of(&journal)).unwrap();
         assert_eq!(again.history(), Some(5000));
         assert_eq!(again.total(), 0, "and the rest of the header is untouched");
+    }
+
+    #[test]
+    fn the_past_that_was_forgotten_is_in_the_header_and_the_ring_still_holds_it() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        assert_eq!(journal.floor(), 0, "nothing was forgotten");
+        journal.append(b"before");
+        journal.set_floor(6);
+        journal.append(b" after");
+        assert_eq!(journal.floor(), 6);
+        assert_eq!(
+            journal.retained_from(),
+            6,
+            "a client that comes is given from here"
+        );
+        assert_eq!(journal.ring_from(), 0, "and the ring has all of it");
+        // A client that is owed bytes before the floor can still be given them.
+        let mut out = [0u8; 16];
+        assert_eq!(journal.copy_out(0, &mut out), Some(12));
+        assert_eq!(&out[..12], b"before after");
+        assert_eq!(
+            journal.line_start_from(0),
+            0,
+            "no break: from the ring's start"
+        );
+
+        // It moves forward only, and not past what was written.
+        journal.set_floor(3);
+        assert_eq!(journal.floor(), 6);
+        journal.set_floor(1 << 40);
+        assert_eq!(journal.floor(), 12);
+
+        // Another mapping of the same memory (a relay that comes after) reads it.
+        let again = Journal::open(dup_of(&journal)).unwrap();
+        assert_eq!(again.floor(), 12);
+        assert_eq!(
+            again.history(),
+            None,
+            "and the rest of the header is untouched"
+        );
+
+        // A journal an older warden made has zero there: no floor.
+        // SAFETY: the header is inside the mapping; the single writer is this test.
+        unsafe {
+            journal
+                .base
+                .as_ptr()
+                .add(OFFSET_FLOOR)
+                .cast::<u64>()
+                .write_unaligned(0);
+        }
+        assert_eq!(journal.floor(), 0);
+        assert_eq!(journal.retained_from(), 0);
+    }
+
+    #[test]
+    fn the_ring_passing_the_floor_is_the_start_again() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let cap = MIN_CAPACITY as usize;
+        journal.append(&pattern(0, 100));
+        journal.set_floor(100);
+        journal.append(&pattern(100, cap + 50));
+        // The ring wrote over the floor: it is the later of the two that counts.
+        assert_eq!(journal.ring_from(), 150);
+        assert_eq!(journal.retained_from(), 150);
+        let mut out = [0u8; 8];
+        assert_eq!(journal.copy_out(120, &mut out), None, "written over");
     }
 
     fn dup_of(journal: &Journal) -> OwnedFd {

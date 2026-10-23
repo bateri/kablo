@@ -20,9 +20,15 @@
 //! scroll, cursor visibility); the kitty keyboard stacks of both screens; the title and
 //! the title stack; the palette changes (OSC 4, 10, 11, 12).
 //!
+//! **Two modes the emulator has no bit for travel too**: SGR-pixel mouse (`?1016`) and
+//! in-band size reports (`?2048`) are dropped by `alacritty_terminal`, so the screen
+//! follows the stream for them itself (`kept`) and the image turns on the ones that are on
+//! (`CSI ? 1016 h`, `CSI ? 2048 h`), after everything else; a full reset (`ESC c`) turns them
+//! off. The screen only remembers them: it sends no report of the size when `?2048` is
+//! turned on, which is the terminal's owner to do.
+//!
 //! **What it does not**: kitty graphics (the parser drops those commands; an image is a
-//! text screen); a mode `alacritty_terminal` keeps no bit for (SGR-pixel mouse, `?1016`);
-//! the selection and vi mode, which are the terminal's own; a title that was never set
+//! text screen); any other mode `alacritty_terminal` keeps no bit for; the selection and vi mode, which are the terminal's own; a title that was never set
 //! after one that was comes back as the empty title; G2 or G3 as the active character set
 //! comes back as G0 (no sequence invokes them). The order the image is written in, and the
 //! limits that come from the writer driving the terminal, are in the header of `image.rs`.
@@ -50,6 +56,7 @@
 //! size in pixels) get no answer.
 
 mod image;
+mod kept;
 mod keys;
 mod tail;
 mod text;
@@ -62,8 +69,8 @@ use std::time::Duration;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, Timeout};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{ClearMode, Handler, Processor, Timeout};
 
 pub use keys::{Key, Modes, Mods};
 
@@ -140,6 +147,8 @@ pub struct Screen {
     tail: Tail,
     heard: Recorder,
     history: usize,
+    /// A forget that waits for the primary screen: a program holds the alternate one.
+    forgetting: bool,
 }
 
 impl Screen {
@@ -153,6 +162,7 @@ impl Screen {
             tail: Tail::default(),
             heard,
             history,
+            forgetting: false,
         }
     }
 
@@ -177,6 +187,25 @@ impl Screen {
     pub fn feed(&mut self, bytes: &[u8]) {
         self.tail.feed(bytes);
         self.parser.advance(&mut self.term, bytes);
+        if self.forgetting {
+            self.forget_history();
+        }
+    }
+
+    /// Forgets the scrollback: the rows that scrolled off the top of the screen. What is
+    /// shown stays, and so does everything the screen keeps besides its rows; rows that
+    /// scroll off later are kept as before.
+    ///
+    /// A program that holds the alternate screen (an editor, a pager) leaves the primary
+    /// screen, and its scrollback, out of reach of the emulator until it gives the screen
+    /// back; the forget waits for that and is done at the end of the first [`Screen::feed`]
+    /// that finds the primary screen in use again, so rows that scrolled off in that same
+    /// feed after the program left are forgotten too.
+    pub fn forget_history(&mut self) {
+        self.forgetting = self.term.mode().contains(TermMode::ALT_SCREEN);
+        if !self.forgetting {
+            self.term.clear_screen(ClearMode::Saved);
+        }
     }
 
     /// Changes the size; rows reflow the way the terminal does it. A size of zero is one.
@@ -240,6 +269,9 @@ impl Screen {
         let pending = self.heard.take_replies();
         let heard = self.heard.clone();
         let (mut image, _) = image::encode(&mut self.term, &move || heard.title());
+        // The modes `Term` drops are the stream's, not the terminal's: written here, from
+        // what the stream said, and read back by the `feed` of the image below.
+        self.tail.kept().write(&mut image);
         image.extend_from_slice(self.tail.bytes());
 
         // The terminal is spent: a new one learns everything from the image, the title

@@ -1,0 +1,6 @@
+# forget the past of "work": its scrollback and the record before now
+12                                  # kind 0x12: forget
+00                                  # channel 0: terminal session
+04                                  # session id length 4
+00 00 00 00                         # payload length 0
+77 6f 72 6b                         # session id "work"

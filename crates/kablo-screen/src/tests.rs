@@ -12,6 +12,7 @@ use alacritty_terminal::vte::ansi::{
 
 use super::*;
 use crate::image::{LAST_SETTABLE_COLOR, MODES, MODES_NOT_WRITTEN, Pen, Probed, encode, live_link};
+use crate::kept::Kept;
 use crate::tail::KEEP_LIMITS;
 
 const HISTORY: usize = 1000;
@@ -1042,4 +1043,236 @@ fn a_large_osc_does_not_pin_the_tails_capacity() {
     assert!(tail.bytes().len() > 100_000);
     tail.feed(b"\x07");
     assert!(tail.capacity() <= tail_keep);
+}
+
+// ─── the modes the emulator drops, and forgetting the scrollback ─────────────────
+
+const NONE: Kept = Kept {
+    pixel_mouse: false,
+    resize_reports: false,
+};
+const PIXEL: Kept = Kept {
+    pixel_mouse: true,
+    resize_reports: false,
+};
+const REPORTS: Kept = Kept {
+    pixel_mouse: false,
+    resize_reports: true,
+};
+const BOTH: Kept = Kept {
+    pixel_mouse: true,
+    resize_reports: true,
+};
+
+fn kept_after(bytes: &[u8]) -> Kept {
+    let mut tail = Tail::default();
+    tail.feed(bytes);
+    tail.kept()
+}
+
+fn has(image: &[u8], needle: &[u8]) -> bool {
+    image.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn the_stream_turns_the_modes_the_emulator_drops_on_and_off() {
+    assert_eq!(kept_after(b""), NONE);
+    assert_eq!(kept_after(b"\x1b[?1016h"), PIXEL);
+    assert_eq!(kept_after(b"\x1b[?2048h"), REPORTS);
+    // A list names every mode in it, the others among them.
+    assert_eq!(kept_after(b"\x1b[?1000;1016;1006;2048h"), BOTH);
+    assert_eq!(kept_after(b"\x1b[?1016h\x1b[?2048h\x1b[?1016l"), REPORTS);
+    assert_eq!(kept_after(b"\x1b[?1016;2048h\x1b[?2048;1016l"), NONE);
+    // The parser reads a number as it is: leading zeros, and the first of a subparameter.
+    assert_eq!(kept_after(b"\x1b[?01016h"), PIXEL);
+    assert_eq!(kept_after(b"\x1b[?1016:1h"), PIXEL);
+    assert_eq!(kept_after(b"\x1b[?5:2048h"), NONE);
+    // The text between is whatever else happened: text, controls the parser executes.
+    assert_eq!(kept_after(b"x\x1b[?10\n16\x07hy"), PIXEL);
+}
+
+#[test]
+fn what_the_parser_would_not_dispatch_is_not_followed() {
+    for ignored in [
+        // Not a private mode, or not set or reset.
+        &b"\x1b[1016h"[..],
+        b"\x1b[?1016$p",
+        b"\x1b[?1016p",
+        b"\x1b[?1016m",
+        // A marker after the parameters, an intermediate before them, a byte that is none.
+        b"\x1b[?1?1016h",
+        b"\x1b[1;?1016h",
+        b"\x1b[?$1016h",
+        b"\x1b[>1016h",
+        b"\x1b[?1016 h",
+        b"\x1b[?1016x6h",
+        // A number that is not 1016 or 2048 after saturating, and one that is empty.
+        b"\x1b[?71016h",
+        b"\x1b[?;h",
+        // Another string with the bytes in it.
+        b"\x1b]0;[?1016h\x07",
+        b"\x1b_G[?1016h\x1b\\",
+        b"\x1bP1$r[?1016h\x1b\\",
+        // A cancelled one.
+        b"\x1b[?10\x1816h",
+        b"\x1b[?10\x1a16h",
+    ] {
+        assert_eq!(kept_after(ignored), NONE, "{:?}", lossy(ignored));
+    }
+    // The parser keeps 32 parameters, the last of a list one of them.
+    let list = |separators: usize| {
+        let mut sequence = b"\x1b[?1016".to_vec();
+        sequence.extend(b";0".repeat(separators));
+        sequence.push(b'h');
+        sequence
+    };
+    assert_eq!(kept_after(&list(31)), PIXEL);
+    assert_eq!(kept_after(&list(32)), NONE);
+}
+
+#[test]
+fn a_full_reset_turns_them_off_and_nothing_else_does() {
+    assert_eq!(kept_after(b"\x1b[?1016h\x1b[?2048h\x1bc"), NONE);
+    assert_eq!(kept_after(b"\x1bc\x1b[?1016h"), PIXEL);
+    // `ESC ( c` designates a character set; the soft reset and the screen switches leave
+    // the modes where they are.
+    assert_eq!(kept_after(b"\x1b[?1016h\x1b(c"), PIXEL);
+    assert_eq!(
+        kept_after(b"\x1b[?1016h\x1b[!p\x1b[?1049h\x1b[?1049l\x1b[2J"),
+        PIXEL
+    );
+}
+
+#[test]
+fn the_modes_are_followed_however_the_stream_is_cut() {
+    let stream =
+        b"ab\x1b[?1000;10\x1b[?1016h16;2048h\x1b[?2048l\x1b[?1\x1b[?1016l\x1b[?1016;2048hc";
+    let whole = kept_after(stream);
+    assert_eq!(whole, BOTH);
+    for piece in [1, 2, 3, 7] {
+        let mut tail = Tail::default();
+        for chunk in stream.chunks(piece) {
+            tail.feed(chunk);
+        }
+        assert_eq!(tail.kept(), whole, "pieces of {piece}");
+    }
+}
+
+#[test]
+fn the_image_turns_on_what_the_stream_turned_on() {
+    let rich = b"\x1b[1;31mred\x1b[0m text\r\n\x1b]0;a title\x07\x1b[?1000h\x1b[?1006h";
+    for (modes, written) in [
+        (&b""[..], &[][..]),
+        (b"\x1b[?1016h", &[&b"\x1b[?1016h"[..]][..]),
+        (b"\x1b[?2048h", &[&b"\x1b[?2048h"[..]][..]),
+        (
+            b"\x1b[?2048;1016h",
+            &[&b"\x1b[?1016h"[..], &b"\x1b[?2048h"[..]][..],
+        ),
+        (b"\x1b[?1016h\x1b[?2048h\x1b[?1016;2048l", &[][..]),
+        (b"\x1b[?1016h\x1b[?2048h\x1bc", &[][..]),
+    ] {
+        let mut stream = rich.to_vec();
+        stream.extend_from_slice(modes);
+        let mut original = fed(30, 6, &stream);
+        let image = original.image();
+        for needle in [&b"\x1b[?1016h"[..], b"\x1b[?2048h"] {
+            assert_eq!(
+                has(&image, needle),
+                written.contains(&needle),
+                "{:?}: {:?}",
+                lossy(modes),
+                lossy(&image)
+            );
+        }
+        // A blank screen fed the image shows what the original showed, has the modes the
+        // same, and writes the image again byte for byte; the screen that wrote it still
+        // has them, which is the rebuild from its own image reading them back.
+        let mut replayed = fed(30, 6, &image);
+        assert_eq!(replayed.tail.kept(), original.tail.kept());
+        assert_eq!(readable(&replayed), readable(&original));
+        assert_same_bytes(&replayed.image(), &image);
+        assert_same_bytes(&original.image(), &image);
+    }
+}
+
+#[test]
+fn the_image_ends_with_the_open_sequence_and_the_modes_come_before_it() {
+    let mut screen = fed(30, 6, b"hi\x1b[?1016h\x1b[?20");
+    let image = screen.image();
+    assert!(image.ends_with(b"\x1b[?20"), "{:?}", lossy(&image));
+    assert!(has(&image, b"\x1b[?1016h"));
+    // The sequence the stream stopped in goes on from where it stood.
+    screen.feed(b"48h");
+    assert_eq!(screen.tail.kept(), BOTH);
+    let mut replayed = fed(30, 6, &image);
+    replayed.feed(b"48h");
+    assert_eq!(replayed.tail.kept(), BOTH);
+}
+
+fn numbered(count: usize) -> Vec<u8> {
+    (1..=count)
+        .flat_map(|n| format!("row{n:02}\r\n").into_bytes())
+        .collect()
+}
+
+#[test]
+fn forgetting_the_history_keeps_the_screen_and_what_scrolls_off_after() {
+    let mut screen = fed(10, 3, &numbered(20));
+    let before = screen.text(HISTORY, false);
+    assert!(before.len() > 3, "there is history: {before:?}");
+    let shown = screen.text(0, false);
+    assert!(lossy(&screen.image()).contains("row01"));
+
+    screen.forget_history();
+    assert_eq!(
+        screen.text(HISTORY, false),
+        shown,
+        "only the screen is left"
+    );
+    let image = lossy(&screen.image());
+    assert!(
+        !image.contains("row01") && !image.contains("row16"),
+        "{image:?}"
+    );
+    assert!(image.contains("row20"), "the screen stayed: {image:?}");
+
+    // What scrolls off from now on is kept, and the stream goes on as it did.
+    screen.feed(b"new1\r\nnew2\r\n");
+    let after = screen.text(HISTORY, false);
+    assert_eq!(after.len(), shown.len() + 2, "{after:?}");
+    assert_eq!(after.first().map(String::as_str), Some("row19"));
+
+    // Forgetting nothing is nothing.
+    let mut blank = fed(10, 3, b"");
+    blank.forget_history();
+    assert_eq!(
+        blank.text(HISTORY, false),
+        fed(10, 3, b"").text(HISTORY, false)
+    );
+}
+
+#[test]
+fn a_forget_while_a_program_holds_the_alternate_screen_waits_for_it_to_give_it_back() {
+    let mut screen = fed(10, 3, &numbered(20));
+    screen.feed(b"\x1b[?1049halt\r\n");
+    screen.forget_history();
+    // The primary screen is out of reach: nothing is done, nothing is lost.
+    screen.feed(b"more alt\r\n");
+    assert!(screen.forgetting);
+    screen.feed(b"\x1b[?1049l");
+    assert!(!screen.forgetting);
+    let text = screen.text(HISTORY, false);
+    assert_eq!(
+        text.len(),
+        3,
+        "the history is gone, the screen is back: {text:?}"
+    );
+    assert_eq!(text.last().map(String::as_str), Some(""));
+    assert!(text.iter().any(|row| row == "row20"), "{text:?}");
+
+    // A program that leaves without a forget asked leaves the history alone.
+    let mut other = fed(10, 3, &numbered(20));
+    other.feed(b"\x1b[?1049halt\r\n\x1b[?1049l");
+    assert!(other.text(HISTORY, false).len() > 3);
 }

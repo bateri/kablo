@@ -20,7 +20,7 @@
 # after all of it: signing changes the files.
 set -eu
 
-: "${DIST_VERSION:?}" "${DIST_NAME:?}" "${DIST_SUMS:?}" "${DIST_IMAGE:?}" \
+: "${DIST_VERSION:?}" "${DIST_ID:?}" "${DIST_NAME:?}" "${DIST_SUMS:?}" "${DIST_IMAGE:?}" \
     "${DIST_DOCKERFILE:?}" "${DIST_TOOLCHAIN:?}" \
     "${DIST_LINUX_TARGETS:?}" "${DIST_MACOS_TARGETS:?}" "${DIST_LICENSES:?}"
 sign_id=${DIST_SIGN_ID:-}
@@ -36,11 +36,17 @@ name_of() {
     printf '%s\n' "$DIST_NAME" | sed "s/%/$1/"
 }
 
-# $1 is the output of `kablo version`: it must be this version's.
+# The binaries are told the name they carry (DIST_ID: the version for a release, the
+# version with the commit for any other build) when they are compiled; `option_env!`
+# in the crate reads it, and cargo builds again when it changes.
+KABLO_BUILD_VERSION=$DIST_ID
+export KABLO_BUILD_VERSION
+
+# $1 is the output of `kablo version`: it must be this build's.
 check_version() {
     case $1 in
-        "version=$DIST_VERSION "*) ;;
-        *) fail "$2 says '$1', not version $DIST_VERSION" ;;
+        "version=$DIST_ID "*) ;;
+        *) fail "$2 says '$1', not version $DIST_ID" ;;
     esac
 }
 
@@ -92,7 +98,7 @@ for target in $DIST_LINUX_TARGETS; do
     docker build -q --platform "$platform" -t "$image" -f "$DIST_DOCKERFILE" tools/linux >/dev/null
     docker run --rm --platform "$platform" \
         -v "$PWD":/w -v kablo-linux-cargo:/usr/local/cargo/registry \
-        -e CARGO_TARGET_DIR="/w/target/dist-$arch" "$image" \
+        -e CARGO_TARGET_DIR="/w/target/dist-$arch" -e KABLO_BUILD_VERSION "$image" \
         cargo build --release --locked -p kablo --target "$target"
     cp "target/dist-$arch/$target/release/kablo" "dist/$name"
 

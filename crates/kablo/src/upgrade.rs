@@ -18,7 +18,9 @@
 //! so when the warden stays: a warden from before renewals existed (it never
 //! said its version) is not waited for. Two builds of one release cannot be
 //! told apart by their version, so for those the command cannot see whether
-//! the warden has renewed.
+//! the warden has renewed; a development build is named by its commit as well
+//! (`0.2.0-dev+3f2a9c1d0b44`), and is told apart from the release and from
+//! another commit.
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;

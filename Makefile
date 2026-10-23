@@ -130,14 +130,23 @@ notices-check:
 # Docker and the Apple targets are required, and a dist/ without SHA256SUMS is
 # a build that did not finish.
 DIST_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+# What the files are named, and what `kablo version` says they are. A release is named by
+# its version alone (`release`, and `publish` and `ship` with it, which look for those
+# files). Any other `make dist` builds a development binary and names it
+# `<version>-dev+<commit>` (`tools/dev-suffix.sh`: a working tree that is not the commit
+# adds a digest of what differs), so that no two builds of a version share a name, which
+# is what a server's directory per version and a session's "which build am I" rest on.
+DIST_RELEASING = $(filter release release-gate publish ship,$(MAKECMDGOALS))
+DIST_SUFFIX = $(eval DIST_SUFFIX := $(if $(DIST_RELEASING),,$(shell sh tools/dev-suffix.sh)))$(DIST_SUFFIX)
+DIST_ID = $(DIST_VERSION)$(DIST_SUFFIX)
 DIST_LINUX_TARGETS = x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 DIST_MACOS_TARGETS = aarch64-apple-darwin x86_64-apple-darwin
-DIST_NAME = kablo-$(DIST_VERSION)-%
+DIST_NAME = kablo-$(DIST_ID)-%
 DIST_SUMS = SHA256SUMS
 DIST_LICENSES = LICENSE $(NOTICES)
 DIST_TOOLCHAIN ?= stable
 
-DIST_ENV = DIST_VERSION="$(DIST_VERSION)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
+DIST_ENV = DIST_VERSION="$(DIST_VERSION)" DIST_ID="$(DIST_ID)" DIST_NAME="$(DIST_NAME)" DIST_SUMS="$(DIST_SUMS)" \
 	DIST_IMAGE="$(LINUX_IMAGE)" DIST_DOCKERFILE="$(LINUX_DOCKERFILE)" \
 	DIST_TOOLCHAIN="$(DIST_TOOLCHAIN)" DIST_LINUX_TARGETS="$(DIST_LINUX_TARGETS)" \
 	DIST_MACOS_TARGETS="$(DIST_MACOS_TARGETS)" DIST_LICENSES="$(DIST_LICENSES)"

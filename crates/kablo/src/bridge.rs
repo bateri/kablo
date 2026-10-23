@@ -502,7 +502,7 @@ impl Bridge {
                     Message::Detach => return,
                     // The relay would say the same; no connection is needed
                     // to hear it.
-                    Message::Input(_) | Message::Resize(_) => {
+                    Message::Input(_) | Message::Resize(_) | Message::Forget => {
                         return outgoing.push(failure(
                             Some(id),
                             ErrorCode::NOT_ATTACHED,
@@ -739,6 +739,7 @@ fn is_request(message: &Message) -> bool {
             | Message::Write(_)
             | Message::Read(_)
             | Message::Wait
+            | Message::Forget
     )
 }
 

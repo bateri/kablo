@@ -54,5 +54,37 @@ pub fn release() -> String {
     std::env::var(ENV_TEST_VERSION)
         .ok()
         .filter(|version| !version.is_empty())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        .unwrap_or_else(|| build_version().to_owned())
+}
+
+/// The name this build was made under: the crate's version, or the one the build
+/// was told to carry (`KABLO_BUILD_VERSION`, set when it is compiled). A release is
+/// named by its version alone; a build for development is told a name with the commit
+/// it was made from (`0.2.0-dev+3f2a9c1d0b44`, see `make dist`), so that two builds of
+/// one version are not the same name, and neither is a build and the release.
+pub fn build_version() -> &'static str {
+    named(
+        option_env!("KABLO_BUILD_VERSION"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// `told`, unless it is nothing, else `version`.
+fn named<'a>(told: Option<&'a str>, version: &'a str) -> &'a str {
+    told.filter(|name| !name.is_empty()).unwrap_or(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named;
+
+    #[test]
+    fn a_build_is_named_by_what_it_was_told_and_else_by_its_version() {
+        assert_eq!(named(None, "0.2.0"), "0.2.0");
+        assert_eq!(named(Some(""), "0.2.0"), "0.2.0");
+        assert_eq!(
+            named(Some("0.2.0-dev+3f2a9c1d0b44"), "0.2.0"),
+            "0.2.0-dev+3f2a9c1d0b44"
+        );
+    }
 }

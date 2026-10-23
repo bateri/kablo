@@ -125,6 +125,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x0f | `read` | yes | TLV block, below (empty: the rows on screen) |
 | 0x10 | `wait` | yes | (empty) |
 | 0x11 | `label` | yes | UTF-8 text of 0 to 64 bytes (empty clears) |
+| 0x12 | `forget` | yes | (empty) |
 | 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated), then optionally `answered: u64` |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
@@ -183,7 +184,7 @@ The TLV block of `status_reply` and `created`, and the value of each entry in
 | 6 | u32 | `clients`: how many are attached |
 | 7 | u8 | `state`: 0 running, 1 ended, 2 broken (the relay keeps failing; the shell is alive) |
 | 8 | u64 | `offset`: the total bytes the program has written |
-| 9 | u64 | `retained`: the oldest offset the journal still holds |
+| 9 | u64 | `retained`: the oldest offset a client is given without a picture: the oldest the journal holds, or the offset the past was last forgotten at (`forget`) when that is later |
 | 10 | 5 bytes | `exit`: as in `ended`, present once the program has ended |
 | 11 | text | `version`: the version of the relay serving the session |
 | 12 | text | `warden_version`: the version of the warden that keeps the session; absent from a warden that did not say |
@@ -396,6 +397,31 @@ in `list_reply`, and in the `new` that makes the session (key 7); it is the
 session's for as long as the session is there, and a new session with the id of one
 that is gone does not have the old one's.
 
+**`forget`** has no payload and asks the session to forget its past: the scrollback
+its screen keeps and the record of the output so far. It is for a client whose
+user cleared the history (the terminal has dropped it and does not want the next
+`attach` to bring it back). From the moment the server has it, a client that
+attaches from an offset before that moment is told `truncated` and is given a
+picture of the screen, which has the rows that were on it and no scrollback from
+before (rows that scroll off after it are kept as always), and `status` says the
+offset in `retained`. A picture made for a client later than that one is made the
+same way. Clients that are attached are not touched: the bytes they are owed are
+sent as before, they keep their own scrollback, and the one that asked is not let
+go for the output that was on its way when it did. The offset is the end of the
+output the server had read when it got the message, so a client that attaches from
+that offset or from after it is not cut short. It is a request of a connection that
+is attached, as `input` is: from one that is not, it is an `error` (`NOT_ATTACHED`)
+and nothing is forgotten; nothing is said when it is done. A program that holds the
+alternate screen leaves the scrollback out of the server's reach, and the forget
+is carried out when it gives the screen back. A server that is replaced or
+restarted after a `forget` keeps the offset in its journal and forgets at it when it
+builds its screen again, from the ring if the ring still holds the bytes before it,
+so the screen that was on show at that moment comes back too; the forgotten
+scrollback does not. A server or bridge from before this message skips it: nothing
+is forgotten and nothing says so (the bridge of `kablo attach` passes it on to the
+session like `input`, and one from before it, running while kablo was upgraded, skips
+it like the session behind it).
+
 ### error codes
 
 | code | meaning |
@@ -579,6 +605,13 @@ size the picture says, build the screen the program has now (both screens and
 which is active, the scrollback it was made to keep, every cell's text, colours
 and attributes, links, cursors, scrolling region, tab stops, character sets,
 modes, the title) and end with whatever escape sequence the stream stopped in.
+The modes include SGR-pixel mouse (`?1016`) and in-band size reports (`?2048`),
+which the terminal library has no bit for and the server follows in the stream
+itself: the picture turns on the ones that are on (`CSI ? 1016 h`, `CSI ? 2048 h`,
+after the rest of the screen and before the open sequence), a full reset (`ESC c`)
+turns them off, and a picture of a session that never turned either on is the
+bytes it was before. The server does not report the size when `?2048` is turned on
+in a picture: that is for the terminal that gets it.
 `output` goes on from the picture's `offset`, so the client has the screen and
 then the program's own bytes, with nothing missing and nothing twice. A client
 can ask for a picture whatever the offset (`attach` with the picture flag), as
@@ -598,7 +631,7 @@ and gets the program's bytes from the picture's offset on, none of what the
 journal still held and no screen.
 
 What a picture is not: kitty graphics images (the screen is text), the selection,
-a mode its terminal library keeps no bit for (SGR-pixel mouse). The screen is
+any other mode its terminal library keeps no bit for. The screen is
 the server's, kept at the size of the last `resize` or `attach` view (a terminal
 that has ended keeps the size it ended at); a relay that is replaced or
 restarted rebuilds it from what the journal holds, from its start if nothing

@@ -1496,6 +1496,14 @@ mod tests {
         assert!(check_relay(&with("0.2.0")).is_ok());
         assert!(check_relay(&with("0.2.1")).is_ok());
         assert!(check_relay(&with("1.0.0-rc1")).is_ok());
+        // A development build is its release's numbers, whatever commit it carries.
+        assert!(check_relay(&with("0.2.0-dev+d06c0186ff39")).is_ok());
+        assert!(check_relay(&with("0.2.0-dev+d06c0186ff39.dirty-943bb6dd")).is_ok());
+        assert_eq!(
+            release_numbers("0.2.0-dev+d06c0186ff39.dirty-943bb6dd"),
+            Some([0, 2, 0])
+        );
+        assert!(check_relay(&with("0.1.9-dev+d06c0186ff39")).is_err());
         for old in ["0.1.0", "0.1.9", "0.0.1", "", "garbage", "0.2"] {
             let Err(text) = check_relay(&with(old)) else {
                 panic!("{old} is too old");

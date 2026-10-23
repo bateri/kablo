@@ -62,6 +62,9 @@ pub mod kind {
     pub const WAIT: u8 = 0x10;
     /// `label`: set a session's label, or clear it.
     pub const LABEL: u8 = 0x11;
+    /// `forget`: forget the past of a session: its scrollback and the record of
+    /// its output before now.
+    pub const FORGET: u8 = 0x12;
     /// `attached`: the answer to `attach`.
     pub const ATTACHED: u8 = 0x81;
     /// `output`: bytes from the program.
@@ -113,6 +116,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::READ => "read",
         kind::WAIT => "wait",
         kind::LABEL => "label",
+        kind::FORGET => "forget",
         kind::ATTACHED => "attached",
         kind::OUTPUT => "output",
         kind::ENDED => "ended",
@@ -1564,6 +1568,17 @@ pub enum Message {
     /// cleared when it is empty (at most [`MAX_LABEL`] bytes). The bridge answers
     /// it, as it does `New`; nothing is said when it was done.
     Label(String),
+    /// Client to server, from an attached client: forget the past of the session.
+    /// The server drops the scrollback its screen keeps and the record of the
+    /// output so far: a client that attaches later from an offset before this
+    /// moment is told that what it asked for is gone (`Attached` with `truncated`)
+    /// and is sent a picture of the screen, which has no scrollback of what came
+    /// before; the screen that is shown is what it was. Clients that are attached
+    /// are not affected: they get what they are owed and keep their own
+    /// scrollback. Nothing is said when it was done; from a connection that is
+    /// not attached it is an `error` (`NOT_ATTACHED`). A server from before this
+    /// message skips it.
+    Forget,
     /// Server to client: the stream starts at `offset`; `truncated` says the
     /// bytes the client asked for are not coming and a picture is, because they
     /// had left the journal or held a question the server answered (see
@@ -1697,6 +1712,7 @@ impl Message {
             Message::Read(_) => kind::READ,
             Message::Wait => kind::WAIT,
             Message::Label(_) => kind::LABEL,
+            Message::Forget => kind::FORGET,
             Message::Attached { .. } => kind::ATTACHED,
             Message::Output { .. } => kind::OUTPUT,
             Message::Ended(_) => kind::ENDED,
@@ -1721,6 +1737,7 @@ impl Message {
             | Message::List
             | Message::Features
             | Message::Wait
+            | Message::Forget
             | Message::Ask => Vec::new(),
             Message::Write(strokes) => strokes_to_block(strokes),
             Message::Read(capture) => capture.to_block(),
@@ -1877,6 +1894,7 @@ impl Message {
             kind::WRITE => Message::Write(strokes_from_block(payload)?),
             kind::READ => Message::Read(Capture::from_block(payload)?),
             kind::WAIT => Message::Wait,
+            kind::FORGET => Message::Forget,
             kind::LABEL => {
                 let label = tlv::read_text(payload, "label")?;
                 check_label(&label)?;

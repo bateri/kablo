@@ -63,7 +63,11 @@ cargo build --release          # target/release/kablo
 
 `make dist` builds the files a release ships: `dist/kablo-<version>-<target>`
 for the four targets, with `LICENSE`, `THIRD-PARTY-LICENSES.txt` and the
-`SHA256SUMS` over all of them. It needs a Mac with Docker (the Linux binaries
+`SHA256SUMS` over all of them. The build is named for the commit it was made
+from, `<version>-dev+<commit>` (and `.dirty-<digest>` for a working tree that is
+not that commit), in the file names and in what `kablo version` says; only
+`make release` names a build by its version alone, so two builds never share a
+name and a server's directory per version never holds two different files. It needs a Mac with Docker (the Linux binaries
 are static musl builds, made and tried in a container of their own
 architecture), a local `rustc` of the version named in
 `tools/linux/Dockerfile` (as for `make linux`), and rustup with both Apple

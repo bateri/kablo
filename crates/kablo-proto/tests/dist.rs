@@ -46,15 +46,59 @@ fn dist_names_a_binary_as_the_release_does() {
     let makefile = std::fs::read_to_string(MAKEFILE).unwrap();
     let pattern = variable(&makefile, "DIST_NAME");
     assert_eq!(pattern.matches('%').count(), 1, "{pattern}");
-    let version = "0.1.0";
-    let pattern = pattern.replace("$(DIST_VERSION)", version);
-    for target in Target::ALL {
-        assert_eq!(
-            pattern.replace('%', target.triple()),
-            install::artifact_name(version, target).unwrap()
-        );
+    // A release is named by its version, a development build by that and the commit.
+    for version in [
+        "0.1.0",
+        "0.2.0-dev+d06c0186ff39",
+        "0.2.0-dev+d06c0186ff39.dirty-943bb6dd",
+    ] {
+        let pattern = pattern.replace("$(DIST_ID)", version);
+        for target in Target::ALL {
+            assert_eq!(
+                pattern.replace('%', target.triple()),
+                install::artifact_name(version, target).unwrap()
+            );
+        }
+        assert!(install::install_path(version).is_ok(), "{version}");
     }
+    assert_eq!(
+        variable(&makefile, "DIST_ID"),
+        "$(DIST_VERSION)$(DIST_SUFFIX)"
+    );
     assert_eq!(variable(&makefile, "DIST_SUMS"), install::CHECKSUMS);
+}
+
+/// The name a development build is given is a version a server may keep a directory for,
+/// whatever state the tree is in: the suffix the script prints is what `make dist` appends.
+#[test]
+fn the_suffix_of_a_development_build_is_a_version_a_server_keeps() {
+    let root = std::path::Path::new(MAKEFILE).parent().unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("tools/dev-suffix.sh")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let suffix = text.trim_end_matches('\n');
+    assert!(!text.is_empty() && text.ends_with('\n') && text.matches('\n').count() == 1);
+    let rest = suffix.strip_prefix("-dev+").expect(suffix);
+    let (commit, dirt) = match rest.split_once(".dirty-") {
+        Some((commit, digest)) => (commit, Some(digest)),
+        None => (rest, None),
+    };
+    let hex =
+        |text: &str, len: usize| text.len() == len && text.bytes().all(|b| b.is_ascii_hexdigit());
+    assert!(
+        (hex(commit, 12) && dirt.is_none_or(|digest| hex(digest, 8)))
+            || (commit == "unversioned" && dirt.is_none()),
+        "{suffix}"
+    );
+    let version = format!("0.2.0{suffix}");
+    assert_eq!(
+        install::install_dir(&version).unwrap(),
+        format!(".local/share/kablo/{version}")
+    );
 }
 
 /// The licenses a release carries next to the binaries are files of the

@@ -718,3 +718,28 @@ fn a_terminal_bigger_than_a_screen_may_be_is_refused_and_changes_nothing() {
     let refused = env.try_start("big2", &["--cols", "1001", "--", "/bin/sh"]);
     assert!(refused.is_err());
 }
+
+#[test]
+fn a_picture_turns_on_the_pixel_mouse_and_size_report_modes_the_program_turned_on() {
+    let mut env = Env::new();
+    let id = env.start("kept", &SH);
+    let mut witness = env.connect(&id);
+    witness.attach(0);
+    let has = |picture: &[u8], needle: &[u8]| picture.windows(needle.len()).any(|w| w == needle);
+
+    // The shell writes the sequences (what is typed is the text `\033[?1016h`, not the
+    // escape), and the screen follows the program's output, not its echo.
+    witness.type_in("printf '\\033[?1016h\\033[?2048h'; echo done-$((40+2))\n");
+    witness.wait_for("done-42\r\n", 0);
+    let mut late = env.connect(&id);
+    late.attach_with_picture(OFFSET_END, 80, 24);
+    assert!(has(&late.picture().bytes, b"\x1b[?1016h"));
+    assert!(has(&late.picture().bytes, b"\x1b[?2048h"));
+
+    witness.type_in("printf '\\033[?1016l'; echo done-$((40+3))\n");
+    witness.wait_for("done-43\r\n", 0);
+    let mut later = env.connect(&id);
+    later.attach_with_picture(OFFSET_END, 80, 24);
+    assert!(!has(&later.picture().bytes, b"\x1b[?1016h"));
+    assert!(has(&later.picture().bytes, b"\x1b[?2048h"));
+}

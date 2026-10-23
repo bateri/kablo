@@ -33,6 +33,77 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **A client can ask a session to forget its history.** The new `forget` request
+  (an app's clear-history command) makes the session drop the scrollback its
+  screen keeps and the record of its output so far: a client that attaches later
+  and asks for bytes from before that moment is told they are gone and is given
+  the screen as it is, with no scrollback from before. Until now what a client had
+  cleared came back with the next picture. Clients that are attached are not
+  affected, and `kablo list` shows the offset the past starts at in the place it
+  showed the oldest byte the session held.
+
+### Changed
+
+- **A picture of a session now turns on the pixel mouse and size report modes.**
+  A program that asked for pointer reports in pixels (`CSI ? 1016 h`) or for the
+  size in the stream (`CSI ? 2048 h`) keeps getting them from a terminal that
+  reconnects, because the picture it is given says they are on; it used to leave
+  them off, so the program was answered as if it had never asked. A full reset
+  (`ESC c`) turns them off again.
+- **A build made with `make dist` is named for its commit.** `kablo version` and
+  the file names say `0.2.0-dev+<commit>` (and
+  `.dirty-<digest>` when the working tree is not that commit) instead of the
+  version of `Cargo.toml`, so a development build is told apart from the release
+  and from every other commit; `make release` and the released files are named
+  by the version as before.
+
+### For apps
+
+- **Protocol: `forget` (kind 0x12).** A client request with no payload and a
+  session, from an attached connection (from one that is not: `error`
+  `NOT_ATTACHED`, nothing forgotten; nothing is said when it was done): the
+  session drops the scrollback of its screen and takes the end of the output it has
+  read as the oldest offset it gives without a picture. An `attach` from an offset
+  before it is answered `attached` with `truncated` and a picture, as one from an
+  offset the ring has lost; the picture has no scrollback from before the forget.
+  `status` key 9 (`retained` in `kablo list --json`) is that offset when it is
+  later than the oldest the ring holds. Clients that are attached are given the
+  bytes they are owed, including the one that asked: the ring still has them. The
+  offset lives in the journal's header (the reserved bytes at 48, zero in a journal
+  an earlier warden made, so the journal's layout and version are as before) and a
+  relay that replaces or follows another forgets at it too. A program that holds
+  the alternate screen makes the forget wait until it gives the screen back. A
+  relay or bridge from before this release skips the kind, so nothing is forgotten
+  and nothing says so; an app that needs to know reads `version` from `status`
+  (0.2.0 does not have it). `kablo-proto`: `v1::kind::FORGET`, `Message::Forget`
+  (`v1::kind_name` is `"forget"`), and `kablo-screen`: `Screen::forget_history`.
+
+- **Pictures carry `?1016` and `?2048`.** `Screen::image` and the `picture` messages
+  end, before the open sequence the stream stopped in, with `CSI ? 1016 h` and
+  `CSI ? 2048 h` for the modes that are on, and write nothing for those that are
+  off, so the picture of a session that never turned either on is the bytes it was.
+  The screen follows them in the stream itself (alacritty drops both): a list of
+  modes in one sequence counts each, `ESC c` turns both off, and the soft reset and
+  the switch of screens leave them. It does not report the size when `?2048` is
+  turned on; the terminal that gets the picture does. An app that feeds a picture to
+  a terminal with no sink and the same two modes kept (bateri) turns them on without
+  having to ask the program again.
+
+- **Development builds are named for their commit.** `make dist` (and
+  `make dist-signed` alone) names the files `kablo-<version>-dev+<commit>-<target>`,
+  with `.dirty-<8 hex digits>` after the commit when the working tree has changes
+  (the digest is of the changes, tracked and not), and the binary says the same in
+  `kablo version`, `status` and `warden_version`; the name is told to the compiler
+  (`KABLO_BUILD_VERSION`), so a plain `cargo build` is still the version of
+  `Cargo.toml`. `kablo_proto::install` takes the name as it takes a release
+  candidate's (`install_dir`, `artifact_name`), and its numbers are the release's
+  (`0.2.0-dev+...` counts as 0.2.0 where a build is asked to be 0.2.0 or later). A
+  build is named by its version alone only by `make release`, `make publish` and
+  `make ship`, which still need `x.y.z`. Two builds with the same name are of the same
+  sources: an app that keeps one directory per version can rely on it.
+
 ## [0.2.0] - 2026-10-22
 
 Programs on a server can now work with the sessions there and with the app

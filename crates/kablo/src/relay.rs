@@ -375,6 +375,12 @@ struct Relay {
     screen: Screen,
     /// The offset after the last journal byte the screen has had.
     screen_at: u64,
+    /// The journal's floor (where the past was last forgotten) that the screen has been
+    /// brought to: it forgot its scrollback on reaching it, or began after it and had
+    /// none from before to forget. A relay that starts builds its screen from what the ring
+    /// still holds and forgets at the floor on the way, as the one before it did when it was
+    /// asked.
+    forgotten: u64,
     /// The end of the last stretch of output that held a question the terminal
     /// had an answer for, whoever sent it to the program (this relay with
     /// nobody attached, or a client's own terminal). A relay that takes over
@@ -532,6 +538,7 @@ impl Relay {
             input_sent: 0,
             screen,
             screen_at,
+            forgotten: 0,
             last_reply,
             history,
             scratch: vec![0; SCREEN_CHUNK],
@@ -868,12 +875,18 @@ impl Relay {
         let mut restarts = 0;
         loop {
             let total = self.journal.total();
+            self.reach_floor();
             if self.screen_at >= total {
                 return;
             }
             let mut wanted = usize::try_from(total - self.screen_at)
                 .unwrap_or(usize::MAX)
                 .min(self.scratch.len());
+            // Not past the floor in one piece: the screen forgets its scrollback at it.
+            let floor = self.journal.floor();
+            if self.forgotten < floor {
+                wanted = wanted.min(usize::try_from(floor - self.screen_at).unwrap_or(wanted));
+            }
             let answers = match (mode, self.journal.answered()) {
                 (Feed::Live, _) => true,
                 (Feed::Spent, _) | (Feed::Held, None) => false,
@@ -908,12 +921,27 @@ impl Relay {
                     let (cols, rows) = self.screen.size();
                     self.screen = Screen::new(cols, rows, self.history);
                     self.screen_at = replay_start(&self.journal, REPLAY_LIMIT);
+                    self.forgotten = 0;
                 }
                 None => {
                     self.screen_at = total;
                     return;
                 }
             }
+        }
+    }
+
+    /// Has the screen forget its scrollback if it stands at the journal's floor, where
+    /// the past was forgotten: the rows before are gone from what a client is given, and
+    /// the picture of the screen must not bring them back. A screen that began after the
+    /// floor has none from before it.
+    fn reach_floor(&mut self) {
+        let floor = self.journal.floor();
+        if self.forgotten < floor && self.screen_at >= floor {
+            if self.screen_at == floor {
+                self.screen.forget_history();
+            }
+            self.forgotten = floor;
         }
     }
 
@@ -1232,6 +1260,7 @@ impl Relay {
                     client.waiting = true;
                 }
             }
+            Message::Forget => self.forget(i),
             Message::Label(_) => self.error(
                 i,
                 ErrorCode::BAD_REQUEST,
@@ -1353,6 +1382,20 @@ impl Relay {
             }
             self.error(other, ErrorCode::TAKEN, &text);
         }
+    }
+
+    /// A client asks the session to forget its past: the screen drops its scrollback
+    /// and a client that comes for bytes before this moment is sent a picture, as if the
+    /// ring had lapped. Those who are attached are not touched (see the journal's header).
+    fn forget(&mut self, i: usize) {
+        if !self.is_attached(i) {
+            return self.error(i, ErrorCode::NOT_ATTACHED, "attach first");
+        }
+        // The past is what the screen has had; its scrollback is forgotten at the offset
+        // it stands at, which is also the floor.
+        self.feed_screen(Feed::Spent);
+        self.journal.set_floor(self.screen_at);
+        self.reach_floor();
     }
 
     fn resize(&mut self, i: usize, size: Size) {
@@ -1749,7 +1792,7 @@ impl Relay {
         // A client the ring has left behind is dropped even when it is not
         // reading: it never gets what it has not got, and it must not hold a
         // seat for the whole session.
-        let oldest = self.journal.retained_from();
+        let oldest = self.journal.ring_from();
         if client
             .attach
             .as_ref()
@@ -1864,7 +1907,7 @@ fn replayed_mark(journal: &Journal, replay_start: u64) -> u64 {
 /// screen does not start inside an escape sequence.
 fn replay_start(journal: &Journal, limit: u64) -> u64 {
     let from = journal.total().saturating_sub(limit);
-    if from == 0 && journal.retained_from() == 0 {
+    if from == 0 && journal.ring_from() == 0 {
         0
     } else {
         journal.line_start_from(from)
@@ -1934,6 +1977,7 @@ mod tests {
             master: pty.master,
             screen: Screen::new(80, 24, 10),
             screen_at: replay_start(&journal, REPLAY_LIMIT),
+            forgotten: 0,
             last_reply: replayed_mark(&journal, replay_start(&journal, REPLAY_LIMIT)),
             history: 10,
             scratch: vec![0; SCREEN_CHUNK],
@@ -2327,5 +2371,120 @@ mod tests {
         relay.drive(0);
         relay.deliver_if_due(Instant::now());
         assert!(relay.delivered_sent);
+    }
+    /// The numbered lines `from..=to`, each ended the way a terminal ends one.
+    fn rows(from: u32, to: u32) -> Vec<u8> {
+        (from..=to)
+            .flat_map(|n| format!("row{n:02}\r\n").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_forget_leaves_the_client_that_is_owed_bytes_attached_and_owed() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(&rows(1, 5));
+        let (mut relay, _slave) = relay_over(journal);
+        let (client, _far) = client_of(false);
+        relay.clients.push(client);
+        let total = relay.journal.total();
+        relay.forget(0);
+        assert_eq!(relay.journal.floor(), total);
+        assert_eq!(relay.journal.retained_from(), total);
+        // It had not been given a byte: the ring has them, and it is not the one the
+        // ring has left behind.
+        relay.drive(0);
+        let client = relay.clients.first().unwrap();
+        assert!(!client.dead);
+        assert_eq!(client.attach.as_ref().unwrap().next, total);
+        // One that comes for what the floor passed is told it is gone.
+        let (mut late, _far) = client_of(false);
+        late.attach = None;
+        relay.clients.push(late);
+        relay.attach(1, 0, None);
+        let queued = relay.clients.get(1).unwrap().out.clone();
+        let mut decoder = PacketDecoder::new();
+        decoder.push(&queued);
+        let packet = decoder.next_packet().unwrap().unwrap();
+        assert!(
+            matches!(
+                packet.message,
+                Message::Attached {
+                    truncated: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            packet.message
+        );
+    }
+
+    #[test]
+    fn a_forget_from_a_connection_that_is_not_attached_changes_nothing() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(&rows(1, 40));
+        let (mut relay, _slave) = relay_over(journal);
+        let (mut client, _far) = client_of(false);
+        client.attach = None;
+        relay.clients.push(client);
+        relay.feed_screen(Feed::Spent);
+        let before = relay.screen.text(10, false);
+        relay.forget(0);
+        assert_eq!(relay.journal.floor(), 0);
+        assert_eq!(relay.screen.text(10, false), before);
+        let mut decoder = PacketDecoder::new();
+        decoder.push(&relay.clients.first().unwrap().out);
+        let packet = decoder.next_packet().unwrap().unwrap();
+        assert!(
+            matches!(
+                packet.message,
+                Message::Error {
+                    code: ErrorCode::NOT_ATTACHED,
+                    ..
+                }
+            ),
+            "{:?}",
+            packet.message
+        );
+    }
+
+    #[test]
+    fn a_relay_that_comes_after_a_forget_forgets_at_the_same_place() {
+        // 40 lines, the past forgotten, three more lines. The screen is 24 rows and keeps
+        // 10 rows of scrollback; the lines the floor passed are not among them, the ones
+        // on the screen at the floor are, and a screen built from the floor would not
+        // have those on it.
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(&rows(1, 40));
+        journal.set_floor(journal.total());
+        journal.append(&rows(41, 43));
+        assert_eq!(replay_start(&journal, REPLAY_LIMIT), 0);
+        let (mut relay, _slave) = relay_over(journal);
+        relay.feed_screen(Feed::Spent);
+        let text = relay.screen.text(10, false);
+        assert_eq!(relay.forgotten, relay.journal.floor());
+        assert_eq!(text.len(), 24 + 3, "{text:?}");
+        assert_eq!(text.first().map(String::as_str), Some("row18"), "{text:?}");
+        assert!(text.iter().any(|row| row == "row40"), "{text:?}");
+
+        // The same journal without the floor keeps the lines before it.
+        let mut plain = Journal::create(MIN_CAPACITY).unwrap();
+        plain.append(&rows(1, 43));
+        let (mut relay, _slave) = relay_over(plain);
+        relay.feed_screen(Feed::Spent);
+        assert_eq!(relay.screen.text(10, false).len(), 24 + 10);
+    }
+
+    #[test]
+    fn a_screen_that_begins_after_the_floor_has_nothing_from_before_it_to_forget() {
+        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        journal.append(&rows(1, 10));
+        journal.set_floor(journal.total());
+        journal.append(&rows(11, 30));
+        let (mut relay, _slave) = relay_over(journal);
+        // The replay starts at a line past the floor (a long journal's limit).
+        relay.screen_at = relay.journal.line_start_from(relay.journal.floor() + 3);
+        relay.feed_screen(Feed::Spent);
+        assert_eq!(relay.forgotten, relay.journal.floor());
+        assert_eq!(relay.screen_at, relay.journal.total());
     }
 }

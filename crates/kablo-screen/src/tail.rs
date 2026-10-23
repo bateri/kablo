@@ -1,4 +1,6 @@
-//! The sequence a read stopped in.
+//! The sequence a read stopped in, and the two modes the parser does not keep.
+
+use crate::kept::Kept;
 
 /// Where the parser stands, as far as [`Tail`] needs: vte's states folded into the ones
 /// that end a sequence alike (`vte-0.15.0/src/lib.rs`).
@@ -49,6 +51,10 @@ const APC_KEEP: usize = (64 << 20) + 4096;
 /// vte does not say where it stands; this follows the same bytes. The C0 controls vte
 /// **executes** inside an escape or a CSI are left out — they already took effect.
 ///
+/// The same walk sees every sequence end, so it is also where [`Kept`] follows the modes
+/// `alacritty_terminal` drops (`?1016`, `?2048`): a CSI that ends tells it, and so does
+/// `ESC c`. Fed an image that wrote them, a new `Tail` is back where the old one was.
+///
 /// **Known limit:** the cut is per code point, not per cluster: an emoji sequence cut
 /// **between** two code points comes back as two clusters in a terminal that clusters
 /// (the relay's own `Term` does not).
@@ -58,6 +64,8 @@ pub(crate) struct Tail {
     /// UTF-8 continuation bytes still missing in the ground state.
     utf8_need: u8,
     bytes: Vec<u8>,
+    /// The modes the program turned on that `Term` has no bit for.
+    kept: Kept,
     /// How many bytes an application program command may hold ([`APC_KEEP`]; a test
     /// makes it small).
     apc_keep: usize,
@@ -69,6 +77,7 @@ impl Default for Tail {
             state: Seq::default(),
             utf8_need: 0,
             bytes: Vec::new(),
+            kept: Kept::default(),
             apc_keep: APC_KEEP,
         }
     }
@@ -86,6 +95,11 @@ impl Tail {
     /// ground state.
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The modes the stream turned on that `Term` does not keep.
+    pub(crate) fn kept(&self) -> Kept {
+        self.kept
     }
 
     fn ground(&mut self) {
@@ -160,6 +174,11 @@ impl Tail {
                 0x5f => self.enter(byte, Seq::Apc),
                 0x5b => self.enter(byte, Seq::Csi),
                 0x5d => self.enter(byte, Seq::Osc),
+                // `ESC c`, a full reset (no intermediate: that is another sequence).
+                0x63 => {
+                    self.kept.reset();
+                    self.ground();
+                }
                 0x30..=0x7e => self.ground(),
                 _ => {}
             },
@@ -172,7 +191,10 @@ impl Tail {
             Seq::Csi => match byte {
                 _ if executed => {}
                 0x20..=0x3f => self.bytes.push(byte),
-                0x40..=0x7e => self.ground(),
+                0x40..=0x7e => {
+                    self.kept.csi(&self.bytes, byte);
+                    self.ground();
+                }
                 _ => self.anywhere(byte),
             },
             Seq::DcsEntry => match byte {

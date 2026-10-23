@@ -483,6 +483,7 @@ fn messages() -> Vec<(&'static str, Packet)> {
         ("wait", work(Message::Wait)),
         ("label", work(Message::Label("deploy".into()))),
         ("label_clear", work(Message::Label(String::new()))),
+        ("forget", work(Message::Forget)),
         (
             "screen_text",
             work(Message::ScreenText {
@@ -890,6 +891,7 @@ fn every_message_kind_has_a_fixture() {
         READ,
         WAIT,
         LABEL,
+        FORGET,
         ATTACHED,
         OUTPUT,
         ENDED,
@@ -2425,7 +2427,8 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(v1::kind_name(kind::READ), "read");
     assert_eq!(v1::kind_name(kind::WAIT), "wait");
     assert_eq!(v1::kind_name(kind::LABEL), "label");
-    assert_eq!(v1::kind_name(0x12), "unknown");
+    assert_eq!(v1::kind_name(kind::FORGET), "forget");
+    assert_eq!(v1::kind_name(0x13), "unknown");
     assert_eq!(v1::kind_name(kind::STATE), "state");
     assert_eq!(v1::kind_name(kind::ASK_REPLY), "ask_reply");
     assert_eq!(v1::kind_name(kind::TICKET), "ticket");
@@ -2965,6 +2968,7 @@ fn the_kinds_of_driving_go_the_way_their_halves_say() {
         (kind::READ, false),
         (kind::WAIT, false),
         (kind::LABEL, false),
+        (kind::FORGET, false),
         (kind::SCREEN_TEXT, true),
     ] {
         assert_eq!(k >= 0x80, from_server, "{k:#04x}");
@@ -3148,6 +3152,39 @@ fn a_label_is_sixty_four_bytes_at_most_and_an_empty_one_is_none() {
         Some(Packet::connection(Message::New(NewSession::default())))
     );
     assert_eq!(wire, fixture("new_empty"));
+}
+
+/// `forget` is a request with nothing to say, like `detach`: whatever follows its header is
+/// not read, and a reader that does not know the kind goes on past it (the kind after the
+/// last one this version has is to it what `forget` is to a reader from before it).
+#[test]
+fn a_forget_says_nothing_and_a_reader_that_does_not_know_it_reads_on() {
+    assert_eq!(
+        read_packet(&mut fixture("forget").as_slice()).unwrap(),
+        Some(work(Message::Forget))
+    );
+    let with_bytes = raw(kind::FORGET, 0, "work", &[1, 2, 3]);
+    assert_eq!(
+        read_packet(&mut with_bytes.as_slice()).unwrap(),
+        Some(work(Message::Forget))
+    );
+
+    // `read_packet` passes over a frame of a kind it has no name for and gives the next.
+    let mut stream = raw(0x13, 0, "work", &[1, 2, 3]);
+    stream.extend(fixture("forget"));
+    stream.extend(raw(0x13, 0, "work", &[]));
+    stream.extend(fixture("wait"));
+    let mut reader = stream.as_slice();
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        Some(work(Message::Forget))
+    );
+    assert_eq!(read_packet(&mut reader).unwrap(), Some(work(Message::Wait)));
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        None,
+        "the end of the stream"
+    );
 }
 
 #[test]
