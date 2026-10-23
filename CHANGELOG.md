@@ -33,6 +33,12 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+A session can now be told to forget its past, so what an app cleared does not come
+back when it reconnects, and a terminal that reconnects keeps the pixel mouse and
+size reports the program asked for.
+
 ### Added
 
 - **A client can ask a session to forget its history.** The new `forget` request
