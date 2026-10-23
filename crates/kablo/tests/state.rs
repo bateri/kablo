@@ -294,6 +294,14 @@ fn a_release(env: &Env) -> std::path::PathBuf {
     std::fs::create_dir(&versions).unwrap();
     let release = versions.join("2.1.296");
     std::fs::copy(env!("CARGO_BIN_EXE_kablo"), &release).unwrap();
+    // Run once before a session runs it: macOS holds a file it has not run before at its first
+    // `exec` for a moment (up to seconds on a busy machine), longer than the look that follows
+    // output waits, and a program that says nothing is not looked at again.
+    let ran = std::process::Command::new(&release)
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{ran:?}");
     release
 }
 
@@ -307,14 +315,18 @@ fn a_release_kept_under_its_version_is_told_by_the_name_it_was_started_by() {
     // Started under another name than the file's own: the one scene in which
     // the kernel's name is the version on both systems. The shell says
     // something before it becomes the release, as the program that says
-    // nothing afterwards is found by the look that follows that output.
+    // nothing afterwards is found by the look that follows that output — and
+    // says it once the client is attached, since nothing is looked at for
+    // nobody.
     let command = format!(
-        "echo ready; exec -a claude {} wait {awaited}",
+        "read -r _; echo ready; exec -a claude {} wait {awaited}",
         release.display()
     );
     let id = env.start("named", &["--", "/bin/bash", "-c", &command]);
     let mut a = env.connect(&id);
     a.attach(0);
+    a.until("a state", |c| !c.states.is_empty());
+    a.type_in("\n");
     a.until("claude", |c| program(c).as_deref() == Some("claude"));
     assert_eq!(a.status().program.as_deref(), Some(&b"claude"[..]));
     // The name is all of the command line that is told.
