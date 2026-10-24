@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "kablo"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kablo-proto",
  "kablo-screen",
@@ -132,11 +132,11 @@ dependencies = [
 
 [[package]]
 name = "kablo-proto"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "kablo-screen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
 ]

@@ -33,6 +33,12 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-24
+
+An app can now ask a session to drop the input its program has not read, so the
+shell that takes the terminal after a program ended does not type what the program
+never took.
+
 ### Added
 
 - **A client can ask a session to drop the input its program has not read.** The new
