@@ -65,6 +65,8 @@ pub mod kind {
     /// `forget`: forget the past of a session: its scrollback and the record of
     /// its output before now.
     pub const FORGET: u8 = 0x12;
+    /// `drop_input`: drop the input the program has not read.
+    pub const DROP_INPUT: u8 = 0x13;
     /// `attached`: the answer to `attach`.
     pub const ATTACHED: u8 = 0x81;
     /// `output`: bytes from the program.
@@ -117,6 +119,7 @@ pub fn kind_name(kind: u8) -> &'static str {
         kind::WAIT => "wait",
         kind::LABEL => "label",
         kind::FORGET => "forget",
+        kind::DROP_INPUT => "drop_input",
         kind::ATTACHED => "attached",
         kind::OUTPUT => "output",
         kind::ENDED => "ended",
@@ -1579,6 +1582,19 @@ pub enum Message {
     /// not attached it is an `error` (`NOT_ATTACHED`). A server from before this
     /// message skips it.
     Forget,
+    /// Client to server, from an attached client: drop the input the program has
+    /// not read. Whatever was typed to the terminal (`Input`, `Write`, the
+    /// terminal's own answers to the program's questions) and is still waiting for
+    /// the program to read it, in the terminal or in the server's hands, is thrown
+    /// away, so that a program that comes to read the terminal next (the shell,
+    /// after the program that was in front has ended without reading all it was
+    /// sent) does not find it and take it for typing. Nothing else is touched: not
+    /// the program's output, the screen, the record of the output, or the
+    /// program, which is neither ended nor signalled. It is harmless when nothing
+    /// is waiting. Nothing is said when it was done; from a connection that is not
+    /// attached it is an `error` (`NOT_ATTACHED`). A server from before this
+    /// message skips it.
+    DropInput,
     /// Server to client: the stream starts at `offset`; `truncated` says the
     /// bytes the client asked for are not coming and a picture is, because they
     /// had left the journal or held a question the server answered (see
@@ -1713,6 +1729,7 @@ impl Message {
             Message::Wait => kind::WAIT,
             Message::Label(_) => kind::LABEL,
             Message::Forget => kind::FORGET,
+            Message::DropInput => kind::DROP_INPUT,
             Message::Attached { .. } => kind::ATTACHED,
             Message::Output { .. } => kind::OUTPUT,
             Message::Ended(_) => kind::ENDED,
@@ -1738,6 +1755,7 @@ impl Message {
             | Message::Features
             | Message::Wait
             | Message::Forget
+            | Message::DropInput
             | Message::Ask => Vec::new(),
             Message::Write(strokes) => strokes_to_block(strokes),
             Message::Read(capture) => capture.to_block(),
@@ -1895,6 +1913,7 @@ impl Message {
             kind::READ => Message::Read(Capture::from_block(payload)?),
             kind::WAIT => Message::Wait,
             kind::FORGET => Message::Forget,
+            kind::DROP_INPUT => Message::DropInput,
             kind::LABEL => {
                 let label = tlv::read_text(payload, "label")?;
                 check_label(&label)?;

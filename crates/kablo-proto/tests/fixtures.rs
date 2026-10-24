@@ -484,6 +484,7 @@ fn messages() -> Vec<(&'static str, Packet)> {
         ("label", work(Message::Label("deploy".into()))),
         ("label_clear", work(Message::Label(String::new()))),
         ("forget", work(Message::Forget)),
+        ("drop_input", work(Message::DropInput)),
         (
             "screen_text",
             work(Message::ScreenText {
@@ -892,6 +893,7 @@ fn every_message_kind_has_a_fixture() {
         WAIT,
         LABEL,
         FORGET,
+        DROP_INPUT,
         ATTACHED,
         OUTPUT,
         ENDED,
@@ -2428,7 +2430,8 @@ fn the_new_kinds_have_names_and_the_kinds_after_them_do_not() {
     assert_eq!(v1::kind_name(kind::WAIT), "wait");
     assert_eq!(v1::kind_name(kind::LABEL), "label");
     assert_eq!(v1::kind_name(kind::FORGET), "forget");
-    assert_eq!(v1::kind_name(0x13), "unknown");
+    assert_eq!(v1::kind_name(kind::DROP_INPUT), "drop_input");
+    assert_eq!(v1::kind_name(0x14), "unknown");
     assert_eq!(v1::kind_name(kind::STATE), "state");
     assert_eq!(v1::kind_name(kind::ASK_REPLY), "ask_reply");
     assert_eq!(v1::kind_name(kind::TICKET), "ticket");
@@ -2969,6 +2972,7 @@ fn the_kinds_of_driving_go_the_way_their_halves_say() {
         (kind::WAIT, false),
         (kind::LABEL, false),
         (kind::FORGET, false),
+        (kind::DROP_INPUT, false),
         (kind::SCREEN_TEXT, true),
     ] {
         assert_eq!(k >= 0x80, from_server, "{k:#04x}");
@@ -3170,9 +3174,9 @@ fn a_forget_says_nothing_and_a_reader_that_does_not_know_it_reads_on() {
     );
 
     // `read_packet` passes over a frame of a kind it has no name for and gives the next.
-    let mut stream = raw(0x13, 0, "work", &[1, 2, 3]);
+    let mut stream = raw(0x14, 0, "work", &[1, 2, 3]);
     stream.extend(fixture("forget"));
-    stream.extend(raw(0x13, 0, "work", &[]));
+    stream.extend(raw(0x14, 0, "work", &[]));
     stream.extend(fixture("wait"));
     let mut reader = stream.as_slice();
     assert_eq!(
@@ -3180,6 +3184,42 @@ fn a_forget_says_nothing_and_a_reader_that_does_not_know_it_reads_on() {
         Some(work(Message::Forget))
     );
     assert_eq!(read_packet(&mut reader).unwrap(), Some(work(Message::Wait)));
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        None,
+        "the end of the stream"
+    );
+}
+
+/// `drop_input` is a request with nothing to say too: it is read from its header alone, and a
+/// reader from before it goes on past it as it does past any kind it has no name for.
+#[test]
+fn a_drop_input_says_nothing_and_a_reader_that_does_not_know_it_reads_on() {
+    assert_eq!(
+        read_packet(&mut fixture("drop_input").as_slice()).unwrap(),
+        Some(work(Message::DropInput))
+    );
+    let with_bytes = raw(kind::DROP_INPUT, 0, "work", &[1, 2, 3]);
+    assert_eq!(
+        read_packet(&mut with_bytes.as_slice()).unwrap(),
+        Some(work(Message::DropInput))
+    );
+    assert_eq!(Message::DropInput.kind(), kind::DROP_INPUT);
+    assert_ne!(kind::DROP_INPUT, kind::FORGET);
+
+    let mut stream = raw(0x14, 0, "work", &[1, 2, 3]);
+    stream.extend(fixture("drop_input"));
+    stream.extend(raw(0x14, 0, "work", &[]));
+    stream.extend(fixture("forget"));
+    let mut reader = stream.as_slice();
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        Some(work(Message::DropInput))
+    );
+    assert_eq!(
+        read_packet(&mut reader).unwrap(),
+        Some(work(Message::Forget))
+    );
     assert_eq!(
         read_packet(&mut reader).unwrap(),
         None,

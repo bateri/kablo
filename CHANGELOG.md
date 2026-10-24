@@ -33,6 +33,33 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **A client can ask a session to drop the input its program has not read.** The new
+  `drop_input` request throws away what was typed to the terminal and waits there
+  unread. An app uses it when a program ends without reading all it was sent, so that
+  the shell that reads the terminal next does not find it and type it at its prompt.
+  The program's output and the screen are not touched, and nothing is ended or
+  signalled.
+
+### For apps
+
+- **Protocol: `drop_input` (kind 0x13).** A client request with no payload and a
+  session, from an attached connection (from one that is not: `error` `NOT_ATTACHED`,
+  nothing dropped; nothing is said when it was done, or when there was nothing to do).
+  The session drops the input its program has not read, both what its terminal holds
+  and what the session itself still holds back for the terminal (a terminal takes only
+  so much at once), and does nothing else: no output, screen, journal or offset changes,
+  no signal, and what is sent after it is taken by the program as ever. It is made on
+  the program's side of the terminal, opened and closed again for it, because a flush
+  on the master side drops the program's input on macOS but its output on Linux. A
+  session whose program has ended ignores it. A relay or bridge from before this release
+  skips the kind, so nothing is dropped and nothing says so; an app that needs to know
+  reads `version` from `status` and sends it only to a relay from the release that has
+  it (0.3.0 and earlier do not). `kablo-proto`: `v1::kind::DROP_INPUT`, `Message::DropInput`
+  (`v1::kind_name` is `"drop_input"`); the kind after it, 0x14, is the first this
+  version has no name for.
+
 ## [0.3.0] - 2026-10-23
 
 A session can now be told to forget its past, so what an app cleared does not come

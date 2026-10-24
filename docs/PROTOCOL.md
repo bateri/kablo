@@ -126,6 +126,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 | 0x10 | `wait` | yes | (empty) |
 | 0x11 | `label` | yes | UTF-8 text of 0 to 64 bytes (empty clears) |
 | 0x12 | `forget` | yes | (empty) |
+| 0x13 | `drop_input` | yes | (empty) |
 | 0x81 | `attached` | yes | `offset: u64, flags: u8` (bit 0: truncated), then optionally `answered: u64` |
 | 0x82 | `output` | yes | `offset: u64`, then the bytes |
 | 0x83 | `ended` | yes | `kind: u8` (0 exit code, 1 signal), `value: i32` |
@@ -421,6 +422,24 @@ scrollback does not. A server or bridge from before this message skips it: nothi
 is forgotten and nothing says so (the bridge of `kablo attach` passes it on to the
 session like `input`, and one from before it, running while kablo was upgraded, skips
 it like the session behind it).
+
+**`drop_input`** has no payload and asks the session to drop the input its program has
+not read: what was typed to the terminal (`input`, `write`, the server's own answers to
+the program's questions) and still waits for the program to read it, whether in the
+terminal or in the server's hands (the terminal takes only so much of what is sent at
+once, and the server holds back the rest until it is taken). It is for a client that
+knows the program in the terminal has ended without reading what it was sent, so that
+the program that reads the terminal next (the shell) does not find it and take it for
+typing. Nothing else is touched: not the output of the program, the screen, the record
+of the output or the offsets, and the program is neither ended nor signalled. What is
+typed after the server has the message is not dropped. It is harmless when nothing is
+waiting, and so when the program has already ended or the terminal cannot be reached:
+nothing is said when it is done and nothing when there was nothing to do. It is a request
+of a connection that is attached, as `input` is: from one that is not, it is an `error`
+(`NOT_ATTACHED`) and nothing is dropped. A server or bridge from before this message
+skips it, nothing is dropped and nothing says so (the bridge of `kablo attach` passes it
+on to the session like `input`): a client that needs the input gone reads `version` from
+`status` and sends the message only to a relay from the release that has it.
 
 ### error codes
 

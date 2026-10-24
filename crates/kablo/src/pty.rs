@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, OsStr};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -57,7 +57,6 @@ pub fn open(size: Size) -> io::Result<Pty> {
     })?;
     // SAFETY: a descriptor just returned to us, owned from here.
     let slave = unsafe { OwnedFd::from_raw_fd(raw) };
-    use std::os::fd::AsFd;
     sys::set_window_size(master.as_fd(), size)?;
     utf8_input(&slave);
     Ok(Pty { master, slave })
@@ -65,10 +64,11 @@ pub fn open(size: Size) -> io::Result<Pty> {
 
 /// The path of the slave side of `master`.
 #[cfg(target_os = "linux")]
-fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+fn slave_name(master: impl AsFd) -> io::Result<std::ffi::CString> {
     let mut buf = [0 as libc::c_char; 128];
     // SAFETY: `buf` is a writable buffer of the length passed.
-    let status = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    let status =
+        unsafe { libc::ptsname_r(master.as_fd().as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
@@ -78,15 +78,41 @@ fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
 
 /// The path of the slave side of `master`.
 #[cfg(not(target_os = "linux"))]
-fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+fn slave_name(master: impl AsFd) -> io::Result<std::ffi::CString> {
     // SAFETY: `ptsname` returns a pointer into static storage (or null); it
     // is copied at once, and the keeper is a single thread.
-    let name = unsafe { libc::ptsname(master.as_raw_fd()) };
+    let name = unsafe { libc::ptsname(master.as_fd().as_raw_fd()) };
     if name.is_null() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a non-null result is a NUL-terminated string.
     Ok(unsafe { CStr::from_ptr(name) }.to_owned())
+}
+
+/// Throws away the input the program has not read: what was typed to the terminal and is
+/// still waiting in it. The flush is made on the program's side of the terminal, opened
+/// here for the moment (it becomes nobody's controlling terminal and the open waits for
+/// nobody) and closed again, because the master side cannot do it on both systems:
+/// `tcflush(TCIFLUSH)` on a master drops the program's input on macOS and the program's
+/// *output* on Linux, where no flush on the master reaches the program's input at all.
+/// The program's side is not kept open: a terminal whose program's side somebody holds
+/// never shows its master that the program has ended.
+///
+/// An error means the program's side could not be opened or flushed because it is gone,
+/// and then nobody is left to read anything.
+pub fn drop_unread_input(master: BorrowedFd<'_>) -> io::Result<()> {
+    let name = slave_name(master)?;
+    // SAFETY: `name` is a C string for the call.
+    let raw = sys::cvt(unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    })?;
+    // SAFETY: a descriptor just returned to us, owned from here (closed on return).
+    let slave = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `slave` is an open terminal.
+    sys::cvt(unsafe { libc::tcflush(slave.as_raw_fd(), libc::TCIFLUSH) }).map(drop)
 }
 
 /// Tells the line discipline the input is UTF-8, so that erasing a character

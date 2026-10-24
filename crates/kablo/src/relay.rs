@@ -1261,6 +1261,7 @@ impl Relay {
                 }
             }
             Message::Forget => self.forget(i),
+            Message::DropInput => self.drop_input(i),
             Message::Label(_) => self.error(
                 i,
                 ErrorCode::BAD_REQUEST,
@@ -1396,6 +1397,28 @@ impl Relay {
         self.feed_screen(Feed::Spent);
         self.journal.set_floor(self.screen_at);
         self.reach_floor();
+    }
+
+    /// A client asks the session to drop the input the program has not read: what the
+    /// terminal still holds for it, and what this relay still holds back for the terminal
+    /// (the terminal takes only so much before the rest waits in `input`). The program's
+    /// output, the screen and the journal are not touched, and nothing is said, whether
+    /// there was anything or not.
+    fn drop_input(&mut self, i: usize) {
+        if !self.is_attached(i) {
+            return self.error(i, ErrorCode::NOT_ATTACHED, "attach first");
+        }
+        // With the program gone there is nobody to read what is left, and the terminal's
+        // far side may be nobody's: not opened again.
+        if self.exit.is_some() || self.master_done {
+            return;
+        }
+        self.input.clear();
+        self.input_sent = 0;
+        // A failure is a terminal with nothing on the other side: nothing to read, nothing
+        // to say (an `error` here would be read as the end of the attachment by a client
+        // that has no request of this kind to answer).
+        let _ = pty::drop_unread_input(self.master.as_fd());
     }
 
     fn resize(&mut self, i: usize, size: Size) {
@@ -2486,5 +2509,83 @@ mod tests {
         relay.feed_screen(Feed::Spent);
         assert_eq!(relay.forgotten, relay.journal.floor());
         assert_eq!(relay.screen_at, relay.journal.total());
+    }
+
+    /// Client 0 of `relay` sends `message` to it.
+    fn dropping(relay: &mut Relay, message: Message) {
+        let id = relay.id.clone();
+        relay.handle(0, Packet::about(id, message));
+    }
+
+    #[test]
+    fn the_input_a_program_has_not_read_is_dropped_wherever_it_waits_and_what_comes_later_arrives()
+    {
+        let (mut relay, slave) = relay_over(Journal::create(MIN_CAPACITY).unwrap());
+        let (client, _far) = client_of(false);
+        relay.clients.push(client);
+
+        // More than a terminal takes: part of it is in the terminal and part is held back
+        // by the relay until the terminal takes it, and a flush of the terminal alone would
+        // leave the relay writing the rest.
+        assert!(relay.queue_input(&vec![b'x'; 200 * 1024]));
+        assert!(relay.input_pending() > 0, "some of it waits in the relay");
+        // The program has written something that nobody has read yet.
+        assert_eq!(sys::write_fd(slave.as_fd(), b"output").unwrap(), 6);
+
+        dropping(&mut relay, Message::DropInput);
+        assert_eq!(relay.input_pending(), 0);
+        assert!(relay.clients[0].out.is_empty(), "nothing is said");
+        assert_eq!(
+            typed_to_the_program(&slave),
+            b"",
+            "the program finds nothing"
+        );
+
+        // The terminal takes input as before.
+        assert!(relay.queue_input(b"later"));
+        assert_eq!(typed_to_the_program(&slave), b"later");
+
+        // What the program wrote is still there for the relay to read.
+        let mut buf = [0u8; 64];
+        let n = sys::read_fd(relay.master.as_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"output");
+
+        // Nothing waiting is nothing to do.
+        dropping(&mut relay, Message::DropInput);
+        assert!(relay.clients[0].out.is_empty());
+        assert_eq!(typed_to_the_program(&slave), b"");
+        assert!(relay.queue_input(b"again"));
+        assert_eq!(typed_to_the_program(&slave), b"again");
+    }
+
+    #[test]
+    fn a_drop_of_input_from_a_connection_that_is_not_attached_is_refused_and_drops_nothing() {
+        let (mut relay, slave) = relay_over(Journal::create(MIN_CAPACITY).unwrap());
+        let (mut client, _far) = client_of(false);
+        client.attach = None;
+        relay.clients.push(client);
+        assert!(relay.queue_input(b"kept"));
+
+        dropping(&mut relay, Message::DropInput);
+        let mut said = PacketDecoder::new();
+        said.push(&relay.clients[0].out);
+        let Some(Packet {
+            message: Message::Error { code, .. },
+            ..
+        }) = said.next_packet().unwrap()
+        else {
+            panic!("an error was expected");
+        };
+        assert_eq!(code, ErrorCode::NOT_ATTACHED);
+        assert_eq!(typed_to_the_program(&slave), b"kept");
+    }
+
+    #[test]
+    fn a_drop_of_input_after_the_program_has_ended_does_nothing() {
+        let (mut relay, _slave) = ended_relay();
+        let (client, _far) = client_of(false);
+        relay.clients.push(client);
+        dropping(&mut relay, Message::DropInput);
+        assert!(relay.clients[0].out.is_empty(), "nothing is said");
     }
 }

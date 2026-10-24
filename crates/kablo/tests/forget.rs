@@ -20,7 +20,7 @@ const SH: [&str; 2] = ["--", "/bin/sh"];
 
 /// The kind after the last this version has: to it what `forget` is to a relay from before
 /// `forget` existed. (A server that does not know a kind skips the frame and reads on.)
-const UNKNOWN_KIND: u8 = 0x13;
+const UNKNOWN_KIND: u8 = 0x14;
 
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
