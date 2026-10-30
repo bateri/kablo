@@ -28,10 +28,12 @@
 //! connection there is and never again. One that finds the link without a
 //! connection is answered with an error and typed nowhere; one whose connection
 //! is lost before the `ping` that follows it was answered leaves the client with an
-//! error that says it cannot know ([`UNSURE`]). A `ping` is the link's business
-//! only while a `write` waits for one ([`Link::awaits_confirmation`]); any other is
-//! the owner's to answer, since a link that is replaced must not take a pulse for
-//! typing.
+//! error that says it cannot know ([`UNSURE`]). `input` the client sends is
+//! answered the same way: the `ping` after it goes to the relay, which answers
+//! it once the program's terminal has taken what came before it. A `ping` is the
+//! link's business only while a `write` or `input` waits for one
+//! ([`Link::awaits_confirmation`]); any other is the owner's to answer, since a
+//! link that is replaced must not take a pulse for typing.
 //!
 //! The link talks to its owner through packets: [`Link::send`] takes what the
 //! client sent, and everything that is to go back to the client is pushed to
@@ -197,8 +199,8 @@ impl Link {
         self.attach.is_some()
     }
 
-    /// Whether a `write` is waiting to be confirmed: one went on the connection
-    /// and the `pong` of a `ping` after it has not come. A `ping` the client
+    /// Whether a `write` or `input` is waiting to be confirmed: one went on the
+    /// connection and the `pong` of a `ping` after it has not come. A `ping` the client
     /// sends now is the answer to that, and goes to the session (its `pong`
     /// comes after the `write`'s `error`); any other is not the link's.
     pub fn awaits_confirmation(&self) -> bool {
@@ -286,6 +288,10 @@ impl Link {
                 self.pings += 1;
                 self.typed = false;
             }
+            // Input is typed on the connection there is, as a `write` is, and
+            // a `ping` after it is how the client learns the terminal took it:
+            // the relay answers that one, so it must reach the relay.
+            Message::Input(_) => self.typed = true,
             _ => {}
         }
         let Some(peer) = self.peer.as_mut() else {

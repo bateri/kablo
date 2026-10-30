@@ -33,6 +33,27 @@ section is not released.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Typing a lot at a program that reads slowly no longer loses input without a word.** A
+  ping that names a session is now answered after the program's terminal has taken
+  everything the connection typed to the session before it, where it used to be answered at once. A client
+  that sends a ping after each batch of input knows how much of it has arrived and can hold
+  the rest back, instead of overflowing the one megabyte the bridge and the session keep
+  for a program that is not reading (the overflow was an `unavailable` or `input_full`
+  error that did not say which input it dropped).
+
+### For apps
+
+- **`ping` is a barrier for the input before it.** A `Ping` that names a session gets its
+  `Pong` once the program's terminal has taken all the `Input` the connection sent before the
+  ping (`kablo-proto`'s `Message::Ping`); a `Write` is not waited for, as before. A ping with
+  no session is a pulse and is answered at once. Through `kablo attach`, a ping that follows `Input` is sent
+  on to the session, as one after `Write` always was; if the connection to the session is
+  lost before the `Pong`, the ping is answered with the same `unavailable` error that a
+  `Write` gets. An older server answers at once, so a client that waits for the `Pong` to
+  send more must also bound how much it sends without one.
+
 ## [0.5.0] - 2026-10-30
 
 A terminal shown from a picture, after more output than the session kept, now comes back

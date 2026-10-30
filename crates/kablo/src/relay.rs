@@ -77,6 +77,7 @@
 //! exactly one reads the terminal at any time; a client that was here comes
 //! back, to the relay that took over, with the offset it had.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -115,6 +116,9 @@ const OUT_LIMIT: usize = 4 << 20;
 /// program is owed must never keep a person from asking about the session or
 /// ending it.
 const INPUT_LIMIT: usize = 1 << 20;
+
+/// `ping`s one client may have waiting for the terminal to take its input.
+const PINGS_WAITING: usize = 1024;
 
 /// How long after the last output, or the last input a client typed, the
 /// terminal is looked at once more. The look at the end of a turn that read
@@ -287,6 +291,14 @@ struct Client {
     /// Telling it is not delivery: the session is kept for the clients that
     /// were attached to it ([`Relay::drive`]).
     waiting: bool,
+    /// The `ping`s it sent that name the session and are not answered yet: each
+    /// waits for the program's terminal to take the input that was queued before
+    /// it. `(owed, session, bytes)`: answered once [`Relay::input_taken`] has
+    /// reached `owed`.
+    pings: VecDeque<(u64, Option<SessionId>, Vec<u8>)>,
+    /// What [`Relay::input_queued`] was after the last `input` it sent: the bytes
+    /// of it are the ones a `ping` of its own waits for.
+    typed_to: u64,
 }
 
 impl Client {
@@ -371,6 +383,10 @@ struct Relay {
     final_drained: bool,
     input: Vec<u8>,
     input_sent: usize,
+    /// Every byte of input ever queued for the program (what [`Self::input`]
+    /// holds and what the terminal has taken of it already). The terminal has
+    /// taken `input_queued - input_pending()` of them.
+    input_queued: u64,
     /// The screen of the stream up to `screen_at`.
     screen: Screen,
     /// The offset after the last journal byte the screen has had.
@@ -536,6 +552,7 @@ impl Relay {
             final_drained: false,
             input: Vec::new(),
             input_sent: 0,
+            input_queued: 0,
             screen,
             screen_at,
             forgotten: 0,
@@ -633,6 +650,7 @@ impl Relay {
                 }
             }
             self.answer_questions();
+            self.answer_pings();
             self.look_at_the_terminal();
             for i in 0..self.clients.len() {
                 self.drive(i);
@@ -1112,6 +1130,8 @@ impl Relay {
             upgrading: false,
             asked: None,
             waiting: false,
+            pings: VecDeque::new(),
+            typed_to: 0,
         });
     }
 
@@ -1213,6 +1233,54 @@ impl Relay {
         }
     }
 
+    /// Answers a `ping`. One that names the session is answered once the
+    /// program's terminal has taken the `input` this client sent before it: it
+    /// is how a sender that types more than a terminal holds learns how much of
+    /// it has arrived. (A `write` is not waited for: it is queued whole or
+    /// refused whole, and its `pong` says which.) One with no session is a
+    /// pulse and is answered at once.
+    fn ping(&mut self, i: usize, session: Option<SessionId>, bytes: Vec<u8>) {
+        let owed = self.clients.get(i).map_or(0, |client| client.typed_to);
+        if session.is_none() || self.input_taken() >= owed {
+            return self.queue(i, session, Message::Pong(bytes));
+        }
+        let Some(client) = self.clients.get_mut(i) else {
+            return;
+        };
+        if client.pings.len() >= PINGS_WAITING {
+            return self.error(i, ErrorCode::INPUT_FULL, "too many pings are waiting");
+        }
+        client.pings.push_back((owed, session, bytes));
+    }
+
+    /// How many of the bytes queued for the program its terminal has taken (or
+    /// that were dropped because nobody will read them).
+    fn input_taken(&self) -> u64 {
+        self.input_queued
+            .saturating_sub(self.input_pending() as u64)
+    }
+
+    /// Answers the `ping`s whose input the terminal has taken, in the order
+    /// they came.
+    fn answer_pings(&mut self) {
+        let taken = self.input_taken();
+        let mut due = Vec::new();
+        for (i, client) in self.clients.iter_mut().enumerate() {
+            while client
+                .pings
+                .front()
+                .is_some_and(|(owed, ..)| *owed <= taken)
+            {
+                if let Some((_, session, bytes)) = client.pings.pop_front() {
+                    due.push((i, session, bytes));
+                }
+            }
+        }
+        for (i, session, bytes) in due {
+            self.queue(i, session, Message::Pong(bytes));
+        }
+    }
+
     fn error(&mut self, i: usize, code: ErrorCode, text: &str) {
         let session = Some(self.id.clone());
         self.queue(
@@ -1234,7 +1302,7 @@ impl Relay {
             );
         }
         match packet.message {
-            Message::Ping(bytes) => self.queue(i, packet.session, Message::Pong(bytes)),
+            Message::Ping(bytes) => self.ping(i, packet.session, bytes),
             Message::List => self.ask(i, Question::List),
             Message::Status => self.ask(i, Question::Status),
             Message::New(_) => self.error(
@@ -1455,6 +1523,10 @@ impl Relay {
             self.error(i, ErrorCode::INPUT_FULL, "the program is not taking input");
             return;
         }
+        let queued = self.input_queued;
+        if let Some(client) = self.clients.get_mut(i) {
+            client.typed_to = queued;
+        }
         // What is typed may start a program that says nothing.
         self.settle.arm(Instant::now());
     }
@@ -1499,6 +1571,7 @@ impl Relay {
             self.input_sent = 0;
         }
         self.input.extend_from_slice(bytes);
+        self.input_queued += bytes.len() as u64;
         self.flush_input();
         true
     }
@@ -2017,6 +2090,7 @@ mod tests {
             final_drained: false,
             input: Vec::new(),
             input_sent: 0,
+            input_queued: 0,
             clients: Vec::new(),
             ended_told: false,
             keep: EndKeep::default(),
@@ -2284,6 +2358,8 @@ mod tests {
             upgrading: false,
             asked: None,
             waiting: false,
+            pings: VecDeque::new(),
+            typed_to: 0,
         };
         (client, far)
     }

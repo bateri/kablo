@@ -12,8 +12,9 @@
 //! to the client as it is. The program's bytes are not looked at, and the bridge
 //! keeps no copy of them: a client that comes back asks for its offset again.
 //! Four things it answers itself, because they are about the connection and
-//! not a session: `ping`, unless it names a session the client has a link to (the
-//! relay answers that one, after what was written to it: it is how a client
+//! not a session: `ping`, unless it names a session the client has written or
+//! typed to and not yet had a `pong` for (the relay answers that one, once the
+//! program's terminal has taken what was sent before it: it is how a client
 //! learns that keys were typed); `list`, by asking every relay for its status;
 //! `new`, by starting the session as `kablo new` does and answering with the
 //! new session's status; and `label`, by writing the session's label file.

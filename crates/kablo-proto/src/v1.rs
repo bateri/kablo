@@ -1524,7 +1524,14 @@ pub enum Message {
     /// Client to server: start a session. The session id in the packet is the
     /// one asked for; without one the server makes a name.
     New(NewSession),
-    /// Client to server: answer with a `Pong` carrying the same bytes.
+    /// Client to server: answer with a `Pong` carrying the same bytes. A `Ping`
+    /// that names a session is answered once the program's terminal has taken
+    /// all the `Input` the connection sent before it: a sender that wants to
+    /// know how much of what it typed has arrived sends a `Ping` after it, and a
+    /// program that reads slowly delays the `Pong` and not the input. (A `Write`
+    /// is not waited for: its `Pong` says it was queued whole or refused.) A server that predates this answers at
+    /// once, and a client that does not wait for the `Pong` sees no difference.
+    /// A `Ping` with no session is a pulse and is answered at once.
     Ping(Vec<u8>),
     /// Client to server: say what you can do beyond sessions. Answered by
     /// `FeaturesReply`, which a server that has it sends before the `Pong` of a
