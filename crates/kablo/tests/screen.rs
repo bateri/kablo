@@ -94,6 +94,62 @@ fn a_client_that_missed_more_than_the_ring_holds_gets_the_screen_and_then_the_st
     same(rebuilt(&picture, &late.data), whole(&witness.data, 80, 24));
 }
 
+/// Where `needle` first is in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[test]
+fn a_picture_tells_the_shells_marks_the_ring_no_longer_holds() {
+    let mut env = Env::new();
+    let id = env.start("marks", &SMALL_RING);
+    let mut witness = env.connect(&id);
+    witness.attach(0);
+    witness
+        .type_in("printf '\\033]133;A;bt_block=1\\007\\033]7;file:///first\\007mark-%s\\n' one\n");
+    witness.wait_for("mark-one\r\n", 0);
+    print_lines(&mut witness, 300);
+    witness.type_in(
+        "printf '\\033]133;D;0;bt_block=1\\007\\033]133;A;bt_block=2\\007mark-%s\\n' two\n",
+    );
+    witness.wait_for("mark-two\r\n", 0);
+    let mut control = env.connect(&id);
+    settle(&mut control, &mut witness);
+    let first = find(&witness.data, b"\x1b]133;A;bt_block=1\x07").unwrap();
+    assert!(
+        (first as u64) < control.status().retained_from,
+        "the ring no longer holds the first mark"
+    );
+
+    let mut late = env.connect(&id);
+    let (_, truncated) = late.attach(0);
+    assert!(truncated, "what it asked for is gone");
+    late.until("the picture", |c| {
+        c.pictures.last().is_some_and(|p| p.complete)
+    });
+    let picture = &late.picture().bytes;
+    // Told again in the order they came, after the screen.
+    let at = |mark: &[u8]| {
+        find(picture, mark).unwrap_or_else(|| {
+            panic!(
+                "{:?} in {:?}",
+                String::from_utf8_lossy(mark),
+                String::from_utf8_lossy(picture)
+            )
+        })
+    };
+    let marks = [
+        at(b"\x1b]133;A;bt_block=1\x07"),
+        at(b"\x1b]7;file:///first\x07"),
+        at(b"\x1b]133;D;0;bt_block=1\x07"),
+        at(b"\x1b]133;A;bt_block=2\x07"),
+    ];
+    assert!(marks.is_sorted(), "{marks:?}");
+    assert!(marks[0] > at(b"mark-two"), "after the screen");
+}
+
 #[test]
 fn a_picture_is_made_for_the_size_the_client_says() {
     let mut env = Env::new();

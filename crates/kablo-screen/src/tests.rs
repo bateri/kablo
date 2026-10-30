@@ -13,6 +13,7 @@ use alacritty_terminal::vte::ansi::{
 use super::*;
 use crate::image::{LAST_SETTABLE_COLOR, MODES, MODES_NOT_WRITTEN, Pen, Probed, encode, live_link};
 use crate::kept::Kept;
+use crate::marks::{DIRECTORY_HOSTS, DOCK_LIMIT, MARK_LIMIT, PROMPT_BYTES};
 use crate::tail::KEEP_LIMITS;
 
 const HISTORY: usize = 1000;
@@ -1275,4 +1276,219 @@ fn a_forget_while_a_program_holds_the_alternate_screen_waits_for_it_to_give_it_b
     let mut other = fed(10, 3, &numbered(20));
     other.feed(b"\x1b[?1049halt\r\n\x1b[?1049l");
     assert!(other.text(HISTORY, false).len() > 3);
+}
+
+// ─── the shell's marks ───────────────────────────────────────────────────────────────
+
+/// The marks a tail keeps after `bytes`, as text, in the order they came.
+fn marks_after(bytes: &[u8]) -> Vec<String> {
+    let mut tail = Tail::default();
+    tail.feed(bytes);
+    marks_of(&tail)
+}
+
+fn marks_of(tail: &Tail) -> Vec<String> {
+    tail.marks().in_order().into_iter().map(lossy).collect()
+}
+
+/// A zsh with bateri's integration: a first prompt, a command that runs and ends, and the
+/// prompt after it with a line being typed.
+const SHELL: &[u8] = b"\x1b]133;A;bt_block=1\x07\x1b]7;file:///Users/me\x07\
+\x1b]8133;b;bWFpbg==\x07\x1b]8;;bateri://block/1\x07  \x1b]133;B\x07\x1b]8133;w\x07\
+\x1b]8133;u;0;;;;\x07\x1b]8133;u;4;;YnRvcA==;;\x07\x1b]8133;e\x07btop\r\n\x1b]133;C\x07\
+\x1b[?1049hthe program\x1b[?1049l\x1b]133;D;0;bt_block=1\x07\x1b]133;A;bt_block=2\x07\
+\x1b]7;file:///Users/me/src\x07\x1b]8133;b;bWFpbg==\x07\x1b]8;;bateri://block/2\x07  \
+\x1b]133;B\x07\x1b]8133;w\x07\x1b]8133;u;2;;bHM=;;\x07";
+
+#[test]
+fn the_marks_a_shell_leaves_are_kept_in_the_order_they_came() {
+    assert_eq!(
+        marks_after(SHELL),
+        [
+            "133;A;bt_block=1",
+            "133;B",
+            "8133;e",
+            "133;C",
+            "133;D;0;bt_block=1",
+            "133;A;bt_block=2",
+            "7;file:///Users/me/src",
+            "8133;b;bWFpbg==",
+            "133;B",
+            "8133;w",
+            "8133;u;2;;bHM=;;",
+        ]
+    );
+    // The first prompt's dock marks are the ones the second prompt's replaced; the line
+    // that finished (`e`) stays, before the prompt that came after it.
+    let mut finished = SHELL.to_vec();
+    finished.extend_from_slice(b"\x1b]8133;e\x07");
+    assert_eq!(
+        marks_after(&finished).last().map(String::as_str),
+        Some("8133;e")
+    );
+    assert!(marks_after(b"plain text\r\n\x1b[1mbold\x1b[0m").is_empty());
+}
+
+#[test]
+fn the_image_tells_the_marks_again_after_the_modes_and_before_the_open_sequence() {
+    let mut stream = SHELL.to_vec();
+    stream.extend_from_slice(b"\x1b[?1016h\x1b]8133;u;3;;bHM=");
+    let mut original = fed(40, 8, &stream);
+    let marks = marks_of(&original.tail);
+    let image = original.image();
+    let told: Vec<u8> = marks
+        .iter()
+        .flat_map(|mark| [b"\x1b]".as_slice(), mark.as_bytes(), b"\x07"].concat())
+        .collect();
+    assert!(
+        image.ends_with(&[told.as_slice(), b"\x1b]8133;u;3;;bHM="].concat()),
+        "{:?}",
+        lossy(&image)
+    );
+    let modes = image
+        .windows(8)
+        .position(|window| window == b"\x1b[?1016h")
+        .expect("the modes are written");
+    assert!(modes + 8 <= image.len() - told.len() - 16);
+    // The screen the image builds keeps the same marks and writes the same image; so does
+    // the screen that wrote it, which is built from it again.
+    let mut replayed = fed(40, 8, &image);
+    assert_eq!(marks_of(&replayed.tail), marks);
+    assert_eq!(readable(&replayed), readable(&original));
+    assert_same_bytes(&replayed.image(), &image);
+    assert_eq!(marks_of(&original.tail), marks);
+    assert_same_bytes(&original.image(), &image);
+    // The line goes on where it stood, in both.
+    original.feed(b";;\x07");
+    replayed.feed(b";;\x07");
+    assert_eq!(marks_of(&original.tail), marks_of(&replayed.tail));
+    assert_eq!(
+        marks_of(&original.tail).last().map(String::as_str),
+        Some("8133;u;3;;bHM=;;")
+    );
+}
+
+#[test]
+fn a_dock_mark_is_kept_as_the_last_of_its_kind_and_a_remote_shells_apart() {
+    assert_eq!(
+        marks_after(
+            b"\x1b]8133;u;1;;YQ==;;\x07\x1b]8133;bt_remote=1.2.3;u;1;;Yg==;;\x07\
+\x1b]8133;u;2;;YWE=;;\x07\x1b]8133;bt_remote=1.2.4;w\x07\x1b]8133;bt_remote=1.2.4;u;0;;;;\x07"
+        ),
+        [
+            "8133;u;2;;YWE=;;",
+            "8133;bt_remote=1.2.4;w",
+            "8133;bt_remote=1.2.4;u;0;;;;",
+        ]
+    );
+    // What happened once is not told again, nor what is not a kind.
+    assert!(
+        marks_after(
+            b"\x1b]8133;f;nokablo\x07\x1b]8133;bt_remote=1.2.3;i;up;ab12\x07\x1b]8133;x\x07\
+\x1b]8133;uu\x07\x1b]8133\x07\x1b]8133;\x07\x1b]8133;a=b\x07"
+        )
+        .is_empty()
+    );
+    // A line too long for a terminal to take leaves no line of its kind, not the one before.
+    let mut long = b"\x1b]8133;w\x07\x1b]8133;u;1;;YQ==;;\x07\x1b]8133;u;0;;".to_vec();
+    long.extend(std::iter::repeat_n(b'Q', DOCK_LIMIT));
+    long.extend_from_slice(b";;\x07");
+    assert_eq!(marks_after(&long), ["8133;w"]);
+}
+
+#[test]
+fn each_host_keeps_its_last_directory_and_only_the_newest_hosts_are_kept() {
+    assert_eq!(
+        marks_after(
+            b"\x1b]7;file:///a\x07\x1b]7;file://server/srv\x07\x1b]7;file:///b\x07\
+\x1b]7;kitty-shell-cwd://x/y\x07"
+        ),
+        [
+            "7;file://server/srv",
+            "7;file:///b",
+            "7;kitty-shell-cwd://x/y"
+        ]
+    );
+    let hosts: Vec<u8> = (0..=DIRECTORY_HOSTS)
+        .flat_map(|n| format!("\x1b]7;file://host{n}/dir\x07").into_bytes())
+        .collect();
+    let kept = marks_after(&hosts);
+    assert_eq!(kept.len(), DIRECTORY_HOSTS);
+    assert_eq!(kept.first().map(String::as_str), Some("7;file://host1/dir"));
+}
+
+#[test]
+fn the_oldest_prompt_marks_go_past_the_bound_and_a_mark_too_long_is_not_kept() {
+    let commands = PROMPT_BYTES / 40;
+    let stream: Vec<u8> = (1..=commands)
+        .flat_map(|n| {
+            format!("\x1b]133;A;bt_block={n}\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0;bt_block={n}\x07")
+                .into_bytes()
+        })
+        .collect();
+    let kept = marks_after(&stream);
+    let bytes: usize = kept.iter().map(String::len).sum();
+    assert!(bytes <= PROMPT_BYTES, "{bytes}");
+    assert!(bytes > PROMPT_BYTES - 32, "{bytes}");
+    assert_eq!(
+        kept.last().map(String::as_str),
+        Some(format!("133;D;0;bt_block={commands}").as_str())
+    );
+    assert!(!kept.iter().any(|mark| mark == "133;A;bt_block=1"));
+
+    let mut long = b"\x1b]133;A;bt_block=1\x07\x1b]133;D;0;".to_vec();
+    long.extend(std::iter::repeat_n(b'x', MARK_LIMIT));
+    long.push(0x07);
+    assert_eq!(marks_after(&long), ["133;A;bt_block=1"]);
+}
+
+#[test]
+fn a_mark_is_one_the_parser_would_dispatch() {
+    // The four ends a sequence has, and the C0 controls inside it left out.
+    assert_eq!(
+        marks_after(b"\x1b]133;A\x1b\\\x1b]133;B\x18\x1b]133;C\x1a\x1b]133;D;\r0\x07"),
+        ["133;A", "133;B", "133;C", "133;D;0"]
+    );
+    // The bytes in another string, a number that is not one of these, a cancelled escape.
+    for ignored in [
+        &b"\x1bP1$r\x1b]133;A"[..],
+        b"\x1b_G]133;A\x1b\\",
+        b"\x1b]0133;A\x07",
+        b"\x1b]1337;A\x07",
+        b"\x1b]133",
+        b"\x1b]0;133;A\x07",
+    ] {
+        assert!(
+            marks_after(ignored).is_empty(),
+            "{:?}: {:?}",
+            lossy(ignored),
+            marks_after(ignored)
+        );
+    }
+    // However the stream is cut.
+    let whole = marks_after(SHELL);
+    for piece in [1, 2, 3, 7, 64] {
+        let mut tail = Tail::default();
+        for chunk in SHELL.chunks(piece) {
+            tail.feed(chunk);
+        }
+        assert_eq!(marks_of(&tail), whole, "pieces of {piece}");
+    }
+}
+
+#[test]
+fn a_reset_and_a_forget_leave_the_marks_where_they_are() {
+    let mut screen = fed(20, 3, SHELL);
+    let marks = marks_of(&screen.tail);
+    screen.feed(b"\x1bc");
+    assert_eq!(marks_of(&screen.tail), marks);
+    screen.feed(&numbered(10));
+    screen.forget_history();
+    assert_eq!(marks_of(&screen.tail), marks);
+    let image = screen.image();
+    assert!(
+        has(&image, b"\x1b]133;A;bt_block=2\x07"),
+        "{:?}",
+        lossy(&image)
+    );
 }

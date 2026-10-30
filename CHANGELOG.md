@@ -33,6 +33,29 @@ section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **A terminal shown from a picture keeps its shell's prompt.** When a client missed more
+  output than the session kept (a long build, a program that redraws for an hour), the
+  picture it gets now ends with the marks a shell integration left in the stream: where
+  its prompts and commands started and ended, its directory and the line it is editing.
+  A terminal that draws its prompts and commands from those marks shows them again,
+  instead of plain text until the shell's next prompt.
+
+### For apps
+
+- **A picture ends with the shell's marks, in the order they came** (`kablo-screen`'s
+  `Screen::image`), after the modes and before the sequence the stream stopped in, as
+  `ESC ] … BEL`: every OSC 133 mark (the newest 128 KiB of them, a mark longer than 512
+  bytes left out), the last OSC 7 of each host (the `file://` URL's authority; the newest
+  8 hosts), and the last OSC 8133 of each kind `u`, `e`, `o`, `b`, `w` and `g` (up to
+  64.5 KiB; a longer one leaves its kind with none), apart for each set of `name=` fields
+  before the kind (`bt_remote=`), whatever their values. The other OSC 8133 kinds
+  (`f`, `i`) say what happened once and are not told again. A full reset (`ESC c`) and a
+  forgotten past (`forget_past`) leave them: a picture taken after either still has them.
+  A client that reads them from a picture reads them as the past, as it reads the output
+  it replays (the program is not waiting for an answer to them).
+
 ## [0.4.0] - 2026-10-24
 
 An app can now ask a session to drop the input its program has not read, so the

@@ -1,6 +1,8 @@
-//! The sequence a read stopped in, and the two modes the parser does not keep.
+//! The sequence a read stopped in, the two modes the parser does not keep, and the shell's
+//! marks.
 
 use crate::kept::Kept;
+use crate::marks::Marks;
 
 /// Where the parser stands, as far as [`Tail`] needs: vte's states folded into the ones
 /// that end a sequence alike (`vte-0.15.0/src/lib.rs`).
@@ -53,7 +55,8 @@ const APC_KEEP: usize = (64 << 20) + 4096;
 ///
 /// The same walk sees every sequence end, so it is also where [`Kept`] follows the modes
 /// `alacritty_terminal` drops (`?1016`, `?2048`): a CSI that ends tells it, and so does
-/// `ESC c`. Fed an image that wrote them, a new `Tail` is back where the old one was.
+/// `ESC c`. Fed an image that wrote them, a new `Tail` is back where the old one was. Every
+/// OSC that ends goes to [`Marks`] the same way, as the parser dispatches it.
 ///
 /// **Known limit:** the cut is per code point, not per cluster: an emoji sequence cut
 /// **between** two code points comes back as two clusters in a terminal that clusters
@@ -66,6 +69,8 @@ pub(crate) struct Tail {
     bytes: Vec<u8>,
     /// The modes the program turned on that `Term` has no bit for.
     kept: Kept,
+    /// The shell's marks the stream left.
+    marks: Marks,
     /// How many bytes an application program command may hold ([`APC_KEEP`]; a test
     /// makes it small).
     apc_keep: usize,
@@ -78,6 +83,7 @@ impl Default for Tail {
             utf8_need: 0,
             bytes: Vec::new(),
             kept: Kept::default(),
+            marks: Marks::default(),
             apc_keep: APC_KEEP,
         }
     }
@@ -100,6 +106,17 @@ impl Tail {
     /// The modes the stream turned on that `Term` does not keep.
     pub(crate) fn kept(&self) -> Kept {
         self.kept
+    }
+
+    /// The shell's marks the stream left.
+    pub(crate) fn marks(&self) -> &Marks {
+        &self.marks
+    }
+
+    /// The OSC open in [`Tail::bytes`] ends here and the parser dispatches it: its payload is
+    /// what follows `ESC ]`.
+    fn dispatch_osc(&mut self) {
+        self.marks.osc(self.bytes.get(2..).unwrap_or_default());
     }
 
     fn ground(&mut self) {
@@ -242,9 +259,16 @@ impl Tail {
                 0x1b => self.escape(),
                 _ => self.bytes.push(byte),
             },
+            // All four end the sequence and dispatch it (vte's `osc_end`).
             Seq::Osc => match byte {
-                0x07 | 0x18 | 0x1a => self.ground(),
-                0x1b => self.escape(),
+                0x07 | 0x18 | 0x1a => {
+                    self.dispatch_osc();
+                    self.ground();
+                }
+                0x1b => {
+                    self.dispatch_osc();
+                    self.escape();
+                }
                 // Ignored inside an OSC.
                 _ if executed => {}
                 _ => self.bytes.push(byte),

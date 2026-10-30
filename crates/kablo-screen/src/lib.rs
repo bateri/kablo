@@ -27,6 +27,15 @@
 //! off. The screen only remembers them: it sends no report of the size when `?2048` is
 //! turned on, which is the terminal's owner to do.
 //!
+//! **The shell's marks travel too** (`marks`): a shell integrated with its terminal says where
+//! its prompts and commands start and end (OSC 133), its directory (OSC 7) and, to bateri, the
+//! line it edits (OSC 8133), and the emulator drops all of it. The screen follows the stream
+//! for the state they leave — every prompt mark (the newest 128 KiB of them), each host's last
+//! directory, the last dock mark of each kind that says what is so — and the image ends with
+//! them in the order they came, after the modes, so a terminal that builds its blocks and its
+//! prompt from them has them back with the screen. Neither `ESC c` nor a forget of the history
+//! takes them away.
+//!
 //! **What it does not**: kitty graphics (the parser drops those commands; an image is a
 //! text screen); any other mode `alacritty_terminal` keeps no bit for; the selection and vi mode, which are the terminal's own; a title that was never set
 //! after one that was comes back as the empty title; G2 or G3 as the active character set
@@ -58,6 +67,7 @@
 mod image;
 mod kept;
 mod keys;
+mod marks;
 mod tail;
 mod text;
 
@@ -272,6 +282,9 @@ impl Screen {
         // The modes `Term` drops are the stream's, not the terminal's: written here, from
         // what the stream said, and read back by the `feed` of the image below.
         self.tail.kept().write(&mut image);
+        // The shell's marks last, in the order they came: what they say of a prompt is said
+        // of the screen above.
+        self.tail.marks().write(&mut image);
         image.extend_from_slice(self.tail.bytes());
 
         // The terminal is spent: a new one learns everything from the image, the title
