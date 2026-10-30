@@ -33,6 +33,12 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-30
+
+A terminal shown from a picture, after more output than the session kept, now comes back
+with its shell's prompt and commands: the picture ends with the marks a shell integration
+left in the stream.
+
 ### Changed
 
 - **A terminal shown from a picture keeps its shell's prompt.** When a client missed more
