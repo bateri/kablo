@@ -1112,7 +1112,17 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let got = arg0_of(child.id());
+        // The kernel may show the program it became a moment after `spawn` returns.
+        let start = std::time::Instant::now();
+        let got = loop {
+            let got = arg0_of(child.id());
+            if got.as_deref() == Some(&b"claude"[..])
+                || start.elapsed() > std::time::Duration::from_secs(5)
+            {
+                break got;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         let as_shown = {
             let mut watch = Watch::default();
             watch.called(child.id(), b"2.1.296".to_vec())

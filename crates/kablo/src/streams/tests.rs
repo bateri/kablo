@@ -1373,7 +1373,9 @@ fn a_close_ends_the_program_and_what_it_started_and_collects_them() {
     assert!(!pids.iter().any(|&pid| gone(pid)));
     p.send(1, Message::Close);
     assert!(p.server.is_empty(), "the stream is gone at once");
-    assert_eq!(p.server.dying.len(), 1);
+    // A program that ends at the signal may be collected in the same turn, so it is waited for
+    // rather than counted among the dying.
+    assert!(p.server.dying.len() <= 1);
     p.until("the program to be collected", |p| p.server.dying.is_empty());
     wait_gone("the program and what it started", &pids);
     assert_eq!(
