@@ -33,6 +33,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-31
+
 ### Fixed
 
 - **Typing a lot at a program that reads slowly no longer loses input without a word.** A
