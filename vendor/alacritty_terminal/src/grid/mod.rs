@@ -1,3 +1,8 @@
+// Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
+// `Grid::scroll_up` asks for the rows it will recycle soon to be brought into the cache
+// (`Row::prefetch_for_reset`). Nothing else in this file differs from the release; FORK.md
+// lists the changes of the whole package.
+
 //! A specialized 2D grid implementation optimized for use in a terminal.
 
 use std::cmp::{max, min};
@@ -15,6 +20,9 @@ mod row;
 mod storage;
 #[cfg(test)]
 mod tests;
+
+/// How many lines before it is recycled a line of the history is asked for.
+const PREFETCH_AHEAD: usize = 32;
 
 pub use self::row::Row;
 use self::storage::Storage;
@@ -303,6 +311,21 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // Ensure all new lines are fully cleared.
         for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
             self.raw[i].reset(&self.cursor.template);
+        }
+
+        // With a full history the lines reset above are the oldest of it, long out of the
+        // cache, and the ones to follow are the oldest now. Ask for the cells of the lines
+        // `PREFETCH_AHEAD` turns from the end of the history, so they are close when it comes
+        // to them (a program printing without pause scrolls one line per few hundred
+        // nanoseconds, and waiting for memory is most of what a reset costs).
+        if region.start == 0 {
+            let history = self.history_size();
+            if history > PREFETCH_AHEAD + positions {
+                for i in 0..positions {
+                    let line = Line(PREFETCH_AHEAD as i32 + i as i32 - history as i32);
+                    self.raw[line].prefetch_for_reset();
+                }
+            }
         }
     }
 

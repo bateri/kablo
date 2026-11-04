@@ -74,6 +74,17 @@ below) and with its default features, so upstream's reference tests run too.
   `--config` with the `[patch.crates-io]` the package is not part of, and the `vte` entry of
   `Cargo.lock` is the path instead of the registry).
 
+- **The rows a scroll will recycle are asked for ahead of their turn.** With a full history
+  every scroll resets the oldest row, whose cells nothing has touched for as many scrolls as
+  the history has lines, so they are in memory and not in any cache, and `Row::reset` is
+  mostly waiting for them (on plain text it was over half of what `Term` cost). `Grid::scroll_up`
+  now also calls the new `Row::prefetch_for_reset` on the lines that will come up 32 scrolls
+  later, which issues the CPU's prefetch hint (`prfm` on aarch64, `prefetcht0` on x86_64,
+  nothing elsewhere) for the cache lines of their occupied cells. Nothing is read or written as
+  far as the program can tell: the cell, the storage and every result are as they were. Touches
+  `src/grid/mod.rs`, `src/grid/row.rs` and `src/grid/tests.rs` (all carry the §4(b) notice).
+  Test: `prefetching_for_a_reset_changes_nothing`.
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri only

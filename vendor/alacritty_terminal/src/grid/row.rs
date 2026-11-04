@@ -1,8 +1,12 @@
+// Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
+// `Row::prefetch_for_reset` was added. Nothing else in this file differs from the release;
+// FORK.md lists the changes of the whole package.
+
 //! Defines the Row type which makes up lines in the grid.
 
 use std::cmp::{max, min};
 use std::ops::{Index, IndexMut, Range, RangeFrom, RangeFull, RangeTo, RangeToInclusive};
-use std::{ptr, slice};
+use std::{mem, ptr, slice};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -84,6 +88,23 @@ impl<T: Default> Row<T> {
         self.occ = min(self.occ, columns);
 
         if new_row.is_empty() { None } else { Some(new_row) }
+    }
+
+    /// Ask the CPU to bring the cells a [`reset`](Self::reset) will touch into its cache.
+    ///
+    /// Only a hint: nothing is read or written as far as the program can tell. The rows a
+    /// scroll recycles are the oldest of a long history, so a row's cells are in memory and
+    /// nowhere closer when its turn comes, and the reset waits for them; asked for some rows
+    /// ahead of their turn, they arrive meanwhile.
+    #[inline]
+    pub fn prefetch_for_reset(&self) {
+        let bytes = self.occ * mem::size_of::<T>();
+        let start = self.inner.as_ptr().cast::<u8>();
+
+        // One hint per cache line (64 bytes on every target that has the hint at all).
+        for offset in (0..bytes).step_by(64) {
+            prefetch_for_write(start.wrapping_add(offset));
+        }
     }
 
     /// Reset all cells in the row to the `template` cell.
@@ -290,4 +311,28 @@ impl<T> IndexMut<RangeToInclusive<Column>> for Row<T> {
         self.occ = max(self.occ, *index.end + 1);
         &mut self.inner[..=(index.end.0)]
     }
+}
+
+/// The hint that `ptr` will be written soon, where the target has one. It never faults, so
+/// the address needs no checking.
+#[inline(always)]
+fn prefetch_for_write(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` is a hint; it reads and writes nothing the program can see.
+    unsafe {
+        std::arch::asm!(
+            "prfm pstl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the same, for the x86 hint.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
 }
