@@ -102,6 +102,18 @@ workspace depends on).
   (`utf8_char_len` against `str::from_utf8`) in `lib.rs`, and
   `repeating_after_a_run_repeats_its_last_character` in `ansi.rs`. A parser bump must carry it.
 
+- **The numbers of a CSI sequence are taken in one step.** Where the walk over a read meets an
+  escape followed by `[`, `advance_ground` now takes the digits and semicolons after it (and
+  the final byte, when it is there) with the very actions `change_state` takes for them in the
+  states `CsiEntry` and `CsiParam` (`advance_csi_numbers`), without going through the state
+  machine byte by byte; a byte that is anything else (a marker, a colon, an intermediate, a
+  control, a byte outside ASCII) or the end of the read stops it with the parser in the state
+  the machine would be in, and the machine goes on from there. Every color change is such a
+  sequence. Nothing the performer is told changes. Test:
+  `csi_sequences_cut_anywhere_dispatch_what_the_whole_does` (a list of the ways a sequence
+  can leave its numbers and forty random mixes of CSI pieces, whole, one byte per read and every
+  two-way cut; a read of one byte never reaches the faster step, so it is the reference).
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri

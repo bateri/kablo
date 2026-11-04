@@ -672,11 +672,44 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         if bytes[done] == 0x1B {
             self.state = State::Escape;
             self.reset_params();
+
+            // `ESC [` is by far the most common escape (every color change is one), and its
+            // numbers need no step of the state machine each.
+            if bytes.get(done + 1) == Some(&b'[') {
+                self.state = State::CsiEntry;
+                return done + 2 + self.advance_csi_numbers(performer, &bytes[done + 2..]);
+            }
+
             return done + 1;
         }
 
         let plain_chars = memchr::memchr(0x1B, &bytes[done..]).unwrap_or(num_bytes - done);
         done + self.advance_ground_checked(performer, &bytes[done..], plain_chars)
+    }
+
+    /// Take the digits and semicolons at the start of `bytes` as the parameters of a CSI
+    /// sequence and, if a final byte follows, dispatch it; return how many bytes that took.
+    ///
+    /// These are the steps `change_state` takes in the states `CsiEntry` and `CsiParam` for
+    /// those bytes, one after the other, and where it would take another step (a byte that is
+    /// anything else, or the end of `bytes`) this stops with the parser in the state it would
+    /// be in.
+    #[inline(always)]
+    fn advance_csi_numbers<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        for (i, &byte) in bytes.iter().enumerate() {
+            match byte {
+                b'0'..=b'9' => self.action_paramnext(byte),
+                b';' => self.action_param(),
+                0x40..=0x7E => {
+                    self.action_csi_dispatch(performer, byte);
+                    return i + 1;
+                },
+                _ => return i,
+            }
+            self.state = State::CsiParam;
+        }
+
+        bytes.len()
     }
 
     /// Advance the parser from ground over `bytes`, whose first `plain_chars` bytes hold no
@@ -1993,6 +2026,62 @@ mod tests {
         // And the ends of a read.
         assert_eq!(utf8_char_len(&[0xE6]), None);
         assert_eq!(utf8_char_len(&[0xF0, 0x9F, 0x8E]), None);
+    }
+
+    #[test]
+    fn csi_sequences_cut_anywhere_dispatch_what_the_whole_does() {
+        // The numbers of a sequence that starts in a read are taken in one step, and a read
+        // that ends inside it, after any byte, leaves it to the steps of the state machine;
+        // reads of one byte take no other. Everything a CSI can contain is in the pieces:
+        // numbers, both separators, private markers, intermediates, controls, bytes that end it
+        // and others that do not belong in one, and enough numbers to overflow the list.
+        const PIECES: &[&[u8]] = &[
+            b"\x1b[", b"\x1b[", b"\x1b[", b"0", b"1", b"38", b"255", b"65535", b"999999", b";", b";",
+            b":", b"m", b"m", b"H", b"K", b"b", b"~", b"@", b"?", b"<", b">", b"=", b" ", b"!", b"\"",
+            b"/", b"\n", b"\x08", b"\x18", b"\x1a", b"\x1b", b"\x7f", b"\xC3\xA9", b"\xFF", b"\xC3",
+            b"abc", b" d", b"1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;",
+            b"25;26;27;28;29;30;31;32;33;34;35", b"\x1b]0;t\x07", b"\x1bM", b"\x1b(B",
+        ];
+
+        // And the ways a sequence leaves the numbers: a marker after a number is not one
+        // before it.
+        const CASES: &[&[u8]] = &[
+            b"\x1b[m", b"\x1b[1m", b"\x1b[;m", b"\x1b[1;m", b"\x1b[1?m", b"\x1b[?1m", b"\x1b[1:2m",
+            b"\x1b[:m", b"\x1b[ m", b"\x1b[1 m", b"\x1b[1!p", b"\x1b[1\nm", b"\x1b[1\x18m", b"\x1b[1\x1bm",
+            b"\x1b[1\xFFm", b"\x1b[1\xC3\xA9m", b"\x1b[99999999m", b"\x1b[1;2;3~x", b"\x1b[", b"\x1b[1",
+            b"\x1b[1;", b"\x1b[1;2m\x1b[3", b"\x1b[\x7f1m", b"\x1b[1\x7fm", b"\x1b[1m\x1b[2m\x1b[3m",
+        ];
+
+        let mut inputs: Vec<Vec<u8>> = CASES.iter().map(|case| case.to_vec()).collect();
+        for seed in 1..=40_u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            let mut bytes = Vec::new();
+            for _ in 0..(5 + next(25)) {
+                bytes.extend_from_slice(PIECES[next(PIECES.len())]);
+            }
+            inputs.push(bytes);
+        }
+
+        for bytes in inputs {
+            let whole = dispatched_in_reads(&bytes, &[]);
+            let every_byte: Vec<usize> = (1..bytes.len()).collect();
+            assert_eq!(dispatched_in_reads(&bytes, &every_byte), whole, "{bytes:02x?}");
+            for first in 0..=bytes.len() {
+                for second in first..=bytes.len() {
+                    assert_eq!(
+                        dispatched_in_reads(&bytes, &[first, second]),
+                        whole,
+                        "{bytes:02x?} cut at {first} and {second}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
