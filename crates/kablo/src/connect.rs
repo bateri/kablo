@@ -182,9 +182,9 @@ fn on_this_machine(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
 /// A terminal on this machine wants every byte. It draws what a program writes as a terminal
 /// without a session would, and the program waits for it in the same way: a relay can read a
 /// flood faster than this connection carries it, and left behind by the ring this client is
-/// dropped and comes back to a reset and a picture, every few hundredths of a second, with a
-/// key typed in that moment gone along with the connection. Over `ssh` the link may be what
-/// is slow and a program is not kept waiting for it: the picture is the answer there.
+/// dropped and comes back to a reset and a picture, every few hundredths of a second. Over
+/// `ssh` the link may be what is slow and a program is not kept waiting for it: the picture
+/// is the answer there.
 fn view_of(
     size: Option<Size>,
     answers_itself: bool,

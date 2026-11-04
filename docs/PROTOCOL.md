@@ -565,11 +565,12 @@ unix socket). Without it, a client that falls behind by more than the journal
 holds is sent a picture of the screen in place of the bytes it lost (`attached`
 with `truncated`), which is what a slow link wants: the program is never kept
 waiting for it. With it, while the client is behind by more than half the
-journal and no client attached to the session is less far behind than that, the
-server stops reading the program's output, so the program waits (in the terminal's
-own buffer, as it does for any slow reader) and nothing is lost. A client that keeps
-up sets the pace: one beside it that asked for every byte and cannot keep up is
-dropped behind as without the bit.
+journal the server stops reading the program's output, so the program waits (in the
+terminal's own buffer, as it does for any slow reader) and nothing is lost. Among
+clients that set the bit the one furthest along sets the pace: the server does not
+wait for one behind by that much while another is not (and has its picture), and
+the slower one is dropped behind as without the bit. A client without the bit has
+no say, however far along or behind it is.
 A client that stops reading does not hold the program for good: when its
 position has not moved for a second the server goes on reading and the client
 is dropped behind as without the bit, until it reads again. A bridge that
@@ -684,7 +685,7 @@ dropped (a full-screen program entered long ago) may lack state the dropped
 bytes set.
 
 A client that is slow to take a picture while the program writes faster than the
-journal holds is let go when the journal passes the picture's offset, and asks
+journal holds is dropped behind when the journal passes the picture's offset, and asks
 again with the picture still owed to it; the bridge does this for a client that
 did not notice, and a fast enough link never has the problem.
 
@@ -813,18 +814,19 @@ about), so an idle connection costs nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
 the program, unless it asked for every byte (Attach), and then for a second at
-most; one that reads slowly and asked sets the program's pace while no client
-attached keeps up. Output is sent a frame at a time and only when the connection
+most; one that reads slowly and asked sets the program's pace unless another that
+asked keeps up. Output is sent a frame at a time and only when the connection
 takes it, so what a client costs is one frame (and the larger send buffer of one
-that asked for every byte) and its position in the journal. A client is let go when the journal has moved past the next byte
-it is owed: the server closes its side of the connection, without a message, and
-the client, which reads the end of the stream after what was on its way, closes
-its own and comes back with the offset it had. What it typed (`input`, `write`)
-until then is still read and reaches the program, so a key pressed before it has
-noticed is not lost; nothing else it sends is acted on, and nothing is answered.
-One that has not closed in 30 seconds is closed. Replies to a client's requests are queued for it and a
-client that asks without ever reading is dropped the same way once 4 MiB of
-them are waiting.
+that asked for every byte) and its position in the journal. A client is dropped
+behind when the journal has moved past the next byte it is owed: the server closes
+its side of the connection, without a message, and the client, which reads the end
+of the stream after what was on its way, closes its own and comes back with the
+offset it had. What it wrote (`input`, `write`) until it closed is still read and
+reaches the program, so a key pressed before it has noticed is not lost; nothing
+else it sends is acted on, and nothing is answered. A client that has not closed
+in 30 seconds has its connection closed, and what it writes after that is lost.
+Replies to a client's requests are queued for it, and a client that asks without
+ever reading has its connection closed once 4 MiB of them are waiting.
 
 **Many clients.** A session serves 64 connections at once. A 65th is not
 refused: it waits, unaccepted, until a seat frees, and so does one that comes
@@ -1108,7 +1110,7 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
 | connections to one session | 64 |
 | input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |
-| a client let go for being behind | 30 s to close its side, then the server closes it |
+| a client dropped behind | 30 s to close its side, then the server closes it |
 | streams open on one connection | 128, counting the ones still connecting; one more is `failed` (5) |
 | streams connecting at once on one connection | 16; one more is `failed` (5) |
 | window of a stream, and credit outstanding | 16 MiB; an `open` asking for more is `failed` (5) |

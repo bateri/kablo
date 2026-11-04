@@ -41,7 +41,7 @@ section is not released.
 - **`kablo connect` in a terminal on the session's own machine shows all of a flood.** A program
   that writes faster than the terminal draws waits for it, as it would in that terminal without a
   session, where it could have left you with a reset and a picture of the screen in place of what
-  it wrote. With several clients the quickest sets the pace. Over `ssh` (`SSH_CONNECTION` or
+  it wrote. With several terminals on that machine the quickest sets the pace. Over `ssh` (`SSH_CONNECTION` or
   `SSH_TTY` in the environment) the program is not kept waiting for a link that may be slow, and
   that picture is what you get.
 
@@ -58,8 +58,8 @@ section is not released.
 - **A client that falls behind the journal now reads the end of the stream with its own side
   still open.** The server closes only its side, and reads what the client types (`input`,
   `write`) until the client closes; nothing else it sends is acted on or answered. A client that
-  closes when it reads the end has nothing to change. One that has not closed in 30 seconds is
-  closed (`docs/PROTOCOL.md`, A slow reader).
+  closes when it reads the end has nothing to change. One that has not closed in 30 seconds has
+  its connection closed, and what it writes after that is lost (`docs/PROTOCOL.md`, A slow reader).
 - **Protocol: a client can ask not to be lapped.** The flags byte of the `attach` view gains bit
   4, `every_byte` (`kablo-proto`: `v1::View::every_byte`, `false` from `View::new`, so this breaks
   no one that builds one). An app that sets it reads the session's stream as fast as it can and
@@ -68,7 +68,8 @@ section is not released.
   of writing over what the app has not read, and the app is not sent a picture of the screen in
   place of the bytes it lost (its scrollback with them). An app that stops reading releases the
   program after a second, and is lapped as without the bit, and so is one slower than another
-  client attached to the session: the one that keeps up sets the pace. Leave it off on a slow link, where
+  client that set it: the one furthest along sets the pace, and a client without the bit has no
+  say. Leave it off on a slow link, where
   the picture is the right answer; the bridge keeps the bit across a resize and a new connection
   as it does the others. A relay from before the bit ignores it, and so does a bridge from before
   it (a `kablo attach` still running from before the upgrade decodes the view and encodes it
