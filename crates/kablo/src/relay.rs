@@ -712,7 +712,11 @@ impl Relay {
             if self.exit.is_some() || self.attached() == 0 {
                 self.settle.cancel();
             }
-            if sys::poll(&mut set, self.wake_in(Instant::now())).is_err() {
+            // The same instant that decided whether the terminal is in the set: a pause
+            // that ends in between would leave the terminal out of it and the timeout
+            // for it gone, and `poll` would be deaf to the terminal until something else
+            // woke it.
+            if sys::poll(&mut set, self.wake_in(now)).is_err() {
                 return 1;
             }
             for (fd, source) in set.iter().zip(&sources) {
@@ -1049,6 +1053,20 @@ impl Relay {
         }
     }
 
+    /// Writes what each client that asked for every byte can take.
+    fn drive_those_who_asked_for_every_byte(&mut self) {
+        for i in 0..self.clients.len() {
+            let asked = self
+                .clients
+                .get(i)
+                .and_then(|client| client.attach.as_ref())
+                .is_some_and(|attach| attach.every_byte);
+            if asked {
+                self.drive(i);
+            }
+        }
+    }
+
     /// The shell is gone: take what it left in the terminal and read no more.
     /// (A background process that kept the terminal open may write later; the
     /// session is over and that is not part of it.)
@@ -1056,6 +1074,11 @@ impl Relay {
         // What was read while a client was shown it comes first, in stream order.
         self.catch_up();
         loop {
+            // The program is gone, so there is no pause to wait out: a client that asked
+            // for every byte is given what it can take between the fills, and a ring a
+            // few fills long (the smallest is a Linux terminal's buffer) is not turned
+            // over under one that stood half a ring behind when the program ended.
+            self.drive_those_who_asked_for_every_byte();
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => self.feed_screen(Feed::Spent),
@@ -2024,6 +2047,10 @@ impl Relay {
                         .to_vec(),
                 };
                 picture.sent = end;
+                // It moved: whatever it was waited for is over. A picture is taken a piece
+                // at a time while `next` stands still, and a client that drains a large one
+                // steadily is not a client that has stopped.
+                attach.waited_since = None;
                 if end >= picture.bytes.len() {
                     attach.picture = None;
                 }
@@ -2707,9 +2734,12 @@ mod tests {
     #[test]
     fn a_program_that_writes_a_full_read_every_so_often_is_not_gathered_for_long() {
         let (mut relay, write, far) = relay_over_a_pipe(1 << 20, FULL_READ);
+        // Whatever the writer sends has to fit the pipe: it is joined below with the read
+        // end still open, and a pipe holds 64 KiB on Linux and less on other systems.
+        let writes = 48 * 1024 / FULL_READ;
         let writer = std::thread::spawn(move || {
             let data = vec![b'x'; FULL_READ];
-            for _ in 0..64 {
+            for _ in 0..writes {
                 if sys::write_fd(write.as_fd(), &data).is_err() {
                     return;
                 }
@@ -2725,7 +2755,7 @@ mod tests {
         // writer, not this bound's meaning: the turn gives up on time, not on bytes.
         assert!(took < Duration::from_millis(25), "{took:?}");
         let gathered = usize::try_from(relay.journal.total()).unwrap_or(usize::MAX);
-        assert!(gathered < FULL_READ * 64, "{gathered}");
+        assert!(gathered < FULL_READ * writes, "{gathered}");
         assert_eq!(delivered(&mut relay, &far, gathered), gathered);
         writer.join().unwrap();
     }
@@ -3191,6 +3221,96 @@ mod tests {
                 until: again + STALL_LIMIT
             })
         );
+    }
+
+    #[test]
+    fn the_pause_and_the_timer_that_ends_it_are_the_same_at_every_instant() {
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        on_a_ring(&mut relay, MIN_CAPACITY);
+        relay.settle.cancel();
+        if let Some(attach) = relay.clients[0].attach.as_mut() {
+            attach.every_byte = true;
+        }
+        relay.journal.append(&vec![b'x'; 12 * 1024]);
+        let start = Instant::now();
+        relay.note_laggards(start);
+        // `serve` asks both at one instant, and the terminal is left out of the set exactly
+        // when there is a pause: so wherever the pause is about to end, a timer must be
+        // set for it, or `poll` would sleep on with nothing to wake it.
+        let nanosecond = Duration::from_nanos(1);
+        for at in [
+            start,
+            start + STALL_LIMIT / 2,
+            start + STALL_LIMIT - nanosecond,
+            start + STALL_LIMIT,
+            start + STALL_LIMIT + nanosecond,
+        ] {
+            let pause = relay.paused(at);
+            let timer = relay.wake_in(at);
+            assert_eq!(pause.is_some(), timer.is_some(), "{at:?}");
+            if let Some(Pause::Client { until }) = pause {
+                assert_eq!(timer, Some(until - at));
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_that_asked_for_every_byte_is_not_lapped_by_what_the_program_left_at_its_end() {
+        // The smallest ring, which a Linux terminal's buffer fills in a few reads, and a
+        // client that stood half of it and a byte behind when the program ended.
+        let chunk = usize::try_from(MIN_CAPACITY / 4).unwrap();
+        let (mut relay, write, far) = relay_over_a_pipe(MIN_CAPACITY, chunk);
+        let half = usize::try_from(MIN_CAPACITY / 2).unwrap();
+        sys::widen_buffers(relay.clients[0].sock.as_fd());
+        if let Some(attach) = relay.clients[0].attach.as_mut() {
+            attach.every_byte = true;
+        }
+        relay.journal.append(&vec![b'a'; half + 1]);
+        let left = 3 * chunk;
+        sys::write_fd(write.as_fd(), &vec![b'b'; left]).unwrap();
+        drop(write);
+        // More than the ring holds, in all.
+        assert!(half + 1 + left > MIN_CAPACITY as usize);
+        relay.drain_to_the_end();
+        assert!(
+            !relay.clients[0].dead,
+            "lapped while the program's last bytes were read"
+        );
+        assert_eq!(
+            delivered(&mut relay, &far, half + 1 + left),
+            half + 1 + left
+        );
+        assert!(!relay.clients[0].dead);
+        assert!(relay.clients[0].attach.as_ref().unwrap().picture.is_none());
+    }
+
+    #[test]
+    fn a_client_that_takes_a_picture_a_piece_at_a_time_is_not_one_that_stood_still() {
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        let start = Instant::now();
+        let Some(attach) = relay.clients[0].attach.as_mut() else {
+            panic!("the client is attached");
+        };
+        attach.every_byte = true;
+        attach.picture = Some(Picture {
+            offset: 0,
+            cols: 80,
+            rows: 24,
+            bytes: vec![b'p'; 3 * OUT_CHUNK],
+            sent: 0,
+        });
+        // It was waited for since before the picture began: `next` does not move while a
+        // picture is sent, so a piece taken is the only sign that it is reading.
+        attach.waited_since = Some(start);
+        relay.drive(0);
+        let attach = relay.clients[0].attach.as_ref().unwrap();
+        assert!(
+            attach
+                .picture
+                .as_ref()
+                .is_none_or(|picture| picture.sent > 0)
+        );
+        assert_eq!(attach.waited_since, None);
     }
 
     #[test]
