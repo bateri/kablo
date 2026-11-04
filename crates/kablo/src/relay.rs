@@ -258,10 +258,21 @@ impl EndKeep {
     }
 }
 
-/// Terminal reads in one turn before the other descriptors get a look. A kernel read of a
-/// terminal is small (a macOS one returns at most a kibibyte), so a stream needs many of
-/// them to fill one frame.
-const READ_BUDGET: usize = 64;
+/// Terminal reads (and waits for more) in one turn before the other descriptors get a look.
+/// A kernel read of a terminal is small (a macOS one returns at most a kibibyte), so a
+/// stream needs [`OUT_CHUNK`] over that many of them to fill a frame; twice as many, so
+/// that each may be followed by a wait for the next ([`REFILL_WAIT`]) and the turn still
+/// ends on the bytes and not on this. It is also what bounds a turn that a trickle of full
+/// reads would otherwise stretch.
+const READ_BUDGET: usize = 2 * (OUT_CHUNK / 1024);
+
+/// How long a turn that is gathering waits for the terminal to be readable again after a
+/// full read left it empty. A stream that fills the kernel's read refills it in
+/// microseconds, and a turn that ended there would send what it has as a frame of a few
+/// kibibytes and come back for the next, which costs the relay and the client more than
+/// the bytes do. A millisecond is the finest wait `poll` has. When nothing comes the stream
+/// has stopped, the turn ends and the relay sleeps with no timeout.
+const REFILL_WAIT: Duration = Duration::from_millis(1);
 
 /// How much the screen may be behind the reads before the worker is woken from its rest.
 const WAKE_BACKLOG: u64 = (SCREEN_CHUNK / 2) as u64;
@@ -272,7 +283,7 @@ const WAKE_BACKLOG: u64 = (SCREEN_CHUNK / 2) as u64;
 /// a line of output, a redraw. A macOS pseudo-terminal returns at most a kibibyte per
 /// read. A Linux one returns what its line discipline holds, which under a flood is 4095
 /// bytes at a time, so a kibibyte is no sign of a flood there: a full-screen program's
-/// redraw after a keystroke is a few kibibytes and must not wait for the hold.
+/// redraw after a keystroke is a few kibibytes and must not be taken for one.
 const FULL_READ: usize = if cfg!(target_os = "linux") {
     4095
 } else {
@@ -295,12 +306,6 @@ const BEHIND_LIMIT: u64 = 256 * 1024;
 /// runs with a backlog, and a backlog is only ever the worker's to work off, so it ends
 /// with it: an idle session has none.
 const THROTTLE_WAIT: Duration = Duration::from_millis(1);
-
-/// The longest the relay holds output back from its clients while a stream saturates the
-/// terminal, to send it in frames of a useful size and not one per kernel read. The hold
-/// also ends when [`OUT_CHUNK`] has gathered behind the furthest client, when a client has
-/// bytes the socket did not take, and with the stream (a read shorter than a full one).
-const HOLD_LIMIT: Duration = Duration::from_millis(2);
 
 /// Reads of one client's socket in one turn, at most. A client that leaves
 /// with more than this many reads' worth unread is seen to have left a turn
@@ -473,14 +478,6 @@ struct Relay {
     /// Output was read in this turn of the loop: the terminal is looked at
     /// once at its end.
     output_read: bool,
-    /// The last terminal read was a full one ([`FULL_READ`]): the stream is saturating
-    /// the terminal. It ends when the output is delivered, so a stream that stops leaves
-    /// nothing to wait for.
-    saturated: bool,
-    /// When the output was first held back in this stretch of the stream, and whether it
-    /// is held now (the poll set and the next wait follow it).
-    held_since: Option<Instant>,
-    holding: bool,
     /// A descriptor set aside for the next connection, let go just before
     /// each `accept` so that one is free for it. An `accept` that finds none
     /// does not leave the connection waiting everywhere: macOS drops it, and
@@ -617,9 +614,6 @@ impl Relay {
             settle: Settle::default(),
             looks: Looks::default(),
             output_read: false,
-            saturated: false,
-            held_since: None,
-            holding: false,
             spare: None,
             chunk,
         };
@@ -708,7 +702,6 @@ impl Relay {
             self.answer_questions();
             self.answer_pings();
             self.look_at_the_terminal();
-            self.hold_output(Instant::now());
             for i in 0..self.clients.len() {
                 self.drive(i);
             }
@@ -867,9 +860,9 @@ impl Relay {
         // reads. Nobody can attach in the middle of this.
         let watched = self.attached() > 0;
         let mut last = None;
-        // A turn reads no more than a fraction of the ring before the clients are driven:
-        // reads that no `drive` follows would lap a client on a ring they fill in a turn.
-        let turn_limit = self.journal.capacity() / 8;
+        // A turn ends at a frame's worth, and at no more than a fraction of the ring: reads
+        // that no `drive` follows would lap a client on a ring they fill in a turn.
+        let turn_limit = (OUT_CHUNK as u64).min(self.journal.capacity() / 8);
         let mut read = 0u64;
         for _ in 0..READ_BUDGET {
             if read >= turn_limit || self.throttled() {
@@ -878,7 +871,6 @@ impl Relay {
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) => {
                     self.master_done = true;
-                    self.saturated = false;
                     break;
                 }
                 Ok(n) => {
@@ -890,25 +882,43 @@ impl Relay {
                         self.feed_screen(Feed::Live);
                     }
                     last = Some(n);
+                    // What a client is shown ends the turn on a short read: the program
+                    // had no more, and a keystroke's echo goes out in the turn it came.
+                    if watched && n < FULL_READ {
+                        break;
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // A full read that left the terminal empty is a stream that refills
+                    // it in a moment: wait for it here, to send one frame and not many.
+                    // Never a `read` again without a `poll` between: reading in a loop
+                    // while the program is writing contends with it and is slower.
+                    if watched && last.is_some_and(|n| n >= FULL_READ) && self.refills() {
+                        last = None;
+                        continue;
+                    }
+                    break;
+                }
                 // `EIO` is how Linux says the program's side is closed.
                 Err(_) => {
                     self.master_done = true;
-                    self.saturated = false;
                     break;
                 }
             }
         }
-        if let Some(n) = last {
+        if read > 0 {
             self.output_read = true;
             // The only clock this takes; what was read is not looked at.
             self.output_at = sys::unix_now();
             self.settle.arm(Instant::now());
-            if !self.master_done {
-                self.saturated = n >= FULL_READ;
-            }
         }
+    }
+
+    /// Waits [`REFILL_WAIT`] for the terminal to be readable again. Anything but silence
+    /// (a hang-up too) is for the next `read` to say.
+    fn refills(&self) -> bool {
+        let mut set = [sys::want(self.master.as_raw_fd(), libc::POLLIN)];
+        sys::poll(&mut set, Some(REFILL_WAIT)).is_ok_and(|ready| ready > 0)
     }
 
     /// What was just read goes to a client that is shown it: the client's terminal answers
@@ -1143,7 +1153,7 @@ impl Relay {
         (ended && client.waiting)
             || client.attach.as_ref().is_some_and(|attach| {
                 attach.picture.is_some()
-                    || (attach.next < self.journal.total() && !self.holding)
+                    || attach.next < self.journal.total()
                     || (ended && !client.ended_queued)
             })
     }
@@ -1934,7 +1944,7 @@ impl Relay {
                     client.dead = true;
                     return;
                 }
-            } else if attach.next < total && !self.holding {
+            } else if attach.next < total {
                 let owed = (total - attach.next).min(OUT_CHUNK as u64);
                 let mut data = vec![0u8; usize::try_from(owed).unwrap_or(OUT_CHUNK)];
                 match self.journal.copy_out(attach.next, &mut data) {
@@ -2005,63 +2015,9 @@ impl Relay {
         }
     }
 
-    /// Decides whether the output is held back from the clients in this turn, and
-    /// remembers it for the poll set and the next wait.
-    ///
-    /// While a stream saturates the terminal ([`FULL_READ`]) every read adds a few
-    /// kibibytes, and a frame, a write and a read on the far side per read cost more than
-    /// the bytes do. The output is held until [`OUT_CHUNK`] has gathered behind the
-    /// furthest client or [`HOLD_LIMIT`] has passed since the hold began; it is not held
-    /// when a client has bytes its socket did not take (it would wait on the socket, and
-    /// the hold would spin on it), when a picture is on its way, when nobody is attached,
-    /// or when the stream is not saturating. Whenever the output is not held, the hold is
-    /// over and the stream has to saturate again for a new one.
-    fn hold_output(&mut self, now: Instant) -> bool {
-        let total = self.journal.total();
-        let mut attached = 0;
-        let mut furthest = total;
-        let mut busy = false;
-        for client in self.clients.iter().filter(|client| !client.dead) {
-            busy |= client.sent < client.out.len();
-            if let Some(attach) = &client.attach {
-                attached += 1;
-                busy |= attach.picture.is_some();
-                furthest = furthest.min(attach.next);
-            }
-        }
-        let owed = total.saturating_sub(furthest);
-        let streaming = self.saturated && self.reading && !self.master_done && self.exit.is_none();
-        // A frame's worth, but never more than half a ring: more than the ring holds is
-        // not a client that is behind, it is output the relay did not send in time.
-        let bound = (OUT_CHUNK as u64).min(self.journal.capacity() / 2);
-        if streaming && attached > 0 && !busy && owed > 0 && owed < bound {
-            let since = *self.held_since.get_or_insert(now);
-            if now.saturating_duration_since(since) < HOLD_LIMIT {
-                self.holding = true;
-                return true;
-            }
-        }
-        self.holding = false;
-        self.held_since = None;
-        self.saturated = false;
-        false
-    }
-
-    /// The rest of the hold at `now`, in whole milliseconds rounded up: the clock `poll`
-    /// waits on has millisecond resolution, and a wait of less than one would be taken
-    /// for none and spin until the deadline.
-    fn hold_left(&self, now: Instant) -> Option<Duration> {
-        let since = self.held_since.filter(|_| self.holding)?;
-        let left = HOLD_LIMIT.saturating_sub(now.saturating_duration_since(since));
-        let millis = left.as_millis() + u128::from(left.subsec_nanos() % 1_000_000 != 0);
-        Some(Duration::from_millis(
-            u64::try_from(millis).unwrap_or(u64::MAX),
-        ))
-    }
-
     /// How long a `poll` may wait at `now`: for ever unless a look at the
-    /// terminal, the end of a session's wait, the end of a hold on the output or
-    /// the end of a pause for the parser is due.
+    /// terminal, the end of a session's wait or the end of a pause for the parser
+    /// is due.
     fn wake_in(&self, now: Instant) -> Option<Duration> {
         let keep = if self.delivered_sent {
             None
@@ -2069,15 +2025,10 @@ impl Relay {
             self.keep.timeout(now)
         };
         let throttle = self.throttled().then_some(THROTTLE_WAIT);
-        [
-            self.settle.timeout(now),
-            keep,
-            self.hold_left(now),
-            throttle,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        [self.settle.timeout(now), keep, throttle]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Tells the warden the session may be removed, once, when it is time.
@@ -2242,9 +2193,6 @@ mod tests {
             settle: Settle::default(),
             looks: Looks::default(),
             output_read: false,
-            saturated: false,
-            held_since: None,
-            holding: false,
             spare: None,
             chunk: 4096,
         };
@@ -2518,8 +2466,7 @@ mod tests {
     }
 
     /// Reads turns of the relay until the journal holds `total` bytes.
-    fn read_until(relay: &mut Relay, total: u64) -> bool {
-        let mut saturated = false;
+    fn read_until(relay: &mut Relay, total: u64) {
         let start = Instant::now();
         while relay.journal.total() < total {
             assert!(
@@ -2535,10 +2482,8 @@ mod tests {
             let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
             if sys::poll(&mut set, Some(Duration::from_millis(100))).unwrap() > 0 {
                 relay.read_terminal();
-                saturated |= relay.saturated;
             }
         }
-        saturated
     }
 
     /// The bytes of program output the far end of a client's socket has received.
@@ -2584,24 +2529,22 @@ mod tests {
         (relay, slave, far)
     }
 
-    #[test]
-    fn a_short_read_is_delivered_in_the_turn_it_was_read() {
-        let (mut relay, slave, far) = relay_with_a_client();
-        program_writes(&slave, b"hello\r\n".to_vec());
-        read_until(&mut relay, 7);
-        assert!(!relay.saturated);
-        assert!(!relay.hold_output(Instant::now()));
-        assert!(!relay.holding);
-        assert_eq!(delivered(&mut relay, &far, 7), 7);
-        // And nothing waits on the clock for it.
-        let now = Instant::now();
-        assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
+    /// The relay over a ring of `capacity` bytes, as a session over one reads it.
+    fn on_a_ring(relay: &mut Relay, capacity: u64) {
+        let journal = Arc::new(Journal::create(capacity).unwrap());
+        relay.core = Core::new(
+            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
+            Arc::clone(&journal),
+        );
+        relay.journal = journal;
+        relay.chunk = usize::try_from((64u64 * 1024).min(capacity / 4)).unwrap();
     }
 
-    #[test]
-    fn a_full_read_marks_the_stream_saturated_and_a_shorter_one_ends_it() {
-        // A pipe stands for the terminal: a read of it is as big as what was written.
-        let (mut relay, _slave, _far) = relay_with_a_client();
+    /// A relay with a client that reads a pipe where it would read the terminal, so that
+    /// a read is as big as what was written, and the pipe's writing end.
+    fn relay_over_a_pipe(capacity: u64, chunk: usize) -> (Relay, OwnedFd, UnixStream) {
+        let (mut relay, _slave, far) = relay_with_a_client();
+        on_a_ring(&mut relay, capacity);
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` has room for the two descriptors `pipe` fills in.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -2609,138 +2552,147 @@ mod tests {
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         sys::set_nonblocking(read.as_raw_fd()).unwrap();
         relay.master = read;
-        relay.chunk = 4096;
-        assert_eq!(
-            sys::write_fd(write.as_fd(), &[b'x'; FULL_READ]).unwrap(),
-            FULL_READ
-        );
-        relay.read_terminal();
-        assert!(relay.saturated, "a read of {FULL_READ} bytes is a full one");
-        assert_eq!(
-            sys::write_fd(write.as_fd(), &[b'y'; FULL_READ - 1]).unwrap(),
-            FULL_READ - 1
-        );
-        relay.read_terminal();
-        assert!(!relay.saturated, "a shorter read is not");
-        // The last read of the turn counts: a full one and then a short one.
-        sys::write_fd(write.as_fd(), &[b'z'; 4096]).unwrap();
-        relay.read_terminal();
-        assert!(relay.saturated);
-        // The screen has had it all, or the terminal would not be read again yet.
-        relay.catch_up();
-        assert!(!relay.throttled());
-        sys::write_fd(write.as_fd(), b"a").unwrap();
-        relay.read_terminal();
-        assert!(!relay.saturated);
-        // A turn that read nothing leaves it as it was.
-        relay.saturated = true;
-        relay.read_terminal();
-        assert!(relay.saturated);
+        relay.chunk = chunk;
+        (relay, write, far)
     }
 
-    /// A relay whose stream is saturated, with `bytes` written to the journal that the
-    /// attached client is owed.
-    fn saturated_relay(bytes: usize) -> (Relay, OwnedFd, UnixStream) {
+    #[test]
+    fn a_short_read_is_delivered_in_the_turn_it_was_read() {
         let (mut relay, slave, far) = relay_with_a_client();
-        // The journal is the relay's own: write as the reads would have.
-        let data = vec![b'x'; bytes];
-        let journal = Arc::new(Journal::create(MIN_CAPACITY * 8).unwrap());
-        relay.core = Core::new(
-            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
-            Arc::clone(&journal),
-        );
-        relay.journal = journal;
-        relay.journal.append(&data);
-        relay.feed_screen(Feed::Live);
-        relay.saturated = true;
-        (relay, slave, far)
+        program_writes(&slave, b"hello\r\n".to_vec());
+        read_until(&mut relay, 7);
+        assert_eq!(delivered(&mut relay, &far, 7), 7);
+        // And nothing waits on the clock for it.
+        let now = Instant::now();
+        assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
     }
 
     #[test]
-    fn a_saturated_stream_is_held_and_goes_out_at_the_size_bound() {
-        let (mut relay, _slave, far) = saturated_relay(1024);
-        let mut decoder = PacketDecoder::new();
-        let start = Instant::now();
-        assert!(relay.hold_output(start));
-        // Nothing is queued for the client and its socket is not asked about.
-        relay.drive(0);
-        assert_eq!(received(&far, &mut decoder), 0);
-        assert!(!relay.wants_write(&relay.clients[0]));
-        // More arrives, but not a chunk's worth: still held.
-        relay.journal.append(&vec![b'y'; OUT_CHUNK - 2048]);
-        assert!(relay.hold_output(start));
-        // A chunk has gathered behind the client: out it goes, and the hold is over.
-        relay.journal.append(&[b'z'; 2048]);
-        assert!(!relay.hold_output(start));
-        assert!(relay.wants_write(&relay.clients[0]));
-        relay.drive(0);
-        assert_eq!(
-            delivered(&mut relay, &far, OUT_CHUNK + 1024),
-            OUT_CHUNK + 1024
-        );
-        assert!(!relay.saturated);
+    fn a_short_read_ends_the_turn_of_a_client_that_is_shown_it_and_a_full_one_does_not() {
+        // Reads of a quarter of a full one: the first is short, and what is left in the
+        // pipe is for the next turn.
+        let (mut relay, write, _far) = relay_over_a_pipe(1 << 20, FULL_READ / 4);
+        sys::write_fd(write.as_fd(), &[b'x'; FULL_READ]).unwrap();
+        relay.read_terminal();
+        assert_eq!(relay.journal.total(), (FULL_READ / 4) as u64);
+        // Nobody to show it to: the turn reads on until the terminal is empty.
+        relay.clients.clear();
+        relay.read_terminal();
+        assert_eq!(relay.journal.total(), FULL_READ as u64);
+        // Reads of a full one go on while there are some.
+        let (mut relay, write, _far) = relay_over_a_pipe(1 << 20, FULL_READ);
+        sys::write_fd(write.as_fd(), &vec![b'y'; FULL_READ * 3]).unwrap();
+        relay.read_terminal();
+        assert_eq!(relay.journal.total(), (FULL_READ * 3) as u64);
     }
 
     #[test]
-    fn a_saturated_stream_is_held_and_goes_out_at_the_time_bound() {
-        let (mut relay, _slave, far) = saturated_relay(1024);
-        let start = Instant::now();
-        assert!(relay.hold_output(start));
-        assert!(relay.hold_output(start + HOLD_LIMIT - Duration::from_micros(1)));
-        relay.drive(0);
-        assert_eq!(received(&far, &mut PacketDecoder::new()), 0);
-        assert!(!relay.hold_output(start + HOLD_LIMIT));
-        relay.drive(0);
-        assert_eq!(delivered(&mut relay, &far, 1024), 1024);
-        // The stream did not go on: nothing more to wait for, and the relay's `poll` has
-        // no timeout to wake for.
-        assert!(!relay.hold_output(start + HOLD_LIMIT * 2));
-        assert_eq!(relay.hold_left(start + HOLD_LIMIT * 2), None);
-        assert_eq!(relay.wake_in(start + HOLD_LIMIT * 2), None);
-    }
-
-    #[test]
-    fn holding_waits_whole_milliseconds_and_never_wakes_in_a_loop() {
-        let (mut relay, _slave, _far) = saturated_relay(1024);
+    fn a_stream_that_stops_on_a_full_read_goes_out_within_the_wait_and_the_relay_sleeps() {
+        let (mut relay, write, far) = relay_over_a_pipe(1 << 20, FULL_READ);
+        sys::write_fd(write.as_fd(), &[b'x'; FULL_READ]).unwrap();
+        let turn = Instant::now();
+        relay.read_terminal();
+        let took = turn.elapsed();
+        // One wait for more, nothing came, and the turn was over.
+        assert!(took < Duration::from_millis(250), "{took:?}");
+        assert_eq!(relay.journal.total(), FULL_READ as u64);
+        assert_eq!(delivered(&mut relay, &far, FULL_READ), FULL_READ);
+        // What is left to wait for is the look after output; with that gone the relay's
+        // `poll` has no timeout.
+        let now = Instant::now();
+        assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
         relay.settle.cancel();
-        let start = Instant::now();
-        assert!(relay.hold_output(start));
-        // Every instant of the hold, to the microsecond, has a wait of a whole number of
-        // milliseconds that is not nothing: a wait of none is a spin on the deadline.
-        for micros in 0..2000 {
-            let now = start + Duration::from_micros(micros);
-            assert!(relay.hold_output(now), "{micros}");
-            let wait = relay.wake_in(now).expect("a hold has a wait");
-            assert!(wait >= Duration::from_millis(1), "{micros}: {wait:?}");
-            assert_eq!(wait.subsec_nanos() % 1_000_000, 0, "{micros}: {wait:?}");
-        }
-        assert_eq!(relay.wake_in(start), Some(HOLD_LIMIT));
-        assert_eq!(
-            relay.wake_in(start + Duration::from_micros(1500)),
-            Some(Duration::from_millis(1))
-        );
-        // Over: the wait is gone with it, however often the loop turns.
-        for turn in 0..5 {
-            let now = start + HOLD_LIMIT + Duration::from_millis(turn);
-            relay.hold_output(now);
-            assert_eq!(relay.wake_in(now), None, "{turn}");
-        }
+        assert_eq!(relay.wake_in(now), None);
     }
 
     #[test]
-    fn output_is_not_held_for_a_client_with_bytes_its_socket_has_not_taken() {
-        let (mut relay, _slave, _far) = saturated_relay(1024);
-        if let Some(client) = relay.clients.first_mut() {
-            client.out = vec![0; 10];
+    fn a_saturated_stream_goes_out_in_frames_of_about_the_size_of_a_chunk() {
+        let (mut relay, write, far) = relay_over_a_pipe(8 << 20, FULL_READ);
+        let flood = 1 << 20;
+        let writer = std::thread::spawn(move || {
+            let data = vec![b'x'; FULL_READ];
+            for _ in 0..flood / FULL_READ {
+                if sys::write_fd(write.as_fd(), &data).is_err() {
+                    return;
+                }
+            }
+        });
+        // Blocking writes into a pipe the relay reads: it refills as fast as the relay reads.
+        let start = Instant::now();
+        let (mut decoder, mut sizes, mut turns) = (PacketDecoder::new(), Vec::new(), Vec::new());
+        let mut before = 0;
+        while relay.journal.total() < (flood / FULL_READ * FULL_READ) as u64 {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the stream stopped"
+            );
+            let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+            if sys::poll(&mut set, Some(Duration::from_millis(50))).unwrap() > 0 {
+                relay.read_terminal();
+                turns.push(relay.journal.total() - before);
+                before = relay.journal.total();
+            }
+            relay.drive(0);
+            far.set_nonblocking(true).unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n @ 1..) = (&far).read(&mut buf) {
+                decoder.push(buf.get(..n).unwrap_or_default());
+            }
+            while let Ok(Some(packet)) = decoder.next_packet() {
+                if let Message::Output { data, .. } = packet.message {
+                    sizes.push(data.len());
+                }
+            }
         }
-        assert!(!relay.hold_output(Instant::now()));
-        // And a client that is owed nothing is not a reason to wait either.
-        let (mut relay, _slave, _far) = saturated_relay(0);
-        assert!(!relay.hold_output(Instant::now()));
-        assert_eq!(
-            relay.wake_in(Instant::now()),
-            relay.settle.timeout(Instant::now())
+        writer.join().unwrap();
+        // A turn ends at a frame's worth and a read over it, never past.
+        let longest = turns.iter().copied().max().unwrap();
+        assert!(
+            (OUT_CHUNK as u64..OUT_CHUNK as u64 + FULL_READ as u64).contains(&longest),
+            "the longest turn read {longest}"
         );
+        assert!(
+            sizes.iter().any(|&size| size >= OUT_CHUNK),
+            "no frame of a chunk in {} frames",
+            sizes.len()
+        );
+    }
+
+    #[test]
+    fn what_a_client_types_reaches_the_program_while_a_flood_is_read() {
+        let (mut relay, slave, _far) = relay_with_a_client();
+        on_a_ring(&mut relay, 8 << 20);
+        let stream = b"some text of the flood, a line of it\r\n".repeat(1 << 15);
+        let writer = program_writes(&slave, stream.clone());
+        let (mut worst, mut typed) = (Duration::ZERO, 0);
+        let start = Instant::now();
+        while relay.journal.total() < stream.len() as u64 {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the stream stopped"
+            );
+            if relay.throttled() {
+                std::thread::sleep(THROTTLE_WAIT);
+                continue;
+            }
+            let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+            if sys::poll(&mut set, Some(Duration::from_millis(5))).unwrap() > 0 {
+                let turn = Instant::now();
+                relay.read_terminal();
+                worst = worst.max(turn.elapsed());
+            }
+            // The relay's loop would act on a client's input between two turns.
+            if typed < 20 {
+                relay.type_input(0, b"k");
+                typed += 1;
+            }
+            relay.drive(0);
+        }
+        writer.join().unwrap();
+        assert_eq!(typed_to_the_program(&slave), b"k".repeat(20));
+        // A turn waits for more to gather, but only as many times as the budget has: what
+        // is typed is not kept from the program for long.
+        assert!(worst < Duration::from_millis(250), "a turn took {worst:?}");
     }
 
     /// A stream that scrolls, colours, moves the cursor and switches screens, `lines` lines
@@ -2872,13 +2824,7 @@ mod tests {
         let (mut relay, slave, _far) = relay_with_a_client();
         // A ring that is far larger than the limit: the backlog the parser could be given
         // is not bounded by it.
-        let journal = Arc::new(Journal::create(8 << 20).unwrap());
-        relay.core = Core::new(
-            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
-            Arc::clone(&journal),
-        );
-        relay.journal = journal;
-        relay.chunk = 64 * 1024;
+        on_a_ring(&mut relay, 8 << 20);
         let stream = b"\x1b[2J\x1b[H".repeat(80 * 1024);
         let writer = program_writes(&slave, stream.clone());
         let (mut worst, mut throttled, mut typed) = (Duration::ZERO, 0, 0);
@@ -2892,7 +2838,6 @@ mod tests {
             if relay.throttled() {
                 throttled += 1;
                 relay.core.wake_worker();
-                relay.hold_output(turn);
                 std::thread::sleep(THROTTLE_WAIT);
                 worst = worst.max(turn.elapsed());
             } else {
@@ -2956,7 +2901,6 @@ mod tests {
                         relay.read_terminal();
                     }
                 }
-                relay.hold_output(Instant::now());
                 relay.drive(0);
                 assert!(!relay.clients[0].dead, "{kib}K: dropped after {got} bytes");
                 got += received(&far, &mut decoder);
