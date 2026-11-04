@@ -309,6 +309,13 @@ const WORDS: &[&str] = &[
 ];
 
 #[test]
+fn the_widths_text_skips_the_table_for_are_the_tables() {
+    for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+        assert_eq!(text_width(c), unicode_width::UnicodeWidthChar::width(c), "{c:?}");
+    }
+}
+
+#[test]
 fn a_text_run_fills_and_wraps_lines_like_its_characters() {
     // Every width of terminal up to one wider than the longest word and every place in a line
     // a run can start at, so each fullwidth character meets the last column, and the last but

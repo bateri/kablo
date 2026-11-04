@@ -1078,6 +1078,19 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+/// `c.width()` for the characters of the scripts most text is written in, without the table
+/// lookup: the ranges are the ones where the table says one thing for every character (a test
+/// holds the function to the table for every `char`, so a newer table cannot make them differ
+/// unnoticed). The soft hyphen, `U+00AD`, is in none of them: it has no width.
+#[inline(always)]
+fn text_width(c: char) -> Option<usize> {
+    match c as u32 {
+        0x20..=0x7E | 0xA0..=0xAC | 0xAE..=0x2FF => Some(1),
+        0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xFF01..=0xFF60 => Some(2),
+        _ => c.width(),
+    }
+}
+
 impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
@@ -1247,7 +1260,7 @@ impl<T: EventListener> Handler for Term<T> {
 
         while let Some(first) = next {
             let mut c = first;
-            let mut width = match c.width() {
+            let mut width = match text_width(c) {
                 Some(width @ (1 | 2)) => width,
                 // `input` knows what a mark or a character without a width does; it never
                 // wraps for them.
@@ -1309,7 +1322,7 @@ impl<T: EventListener> Handler for Term<T> {
                 column += width;
 
                 next = chars.next();
-                match next.map(|n| (n, n.width())) {
+                match next.map(|n| (n, text_width(n))) {
                     Some((n, Some(w @ (1 | 2)))) => {
                         c = n;
                         width = w;
