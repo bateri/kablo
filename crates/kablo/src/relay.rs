@@ -37,8 +37,9 @@
 //! of the terminal (the program in the foreground, whether a password is being
 //! asked for, where an ssh session goes) is told to every attached client as a
 //! `state` when it differs from what was last told: right after `attached`,
-//! at the end of a turn that read output, and once more [`STATE_SETTLE`] after
-//! the last output or typed input (a program that says nothing). Nobody
+//! at the end of a turn that read output (not more often than [`LOOK_INTERVAL`]),
+//! and once more [`STATE_SETTLE`] after the last output or typed input (a program
+//! that says nothing). Nobody
 //! attached, nothing looked at, and no timer: an idle session waits in `poll`
 //! for ever.
 //!
@@ -166,6 +167,35 @@ impl Settle {
             return true;
         }
         false
+    }
+}
+
+/// The least time between two looks at the terminal that output brings. Output keeps the
+/// look prompt for the first of it after quiet (a program that starts and prints at once is
+/// seen at once), but a stream that runs for seconds changes nothing a person can tell by
+/// being looked at every turn: each look is three system calls on the process table and the
+/// terminal, which at a stream's pace is a good part of what the relay costs. What a look
+/// skipped would have found is found by the next one, or by [`Settle`]'s once the output
+/// has stopped.
+const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// When the terminal was last looked at, for the rule of [`LOOK_INTERVAL`].
+#[derive(Default)]
+struct Looks {
+    last: Option<Instant>,
+}
+
+impl Looks {
+    /// Whether output read at `now` may bring a look: none was made yet, or the interval
+    /// has passed since the last.
+    fn output_due(&self, now: Instant) -> bool {
+        self.last
+            .is_none_or(|last| now.saturating_duration_since(last) >= LOOK_INTERVAL)
+    }
+
+    /// A look was made at `now`, whatever brought it.
+    fn made(&mut self, now: Instant) {
+        self.last = Some(now);
     }
 }
 
@@ -434,6 +464,8 @@ struct Relay {
     watch: procinfo::Watch,
     /// The look that follows output or input by a moment.
     settle: Settle,
+    /// When the terminal was last looked at.
+    looks: Looks,
     /// Output was read in this turn of the loop: the terminal is looked at
     /// once at its end.
     output_read: bool,
@@ -570,6 +602,7 @@ impl Relay {
             told: None,
             watch: procinfo::Watch::default(),
             settle: Settle::default(),
+            looks: Looks::default(),
             output_read: false,
             spare: None,
             chunk,
@@ -845,11 +878,13 @@ impl Relay {
 
     // --- the terminal's state -----------------------------------------------
 
-    /// The terminal as it is now; nothing once the program has ended.
+    /// The terminal as it is now; nothing once the program has ended. Counts as a look for
+    /// [`LOOK_INTERVAL`].
     fn terminal_now(&mut self) -> TerminalState {
         if self.exit.is_some() {
             return TerminalState::default();
         }
+        self.looks.made(Instant::now());
         self.watch.look(self.master.as_fd(), self.child_pid)
     }
 
@@ -857,15 +892,22 @@ impl Relay {
     /// output or input is due: looks at the terminal once, and tells the
     /// attached clients if it is not what they were told. At most one look in
     /// a turn, whichever of the two brought it, and none when nobody is
-    /// attached (`status` looks when it is asked).
+    /// attached (`status` looks when it is asked). Output brings a look only
+    /// when [`LOOK_INTERVAL`] has passed since the last one; the look after
+    /// output is not held back, so the last of a burst is seen.
     fn look_at_the_terminal(&mut self) {
-        let output = std::mem::take(&mut self.output_read);
-        let due = self.settle.fire(Instant::now());
+        self.look_at_the_terminal_at(Instant::now());
+    }
+
+    fn look_at_the_terminal_at(&mut self, now: Instant) {
+        let output = std::mem::take(&mut self.output_read) && self.looks.output_due(now);
+        let due = self.settle.fire(now);
         if !(output || due) || self.exit.is_some() || self.attached() == 0 {
             return;
         }
-        let now = self.terminal_now();
-        self.tell_the_others(&now, usize::MAX);
+        let state = self.terminal_now();
+        self.looks.made(now);
+        self.tell_the_others(&state, usize::MAX);
     }
 
     /// Tells every attached client but `except` that the terminal is `now`,
@@ -2102,6 +2144,7 @@ mod tests {
             told: None,
             watch: procinfo::Watch::default(),
             settle: Settle::default(),
+            looks: Looks::default(),
             output_read: false,
             spare: None,
             chunk: 4096,
@@ -2310,6 +2353,54 @@ mod tests {
         settle.arm(start);
         settle.cancel();
         assert_eq!(settle.timeout(start), None);
+    }
+
+    #[test]
+    fn output_brings_a_look_at_once_after_quiet_and_then_at_most_one_in_the_interval() {
+        let start = Instant::now();
+        let mut looks = Looks::default();
+        // Nothing looked at yet: the first output is seen at once.
+        assert!(looks.output_due(start));
+        looks.made(start);
+        // A burst inside the interval brings none, to the last millisecond.
+        for ms in 0..50 {
+            assert!(!looks.output_due(start + Duration::from_millis(ms)), "{ms}");
+        }
+        assert!(looks.output_due(start + LOOK_INTERVAL));
+        // Any look, the settle's included, starts the interval again.
+        looks.made(start + LOOK_INTERVAL * 3);
+        assert!(!looks.output_due(start + LOOK_INTERVAL * 3 + LOOK_INTERVAL / 2));
+        assert!(looks.output_due(start + LOOK_INTERVAL * 4));
+    }
+
+    #[test]
+    fn a_burst_of_output_looks_at_the_terminal_once_in_the_interval_and_the_settle_look_follows() {
+        let (mut relay, _slave) = relay_over(Journal::create(MIN_CAPACITY).unwrap());
+        let (client, _far) = client_of(false);
+        relay.clients.push(client);
+        let start = Instant::now();
+        // Output after quiet: looked at at once.
+        relay.output_read = true;
+        relay.settle.arm(start);
+        relay.look_at_the_terminal_at(start);
+        assert_eq!(relay.looks.last, Some(start));
+        // Eight more turns of output inside the interval look at nothing; the clock of the
+        // last look stays where it was.
+        for ms in 1..=8 {
+            let at = start + Duration::from_millis(ms * 5);
+            relay.output_read = true;
+            relay.settle.arm(at);
+            relay.look_at_the_terminal_at(at);
+            assert_eq!(relay.looks.last, Some(start), "{ms}");
+        }
+        // The output stops; the look after it is not held back by the interval.
+        let settled = start + Duration::from_millis(40) + STATE_SETTLE;
+        relay.look_at_the_terminal_at(settled);
+        assert_eq!(relay.looks.last, Some(settled));
+        // And the next output after that is inside the interval of that look.
+        relay.output_read = true;
+        relay.look_at_the_terminal_at(settled + LOOK_INTERVAL / 2);
+        assert_eq!(relay.looks.last, Some(settled));
     }
 
     #[test]
