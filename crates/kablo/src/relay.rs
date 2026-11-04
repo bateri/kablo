@@ -267,10 +267,34 @@ const READ_BUDGET: usize = 64;
 const WAKE_BACKLOG: u64 = (SCREEN_CHUNK / 2) as u64;
 
 /// A terminal read of this many bytes is a full one: the kernel gave all it was willing
-/// to in a read (a macOS pseudo-terminal returns at most a kibibyte, a Linux one more), so
-/// the program is very likely writing faster than the relay reads. A shorter read ended
-/// because the program had no more at that moment: a keystroke's echo, a line of output.
-const FULL_READ: usize = 1024;
+/// to in a read, so the program is very likely writing faster than the relay reads. A
+/// shorter read ended because the program had no more at that moment: a keystroke's echo,
+/// a line of output, a redraw. A macOS pseudo-terminal returns at most a kibibyte per
+/// read. A Linux one returns what its line discipline holds, which under a flood is 4095
+/// bytes at a time, so a kibibyte is no sign of a flood there: a full-screen program's
+/// redraw after a keystroke is a few kibibytes and must not wait for the hold.
+const FULL_READ: usize = if cfg!(target_os = "linux") {
+    4095
+} else {
+    1024
+};
+
+/// The most the screen may be behind the reads (bytes of the journal the worker has not
+/// parsed) before the relay stops reading the terminal until the worker has caught up. The
+/// reads can outrun the parser by a long way (a program that clears the screen in a loop is
+/// parsed at a fraction of the pace it is read at), and whoever needs the screen as it is
+/// (a resize, an attach, a picture, a typed key) parses what is missing itself: a limit
+/// bounds how long that takes, and with it how long the relay can be deaf to its clients,
+/// its warden and its quit. The program that is not read waits in the terminal's own buffer,
+/// as it does for any reader that is slower than it. Never more than half the ring (see
+/// [`Relay::behind_limit`]).
+const BEHIND_LIMIT: u64 = 256 * 1024;
+
+/// How long the relay waits before it looks again at whether the worker has brought the
+/// screen under [`BEHIND_LIMIT`], while the terminal is not read for lack of that. It only
+/// runs with a backlog, and a backlog is only ever the worker's to work off, so it ends
+/// with it: an idle session has none.
+const THROTTLE_WAIT: Duration = Duration::from_millis(1);
 
 /// The longest the relay holds output back from its clients while a stream saturates the
 /// terminal, to send it in frames of a useful size and not one per kernel read. The hold
@@ -621,8 +645,15 @@ impl Relay {
                 sources.push(Source::Listener);
             }
             let mut events = 0;
-            if self.reading && !self.master_done {
+            // Not while the parser is too far behind: the program waits in the terminal's
+            // buffer and the timer in `wake_in` looks again.
+            let throttled = self.throttled();
+            if self.reading && !self.master_done && !throttled {
                 events |= libc::POLLIN;
+            }
+            if throttled {
+                // Never leave the worker asleep with the relay waiting for it.
+                self.core.wake_worker();
             }
             if self.input_pending() > 0 {
                 events |= libc::POLLOUT;
@@ -698,10 +729,9 @@ impl Relay {
                 if self.leaving_for_good() {
                     self.forget_label();
                 }
-                // The screen has had all that was read before the relay goes, and the
-                // thread behind it is done.
-                self.catch_up();
-                self.worker = None;
+                // The screen goes with this process and a successor builds its own from
+                // the journal, every byte of which that a client was shown is at or below
+                // `answered` already: parsing what is left would only delay the release.
                 let offset = self.journal.total();
                 self.send_warden(&ToWarden::Released { offset });
                 return 0;
@@ -837,7 +867,14 @@ impl Relay {
         // reads. Nobody can attach in the middle of this.
         let watched = self.attached() > 0;
         let mut last = None;
+        // A turn reads no more than a fraction of the ring before the clients are driven:
+        // reads that no `drive` follows would lap a client on a ring they fill in a turn.
+        let turn_limit = self.journal.capacity() / 8;
+        let mut read = 0u64;
         for _ in 0..READ_BUDGET {
+            if read >= turn_limit || self.throttled() {
+                break;
+            }
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) => {
                     self.master_done = true;
@@ -845,6 +882,7 @@ impl Relay {
                     break;
                 }
                 Ok(n) => {
+                    read += n as u64;
                     // Before the next read: a read may lap a small ring.
                     if watched {
                         self.leave_to_the_worker();
@@ -878,9 +916,9 @@ impl Relay {
     /// the worker parses it. The offset moves right after the read, as it does when the
     /// relay feeds the screen itself, so a relay that takes over answers nothing twice.
     ///
-    /// The screen may not fall further behind than the ring can bear: past half of it, and
-    /// a read is at most a quarter, the ring could lap the screen, so this thread gives
-    /// the screen what is missing before it reads again.
+    /// This thread never parses for it: when the screen falls [`Relay::behind_limit`]
+    /// behind, the terminal is not read any more until the worker has brought it back
+    /// ([`Relay::throttled`]), which also keeps the ring from lapping the screen.
     fn leave_to_the_worker(&mut self) {
         self.journal.set_answered(self.journal.total());
         if self.worker.is_none() {
@@ -891,14 +929,27 @@ impl Relay {
             }
         }
         let behind = self.journal.total().saturating_sub(self.core.parsed());
-        if behind > self.journal.capacity() / 2 {
-            self.catch_up();
-        } else if behind >= WAKE_BACKLOG.min(self.journal.capacity() / 4) {
-            // Not for every kernel read: a wake-up per kibibyte costs the reads more than
-            // the parser's thread saves them, and what is left below this is small for
-            // whoever looks at the screen next to give it.
+        // Not for every kernel read: a wake-up per kibibyte costs the reads more than the
+        // parser's thread saves them, and what is left below this is small for whoever
+        // looks at the screen next to give it. It is never more than the limit, so a
+        // relay that stops reading for the backlog has woken the worker.
+        if behind >= WAKE_BACKLOG.min(self.journal.capacity() / 4) {
             self.core.wake_worker();
         }
+    }
+
+    /// How far behind the reads the screen may be: [`BEHIND_LIMIT`], and no more than half
+    /// the ring. A read is at most a quarter of it, so the ring cannot lap the screen.
+    fn behind_limit(&self) -> u64 {
+        BEHIND_LIMIT.min(self.journal.capacity() / 2)
+    }
+
+    /// The terminal is not read: the worker has more to parse than [`Relay::behind_limit`].
+    fn throttled(&self) -> bool {
+        self.worker.is_some()
+            && self.reading
+            && !self.master_done
+            && self.journal.total().saturating_sub(self.core.parsed()) >= self.behind_limit()
     }
 
     /// The shell is gone: take what it left in the terminal and read no more.
@@ -1980,7 +2031,10 @@ impl Relay {
         }
         let owed = total.saturating_sub(furthest);
         let streaming = self.saturated && self.reading && !self.master_done && self.exit.is_none();
-        if streaming && attached > 0 && !busy && owed > 0 && owed < OUT_CHUNK as u64 {
+        // A frame's worth, but never more than half a ring: more than the ring holds is
+        // not a client that is behind, it is output the relay did not send in time.
+        let bound = (OUT_CHUNK as u64).min(self.journal.capacity() / 2);
+        if streaming && attached > 0 && !busy && owed > 0 && owed < bound {
             let since = *self.held_since.get_or_insert(now);
             if now.saturating_duration_since(since) < HOLD_LIMIT {
                 self.holding = true;
@@ -2006,18 +2060,24 @@ impl Relay {
     }
 
     /// How long a `poll` may wait at `now`: for ever unless a look at the
-    /// terminal, the end of a session's wait or the end of a hold on the output
-    /// is due.
+    /// terminal, the end of a session's wait, the end of a hold on the output or
+    /// the end of a pause for the parser is due.
     fn wake_in(&self, now: Instant) -> Option<Duration> {
         let keep = if self.delivered_sent {
             None
         } else {
             self.keep.timeout(now)
         };
-        [self.settle.timeout(now), keep, self.hold_left(now)]
-            .into_iter()
-            .flatten()
-            .min()
+        let throttle = self.throttled().then_some(THROTTLE_WAIT);
+        [
+            self.settle.timeout(now),
+            keep,
+            self.hold_left(now),
+            throttle,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Tells the warden the session may be removed, once, when it is time.
@@ -2463,9 +2523,15 @@ mod tests {
         let start = Instant::now();
         while relay.journal.total() < total {
             assert!(
-                start.elapsed() < Duration::from_secs(10),
+                start.elapsed() < Duration::from_secs(60),
                 "the stream stopped"
             );
+            // As the loop of the relay does: a terminal that is not read is not waited on,
+            // and the clock looks again.
+            if relay.throttled() {
+                std::thread::sleep(THROTTLE_WAIT);
+                continue;
+            }
             let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
             if sys::poll(&mut set, Some(Duration::from_millis(100))).unwrap() > 0 {
                 relay.read_terminal();
@@ -2560,6 +2626,9 @@ mod tests {
         sys::write_fd(write.as_fd(), &[b'z'; 4096]).unwrap();
         relay.read_terminal();
         assert!(relay.saturated);
+        // The screen has had it all, or the terminal would not be read again yet.
+        relay.catch_up();
+        assert!(!relay.throttled());
         sys::write_fd(write.as_fd(), b"a").unwrap();
         relay.read_terminal();
         assert!(!relay.saturated);
@@ -2796,6 +2865,105 @@ mod tests {
      {
         the_question_a_client_was_shown_is_not_answered_when_it_leaves(true);
         the_question_a_client_was_shown_is_not_answered_when_it_leaves(false);
+    }
+
+    #[test]
+    fn a_program_that_clears_the_screen_in_a_loop_does_not_stall_the_relay_for_the_parser() {
+        let (mut relay, slave, _far) = relay_with_a_client();
+        // A ring that is far larger than the limit: the backlog the parser could be given
+        // is not bounded by it.
+        let journal = Arc::new(Journal::create(8 << 20).unwrap());
+        relay.core = Core::new(
+            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
+            Arc::clone(&journal),
+        );
+        relay.journal = journal;
+        relay.chunk = 64 * 1024;
+        let stream = b"\x1b[2J\x1b[H".repeat(80 * 1024);
+        let writer = program_writes(&slave, stream.clone());
+        let (mut worst, mut throttled, mut typed) = (Duration::ZERO, 0, 0);
+        let start = Instant::now();
+        while relay.journal.total() < stream.len() as u64 {
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the stream stopped"
+            );
+            let turn = Instant::now();
+            if relay.throttled() {
+                throttled += 1;
+                relay.core.wake_worker();
+                relay.hold_output(turn);
+                std::thread::sleep(THROTTLE_WAIT);
+                worst = worst.max(turn.elapsed());
+            } else {
+                let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+                if sys::poll(&mut set, Some(Duration::from_millis(5))).unwrap() > 0 {
+                    let turn = Instant::now();
+                    relay.read_terminal();
+                    worst = worst.max(turn.elapsed());
+                }
+            }
+            // A client types all the while, and what it types reaches the program.
+            if typed < 20 {
+                relay.type_input(0, b"k");
+                typed += 1;
+            }
+            // The backlog the parser has is never more than the limit and one read.
+            let behind = relay.journal.total() - relay.core.parsed();
+            assert!(
+                behind < relay.behind_limit() + relay.chunk as u64,
+                "{behind}"
+            );
+        }
+        writer.join().unwrap();
+        assert_eq!(typed_to_the_program(&slave), b"k".repeat(20));
+        assert!(
+            worst < Duration::from_millis(500),
+            "a turn took {worst:?} (the terminal was not read in {throttled} of them)"
+        );
+        // And the screen is the one of the bytes in order.
+        relay.catch_up();
+        assert!(relay.picture().bytes == reference_image(&stream));
+    }
+
+    #[test]
+    fn a_client_that_reads_flat_out_is_not_dropped_on_a_small_ring() {
+        for kib in [16u64, 32, 64, 128, 256, 512] {
+            let capacity = kib * 1024;
+            let (mut relay, slave, far) = relay_with_a_client();
+            let journal = Arc::new(Journal::create(capacity).unwrap());
+            relay.core = Core::new(
+                ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
+                Arc::clone(&journal),
+            );
+            relay.journal = journal;
+            // The chunk a session over a ring of this size reads.
+            relay.chunk = usize::try_from((64u64 * 1024).min(capacity / 4)).unwrap();
+            let stream = b"some text of the flood, a line of it\r\n".repeat(2 << 15);
+            let writer = program_writes(&slave, stream.clone());
+            let (mut decoder, mut got) = (PacketDecoder::new(), 0);
+            let start = Instant::now();
+            while got < stream.len() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(60),
+                    "{kib}K: {got} of {}",
+                    stream.len()
+                );
+                // One turn of the relay's loop, and then the client reads what it was sent.
+                if !relay.throttled() {
+                    let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+                    if sys::poll(&mut set, Some(Duration::from_millis(1))).unwrap() > 0 {
+                        relay.read_terminal();
+                    }
+                }
+                relay.hold_output(Instant::now());
+                relay.drive(0);
+                assert!(!relay.clients[0].dead, "{kib}K: dropped after {got} bytes");
+                got += received(&far, &mut decoder);
+            }
+            writer.join().unwrap();
+            assert_eq!(got, stream.len(), "{kib}K");
+        }
     }
 
     #[test]
