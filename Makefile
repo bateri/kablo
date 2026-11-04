@@ -24,15 +24,20 @@ clippy:
 # `-p vte` finds it through `alacritty_terminal`, which also turns on the `ansi`
 # feature the fork's changes to the handler live behind (without it most of them
 # would go untested, so a graph that stops using `alacritty_terminal` stops
-# testing them: look for the 77 tests of its lib target in the output).
+# testing them: look for the 81 tests of its lib target in the output).
 VTE_TEST = test -p vte --all-targets
 
 # The same for the emulator's fork (`vendor/alacritty_terminal`), whose tests are upstream's
 # and ours. It has dev-dependencies and is not a member, so cargo will not test it as `-p` of
 # this workspace: it is tested as the package it is, on the Cargo.lock upstream shipped with
 # it (`--locked`: the versions upstream tested), with its default features, which is also how
-# upstream's reference tests (they need `serde`) run.
-ALACRITTY_TEST = test --manifest-path vendor/alacritty_terminal/Cargo.toml --all-targets --locked
+# upstream's reference tests (they need `serde`) run. The package is the fork, so its `vte`
+# is the fork too (`vendor/vte`): the emulator's `input_ascii` implements a method of the
+# fork's `Handler` that the registry's `vte` does not have. The `--config` is the
+# `[patch.crates-io]` of the root `Cargo.toml` the package is not part of, and the one
+# line of its `Cargo.lock` that names `vte` is the path, not the registry.
+ALACRITTY_TEST = test --manifest-path vendor/alacritty_terminal/Cargo.toml --all-targets --locked \
+	--config patch.crates-io.vte.path=\"vendor/vte\"
 
 test:
 	$(CARGO) test --workspace --all-targets

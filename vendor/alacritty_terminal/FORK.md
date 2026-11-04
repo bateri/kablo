@@ -26,7 +26,8 @@ leave upstream's formatting and lints alone. Its tests, upstream's and ours, run
 `make check` and `make linux`: as the package it is (`cargo test --manifest-path
 vendor/alacritty_terminal/Cargo.toml --all-targets --locked`, since cargo will not test a
 non-member that has dev-dependencies as `-p` of the workspace), on the `Cargo.lock` upstream
-shipped with it and with its default features, so upstream's reference tests run too.
+shipped with it (but for its `vte`, which is the fork next to this one: see the last change
+below) and with its default features, so upstream's reference tests run too.
 
 ## Changes
 
@@ -51,6 +52,27 @@ shipped with it and with its default features, so upstream's reference tests run
   the bug sits in a path every dependent runs once `Config::kitty_keyboard` is on. Touches
   `src/term/mod.rs`. Test: `a_full_keyboard_mode_stack_drops_its_own_bottom_entry` in the
   same file.
+
+- **A run of printable ASCII is written in one go.** `Term` implements
+  `ansi::Handler::input_ascii(&str)`, the method the `vte` fork added (`vendor/vte`, its
+  `FORK.md`; upstream's `vte` has no such method, so this fork no longer builds against the
+  registry's). It writes a run into the cells it lands on stretch by stretch, where `input`
+  looks up the width, maps the charset, copies the template and checks for fullwidth cells for
+  each character. The result is the one `input` for each character leaves, always: the cells,
+  the cursor and `input_needs_wrap`, the rows' `occ` and the damage. Anything that makes a
+  character depend on more than its own cell is left to `input`: insert mode, a charset other
+  than ASCII, line wrap off, a template with `extra` (a hyperlink, an underline color), and a
+  target cell that is a fullwidth character, its spacer or holds `extra` (`write_at_cursor`
+  clears the other half of the character and the previous line's leading spacer, and
+  replaces `extra`). The cell, the grid's storage and the parser are not touched. Touches
+  `src/term/mod.rs` (§4(b) notice) and adds `src/term/input_ascii_tests.rs` (notice at its top),
+  whose differential test runs the same random mix of text, wide and zero-width characters,
+  attributes, hyperlinks, modes, charsets, regions, the alternate screen, cursor moves and REP
+  through a `Term` taking runs and one driven character by character, and compares every cell,
+  the cursor, `occ`, the damage and the modes after each read. A bump must carry both and
+  the tests; `make check` runs this package's tests against the `vte` fork (the Makefile's
+  `--config` with the `[patch.crates-io]` the package is not part of, and the `vte` entry of
+  `Cargo.lock` is the path instead of the registry).
 
 ## When this directory changes
 

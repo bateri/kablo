@@ -660,6 +660,17 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// A run of printable ASCII (`0x20..=0x7e`, never empty) to be displayed.
+    ///
+    /// The default is `input` for each character, so a handler that does not implement this
+    /// behaves as before. One that does must leave the state `input` per character would:
+    /// it exists so a handler can write a run without paying per-character costs.
+    fn input_ascii(&mut self, s: &str) {
+        for c in s.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1480,6 +1491,15 @@ where
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
+    }
+
+    #[inline]
+    fn print_ascii(&mut self, s: &str) {
+        self.handler.input_ascii(s);
+        // REP repeats the last character written, which is the last of the run.
+        if let Some(&last) = s.as_bytes().last() {
+            self.state.preceding_char = Some(last as char);
+        }
     }
 
     #[inline]
@@ -2337,6 +2357,83 @@ mod tests {
         // An empty request, or a list, is not one name: upstream's reading leaves it.
         parser.advance(&mut handler, b"\x1b]22;\x1b\\\x1b]22;>text\x1b\\");
         assert_eq!(handler.cursor_icon, Some(CursorIcon::Pointer));
+    }
+
+    /// A handler that takes a run of ASCII whole, and tells what it got.
+    #[derive(Default)]
+    struct Text {
+        events: Vec<Printed>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Printed {
+        Char(char),
+        Run(String),
+    }
+
+    impl Handler for Text {
+        fn input(&mut self, c: char) {
+            self.events.push(Printed::Char(c));
+        }
+
+        fn input_ascii(&mut self, s: &str) {
+            self.events.push(Printed::Run(s.to_owned()));
+        }
+    }
+
+    fn chars(text: &str) -> impl Iterator<Item = Printed> + '_ {
+        text.chars().map(Printed::Char)
+    }
+
+    /// A handler that knows nothing of runs: `input` only.
+    #[derive(Default)]
+    struct OnlyChars(Vec<Printed>);
+
+    impl Handler for OnlyChars {
+        fn input(&mut self, c: char) {
+            self.0.push(Printed::Char(c));
+        }
+    }
+
+    #[test]
+    fn a_handler_without_input_ascii_gets_every_character_as_before() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = OnlyChars::default();
+
+        parser.advance(&mut handler, "ab c\x1b[3bd\u{e9}\x1b[2be \x1b[b".as_bytes());
+
+        let expected: Vec<_> = chars("ab ccccd\u{e9}\u{e9}\u{e9}e  ").collect();
+        assert_eq!(handler.0, expected);
+    }
+
+    #[test]
+    fn repeating_after_a_run_repeats_its_last_character() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = Text::default();
+
+        // Nothing came before: nothing to repeat.
+        parser.advance(&mut handler, b"\x1b[3b");
+        assert!(handler.events.is_empty());
+
+        // The run's last character, then (after a read of its own) the next run's.
+        parser.advance(&mut handler, b"abc\x1b[2b");
+        parser.advance(&mut handler, b"de\x1b[b");
+        // A character outside ASCII in between takes the place, and a run takes it back.
+        parser.advance(&mut handler, "f\u{e9}\x1b[b g\x1b[b".as_bytes());
+
+        let expected = [
+            Printed::Run("abc".into()),
+            Printed::Char('c'),
+            Printed::Char('c'),
+            Printed::Run("de".into()),
+            Printed::Char('e'),
+            Printed::Run("f".into()),
+            Printed::Char('\u{e9}'),
+            Printed::Char('\u{e9}'),
+            Printed::Run(" g".into()),
+            Printed::Char('g'),
+        ];
+        assert_eq!(handler.events, expected);
     }
 
     #[test]
