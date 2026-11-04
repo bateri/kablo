@@ -258,19 +258,25 @@ impl EndKeep {
     }
 }
 
-/// Terminal reads (and waits for more) in one turn before the other descriptors get a look.
-/// A kernel read of a terminal is small (a macOS one returns at most a kibibyte), so a
-/// stream needs [`OUT_CHUNK`] over that many of them to fill a frame; twice as many, so
-/// that each may be followed by a wait for the next ([`REFILL_WAIT`]) and the turn still
-/// ends on the bytes and not on this.
-const READ_BUDGET: usize = 2 * (OUT_CHUNK / 1024);
+/// Terminal reads in one turn before the other descriptors get a look. A kernel read of a
+/// terminal is small (a macOS one returns at most a kibibyte), so a stream needs [`OUT_CHUNK`]
+/// over that many of them to fill a frame, and each may come after [`REFILL_RETRIES`] that
+/// found nothing: a turn ends on the bytes and not on this.
+const READ_BUDGET: usize = (REFILL_RETRIES + 2) * (OUT_CHUNK / 1024);
 
-/// How long a turn that is gathering waits for the terminal to be readable again after a
-/// full read left it empty. A stream that fills the kernel's read refills it in
-/// microseconds, and a turn that ended there would send what it has as a frame of a few
-/// kibibytes and come back for the next, which costs the relay and the client more than
-/// the bytes do. A millisecond is the finest wait `poll` has. When nothing comes the stream
-/// has stopped, the turn ends and the relay sleeps with no timeout.
+/// How many times a turn that is gathering reads again at once after a full read left the
+/// terminal empty, before it sleeps ([`REFILL_WAIT`]). The program refills it within
+/// microseconds, and a sleep and a wake-up cost several more: sleeping at every gap puts the
+/// reader and the program in lockstep at a kibibyte a wake-up. A read that finds nothing is
+/// a fraction of a microsecond, and these are only for a stream that fills the kernel's read,
+/// so a quiet or interactive terminal never does them. Past this many the gain flattens out.
+const REFILL_RETRIES: usize = 16;
+
+/// How long a turn that is gathering sleeps for the terminal to be readable again, once
+/// [`REFILL_RETRIES`] found it empty. A turn that ended there would send what it has as a
+/// frame of a few kibibytes and come back for the next, which costs the relay and the client
+/// more than the bytes do. A millisecond is the finest wait `poll` has. When nothing comes
+/// the stream has stopped, the turn ends and the relay sleeps with no timeout.
 const REFILL_WAIT: Duration = Duration::from_millis(1);
 
 /// How long a turn goes on gathering. A flood fills a frame well inside this. A program that
@@ -891,7 +897,8 @@ impl Relay {
         // questions, and the screen is only a record that a thread can keep behind the
         // reads. Nobody can attach in the middle of this.
         let watched = self.attached() > 0;
-        let mut last = None;
+        let mut saturated = false;
+        let mut retries = 0;
         // A turn ends at a frame's worth, and at no more than a fraction of the ring: reads
         // that no `drive` follows would lap a client on a ring they fill in a turn.
         let turn_limit = (OUT_CHUNK as u64).min(self.journal.capacity() / 8);
@@ -914,27 +921,29 @@ impl Relay {
                     } else {
                         self.feed_screen(Feed::Live);
                     }
-                    last = Some(n);
+                    saturated = n >= FULL_READ;
+                    retries = 0;
                     // What a client is shown ends the turn on a short read: the program
                     // had no more, and a keystroke's echo goes out in the turn it came.
-                    if watched && n < FULL_READ {
+                    if watched && !saturated {
                         break;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // A full read that left the terminal empty is a stream that refills
-                    // it in a moment: wait for it here, to send one frame and not many.
-                    // Never a `read` again without a `poll` between: reading in a loop
-                    // while the program is writing contends with it and is slower.
-                    if watched
-                        && last.is_some_and(|n| n >= FULL_READ)
-                        && now.elapsed() < GATHER_LIMIT
-                        && self.refills()
-                    {
-                        last = None;
+                    // A full read that left the terminal empty is a stream that refills it
+                    // within microseconds: wait for it here, to send one frame and not many.
+                    if !watched || !saturated || now.elapsed() >= GATHER_LIMIT {
+                        break;
+                    }
+                    // Sleeping costs more than the gap does: read again a few times first.
+                    if retries < REFILL_RETRIES {
+                        retries += 1;
                         continue;
                     }
-                    break;
+                    retries = 0;
+                    if !self.refills() {
+                        break;
+                    }
                 }
                 // `EIO` is how Linux says the program's side is closed.
                 Err(_) => {
