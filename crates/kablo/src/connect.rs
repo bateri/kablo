@@ -184,7 +184,7 @@ fn on_this_machine(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
 /// flood faster than this connection carries it, and left behind by the ring this client is
 /// dropped and comes back to a reset and a picture, every few hundredths of a second, with a
 /// key typed in that moment gone along with the connection. Over `ssh` the link may be what
-/// is slow, and the picture is the answer: `^C` shows without a megabyte of output before it.
+/// is slow and a program is not kept waiting for it: the picture is the answer there.
 fn view_of(
     size: Option<Size>,
     answers_itself: bool,

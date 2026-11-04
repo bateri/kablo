@@ -123,12 +123,6 @@ was answered already, by the session while you were gone or by your terminal
 earlier (where the cursor is, what the terminal is): your terminal would answer
 it again and the second answer would be typed into the program, as `^[[12;1R`
 at the prompt.
-
-A program that writes faster than your terminal draws waits for it, as it would
-in that terminal without a session, and all of it reaches the screen. Over `ssh`
-(`SSH_CONNECTION` or `SSH_TTY` in the environment) it is not kept waiting for a
-link that may be slow: what could not be sent in time is replaced by a picture
-of the screen, so `^C` shows at once.
 `--fresh` skips the past and shows only what comes next.
 Several terminals can be connected to a session at once, and all of them show
 what it writes. `--take` makes this one the only one: the others are let go, each
@@ -141,6 +135,14 @@ When the session cannot take what you type for a moment, `connect` holds it
 and tries again (a few seconds at most, then it says why and exits); when the
 program is not reading its input at all, the terminal rings its bell for the
 keys that were refused and `connect` stays, so Ctrl-\ still works.
+
+A program that writes faster than your terminal draws waits for it, as it would
+in that terminal without a session, and all of it reaches the screen; a terminal
+that stops drawing for a second is no longer waited for. With several terminals
+connected the quickest sets the pace, and one that falls too far behind it gets a
+picture of the screen in place of what it missed. Over `ssh` (`SSH_CONNECTION` or
+`SSH_TTY` in the environment) the program is not kept waiting for a link that may
+be slow, and that picture is what you get.
 
 `kablo list` is a table for people and `kablo list --json` is JSON for
 programs (keys are added to it, never removed; `label` is the session's label

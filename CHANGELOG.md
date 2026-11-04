@@ -41,8 +41,9 @@ section is not released.
 - **`kablo connect` in a terminal on the session's own machine shows all of a flood.** A program
   that writes faster than the terminal draws waits for it, as it would in that terminal without a
   session, where it could have left you with a reset and a picture of the screen in place of what
-  it wrote. Over `ssh` (`SSH_CONNECTION` or `SSH_TTY` in the environment) a link that may be slow
-  still gets the picture, so `^C` shows at once.
+  it wrote. With several clients the quickest sets the pace. Over `ssh` (`SSH_CONNECTION` or
+  `SSH_TTY` in the environment) the program is not kept waiting for a link that may be slow, and
+  that picture is what you get.
 
 ### For apps
 
@@ -53,7 +54,8 @@ section is not released.
   reading the program's output, so a program that writes faster than the app reads waits instead
   of writing over what the app has not read, and the app is not sent a picture of the screen in
   place of the bytes it lost (its scrollback with them). An app that stops reading releases the
-  program after a second, and is lapped as without the bit. Leave it off on a slow link, where
+  program after a second, and is lapped as without the bit, and so is one slower than another
+  client attached to the session: the one that keeps up sets the pace. Leave it off on a slow link, where
   the picture is the right answer; the bridge keeps the bit across a resize and a new connection
   as it does the others. A relay from before the bit ignores it, and so does a bridge from before
   it (a `kablo attach` still running from before the upgrade decodes the view and encodes it
@@ -89,8 +91,8 @@ section is not released.
   `alacritty_terminal::term::text_width` is public: a type that wraps the handler and asks a
   character's width gets the same answer without the table.
 - **The emulator fork pins `unicode-width` to exactly `0.2.2`**, the table `text_width` was made
-  from. An app that takes the fork by `rev` takes that version with it, and a dependency of the
-  app that asks for another does not resolve.
+  from. An app that takes the fork by `rev` takes that version with it, and a requirement elsewhere
+  in the app's tree that rules out `0.2.2` does not resolve.
 
 ## [0.5.1] - 2026-10-31
 

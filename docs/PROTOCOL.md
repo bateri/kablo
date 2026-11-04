@@ -565,8 +565,11 @@ unix socket). Without it, a client that falls behind by more than the journal
 holds is sent a picture of the screen in place of the bytes it lost (`attached`
 with `truncated`), which is what a slow link wants: the program is never kept
 waiting for it. With it, while the client is behind by more than half the
-journal the server stops reading the program's output, so the program waits (in
-the terminal's own buffer, as it does for any slow reader) and nothing is lost.
+journal and no client attached to the session is less far behind than that, the
+server stops reading the program's output, so the program waits (in the terminal's
+own buffer, as it does for any slow reader) and nothing is lost. A client that keeps
+up sets the pace: one beside it that asked for every byte and cannot keep up is
+dropped behind as without the bit.
 A client that stops reading does not hold the program for good: when its
 position has not moved for a second the server goes on reading and the client
 is dropped behind as without the bit, until it reads again. A bridge that
@@ -810,9 +813,10 @@ about), so an idle connection costs nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
 the program, unless it asked for every byte (Attach), and then for a second at
-most. Output is sent a frame at a time and only when the connection
-takes it, so the only buffer a client costs is one frame and its position in
-the journal. A client is dropped when the journal has moved past the next byte
+most; one that reads slowly and asked sets the program's pace while no client
+attached keeps up. Output is sent a frame at a time and only when the connection
+takes it, so what a client costs is one frame (and the larger send buffer of one
+that asked for every byte) and its position in the journal. A client is dropped when the journal has moved past the next byte
 it is owed: its connection is closed, without a message, and it comes back
 with the offset it had. Replies to a client's requests are queued for it and a
 client that asks without ever reading is dropped the same way once 4 MiB of

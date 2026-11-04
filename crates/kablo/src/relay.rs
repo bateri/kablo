@@ -1019,13 +1019,21 @@ impl Relay {
             return Some(Pause::Parser);
         }
         // A client that asked for every byte is behind by more than half the ring, and has
-        // not stood still for [`STALL_LIMIT`]: the reads that would lap it wait for it.
+        // not stood still for [`STALL_LIMIT`]: the reads that would lap it wait for it. Unless
+        // somebody attached keeps up: the quickest sets the pace, and a slow terminal is
+        // lapped beside it as without the bit, not a brake on it and on the program.
         let half = self.journal.capacity() / 2;
-        self.clients
-            .iter()
-            .filter(|client| !client.dead)
-            .filter_map(|client| client.attach.as_ref())
-            .filter(|attach| attach.every_byte && total.saturating_sub(attach.next) > half)
+        let attached = || {
+            self.clients
+                .iter()
+                .filter(|client| !client.dead)
+                .filter_map(|client| client.attach.as_ref())
+        };
+        if attached().any(|attach| total.saturating_sub(attach.next) <= half) {
+            return None;
+        }
+        attached()
+            .filter(|attach| attach.every_byte)
             .map(|attach| attach.waited_since.unwrap_or(now) + STALL_LIMIT)
             .filter(|until| *until > now)
             .min()
@@ -3205,6 +3213,25 @@ mod tests {
         let (mut decoder, mut got, mut picture) = (PacketDecoder::new(), Vec::new(), false);
         read_slowly(&far, &mut decoder, 1 << 20, &mut got, &mut picture);
         assert!(picture, "a client that is lapped gets a picture");
+    }
+
+    #[test]
+    fn a_client_that_keeps_up_is_not_held_back_by_a_slower_one_that_asked_for_every_byte() {
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        on_a_ring(&mut relay, MIN_CAPACITY);
+        if let Some(attach) = relay.clients[0].attach.as_mut() {
+            attach.every_byte = true;
+        }
+        let (quick, _quick_far) = client_of(false);
+        relay.clients.push(quick);
+        relay.journal.append(&vec![b'x'; 12 * 1024]);
+        let now = Instant::now();
+        relay.note_laggards(now);
+        // Nobody keeps up: the program waits for the one that asked.
+        assert!(matches!(relay.paused(now), Some(Pause::Client { .. })));
+        // Somebody does: it sets the pace.
+        relay.clients[1].attach.as_mut().unwrap().next = relay.journal.total();
+        assert_eq!(relay.paused(now), None);
     }
 
     #[test]
