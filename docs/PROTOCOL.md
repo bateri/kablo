@@ -816,9 +816,13 @@ the program, unless it asked for every byte (Attach), and then for a second at
 most; one that reads slowly and asked sets the program's pace while no client
 attached keeps up. Output is sent a frame at a time and only when the connection
 takes it, so what a client costs is one frame (and the larger send buffer of one
-that asked for every byte) and its position in the journal. A client is dropped when the journal has moved past the next byte
-it is owed: its connection is closed, without a message, and it comes back
-with the offset it had. Replies to a client's requests are queued for it and a
+that asked for every byte) and its position in the journal. A client is let go when the journal has moved past the next byte
+it is owed: the server closes its side of the connection, without a message, and
+the client, which reads the end of the stream after what was on its way, closes
+its own and comes back with the offset it had. What it typed (`input`, `write`)
+until then is still read and reaches the program, so a key pressed before it has
+noticed is not lost; nothing else it sends is acted on, and nothing is answered.
+One that has not closed in 30 seconds is closed. Replies to a client's requests are queued for it and a
 client that asks without ever reading is dropped the same way once 4 MiB of
 them are waiting.
 
@@ -1104,6 +1108,7 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
 | connections to one session | 64 |
 | input waiting for the program | 1 MiB, then an `input` is answered with `INPUT_FULL` |
 | replies queued for one client | 4 MiB, then the client is dropped |
+| a client let go for being behind | 30 s to close its side, then the server closes it |
 | streams open on one connection | 128, counting the ones still connecting; one more is `failed` (5) |
 | streams connecting at once on one connection | 16; one more is `failed` (5) |
 | window of a stream, and credit outstanding | 16 MiB; an `open` asking for more is `failed` (5) |

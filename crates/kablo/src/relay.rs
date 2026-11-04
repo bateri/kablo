@@ -13,7 +13,7 @@
 //! after a reconnect and live output are one path, "the bytes it missed,
 //! exactly" falls out of it, and the buffer a slow client costs is the
 //! journal's, not another. A client that falls behind by more than the ring
-//! holds is dropped (it comes back with its offset and is told, by
+//! holds is let go (it comes back with its offset and is told, by
 //! `truncated`, what it lost); it never slows the terminal's reading.
 //!
 //! **The relay keeps the screen too.** Every byte read from the terminal goes
@@ -325,6 +325,11 @@ const THROTTLE_WAIT: Duration = Duration::from_millis(1);
 /// The timer runs only while the relay is waiting for such a client.
 const STALL_LIMIT: Duration = Duration::from_secs(1);
 
+/// How long a client that was let go ([`Client::let_go`]) may take to notice and close its
+/// side. A client that reads gets there when it has shown what was on its way, which over a
+/// slow link is seconds; one that does not read gives its seat back after this.
+const LET_GO_LIMIT: Duration = Duration::from_secs(30);
+
 /// Reads of one client's socket in one turn, at most. A client that leaves
 /// with more than this many reads' worth unread is seen to have left a turn
 /// later, so a question asked in between still counts it.
@@ -372,9 +377,30 @@ struct Client {
     /// What [`Relay::input_queued`] was after the last `input` it sent: the bytes
     /// of it are the ones a `ping` of its own waits for.
     typed_to: u64,
+    /// When the ring left it behind and it was let go ([`Client::let_go`]).
+    let_go_at: Option<Instant>,
 }
 
 impl Client {
+    /// The ring has left this client behind, so it gets no more of the stream. It is told by
+    /// the end of the stream, after what is on its way, and comes back with the offset it has.
+    ///
+    /// Only this side is closed. The client does not know until it has read that far, and over
+    /// a slow link it writes for seconds before it has: a key on a connection that was closed
+    /// is lost, and a key pressed while a program's output outruns the link is a `^C`. What it
+    /// types until it closes is read and goes to the program.
+    fn let_go(&mut self, now: Instant) {
+        // A failure is a socket with nobody on it, which the next read says.
+        let _ = self.sock.shutdown(std::net::Shutdown::Write);
+        self.attach = None;
+        self.out.clear();
+        self.sent = 0;
+        self.asked = None;
+        self.waiting = false;
+        self.pings.clear();
+        self.let_go_at = Some(now);
+    }
+
     /// The end of the program was queued for it and has left: it has been told.
     fn told(&self) -> bool {
         self.ended_queued && self.out.is_empty()
@@ -1346,6 +1372,7 @@ impl Relay {
             waiting: false,
             pings: VecDeque::new(),
             typed_to: 0,
+            let_go_at: None,
         });
     }
 
@@ -1421,6 +1448,11 @@ impl Relay {
                 _ => return,
             };
             match next {
+                // Let go, all a client can still do is type: what else it wants it asks again
+                // on the connection it comes back on, and here it would not be told.
+                Ok(Some(packet))
+                    if self.was_let_go(i)
+                        && !matches!(packet.message, Message::Input(_) | Message::Write(_)) => {}
                 Ok(Some(packet)) => self.handle(i, packet),
                 Ok(None) => return,
                 Err(e) if e.is_recoverable() => {
@@ -1439,6 +1471,10 @@ impl Relay {
         let Some(client) = self.clients.get_mut(i) else {
             return;
         };
+        // The end of the stream was the last thing it is told.
+        if client.let_go_at.is_some() {
+            return;
+        }
         let packet = Packet { session, message };
         if packet.encode(&mut client.out).is_err()
             || client.out.len().saturating_sub(client.sent) > OUT_LIMIT
@@ -1574,6 +1610,12 @@ impl Relay {
         self.clients
             .get(i)
             .is_some_and(|client| client.attach.is_some())
+    }
+
+    fn was_let_go(&self, i: usize) -> bool {
+        self.clients
+            .get(i)
+            .is_some_and(|client| client.let_go_at.is_some())
     }
 
     fn attach(&mut self, i: usize, offset: u64, view: Option<View>) {
@@ -1744,7 +1786,7 @@ impl Relay {
     }
 
     fn type_input(&mut self, i: usize, bytes: &[u8]) {
-        if !self.is_attached(i) {
+        if !self.is_attached(i) && !self.was_let_go(i) {
             return self.error(i, ErrorCode::NOT_ATTACHED, "attach first");
         }
         if self.exit.is_some() {
@@ -2021,10 +2063,19 @@ impl Relay {
 
     /// Writes what client `i` can take and queues what it is owed.
     fn drive(&mut self, i: usize) {
+        // Let go: it is owed nothing more, and it is for it to notice.
+        if let Some(client) = self.clients.get_mut(i)
+            && let Some(at) = client.let_go_at
+        {
+            if at.elapsed() >= LET_GO_LIMIT {
+                client.dead = true;
+            }
+            return;
+        }
         let ended_ready = self.exit.is_some() && self.final_drained;
         for _ in 0..FRAMES_PER_TURN {
             if !self.flush(i) {
-                // Blocked or dead; the lapped check below still applies.
+                // Blocked or dead; the check for a ring that left it behind still applies.
                 break;
             }
             let total = self.journal.total();
@@ -2097,7 +2148,7 @@ impl Relay {
                     }
                     // The ring was lapped under it.
                     _ => {
-                        client.dead = true;
+                        client.let_go(Instant::now());
                         return;
                     }
                 }
@@ -2127,7 +2178,7 @@ impl Relay {
         let Some(client) = self.clients.get_mut(i) else {
             return;
         };
-        // A client the ring has left behind is dropped even when it is not
+        // A client the ring has left behind is let go even when it is not
         // reading: it never gets what it has not got, and it must not hold a
         // seat for the whole session.
         let oldest = self.journal.ring_from();
@@ -2136,7 +2187,7 @@ impl Relay {
             .as_ref()
             .is_some_and(|attach| attach.next < oldest)
         {
-            client.dead = true;
+            client.let_go(Instant::now());
             return;
         }
         if client.told() {
@@ -2152,8 +2203,9 @@ impl Relay {
     }
 
     /// How long a `poll` may wait at `now`, with the terminal left out of it for `pause`: for
-    /// ever unless a look at the terminal, the end of a session's wait or the end of the pause
-    /// (the screen's thread, a client that is waited for) is due.
+    /// ever unless a look at the terminal, the end of a session's wait, the end of the pause
+    /// (the screen's thread, a client that is waited for) or the end of a client that was let
+    /// go is due.
     fn wake_in(&self, now: Instant, pause: Option<Pause>) -> Option<Duration> {
         let keep = if self.delivered_sent {
             None
@@ -2164,7 +2216,13 @@ impl Relay {
             Pause::Parser => THROTTLE_WAIT,
             Pause::Client { until } => until.saturating_duration_since(now),
         });
-        [self.settle.timeout(now), keep, pause]
+        let let_go = self
+            .clients
+            .iter()
+            .filter_map(|client| client.let_go_at)
+            .map(|at| (at + LET_GO_LIMIT).saturating_duration_since(now))
+            .min();
+        [self.settle.timeout(now), keep, pause, let_go]
             .into_iter()
             .flatten()
             .min()
@@ -3096,7 +3154,10 @@ mod tests {
                     }
                 }
                 relay.drive(0);
-                assert!(!relay.clients[0].dead, "{kib}K: dropped after {got} bytes");
+                assert!(
+                    relay.clients[0].attach.is_some(),
+                    "{kib}K: let go after {got} bytes"
+                );
                 got += received(&far, &mut decoder);
             }
             writer.join().unwrap();
@@ -3162,7 +3223,11 @@ mod tests {
                     std::thread::sleep(Duration::from_micros(200));
                 }
                 relay.drive(0);
-                assert!(!relay.clients[0].dead, "{kib}K: lapped after {}", got.len());
+                assert!(
+                    relay.clients[0].attach.is_some(),
+                    "{kib}K: lapped after {}",
+                    got.len()
+                );
                 // The client reads a little each turn: far slower than the program writes.
                 read_slowly(&far, &mut decoder, 2048, &mut got, &mut picture);
             }
@@ -3203,7 +3268,10 @@ mod tests {
             relay.drive(0);
         }
         writer.join().unwrap();
-        assert!(relay.clients[0].dead, "the ring turned over under it");
+        assert!(
+            relay.clients[0].let_go_at.is_some(),
+            "the ring turned over under it"
+        );
         // It comes back for what it missed and is sent a picture of the screen.
         let (mut client, far) = client_of(false);
         client.attach = None;
@@ -3213,6 +3281,68 @@ mod tests {
         let (mut decoder, mut got, mut picture) = (PacketDecoder::new(), Vec::new(), false);
         read_slowly(&far, &mut decoder, 1 << 20, &mut got, &mut picture);
         assert!(picture, "a client that is lapped gets a picture");
+    }
+
+    /// A client attached from the start of a ring that has just turned over under it.
+    fn a_client_the_ring_left_behind() -> (Relay, OwnedFd, UnixStream) {
+        let (mut relay, slave, far) = relay_with_a_client();
+        relay.settle.cancel();
+        relay.journal.append(&vec![b'x'; 2 * MIN_CAPACITY as usize]);
+        relay.drive(0);
+        assert!(relay.clients[0].let_go_at.is_some());
+        (relay, slave, far)
+    }
+
+    #[test]
+    fn a_client_that_was_let_go_reads_the_end_and_what_it_types_still_reaches_the_program() {
+        let (mut relay, _slave, far) = a_client_the_ring_left_behind();
+        assert!(!relay.clients[0].dead);
+        assert_eq!(relay.attached(), 0);
+        // Nothing wakes the relay for it until there is something to read.
+        let mut set = [sys::want(relay.clients[0].sock.as_raw_fd(), libc::POLLIN)];
+        assert_eq!(
+            sys::poll(&mut set, Some(Duration::from_millis(20))).unwrap(),
+            0
+        );
+        // It reads to the end of the stream, and its own side is still open.
+        far.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 4096];
+        assert_eq!((&far).read(&mut buf).unwrap(), 0);
+        let typed = Packet::about(relay.id.clone(), Message::Input(vec![3]));
+        let mut bytes = Vec::new();
+        typed.encode(&mut bytes).unwrap();
+        (&far).write_all(&bytes).unwrap();
+        relay.client_readable(0);
+        assert_eq!(relay.input_queued, 1);
+        assert_eq!(relay.input_pending(), 0, "the terminal took it");
+        // Anything else is not acted on, and nothing goes to it.
+        let mut bytes = Vec::new();
+        Packet::about(relay.id.clone(), Message::Status)
+            .encode(&mut bytes)
+            .unwrap();
+        (&far).write_all(&bytes).unwrap();
+        relay.client_readable(0);
+        assert!(relay.clients[0].asked.is_none());
+        relay.error(0, ErrorCode::BAD_REQUEST, "not for it");
+        assert!(relay.clients[0].out.is_empty());
+        // It closes and comes back on another connection: the seat goes with this one.
+        drop(far);
+        relay.client_readable(0);
+        relay.drive(0);
+        assert!(relay.clients[0].dead);
+    }
+
+    #[test]
+    fn a_client_that_was_let_go_and_does_not_close_gives_its_seat_back_after_the_limit() {
+        let (mut relay, _slave, _far) = a_client_the_ring_left_behind();
+        let now = Instant::now();
+        relay.clients[0].let_go_at = Some(now);
+        assert_eq!(timer(&relay, now), Some(LET_GO_LIMIT));
+        relay.drive(0);
+        assert!(!relay.clients[0].dead);
+        relay.clients[0].let_go_at = now.checked_sub(LET_GO_LIMIT);
+        relay.drive(0);
+        assert!(relay.clients[0].dead);
     }
 
     #[test]
@@ -3331,14 +3461,13 @@ mod tests {
         assert!(half + 1 + left > MIN_CAPACITY as usize);
         relay.drain_to_the_end();
         assert!(
-            !relay.clients[0].dead,
+            relay.clients[0].attach.is_some(),
             "lapped while the program's last bytes were read"
         );
         assert_eq!(
             delivered(&mut relay, &far, half + 1 + left),
             half + 1 + left
         );
-        assert!(!relay.clients[0].dead);
         assert!(relay.clients[0].attach.as_ref().unwrap().picture.is_none());
     }
 
@@ -3543,6 +3672,7 @@ mod tests {
             waiting: false,
             pings: VecDeque::new(),
             typed_to: 0,
+            let_go_at: None,
         };
         (client, far)
     }
@@ -3676,7 +3806,6 @@ mod tests {
         // ring has left behind.
         relay.drive(0);
         let client = relay.clients.first().unwrap();
-        assert!(!client.dead);
         assert_eq!(client.attach.as_ref().unwrap().next, total);
         // One that comes for what the floor passed is told it is gone.
         let (mut late, _far) = client_of(false);

@@ -45,8 +45,21 @@ section is not released.
   `SSH_TTY` in the environment) the program is not kept waiting for a link that may be slow, and
   that picture is what you get.
 
+### Fixed
+
+- **A key pressed while a program's output outruns your connection reaches the program.** `^C`
+  during a big `cat` over a slow link could be lost: the session had already let go of a
+  connection that fell too far behind, and the connection did not know yet. The session now reads
+  what you typed until the connection has noticed. The output that was on its way still comes
+  first, so on a slow link the prompt can take seconds to show.
+
 ### For apps
 
+- **A client that falls behind the journal now reads the end of the stream with its own side
+  still open.** The server closes only its side, and reads what the client types (`input`,
+  `write`) until the client closes; nothing else it sends is acted on or answered. A client that
+  closes when it reads the end has nothing to change. One that has not closed in 30 seconds is
+  closed (`docs/PROTOCOL.md`, A slow reader).
 - **Protocol: a client can ask not to be lapped.** The flags byte of the `attach` view gains bit
   4, `every_byte` (`kablo-proto`: `v1::View::every_byte`, `false` from `View::new`, so this breaks
   no one that builds one). An app that sets it reads the session's stream as fast as it can and
