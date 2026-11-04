@@ -671,6 +671,16 @@ pub trait Handler {
         }
     }
 
+    /// A run of printable text: characters that are not controls, at least one of them outside
+    /// ASCII (a run of ASCII only comes to [`input_ascii`](Self::input_ascii)).
+    ///
+    /// The default is `input` for each character, as for `input_ascii`.
+    fn input_text(&mut self, s: &str) {
+        for c in s.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1499,6 +1509,14 @@ where
         // REP repeats the last character written, which is the last of the run.
         if let Some(&last) = s.as_bytes().last() {
             self.state.preceding_char = Some(last as char);
+        }
+    }
+
+    #[inline]
+    fn print_text(&mut self, s: &str) {
+        self.handler.input_text(s);
+        if let Some(last) = s.chars().next_back() {
+            self.state.preceding_char = Some(last);
         }
     }
 
@@ -2359,7 +2377,7 @@ mod tests {
         assert_eq!(handler.cursor_icon, Some(CursorIcon::Pointer));
     }
 
-    /// A handler that takes a run of ASCII whole, and tells what it got.
+    /// A handler that takes a run of ASCII or of text whole, and tells what it got.
     #[derive(Default)]
     struct Text {
         events: Vec<Printed>,
@@ -2369,6 +2387,7 @@ mod tests {
     enum Printed {
         Char(char),
         Run(String),
+        Text(String),
     }
 
     impl Handler for Text {
@@ -2378,6 +2397,10 @@ mod tests {
 
         fn input_ascii(&mut self, s: &str) {
             self.events.push(Printed::Run(s.to_owned()));
+        }
+
+        fn input_text(&mut self, s: &str) {
+            self.events.push(Printed::Text(s.to_owned()));
         }
     }
 
@@ -2418,7 +2441,7 @@ mod tests {
         // The run's last character, then (after a read of its own) the next run's.
         parser.advance(&mut handler, b"abc\x1b[2b");
         parser.advance(&mut handler, b"de\x1b[b");
-        // A character outside ASCII in between takes the place, and a run takes it back.
+        // A run with a character outside ASCII comes as text, and REP repeats its last one.
         parser.advance(&mut handler, "f\u{e9}\x1b[b g\x1b[b".as_bytes());
 
         let expected = [
@@ -2427,8 +2450,7 @@ mod tests {
             Printed::Char('c'),
             Printed::Run("de".into()),
             Printed::Char('e'),
-            Printed::Run("f".into()),
-            Printed::Char('\u{e9}'),
+            Printed::Text("f\u{e9}".into()),
             Printed::Char('\u{e9}'),
             Printed::Run(" g".into()),
             Printed::Char('g'),
