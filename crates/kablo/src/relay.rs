@@ -2761,28 +2761,30 @@ mod tests {
         });
         // Reads a little under a millisecond apart: to the end of a frame that is tens of
         // milliseconds, and the limit is a fraction of that. A loaded machine can let one turn
-        // find a frame's worth waiting; all of them fill it only when the limit is gone.
+        // find a frame's worth waiting and end another early on a writer that slept long, so
+        // the middle turn is what is judged: past half a frame only when the limit is gone.
         let frame = (OUT_CHUNK as u64).min(relay.journal.capacity() / 8);
-        let mut least = u64::MAX;
-        let mut quickest = Duration::MAX;
-        for _ in 0..8 {
-            // A turn that finds nothing is over at once: this one starts on a read.
+        let mut turns = Vec::new();
+        for _ in 0..9 {
+            // A turn that finds nothing is over at once: this one starts on a read. (A signal
+            // ends a `poll` with nothing ready.)
             let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
-            assert_eq!(
-                sys::poll(&mut set, Some(Duration::from_secs(5))).unwrap(),
-                1
-            );
+            let start = Instant::now();
+            while sys::poll(&mut set, Some(Duration::from_secs(1))).unwrap() == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "the writer stopped"
+                );
+            }
             let before = relay.journal.total();
-            let turn = Instant::now();
             relay.read_terminal();
-            quickest = quickest.min(turn.elapsed());
             let gathered = relay.journal.total() - before;
-            least = least.min(gathered);
+            turns.push(gathered);
             let gathered = usize::try_from(gathered).unwrap_or(usize::MAX);
             assert_eq!(delivered(&mut relay, &far, gathered), gathered);
         }
-        assert!(least < frame, "{least}");
-        assert!(quickest < Duration::from_millis(25), "{quickest:?}");
+        turns.sort_unstable();
+        assert!(turns[turns.len() / 2] < frame / 2, "{turns:?}");
         // The read end goes with the relay, so a writer in a full pipe is let go.
         stop.store(true, Ordering::Relaxed);
         drop(relay);
