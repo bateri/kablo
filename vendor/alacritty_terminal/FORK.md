@@ -85,6 +85,26 @@ below) and with its default features, so upstream's reference tests run too.
   `src/grid/mod.rs`, `src/grid/row.rs` and `src/grid/tests.rs` (all carry the §4(b) notice).
   Test: `prefetching_for_a_reset_changes_nothing`.
 
+- **A run of printable text outside ASCII is written in one go too.** `Term` implements
+  `ansi::Handler::input_text(&str)` (the `vte` fork's other new method: a run of printable
+  characters with at least one outside ASCII, the ASCII among them included). It writes the
+  characters one or two columns wide that land on plain cells a stretch of a line at a time,
+  a fullwidth character as the two cells `input` writes (the character with `WIDE_CHAR`, then
+  the spacer), and leaves to `input` what depends on more than its own cells: zero-width
+  characters and characters without a width, a fullwidth character with one column left (the
+  leading spacer and the wrap), a cell in the way, and everything `input_ascii` leaves to it
+  (insert mode, a charset other than ASCII, line wrap off, a template with `extra`). A
+  character that has no width, or one for `input` to deal with, never makes the line wrap
+  before it does, as in `input`. Same promise, same test file: the random mix of
+  `a_random_mix_ends_where_its_characters_one_by_one_end` now has runs of text (the words of
+  `WORDS`: Latin with diacritics, CJK, Hangul, fullwidth forms, emoji, joiners and marks), and
+  `a_text_run_fills_and_wraps_lines_like_its_characters`,
+  `a_text_run_overwrites_what_is_in_its_way_like_its_characters`,
+  `text_follows_the_modes_like_its_characters` and
+  `repeating_right_after_a_text_run_repeats_its_last_character` go through every terminal width
+  from 2 to 12, every place in a line a run can start, wide characters and marks underneath, and
+  the modes. Touches `src/term/mod.rs` and `src/term/input_ascii_tests.rs`, as before.
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri only

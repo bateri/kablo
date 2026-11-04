@@ -1,11 +1,12 @@
 // Added to alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)): this file is not part
-// of the release. It tests `Term`'s `Handler::input_ascii` against `input`; FORK.md lists the
-// changes of the whole package.
+// of the release. It tests `Term`'s `Handler::input_ascii` and `input_text` against `input`;
+// FORK.md lists the changes of the whole package.
 
-//! `Term::input_ascii` must leave exactly what `input` called for each character leaves.
+//! `Term::input_ascii` and `Term::input_text` must leave exactly what `input` called for each
+//! character leaves.
 //!
 //! Every test runs the same bytes through two terminals: one takes the runs the parser hands
-//! over (`input_ascii`), the other is driven through [`PerChar`], which forwards everything
+//! over (`input_ascii`, `input_text`), the other is driven through [`PerChar`], which forwards everything
 //! but runs, so the default turns each run into `input` calls. Then it compares what a
 //! dependent can see or tell from the outside: every cell, the cursor and its pending wrap,
 //! the rows' `occ`, the damage and the modes.
@@ -21,7 +22,8 @@ use crate::vte::ansi::{self, Handler, Processor};
 
 type Screen = Term<VoidListener>;
 
-/// A handler that is a `Term` in all but `input_ascii`, which keeps its default.
+/// A handler that is a `Term` in all but `input_ascii` and `input_text`, which keep their
+/// defaults.
 struct PerChar<'a>(&'a mut Screen);
 
 macro_rules! forward {
@@ -299,6 +301,67 @@ fn repeating_right_after_a_run_repeats_its_last_character() {
     assert_eq!(letters(&pair.fast, 0), "abc  deeee");
 }
 
+/// Text of every width a column count can meet, and what comes after a character.
+const WORDS: &[&str] = &[
+    "çalışma", "günü", "終端模擬器", "字符宽度", "한국어", "テスト", "ｱｲｳ", "ＡＢＣ", "😀", "🎉x",
+    "👨\u{200d}👩\u{200d}👧", "e\u{301}", "\u{200d}", "\u{fe0f}", "a\u{300}\u{301}b", "\u{301}",
+    "€", "·", "\u{ff}", "\u{a0}", "\u{2028}", "\u{feff}x", "\u{200b}",
+];
+
+#[test]
+fn a_text_run_fills_and_wraps_lines_like_its_characters() {
+    // Every width of terminal up to one wider than the longest word and every place in a line
+    // a run can start at, so each fullwidth character meets the last column, and the last but
+    // one, as the first, the middle and the last of a run.
+    for columns in 2..=12 {
+        for word in WORDS {
+            for lead in 0..columns + 2 {
+                let text = format!("{}{word} {word}{word}", "x".repeat(lead));
+                same_as_per_character(columns, 6, &text);
+            }
+        }
+    }
+
+    let pair = same_as_per_character(6, 3, "ab日本語çd");
+    assert_eq!(letters(&pair.fast, 0), "ab日 本 ");
+    assert_eq!(letters(&pair.fast, 1), "語 çd  ");
+}
+
+#[test]
+fn a_text_run_overwrites_what_is_in_its_way_like_its_characters() {
+    let (wide, marks) = ("日本語日本語", "e\u{301}a\u{200d}b\u{fe0f}cdef");
+    for goto in ["\x1b[1;1H", "\x1b[1;2H", "\x1b[1;3H", "\x1b[1;4H", "\x1b[1;7H", "\x1b[2;1H"] {
+        for run in ["çı", "çıĸ", "日", "ç日", "日ç", "日本語", "ab日c", "éééééééééé"] {
+            for under in [wide, marks, "plain!"] {
+                same_as_per_character(7, 3, &format!("{under}\r\n{under}{goto}{run}"));
+            }
+        }
+    }
+
+    // A line end leaving a spacer, written over from either side.
+    for goto in ["\x1b[2;1H", "\x1b[2;2H"] {
+        same_as_per_character(5, 3, &format!("abcd日本{goto}çıö"));
+    }
+}
+
+#[test]
+fn text_follows_the_modes_like_its_characters() {
+    same_as_per_character(8, 3, "0123456789\x1b[1;3H\x1b[4hçı日\x1b[4lw");
+    same_as_per_character(8, 3, "\x1b[?7lçıöüğ日本語日本語ab\x1b[?7hçı");
+    same_as_per_character(8, 3, "\x1b(0çıq日q\x1b(Bçıq日q\x0eçıq");
+    same_as_per_character(8, 3, "\x1b]8;id=3;http://a\x07çı日本語ab\x1b]8;;\x07çı");
+    same_as_per_character(8, 3, "\x1b[58;5;4m\x1b[4mçı日本語ab\x1b[0mçı");
+    same_as_per_character(8, 3, "\x1b[7;31mçı日\x1b[0;44m本語ab\x1b[0mçı日");
+}
+
+#[test]
+fn repeating_right_after_a_text_run_repeats_its_last_character() {
+    let pair = same_as_per_character(10, 3, "açı\x1b[3b");
+    assert_eq!(letters(&pair.fast, 0), "açıııı    ");
+    let pair = same_as_per_character(10, 3, "a日\x1b[2b");
+    assert_eq!(letters(&pair.fast, 0), "a日 日 日    ");
+}
+
 #[test]
 fn damage_after_runs_is_what_the_characters_report() {
     let mut pair = Pair::new(6, 4);
@@ -338,12 +401,28 @@ fn ascii_run(rng: &mut Rng) -> String {
     (0..length).map(|_| (0x20 + rng.below(0x5f) as u8) as char).collect()
 }
 
+/// A run of text: the words above and ASCII between and inside them.
+fn text_run(rng: &mut Rng) -> String {
+    let mut text = String::new();
+    let most = if rng.below(4) == 0 { 40 } else { 6 };
+    let words = 1 + rng.below(most);
+    for _ in 0..words {
+        match rng.below(3) {
+            0 => text.push_str(rng.pick(WORDS)),
+            1 => text.extend(ascii_run(rng).chars().take(1 + rng.below(4))),
+            _ => text.push(' '),
+        }
+    }
+    text
+}
+
 /// A piece of a program's output: text, or something that changes what the text lands on.
 fn piece(rng: &mut Rng, columns: usize, lines: usize) -> String {
     let (row, column) = (1 + rng.below(lines), 1 + rng.below(columns));
     let count = 1 + rng.below(columns + 2);
     match rng.below(100) {
-        0..=34 => ascii_run(rng),
+        0..=22 => ascii_run(rng),
+        23..=34 => text_run(rng),
         // Wide and zero-width characters, whole or about to be overwritten from either half.
         35..=41 => rng.pick(&["漢", "日本語", "😀", "👨\u{200d}👩", "ｱ", "ａｂ"]).to_owned(),
         42..=44 => rng.pick(&["e\u{301}", "\u{200d}", "\u{fe0f}", "a\u{300}\u{301}", "\u{301}"]).to_owned(),
@@ -403,12 +482,16 @@ fn a_random_mix_ends_where_its_characters_one_by_one_end() {
 
         let mut stream = Vec::new();
         for _ in 0..(20 + rng.below(80)) {
-            stream.extend_from_slice(piece(&mut rng, columns, lines).as_bytes());
-        }
-        // Bytes that are no valid UTF-8 now and then.
-        if rng.below(4) == 0 {
-            let at = rng.below(stream.len());
-            stream.insert(at, *rng.pick(&[&0xffu8, &0xc3, &0xe6]));
+            let piece = piece(&mut rng, columns, lines);
+            let mut bytes = piece.as_bytes().to_vec();
+            // Bytes that are no valid UTF-8 now and then, but not in the middle of an escape
+            // sequence: a link whose id is not text gets one from a counter the two terminals
+            // share.
+            if !piece.contains('\x1b') && rng.below(40) == 0 {
+                let at = rng.below(bytes.len() + 1);
+                bytes.insert(at, *rng.pick(&[&0xffu8, &0xc3, &0xe6]));
+            }
+            stream.extend_from_slice(&bytes);
         }
 
         // The reads are cut at random, so a run is cut at random too.

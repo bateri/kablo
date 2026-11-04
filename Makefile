@@ -24,7 +24,7 @@ clippy:
 # `-p vte` finds it through `alacritty_terminal`, which also turns on the `ansi`
 # feature the fork's changes to the handler live behind (without it most of them
 # would go untested, so a graph that stops using `alacritty_terminal` stops
-# testing them: look for the 85 tests of its lib target in the output).
+# testing them: look for the 86 tests of its lib target in the output).
 VTE_TEST = test -p vte --all-targets
 
 # The same for the emulator's fork (`vendor/alacritty_terminal`), whose tests are upstream's
