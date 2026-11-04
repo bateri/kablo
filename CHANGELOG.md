@@ -38,6 +38,11 @@ section is not released.
 - **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**
   The session sends a flood of output in larger pieces and does less bookkeeping per read; a
   keystroke's echo or a line of output still goes out at once.
+- **`kablo connect` in a terminal on the session's own machine shows all of a flood.** A program
+  that writes faster than the terminal draws waits for it, as it would in that terminal without a
+  session, where it could have left you with a reset and a picture of the screen in place of what
+  it wrote. Over `ssh` (`SSH_CONNECTION` or `SSH_TTY` in the environment) a link that may be slow
+  still gets the picture, so `^C` shows at once.
 
 ### For apps
 
@@ -57,7 +62,9 @@ section is not released.
   (`docs/PROTOCOL.md`, Attach). The relay gives the socket of a client that sets the bit a larger
   send buffer (a megabyte where the system allows), for as long as the connection lasts, so it can
   write ahead of a client that reads flat out; a connection on which the bit was never set has the
-  system's.
+  system's. An app on the session's machine that leaves the bit off is lapped sooner than it was:
+  the relay reads a flood faster than a macOS socket of 8 KiB carries, and a lap closes the
+  connection (`docs/PROTOCOL.md`, A slow reader), with whatever was typed in that moment. Set it.
 - **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
   `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
   where the parser used to call `print` and `input` for each character; the parser hands every

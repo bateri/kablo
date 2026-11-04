@@ -41,7 +41,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{ClientName, ErrorCode, Exit, Message, OFFSET_END, Packet, View};
+use kablo_proto::v1::{ClientName, ErrorCode, Exit, Message, OFFSET_END, Packet, Size, View};
 
 use crate::link::{self, Link};
 use crate::sys;
@@ -170,6 +170,37 @@ pub fn run(dir: &Path, id: SessionId, options: Options, err: &mut dyn Write) -> 
     }
 }
 
+/// Whether the terminal this runs in is on the session's machine: not reached over `ssh`.
+fn on_this_machine(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .all(|name| var(name).is_none())
+}
+
+/// What the `attach` asks for. A view with no size leaves the session's terminal as it is.
+///
+/// A terminal on this machine wants every byte. It draws what a program writes as a terminal
+/// without a session would, and the program waits for it in the same way: a relay can read a
+/// flood faster than this connection carries it, and left behind by the ring this client is
+/// dropped and comes back to a reset and a picture, every few hundredths of a second, with a
+/// key typed in that moment gone along with the connection. Over `ssh` the link may be what
+/// is slow, and the picture is the answer: `^C` shows without a megabyte of output before it.
+fn view_of(
+    size: Option<Size>,
+    answers_itself: bool,
+    options: Options,
+    on_this_machine: bool,
+) -> Option<View> {
+    (size.is_some() || answers_itself).then(|| {
+        let mut view = View::new(size.unwrap_or_default());
+        view.picture_if_answered = answers_itself;
+        view.take = options.take;
+        view.name = options.name;
+        view.every_byte = on_this_machine;
+        view
+    })
+}
+
 fn serve(
     mut link: Link,
     id: SessionId,
@@ -190,14 +221,8 @@ fn serve(
     let size = sys::window_size(input)
         .ok()
         .filter(|size| size.cols > 0 && size.rows > 0);
-    // (A view with no size leaves the session's terminal as it is.)
-    let view = (size.is_some() || answers_itself).then(|| {
-        let mut view = View::new(size.unwrap_or_default());
-        view.picture_if_answered = answers_itself;
-        view.take = options.take;
-        view.name = options.name;
-        view
-    });
+    let on_this_machine = on_this_machine(|name| std::env::var_os(name));
+    let view = view_of(size, answers_itself, options, on_this_machine);
     link.send(
         Packet::about(id.clone(), Message::Attach { offset, view }),
         now,
@@ -478,7 +503,17 @@ fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kablo_proto::v1::Size;
+
+    #[test]
+    fn a_terminal_on_this_machine_wants_every_byte_and_one_over_ssh_takes_a_picture() {
+        assert!(on_this_machine(|_| None));
+        for set in ["SSH_CONNECTION", "SSH_TTY"] {
+            assert!(!on_this_machine(|name| (name == set).then(|| "x".into())));
+        }
+        let view = |here| view_of(None, true, Options::default(), here).unwrap();
+        assert!(view(true).every_byte);
+        assert!(!view(false).every_byte);
+    }
 
     fn id() -> SessionId {
         SessionId::new("work").unwrap()

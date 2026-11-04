@@ -809,7 +809,8 @@ never speaks unprompted except to stream `output`, to say `ended` once and to sa
 about), so an idle connection costs nothing.
 
 **A slow reader.** A client that does not read its connection never holds up
-the program. Output is sent a frame at a time and only when the connection
+the program, unless it asked for every byte (Attach), and then for a second at
+most. Output is sent a frame at a time and only when the connection
 takes it, so the only buffer a client costs is one frame and its position in
 the journal. A client is dropped when the journal has moved past the next byte
 it is owed: its connection is closed, without a message, and it comes back
