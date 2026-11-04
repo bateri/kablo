@@ -50,8 +50,13 @@ section is not released.
   place of the bytes it lost (its scrollback with them). An app that stops reading releases the
   program after a second, and is lapped as without the bit. Leave it off on a slow link, where
   the picture is the right answer; the bridge keeps the bit across a resize and a new connection
-  as it does the others. A relay from before the bit ignores it, so an app reads `version` in
-  `status` before it relies on it (`docs/PROTOCOL.md`, Attach).
+  as it does the others. A relay from before the bit ignores it, and so does a bridge from before
+  it (a `kablo attach` still running from before the upgrade decodes the view and encodes it
+  again without the bit, while `status` already reports the new relay), so an app reads `version`
+  in `status` and goes through a bridge started after the upgrade before it relies on it
+  (`docs/PROTOCOL.md`, Attach). The relay gives the socket of a client that sets the bit a larger
+  send buffer (a megabyte where the system allows) so it can write ahead of a client that reads
+  flat out; one that does not set it gets the system's.
 - **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
   `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
   where the parser used to call `print` and `input` for each character; the parser hands every

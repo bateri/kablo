@@ -571,7 +571,13 @@ A client that stops reading does not hold the program for good: when its
 position has not moved for a second the server goes on reading and the client
 is dropped behind as without the bit, until it reads again. A bridge that
 carries the view on a connection that is made again sends the bit again. A server
-from before the bit ignores it.
+from before the bit ignores it, and so does a bridge from before it: a `kablo attach`
+that was running when kablo was upgraded decodes the view and encodes it again without
+the bit, while `status` reports the new relay, so a client that goes through a bridge
+needs one started after the upgrade as well as a relay whose `version` has the bit.
+The server gives the socket of a client that sets the bit a larger send buffer (a
+megabyte where the system allows), so it can write ahead of a client that reads flat
+out; a client that does not set it gets the system's.
 
 **Taking the terminal.** Bit 3 of the view's flags, take, makes the `attach` an
 act and not only a way to look: when the server has attached the client, every

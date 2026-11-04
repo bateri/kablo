@@ -339,7 +339,10 @@ pub struct View {
     /// progress the server reads on and the picture is what the client gets, as
     /// without the flag. Leave it off on a slow link, where a picture is what is
     /// wanted and a program that waits for the link is not. A server from before
-    /// the bit ignores it.
+    /// the bit ignores it, and so does a bridge from before it: a `kablo attach` that
+    /// is already running decodes the view and encodes it again without the bit,
+    /// whatever the relay behind it is, so `version` in `status` says only what the
+    /// relay does, and the bridge on the way has to be as new as well.
     pub every_byte: bool,
     /// What the client calls itself, for the list of who is attached that
     /// `status` answers with. `None` says no name, as a client from before the

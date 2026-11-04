@@ -129,6 +129,13 @@ fn keeping(size: Size) -> View {
     view
 }
 
+/// A view of a terminal of `size` that asks not to be lapped, and for nothing else.
+fn wanting_every_byte(size: Size) -> View {
+    let mut view = View::new(size);
+    view.every_byte = true;
+    view
+}
+
 /// A view of a terminal of `size` that takes the terminal, from a client that
 /// calls itself `name`.
 fn taking(size: Size, name: &str) -> View {
@@ -225,6 +232,18 @@ fn messages() -> Vec<(&'static str, Packet)> {
             work(Message::Attach {
                 offset: 0x1000,
                 view: Some(keeping(Size {
+                    cols: 120,
+                    rows: 40,
+                    xpixel: 960,
+                    ypixel: 800,
+                })),
+            }),
+        ),
+        (
+            "attach_view_every_byte",
+            work(Message::Attach {
+                offset: 0x1000,
+                view: Some(wanting_every_byte(Size {
                     cols: 120,
                     rows: 40,
                     xpixel: 960,
