@@ -927,6 +927,15 @@ pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
         std::sync::atomic::Ordering::Relaxed,
     );
     for &signal in signals {
+        // A signal the caller ignores (`nohup` ignores `SIGHUP`) stays ignored: it is not ours to
+        // take, and it is not given back as the default afterwards.
+        // SAFETY: an all-zero `sigaction` is valid; it is the out-pointer of the query.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action only asks what the current one is.
+        let asked = unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut old) };
+        if asked == 0 && old.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
         // SAFETY: an all-zero `sigaction` is valid.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
@@ -936,17 +945,30 @@ pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
         // SAFETY: `action` is fully initialised; the handler is an
         // `extern "C"` function that only calls `write`.
         cvt(unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) })?;
+        TAKEN.fetch_or(1u64 << signal, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(read)
 }
 
-/// Gives `signals` back their default action, after [`signal_pipe`] took them for a while.
+/// The signals [`signal_pipe`] took (bit `n` is signal `n`), which [`release_signals`] gives back.
+static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gives `signals` that [`signal_pipe`] took back their default action, and closes the pipe's
+/// write end: each conversation makes its own, and none is kept.
 pub fn release_signals(signals: &[libc::c_int]) {
     for &signal in signals {
-        // SAFETY: the default action is always a valid disposition to set.
-        unsafe { libc::signal(signal, libc::SIG_DFL) };
+        let bit = 1u64 << signal;
+        if TAKEN.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed) & bit != 0 {
+            // SAFETY: the default action is always a valid disposition to set.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
     }
-    SIGNAL_PIPE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    let fd = SIGNAL_PIPE.swap(-1, std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: the write end `signal_pipe` stored and nothing else owns; no handler writes to it
+        // any more (the dispositions are back, and the store above says there is none).
+        unsafe { libc::close(fd) };
+    }
 }
 
 #[cfg(test)]

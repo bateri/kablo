@@ -99,6 +99,21 @@ pub enum Asked {
     Silent,
 }
 
+/// What a conversation's status and reply come to: the Mac's answer, no Mac (69), a conversation
+/// that did not come to an answer, or the signal that ended it (128 and its number: the command
+/// ends with it).
+fn asked_of(status: u8, reply: &[u8]) -> Result<Asked, Exit> {
+    match status {
+        0 => Ok(match Reply::parse(&String::from_utf8_lossy(reply)) {
+            Ok(reply) => Asked::Reply(reply),
+            Err(_) => Asked::Unreadable,
+        }),
+        app::EXIT_NO_APP => Ok(Asked::NoMac),
+        signal if signal > 128 => Err(Exit::status(signal)),
+        _ => Ok(Asked::Silent),
+    }
+}
+
 impl Ctx {
     fn new() -> Result<Ctx, Exit> {
         let home = std::env::var_os("HOME")
@@ -121,23 +136,18 @@ impl Ctx {
         state::State::new(self.state.clone())
     }
 
-    /// One conversation with the Mac: `text` is a message, as it is written.
-    pub fn ask_text(&self, text: &str) -> Asked {
+    /// One conversation with the Mac: `text` is a message, as it is written. A signal that ends
+    /// the wait ends the command with the signal's status (128 and its number), and nothing else
+    /// is done after it: a `split` that is interrupted does not go on to start a terminal.
+    pub fn ask_text(&self, text: &str) -> Result<Asked, Exit> {
         let (status, reply) = app::converse(text.as_bytes());
-        match status {
-            0 => match Reply::parse(&String::from_utf8_lossy(&reply)) {
-                Ok(reply) => Asked::Reply(reply),
-                Err(_) => Asked::Unreadable,
-            },
-            app::EXIT_NO_APP => Asked::NoMac,
-            _ => Asked::Silent,
-        }
+        asked_of(status, &reply)
     }
 
     /// One conversation with the Mac, for a request.
     pub fn ask(&self, request: &Request) -> Result<Asked, Exit> {
         let text = encode(request)?;
-        Ok(self.ask_text(&text))
+        self.ask_text(&text)
     }
 
     /// The terminal this runs in, under whatever name it has (none outside every terminal): the
@@ -329,4 +339,22 @@ pub fn finish(code: u8) -> Done {
 /// `kablo list` and the like, run in this process with `args`, printing as it does.
 pub fn kablo(io: &mut Io<'_>, args: &[&str]) -> u8 {
     cli::run(args.iter().map(OsString::from), io.out, io.err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a conversation's status is: an answer, no Mac, silence, or a signal that ends the
+    /// command with its own status (a Ctrl-C during the wait is 130, not "the Mac did not answer").
+    #[test]
+    fn a_signal_that_ends_the_wait_ends_the_command_with_its_status() {
+        assert!(matches!(asked_of(69, b""), Ok(Asked::NoMac)));
+        assert!(matches!(asked_of(1, b""), Ok(Asked::Silent)));
+        assert!(matches!(asked_of(0, b"not a reply"), Ok(Asked::Unreadable)));
+        for signal in [129u8, 130, 143] {
+            let exit = asked_of(signal, b"").expect_err("a signal ends it");
+            assert_eq!((exit.code, exit.text), (signal, None));
+        }
+    }
 }

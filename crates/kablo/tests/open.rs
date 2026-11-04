@@ -336,6 +336,27 @@ fn a_mac_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
 }
 
 #[test]
+fn a_mac_that_is_not_read_and_no_bootstrap_starts_nothing_and_leaves_no_note() {
+    // A machine with no bootstrap has nobody to start a terminal with no program: the Mac made it
+    // or nobody did, so a reply that is not read leaves nothing behind (no terminal, no record, no
+    // note for a Mac that would find no terminal) and the command fails.
+    let mut stage = stage();
+    stage.mac_says("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n");
+    let said = stage.run_in("p40", &["split"]);
+    assert_eq!(said.status, 1, "{}", said.err);
+    assert!(
+        said.err
+            .contains("it is the Mac that makes a pane with no program"),
+        "{}",
+        said.err
+    );
+    assert_eq!(said.out, "");
+    assert!(!stage.running().contains(&"p1".to_owned()));
+    assert!(!stage.state().join("terminals/p1").exists());
+    assert_eq!(stage.note("p1"), None);
+}
+
+#[test]
 fn a_pane_that_landed_says_its_tab_group_and_window() {
     let mut stage = stage();
     let program = recorder(&stage).display().to_string();

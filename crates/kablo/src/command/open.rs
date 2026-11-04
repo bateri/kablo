@@ -560,10 +560,7 @@ impl Job<'_> {
             // The asker is a server: the terminal is its own to start, with the bootstrap, and the
             // Mac is asked again for the pane that shows it.
             Asked::Reply(Reply::Start) => {
-                if let Err(exit) = self.start_bootstrap(&id, cwd, shell) {
-                    self.state.forget(&id);
-                    return Err(exit);
-                }
+                self.start_or_forget(&id, cwd, shell)?;
                 let place = self.place(&id, None, None, None);
                 self.place_it(io, &mut landing, &place, &id, false)?;
             }
@@ -581,26 +578,29 @@ impl Job<'_> {
                         "no Mac is connected: it is the Mac that makes a pane with no program",
                     ));
                 }
-                self.start_bootstrap(&id, cwd, shell)?;
+                self.start_or_forget(&id, cwd, shell)?;
                 let place = self.place(&id, None, None, None);
                 self.wait_note(io, &mut landing, &place);
             }
             other => {
-                io.say(match other {
-                    Asked::Silent => {
-                        "the Mac did not answer; its pane will be placed when it next connects"
-                    }
-                    _ => {
-                        "the Mac answered with something this does not read; its pane will be placed when it next connects"
-                    }
-                });
-                if self.state.boot().is_file() {
-                    self.start_bootstrap(&id, cwd, shell)?;
-                    let place = self.place(&id, None, None, None);
-                    self.wait_note(io, &mut landing, &place);
-                } else {
-                    self.wait_note(io, &mut landing, &place);
+                let said = match other {
+                    Asked::Silent => "the Mac did not answer",
+                    _ => "the Mac answered with something this does not read",
+                };
+                // Without a bootstrap there is nobody to start the terminal: nothing is started
+                // and no note is left for a Mac that would find no terminal.
+                if !self.state.boot().is_file() {
+                    self.state.forget(&id);
+                    return Err(Exit::failed(format!(
+                        "{said}, and it is the Mac that makes a pane with no program"
+                    )));
                 }
+                io.say(&format!(
+                    "{said}; its pane will be placed when it next connects"
+                ));
+                self.start_or_forget(&id, cwd, shell)?;
+                let place = self.place(&id, None, None, None);
+                self.wait_note(io, &mut landing, &place);
             }
         }
         self.report(io, &landing);
@@ -627,6 +627,14 @@ impl Job<'_> {
             version,
             "-".to_owned(),
         ]
+    }
+
+    /// [`start_bootstrap`](Self::start_bootstrap), and the record of the terminal is taken back
+    /// when it could not be started.
+    fn start_or_forget(&self, id: &str, cwd: &str, shell: Option<&str>) -> Result<(), Exit> {
+        self.start_bootstrap(id, cwd, shell).inspect_err(|_| {
+            self.state.forget(id);
+        })
     }
 
     fn start_bootstrap(&self, id: &str, cwd: &str, shell: Option<&str>) -> Result<(), Exit> {

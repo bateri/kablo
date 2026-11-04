@@ -40,9 +40,27 @@ impl State {
     }
 
     /// Where the bootstrap writes the command's files: `shell/`, with `bin/bateri` and, on a
-    /// server, `boot.sh`.
+    /// server, `boot.sh`. The call that writes them puts them under `$XDG_DATA_HOME` when the
+    /// server's command had one, so that is looked in first, where it names an absolute path and
+    /// holds the files; otherwise they are beside the counter's state (`~/.local/share`).
     pub fn shell_dir(&self) -> PathBuf {
-        self.dir.join("shell")
+        let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        self.shell_dir_in(xdg.as_deref())
+    }
+
+    /// [`shell_dir`](Self::shell_dir) for the `XDG_DATA_HOME` there is.
+    fn shell_dir_in(&self, xdg: Option<&Path>) -> PathBuf {
+        let there = xdg
+            .filter(|xdg| xdg.is_absolute())
+            .map(|xdg| xdg.join("bateri/shell"));
+        match there {
+            Some(there)
+                if there.join("boot.sh").is_file() || there.join("bin/bateri").is_file() =>
+            {
+                there
+            }
+            _ => self.dir.join("shell"),
+        }
     }
 
     /// The directory the command is found in, which a terminal it starts gets on its `PATH`.
@@ -234,6 +252,29 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn the_files_are_where_the_writer_put_them() {
+        let root = dir();
+        let state = State::new(root.join("home/.local/share/bateri"));
+        let xdg = root.join("xdg");
+        let beside = state.dir().join("shell");
+        // Nothing anywhere, or an XDG_DATA_HOME that is not an absolute path: beside the state.
+        assert_eq!(state.shell_dir_in(None), beside);
+        assert_eq!(state.shell_dir_in(Some(&xdg)), beside);
+        assert_eq!(state.shell_dir_in(Some(Path::new("relative"))), beside);
+        // The files under it: that is where they are, for the bootstrap and the command alike.
+        fs::create_dir_all(xdg.join("bateri/shell/bin")).unwrap();
+        fs::write(xdg.join("bateri/shell/boot.sh"), "").unwrap();
+        assert_eq!(state.shell_dir_in(Some(&xdg)), xdg.join("bateri/shell"));
+        assert_eq!(
+            state.shell_dir_in(Some(&xdg)).join("boot.sh"),
+            xdg.join("bateri/shell/boot.sh")
+        );
+        // A relative one is still ignored, as the writer ignores it.
+        assert_eq!(state.shell_dir_in(Some(Path::new("relative"))), beside);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
