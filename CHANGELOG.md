@@ -33,6 +33,12 @@ section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**
+  The session sends a flood of output in larger pieces and does less bookkeeping per read; a
+  keystroke's echo or a line of output still goes out at once.
+
 ## [0.5.1] - 2026-10-31
 
 ### Fixed
