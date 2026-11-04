@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kablo-proto", "crates/kablo-screen", "crates/kablo"]
+members = ["crates/kablo-proto", "crates/kablo-bateri", "crates/kablo-screen", "crates/kablo"]
 resolver = "3"
 # The forks of the terminal parser and of the terminal emulator (`[patch.crates-io]` below)
 # are upstream's code in upstream's style: not members, so `fmt` and `clippy` leave them
@@ -9,7 +9,7 @@ resolver = "3"
 exclude = ["vendor/vte", "vendor/alacritty_terminal"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"

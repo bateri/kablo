@@ -1,0 +1,13 @@
+[package]
+name = "kablo-bateri"
+description = "The text bateri and its `bateri` command say to each other over kablo's app channel. Changes with bateri; not kablo's frozen wire. No I/O, and no dependency but `kablo-proto`'s session name."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kablo-proto = { path = "../kablo-proto" }
+
+[lints]
+workspace = true

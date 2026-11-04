@@ -41,6 +41,17 @@ section is not released.
 
 ### For apps
 
+- **`kablo-bateri`, the text bateri and its `bateri` command say to each other.** A new crate in
+  this workspace, with no I/O and no dependency but `kablo-proto`: the `bateri 2` messages that ride
+  one conversation of `kablo app` (the requests `place`, `ls`, `close`, `notify`, `focus`, `zoom`,
+  `swap`, `move`, `rename`, `resize`, `ssh` and `relay`, and the replies to them), with the writer
+  and the strict reader both ends share, and the names they carry (a terminal `p9`, a tab `t3`, a
+  side, a shell). It is not part of kablo's frozen wire: it changes with bateri, and an app takes it
+  from the same revision as `kablo-proto`. Version 2 of the text gains two words, both only ever
+  sent in answer to a request that could not have been made before: `ok start` (a `place` of a
+  terminal the machine that asks has not started, answered by a Mac that is not that machine's: start
+  it and ask again) and `here` as the text of an `ssh` reply (the server named is the machine that
+  asked).
 - **Protocol: a client can ask not to be lapped.** The flags byte of the `attach` view gains bit
   4, `every_byte` (`kablo-proto`: `v1::View::every_byte`, `false` from `View::new`, so this breaks
   no one that builds one). An app that sets it reads the session's stream as fast as it can and
