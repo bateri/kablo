@@ -113,6 +113,12 @@ below) and with its default features, so upstream's reference tests run too.
   the table for every `char`, so a table that moves one of them fails here and not in
   somebody's terminal.
 
+- **`input_text` writes through a slice of the row.** It takes the row as a slice once per
+  stretch, and puts the row's `occ` back to what `input` for each character would have left
+  (the old one, or the column after the last cell written, whichever is further), instead of
+  indexing the row cell by cell. The differential test compares `occ` of every row, and
+  caught the first version of this, which left it at the row's length when no cell was written.
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri only

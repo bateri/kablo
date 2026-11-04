@@ -1280,6 +1280,8 @@ impl<T: EventListener> Handler for Term<T> {
             let template = &self.grid.cursor.template;
             let (fg, bg, flags) = (template.fg, template.bg, template.flags);
             let row = &mut self.grid[line];
+            let occupied = row.occ;
+            let cells = &mut row[..];
             let mut column = start;
             let mut left_to_input = false;
 
@@ -1291,29 +1293,28 @@ impl<T: EventListener> Handler for Term<T> {
                     break;
                 }
 
-                let blocked = (column..column + width).any(|at| {
-                    let cell = &row[Column(at)];
-                    cell.flags.intersects(in_the_way) || cell.extra.is_some()
-                });
+                let blocked = cells[column..column + width]
+                    .iter()
+                    .any(|cell| cell.flags.intersects(in_the_way) || cell.extra.is_some());
                 if blocked {
                     left_to_input = true;
                     break;
                 }
 
                 if width == 1 {
-                    let cell = &mut row[Column(column)];
+                    let cell = &mut cells[column];
                     cell.c = c;
                     cell.fg = fg;
                     cell.bg = bg;
                     cell.flags = flags;
                 } else {
-                    let cell = &mut row[Column(column)];
+                    let cell = &mut cells[column];
                     cell.c = c;
                     cell.fg = fg;
                     cell.bg = bg;
                     cell.flags = flags | Flags::WIDE_CHAR;
 
-                    let spacer = &mut row[Column(column + 1)];
+                    let spacer = &mut cells[column + 1];
                     spacer.c = ' ';
                     spacer.fg = fg;
                     spacer.bg = bg;
@@ -1331,6 +1332,9 @@ impl<T: EventListener> Handler for Term<T> {
                 }
             }
 
+            // Indexing the row as a slice counted all of its cells as occupied, which `input`
+            // does not: put back what is, and the cells written.
+            self.grid[line].occ = if column > start { cmp::max(occupied, column) } else { occupied };
             if column > start {
                 if column < columns {
                     self.grid.cursor.point.column = Column(column);
