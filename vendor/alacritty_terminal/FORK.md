@@ -74,6 +74,51 @@ below) and with its default features, so upstream's reference tests run too.
   `--config` with the `[patch.crates-io]` the package is not part of, and the `vte` entry of
   `Cargo.lock` is the path instead of the registry).
 
+- **The rows a scroll will recycle are asked for ahead of their turn.** With a full history
+  every scroll resets the oldest row, whose cells nothing has touched for as many scrolls as
+  the history has lines, so they are in memory and not in any cache, and `Row::reset` is
+  mostly waiting for them (on plain text it was over half of what `Term` cost). `Grid::scroll_up`
+  now also calls the new `Row::prefetch_for_reset` on the lines that will come up 32 scrolls
+  later, which issues the CPU's prefetch hint (`prfm` on aarch64, `prefetcht0` on x86_64,
+  nothing elsewhere) for the cache lines of their occupied cells. Nothing is read or written as
+  far as the program can tell: the cell, the storage and every result are as they were. Touches
+  `src/grid/mod.rs`, `src/grid/row.rs` and `src/grid/tests.rs` (all carry the §4(b) notice).
+  Test: `prefetching_for_a_reset_changes_nothing`.
+
+- **A run of printable text outside ASCII is written in one go too.** `Term` implements
+  `ansi::Handler::input_text(&str)` (the `vte` fork's other new method: a run of printable
+  characters with at least one outside ASCII, the ASCII among them included). It writes the
+  characters one or two columns wide that land on plain cells a stretch of a line at a time,
+  a fullwidth character as the two cells `input` writes (the character with `WIDE_CHAR`, then
+  the spacer), and leaves to `input` what depends on more than its own cells: zero-width
+  characters and characters without a width, a fullwidth character with one column left (the
+  leading spacer and the wrap), a cell in the way, and everything `input_ascii` leaves to it
+  (insert mode, a charset other than ASCII, line wrap off, a template with `extra`). A
+  character that has no width, or one for `input` to deal with, never makes the line wrap
+  before it does, as in `input`. Same promise, same test file: the random mix of
+  `a_random_mix_ends_where_its_characters_one_by_one_end` now has runs of text (the words of
+  `WORDS`: Latin with diacritics, CJK, Hangul, fullwidth forms, emoji, joiners and marks), and
+  `a_text_run_fills_and_wraps_lines_like_its_characters`,
+  `a_text_run_overwrites_what_is_in_its_way_like_its_characters`,
+  `text_follows_the_modes_like_its_characters` and
+  `repeating_right_after_a_text_run_repeats_its_last_character` go through every terminal width
+  from 2 to 12, every place in a line a run can start, wide characters and marks underneath, and
+  the modes. Touches `src/term/mod.rs` and `src/term/input_ascii_tests.rs`, as before.
+
+- **Text skips the width table for the scripts most of it is in.** `input_text` asks a private
+  `text_width` for each character's width, which answers from three ranges where the table says
+  one thing for every character (the printable ASCII and Latin ranges but the soft hyphen, CJK
+  ideographs, Hangul syllables and the fullwidth forms) and asks `unicode-width` for the
+  rest. Test: `the_widths_text_skips_the_table_for_are_the_tables` compares the function with
+  the table for every `char`, so a table that moves one of them fails here and not in
+  somebody's terminal.
+
+- **`input_text` writes through a slice of the row.** It takes the row as a slice once per
+  stretch, and puts the row's `occ` back to what `input` for each character would have left
+  (the old one, or the column after the last cell written, whichever is further), instead of
+  indexing the row cell by cell. The differential test compares `occ` of every row, and
+  caught the first version of this, which left it at the row's length when no cell was written.
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri only

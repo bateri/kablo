@@ -1,3 +1,7 @@
+// Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
+// a test for `Row::prefetch_for_reset` was added. Nothing else in this file differs from the
+// release; FORK.md lists the changes of the whole package.
+
 //! Tests for the Grid.
 
 use super::*;
@@ -387,4 +391,30 @@ fn wrap_cell(c: char) -> Cell {
     let mut cell = cell(c);
     cell.flags.insert(Flags::WRAPLINE);
     cell
+}
+
+// Asking for the cells of a row to be brought into the cache changes nothing about the row,
+// the grid or how scrolling goes on with a full history.
+#[test]
+fn prefetching_for_a_reset_changes_nothing() {
+    let mut grid = Grid::<usize>::new(5, 4, 20);
+    let mut twin = Grid::<usize>::new(5, 4, 20);
+
+    for number in 1..200usize {
+        for grid in [&mut grid, &mut twin] {
+            grid[Line(4)][Column(number % 4)] = number;
+            grid.scroll_up(&(Line(0)..Line(5)), 1 + number % 3);
+        }
+
+        // The hint on every row, `occ` of it and beyond.
+        for line in -(grid.history_size() as i32)..5 {
+            grid[Line(line)].prefetch_for_reset();
+        }
+
+        for line in -(grid.history_size() as i32)..5 {
+            assert_eq!(grid[Line(line)], twin[Line(line)], "line {line} after {number} scrolls");
+        }
+        assert_eq!(grid.history_size(), twin.history_size());
+    }
+    assert_eq!(grid.history_size(), 20);
 }

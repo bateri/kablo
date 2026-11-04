@@ -1,9 +1,9 @@
 // Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
 // `Term::hidden_primary_grid` was added, and a test for it; a full keyboard mode stack drops
 // its own bottom entry, not the title stack's (upstream's later fix), and a test for it;
-// `Handler::input_ascii` was implemented for `Term` (a run of printable ASCII written in one
-// go), and the module `input_ascii_tests` was added. Nothing else in this file differs from the
-// release; FORK.md lists the changes of the whole package.
+// `Handler::input_ascii` and `input_text` were implemented for `Term` (a run of printable
+// ASCII, or of text, written in one go), and the module `input_ascii_tests` was added. Nothing
+// else in this file differs from the release; FORK.md lists the changes of the whole package.
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
@@ -1078,6 +1078,19 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+/// `c.width()` for the characters of the scripts most text is written in, without the table
+/// lookup: the ranges are the ones where the table says one thing for every character (a test
+/// holds the function to the table for every `char`, so a newer table cannot make them differ
+/// unnoticed). The soft hyphen, `U+00AD`, is in none of them: it has no width.
+#[inline(always)]
+fn text_width(c: char) -> Option<usize> {
+    match c as u32 {
+        0x20..=0x7E | 0xA0..=0xAC | 0xAE..=0x2FF => Some(1),
+        0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xFF01..=0xFF60 => Some(2),
+        _ => c.width(),
+    }
+}
+
 impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
@@ -1220,6 +1233,120 @@ impl<T: EventListener> Handler for Term<T> {
             } else {
                 self.grid.cursor.point.column = Column(columns - 1);
                 self.grid.cursor.input_needs_wrap = true;
+            }
+        }
+    }
+
+    /// A run of printable text, written the way `input` writes it one character at a time.
+    ///
+    /// The same promise and the same exceptions as `input_ascii`: what `input` would do for each
+    /// character is done here for the stretches of a line made of characters one or two columns
+    /// wide that land on plain cells, and left to `input` for the rest (zero-width characters,
+    /// a fullwidth character that does not fit the last column, a cell in the way).
+    fn input_text(&mut self, s: &str) {
+        let plain = !self.mode.contains(TermMode::INSERT)
+            && self.mode.contains(TermMode::LINE_WRAP)
+            && self.grid.cursor.template.extra.is_none()
+            && matches!(self.grid.cursor.charsets[self.active_charset], StandardCharset::Ascii);
+        if !plain {
+            s.chars().for_each(|c| self.input(c));
+            return;
+        }
+
+        let columns = self.columns();
+        let in_the_way = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+        let mut chars = s.chars();
+        let mut next = chars.next();
+
+        while let Some(first) = next {
+            let mut c = first;
+            let mut width = match text_width(c) {
+                Some(width @ (1 | 2)) => width,
+                // `input` knows what a mark or a character without a width does; it never
+                // wraps for them.
+                _ => {
+                    self.input(c);
+                    next = chars.next();
+                    continue;
+                },
+            };
+
+            if self.grid.cursor.input_needs_wrap {
+                self.wrapline();
+            }
+
+            let line = self.grid.cursor.point.line;
+            let start = self.grid.cursor.point.column.0;
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            let row = &mut self.grid[line];
+            let occupied = row.occ;
+            let cells = &mut row[..];
+            let mut column = start;
+            let mut left_to_input = false;
+
+            loop {
+                if column + width > columns {
+                    // Either the line is full, and the next stretch wraps, or a fullwidth
+                    // character has one column left and `input` puts a spacer there.
+                    left_to_input = column < columns;
+                    break;
+                }
+
+                let blocked = cells[column..column + width]
+                    .iter()
+                    .any(|cell| cell.flags.intersects(in_the_way) || cell.extra.is_some());
+                if blocked {
+                    left_to_input = true;
+                    break;
+                }
+
+                if width == 1 {
+                    let cell = &mut cells[column];
+                    cell.c = c;
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags = flags;
+                } else {
+                    let cell = &mut cells[column];
+                    cell.c = c;
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags = flags | Flags::WIDE_CHAR;
+
+                    let spacer = &mut cells[column + 1];
+                    spacer.c = ' ';
+                    spacer.fg = fg;
+                    spacer.bg = bg;
+                    spacer.flags = flags | Flags::WIDE_CHAR_SPACER;
+                }
+                column += width;
+
+                next = chars.next();
+                match next.map(|n| (n, text_width(n))) {
+                    Some((n, Some(w @ (1 | 2)))) => {
+                        c = n;
+                        width = w;
+                    },
+                    _ => break,
+                }
+            }
+
+            // Indexing the row as a slice counted all of its cells as occupied, which `input`
+            // does not: put back what is, and the cells written.
+            self.grid[line].occ = if column > start { cmp::max(occupied, column) } else { occupied };
+            if column > start {
+                if column < columns {
+                    self.grid.cursor.point.column = Column(column);
+                } else {
+                    self.grid.cursor.point.column = Column(columns - 1);
+                    self.grid.cursor.input_needs_wrap = true;
+                }
+            }
+
+            if left_to_input {
+                self.input(c);
+                next = chars.next();
             }
         }
     }

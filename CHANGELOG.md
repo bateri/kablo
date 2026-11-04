@@ -64,6 +64,15 @@ section is not released.
   and ends in the same state as `input` for each character would leave; it now needs the vte fork
   to build (`input_ascii` is a method of the fork's `Handler`), which an app that takes both by
   `rev` already has. See the two `FORK.md` files.
+- **Two more methods of the same kind, for text outside ASCII.** `Perform::print_text(&str)` and
+  `ansi::Handler::input_text(&str)` take a run of printable text that has at least one character
+  outside ASCII (the ASCII around it comes along; a control, DEL or a C1 control ends the run). A
+  run of ASCII alone still goes to `print_ascii` and `input_ascii`. The defaults call `print` and
+  `input` for each character, so nothing changes for a type that does not implement them, and one
+  that forwards `Handler` method by method must forward `input_text` as well to get the gain. The
+  parser now checks UTF-8 while it dispatches, and tells the performer what it always told it
+  about the same bytes; a character cut off by the end of a read is still printed whole when the
+  next read completes it.
 
 ## [0.5.1] - 2026-10-31
 

@@ -81,6 +81,50 @@ workspace depends on).
   `a_handler_without_input_ascii_gets_every_character_as_before` and
   `repeating_after_a_run_repeats_its_last_character` in `ansi.rs`. A parser bump must carry it.
 
+- **A run of printable text outside ASCII reaches the handler whole, and the parser checks
+  UTF-8 while it dispatches.** `Perform::print_text(&str)` and `ansi::Handler::input_text(&str)`
+  are new, with the same kind of defaults as `print_ascii` and `input_ascii` (`print` and `input`
+  for each character). `ground_dispatch`'s caller now walks the bytes of a read once
+  (`dispatch_text`): a run of printable characters, the ASCII ones and the valid others, up to a
+  control, DEL or a C1 control, goes to `print_ascii` when it is ASCII alone and to `print_text`
+  when it is not; controls, DEL and C1 controls are told as before. Bytes that are not a
+  well-formed character, or one cut off by the end of the read, stop that walk and are left to
+  the old `str::from_utf8` code (`advance_ground_checked`, untouched), so what happens to invalid
+  input is exactly what happened. The same walk finds the escape that ends the text (it stops
+  there), where `advance_ground` used to look for it with `memchr` before validating, which
+  cost a call for every few bytes of text between color changes; `memchr` is left for the
+  rare case of invalid bytes. `Performer::print_text` calls `input_text` and leaves
+  `preceding_char` as the last character of the run. Tests: `printable_text_arrives_in_maximal_runs`,
+  `text_is_dispatched_as_checking_it_first_would` (twenty thousand random byte soups of valid and
+  invalid UTF-8, controls and C1 controls through the new walk and through
+  `advance_ground_checked`, same calls and same parser), `text_cut_anywhere_dispatches_what_the_whole_does`
+  (every one- and two-way cut of three hundred such soups, now with escape sequences in them), `well_formed_characters_are_what_std_calls_so`
+  (`utf8_char_len` against `str::from_utf8`) in `lib.rs`, and
+  `repeating_after_a_run_repeats_its_last_character` in `ansi.rs`. A parser bump must carry it.
+
+- **The numbers of a CSI sequence are taken in one step.** Where the walk over a read meets an
+  escape followed by `[`, `advance_ground` now takes the digits and semicolons after it (and
+  the final byte, when it is there) with the very actions `change_state` takes for them in the
+  states `CsiEntry` and `CsiParam` (`advance_csi_numbers`), without going through the state
+  machine byte by byte; a byte that is anything else (a marker, a colon, an intermediate, a
+  control, a byte outside ASCII) or the end of the read stops it with the parser in the state
+  the machine would be in, and the machine goes on from there. Every color change is such a
+  sequence. Nothing the performer is told changes. Test:
+  `csi_sequences_cut_anywhere_dispatch_what_the_whole_does` (a list of the ways a sequence
+  can leave its numbers and forty random mixes of CSI pieces, whole, one byte per read and every
+  two-way cut; a read of one byte never reaches the faster step, so it is the reference).
+
+- **The sixteen SGR colors are picked by arithmetic.** In `attrs_from_sgr_parameters` a
+  parameter of one number from 30 to 37, 40 to 47, 90 to 97 or 100 to 107 becomes its
+  `Attr::Foreground` or `Attr::Background` from a table of the named colors (`SGR_COLORS`)
+  indexed by the number, before the long `match` on slices that decides every other parameter;
+  the 32 arms it makes unreachable are gone from that `match`. A program that colors its
+  output picks the colors in no order, and the `match` was a jump table the CPU could not
+  predict. The handler is told the same attributes in the same order. Test:
+  `the_sixteen_colors_are_the_ones_their_numbers_name` (the 32 numbers against a written-out
+  list, the numbers next to the ranges, and a mix with the parameters that take the numbers
+  after them).
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri
