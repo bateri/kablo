@@ -114,6 +114,17 @@ workspace depends on).
   can leave its numbers and forty random mixes of CSI pieces, whole, one byte per read and every
   two-way cut; a read of one byte never reaches the faster step, so it is the reference).
 
+- **The sixteen SGR colors are picked by arithmetic.** In `attrs_from_sgr_parameters` a
+  parameter of one number from 30 to 37, 40 to 47, 90 to 97 or 100 to 107 becomes its
+  `Attr::Foreground` or `Attr::Background` from a table of the named colors (`SGR_COLORS`)
+  indexed by the number, before the long `match` on slices that decides every other parameter;
+  the 32 arms it makes unreachable are gone from that `match`. A program that colors its
+  output picks the colors in no order, and the `match` was a jump table the CPU could not
+  predict. The handler is told the same attributes in the same order. Test:
+  `the_sixteen_colors_are_the_ones_their_numbers_name` (the 32 numbers against a written-out
+  list, the numbers next to the ranges, and a mix with the parameters that take the numbers
+  after them).
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri

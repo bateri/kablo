@@ -2067,9 +2067,51 @@ where
     }
 }
 
+/// The 16 named colors in the order of the SGR numbers that choose them: 30 to 37 and 90 to 97
+/// for the foreground, 40 to 47 and 100 to 107 for the background.
+const SGR_COLORS: [NamedColor; 16] = [
+    NamedColor::Black,
+    NamedColor::Red,
+    NamedColor::Green,
+    NamedColor::Yellow,
+    NamedColor::Blue,
+    NamedColor::Magenta,
+    NamedColor::Cyan,
+    NamedColor::White,
+    NamedColor::BrightBlack,
+    NamedColor::BrightRed,
+    NamedColor::BrightGreen,
+    NamedColor::BrightYellow,
+    NamedColor::BrightBlue,
+    NamedColor::BrightMagenta,
+    NamedColor::BrightCyan,
+    NamedColor::BrightWhite,
+];
+
 #[inline]
 fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIter<'_>) {
     while let Some(param) = params.next() {
+        // The colors, by arithmetic and a table: a program that colors its output picks them
+        // in no order, and a jump table on the number is a branch the CPU cannot predict.
+        if let &[number] = param {
+            let color = match number {
+                30..=37 => Some((true, SGR_COLORS[(number - 30) as usize])),
+                90..=97 => Some((true, SGR_COLORS[(number - 82) as usize])),
+                40..=47 => Some((false, SGR_COLORS[(number - 40) as usize])),
+                100..=107 => Some((false, SGR_COLORS[(number - 92) as usize])),
+                _ => None,
+            };
+            if let Some((foreground, color)) = color {
+                let color = Color::Named(color);
+                handler.terminal_attribute(if foreground {
+                    Attr::Foreground(color)
+                } else {
+                    Attr::Background(color)
+                });
+                continue;
+            }
+        }
+
         let attr = match param {
             [0] => Some(Attr::Reset),
             [1] => Some(Attr::Bold),
@@ -2094,28 +2136,12 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
             [27] => Some(Attr::CancelReverse),
             [28] => Some(Attr::CancelHidden),
             [29] => Some(Attr::CancelStrike),
-            [30] => Some(Attr::Foreground(Color::Named(NamedColor::Black))),
-            [31] => Some(Attr::Foreground(Color::Named(NamedColor::Red))),
-            [32] => Some(Attr::Foreground(Color::Named(NamedColor::Green))),
-            [33] => Some(Attr::Foreground(Color::Named(NamedColor::Yellow))),
-            [34] => Some(Attr::Foreground(Color::Named(NamedColor::Blue))),
-            [35] => Some(Attr::Foreground(Color::Named(NamedColor::Magenta))),
-            [36] => Some(Attr::Foreground(Color::Named(NamedColor::Cyan))),
-            [37] => Some(Attr::Foreground(Color::Named(NamedColor::White))),
             [38] => {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Foreground)
             },
             [38, params @ ..] => handle_colon_rgb(params).map(Attr::Foreground),
             [39] => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
-            [40] => Some(Attr::Background(Color::Named(NamedColor::Black))),
-            [41] => Some(Attr::Background(Color::Named(NamedColor::Red))),
-            [42] => Some(Attr::Background(Color::Named(NamedColor::Green))),
-            [43] => Some(Attr::Background(Color::Named(NamedColor::Yellow))),
-            [44] => Some(Attr::Background(Color::Named(NamedColor::Blue))),
-            [45] => Some(Attr::Background(Color::Named(NamedColor::Magenta))),
-            [46] => Some(Attr::Background(Color::Named(NamedColor::Cyan))),
-            [47] => Some(Attr::Background(Color::Named(NamedColor::White))),
             [48] => {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Background)
@@ -2130,22 +2156,6 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
                 handle_colon_rgb(params).map(|color| Attr::UnderlineColor(Some(color)))
             },
             [59] => Some(Attr::UnderlineColor(None)),
-            [90] => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlack))),
-            [91] => Some(Attr::Foreground(Color::Named(NamedColor::BrightRed))),
-            [92] => Some(Attr::Foreground(Color::Named(NamedColor::BrightGreen))),
-            [93] => Some(Attr::Foreground(Color::Named(NamedColor::BrightYellow))),
-            [94] => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlue))),
-            [95] => Some(Attr::Foreground(Color::Named(NamedColor::BrightMagenta))),
-            [96] => Some(Attr::Foreground(Color::Named(NamedColor::BrightCyan))),
-            [97] => Some(Attr::Foreground(Color::Named(NamedColor::BrightWhite))),
-            [100] => Some(Attr::Background(Color::Named(NamedColor::BrightBlack))),
-            [101] => Some(Attr::Background(Color::Named(NamedColor::BrightRed))),
-            [102] => Some(Attr::Background(Color::Named(NamedColor::BrightGreen))),
-            [103] => Some(Attr::Background(Color::Named(NamedColor::BrightYellow))),
-            [104] => Some(Attr::Background(Color::Named(NamedColor::BrightBlue))),
-            [105] => Some(Attr::Background(Color::Named(NamedColor::BrightMagenta))),
-            [106] => Some(Attr::Background(Color::Named(NamedColor::BrightCyan))),
-            [107] => Some(Attr::Background(Color::Named(NamedColor::BrightWhite))),
             _ => None,
         };
 
@@ -2456,6 +2466,68 @@ mod tests {
             Printed::Char('g'),
         ];
         assert_eq!(handler.events, expected);
+    }
+
+    /// The attributes the handler is told of, in order.
+    #[derive(Default)]
+    struct Attributes(Vec<Attr>);
+
+    impl Handler for Attributes {
+        fn terminal_attribute(&mut self, attr: Attr) {
+            self.0.push(attr);
+        }
+    }
+
+    fn attributes_of(sequence: &str) -> Vec<Attr> {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = Attributes::default();
+        parser.advance(&mut handler, sequence.as_bytes());
+        handler.0
+    }
+
+    #[test]
+    fn the_sixteen_colors_are_the_ones_their_numbers_name() {
+        // Written out, not computed the way the code does.
+        use NamedColor::*;
+        let normal = [Black, Red, Green, Yellow, Blue, Magenta, Cyan, White];
+        let bright = [
+            BrightBlack,
+            BrightRed,
+            BrightGreen,
+            BrightYellow,
+            BrightBlue,
+            BrightMagenta,
+            BrightCyan,
+            BrightWhite,
+        ];
+
+        for (index, (&normal, &bright)) in normal.iter().zip(&bright).enumerate() {
+            let index = index as u16;
+            assert_eq!(attributes_of(&format!("\x1b[{}m", 30 + index)), [Attr::Foreground(Color::Named(normal))]);
+            assert_eq!(attributes_of(&format!("\x1b[{}m", 40 + index)), [Attr::Background(Color::Named(normal))]);
+            assert_eq!(attributes_of(&format!("\x1b[{}m", 90 + index)), [Attr::Foreground(Color::Named(bright))]);
+            assert_eq!(attributes_of(&format!("\x1b[{}m", 100 + index)), [Attr::Background(Color::Named(bright))]);
+        }
+
+        // The numbers around the ranges are not colors of this kind, and the ones that take the
+        // numbers after them still do.
+        for number in [29, 38, 48, 98, 99, 108, 109, 255, 65535] {
+            for attr in attributes_of(&format!("\x1b[{number}m")) {
+                assert!(
+                    !matches!(attr, Attr::Foreground(Color::Named(c)) | Attr::Background(Color::Named(c)) if SGR_COLORS.contains(&c)),
+                    "{number}"
+                );
+            }
+        }
+        assert_eq!(attributes_of("\x1b[31;1;44;38;5;9;100;48:2::1:2:3;92m"), [
+            Attr::Foreground(Color::Named(Red)),
+            Attr::Bold,
+            Attr::Background(Color::Named(Blue)),
+            Attr::Foreground(Color::Indexed(9)),
+            Attr::Background(Color::Named(BrightBlack)),
+            Attr::Background(Color::Spec(Rgb { r: 1, g: 2, b: 3 })),
+            Attr::Foreground(Color::Named(BrightGreen)),
+        ]);
     }
 
     #[test]
