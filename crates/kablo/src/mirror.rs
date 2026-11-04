@@ -334,7 +334,15 @@ impl Worker {
         let shared = Arc::clone(core);
         let handle = thread::Builder::new()
             .name("kablo-screen".to_owned())
-            .spawn(move || shared.work())?;
+            .spawn(move || {
+                // A panic in the parser ends the relay, as it would on the relay's own
+                // thread, and the warden starts another from the journal: a screen half
+                // way through a piece is not one to go on with.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.work())).is_err()
+                {
+                    std::process::exit(101);
+                }
+            })?;
         Ok(Worker {
             core: Arc::clone(core),
             handle: Some(handle),
