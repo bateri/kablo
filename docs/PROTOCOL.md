@@ -576,8 +576,9 @@ that was running when kablo was upgraded decodes the view and encodes it again w
 the bit, while `status` reports the new relay, so a client that goes through a bridge
 needs one started after the upgrade as well as a relay whose `version` has the bit.
 The server gives the socket of a client that sets the bit a larger send buffer (a
-megabyte where the system allows), so it can write ahead of a client that reads flat
-out; a client that does not set it gets the system's.
+megabyte where the system allows) for as long as the connection lasts, so it can write
+ahead of a client that reads flat out; a connection on which the bit was never set has
+the system's.
 
 **Taking the terminal.** Bit 3 of the view's flags, take, makes the `attach` an
 act and not only a way to look: when the server has attached the client, every

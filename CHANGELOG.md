@@ -55,8 +55,9 @@ section is not released.
   again without the bit, while `status` already reports the new relay), so an app reads `version`
   in `status` and goes through a bridge started after the upgrade before it relies on it
   (`docs/PROTOCOL.md`, Attach). The relay gives the socket of a client that sets the bit a larger
-  send buffer (a megabyte where the system allows) so it can write ahead of a client that reads
-  flat out; one that does not set it gets the system's.
+  send buffer (a megabyte where the system allows), for as long as the connection lasts, so it can
+  write ahead of a client that reads flat out; a connection on which the bit was never set has the
+  system's.
 - **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
   `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
   where the parser used to call `print` and `input` for each character; the parser hands every
@@ -80,6 +81,9 @@ section is not released.
   next read completes it.
   `alacritty_terminal::term::text_width` is public: a type that wraps the handler and asks a
   character's width gets the same answer without the table.
+- **The emulator fork pins `unicode-width` to exactly `0.2.2`**, the table `text_width` was made
+  from. An app that takes the fork by `rev` takes that version with it, and a dependency of the
+  app that asks for another does not resolve.
 
 ## [0.5.1] - 2026-10-31
 

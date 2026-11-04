@@ -712,11 +712,11 @@ impl Relay {
             if self.exit.is_some() || self.attached() == 0 {
                 self.settle.cancel();
             }
-            // The same instant that decided whether the terminal is in the set: a pause
-            // that ends in between would leave the terminal out of it and the timeout
-            // for it gone, and `poll` would be deaf to the terminal until something else
-            // woke it.
-            if sys::poll(&mut set, self.wake_in(now)).is_err() {
+            // The pause that left the terminal out of the set, and not a second look at it:
+            // the screen's thread moves by itself, and a pause that ended in between would
+            // leave the terminal out and the timeout for it gone, with `poll` deaf to the
+            // terminal until something else woke it.
+            if sys::poll(&mut set, self.wake_in(now, pause)).is_err() {
                 return 1;
             }
             for (fd, source) in set.iter().zip(&sources) {
@@ -1075,9 +1075,10 @@ impl Relay {
         self.catch_up();
         loop {
             // The program is gone, so there is no pause to wait out: a client that asked
-            // for every byte is given what it can take between the fills, and a ring a
-            // few fills long (the smallest is a Linux terminal's buffer) is not turned
-            // over under one that stood half a ring behind when the program ended.
+            // for every byte is given what its socket takes between the fills, and a ring a
+            // few fills long (the smallest is a Linux terminal's buffer) is not turned over
+            // under one that stood half a ring behind when the program ended, as long as
+            // its socket has room. Nothing here waits for one that does not read.
             self.drive_those_who_asked_for_every_byte();
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) | Err(_) => break,
@@ -2142,16 +2143,16 @@ impl Relay {
         }
     }
 
-    /// How long a `poll` may wait at `now`: for ever unless a look at the
-    /// terminal, the end of a session's wait or the end of a pause (the screen's
-    /// thread, a client that is waited for) is due.
-    fn wake_in(&self, now: Instant) -> Option<Duration> {
+    /// How long a `poll` may wait at `now`, with the terminal left out of it for `pause`: for
+    /// ever unless a look at the terminal, the end of a session's wait or the end of the pause
+    /// (the screen's thread, a client that is waited for) is due.
+    fn wake_in(&self, now: Instant, pause: Option<Pause>) -> Option<Duration> {
         let keep = if self.delivered_sent {
             None
         } else {
             self.keep.timeout(now)
         };
-        let pause = self.paused(now).map(|pause| match pause {
+        let pause = pause.map(|pause| match pause {
             Pause::Parser => THROTTLE_WAIT,
             Pause::Client { until } => until.saturating_duration_since(now),
         });
@@ -2648,6 +2649,11 @@ mod tests {
         got
     }
 
+    /// How long `serve` would let `poll` wait at `now`.
+    fn timer(relay: &Relay, now: Instant) -> Option<Duration> {
+        relay.wake_in(now, relay.paused(now))
+    }
+
     /// A relay reading its terminal, with one client attached from the start of the
     /// stream, and the far end of the client's socket.
     fn relay_with_a_client() -> (Relay, OwnedFd, UnixStream) {
@@ -2694,7 +2700,7 @@ mod tests {
         assert_eq!(delivered(&mut relay, &far, 7), 7);
         // And nothing waits on the clock for it.
         let now = Instant::now();
-        assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
+        assert_eq!(timer(&relay, now), relay.settle.timeout(now));
     }
 
     #[test]
@@ -2730,37 +2736,56 @@ mod tests {
         // What is left to wait for is the look after output; with that gone the relay's
         // `poll` has no timeout.
         let now = Instant::now();
-        assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
+        assert_eq!(timer(&relay, now), relay.settle.timeout(now));
         relay.settle.cancel();
-        assert_eq!(relay.wake_in(now), None);
+        assert_eq!(timer(&relay, now), None);
     }
 
     #[test]
     fn a_program_that_writes_a_full_read_every_so_often_is_not_gathered_for_long() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let (mut relay, write, far) = relay_over_a_pipe(1 << 20, FULL_READ);
-        // Whatever the writer sends has to fit the pipe: it is joined below with the read
-        // end still open, and a pipe holds 64 KiB on Linux and less on other systems.
-        let writes = 48 * 1024 / FULL_READ;
-        let writer = std::thread::spawn(move || {
-            let data = vec![b'x'; FULL_READ];
-            for _ in 0..writes {
-                if sys::write_fd(write.as_fd(), &data).is_err() {
-                    return;
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                let data = vec![b'x'; FULL_READ];
+                while !stop.load(Ordering::Relaxed) {
+                    if sys::write_fd(write.as_fd(), &data).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
                 }
-                std::thread::sleep(Duration::from_micros(500));
             }
         });
-        std::thread::sleep(Duration::from_millis(1));
-        let turn = Instant::now();
-        relay.read_terminal();
-        let took = turn.elapsed();
         // Reads a little under a millisecond apart: to the end of a frame that is tens of
-        // milliseconds, and the limit is a fraction of that. A loaded machine stretches the
-        // writer, not this bound's meaning: the turn gives up on time, not on bytes.
-        assert!(took < Duration::from_millis(25), "{took:?}");
-        let gathered = usize::try_from(relay.journal.total()).unwrap_or(usize::MAX);
-        assert!(gathered < FULL_READ * writes, "{gathered}");
-        assert_eq!(delivered(&mut relay, &far, gathered), gathered);
+        // milliseconds, and the limit is a fraction of that. A loaded machine can let one turn
+        // find a frame's worth waiting; all of them fill it only when the limit is gone.
+        let frame = (OUT_CHUNK as u64).min(relay.journal.capacity() / 8);
+        let mut least = u64::MAX;
+        let mut quickest = Duration::MAX;
+        for _ in 0..8 {
+            // A turn that finds nothing is over at once: this one starts on a read.
+            let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+            assert_eq!(
+                sys::poll(&mut set, Some(Duration::from_secs(5))).unwrap(),
+                1
+            );
+            let before = relay.journal.total();
+            let turn = Instant::now();
+            relay.read_terminal();
+            quickest = quickest.min(turn.elapsed());
+            let gathered = relay.journal.total() - before;
+            least = least.min(gathered);
+            let gathered = usize::try_from(gathered).unwrap_or(usize::MAX);
+            assert_eq!(delivered(&mut relay, &far, gathered), gathered);
+        }
+        assert!(least < frame, "{least}");
+        assert!(quickest < Duration::from_millis(25), "{quickest:?}");
+        // The read end goes with the relay, so a writer in a full pipe is let go.
+        stop.store(true, Ordering::Relaxed);
+        drop(relay);
         writer.join().unwrap();
     }
 
@@ -3199,15 +3224,15 @@ mod tests {
             })
         );
         // The wait for it is the one timer, and it is for as long as is left.
-        assert_eq!(relay.wake_in(start), Some(STALL_LIMIT));
+        assert_eq!(timer(&relay, start), Some(STALL_LIMIT));
         let later = start + STALL_LIMIT / 2;
         relay.note_laggards(later);
-        assert_eq!(relay.wake_in(later), Some(STALL_LIMIT / 2));
+        assert_eq!(timer(&relay, later), Some(STALL_LIMIT / 2));
         // Not moving for the limit: the program is read again, and there is no timer.
         let over = start + STALL_LIMIT;
         relay.note_laggards(over);
         assert_eq!(relay.paused(over), None);
-        assert_eq!(relay.wake_in(over), None);
+        assert_eq!(timer(&relay, over), None);
         // It reads again: the wait is for it once more, from now.
         let mut decoder = PacketDecoder::new();
         let (mut got, mut picture) = (Vec::new(), false);
@@ -3238,9 +3263,9 @@ mod tests {
         relay.journal.append(&vec![b'x'; 12 * 1024]);
         let start = Instant::now();
         relay.note_laggards(start);
-        // `serve` asks both at one instant, and the terminal is left out of the set exactly
-        // when there is a pause: so wherever the pause is about to end, a timer must be
-        // set for it, or `poll` would sleep on with nothing to wake it.
+        // The terminal is left out of the set exactly when there is a pause: so wherever the
+        // pause is about to end, a timer must be set for it, or `poll` would sleep on with
+        // nothing to wake it.
         let nanosecond = Duration::from_nanos(1);
         for at in [
             start,
@@ -3250,7 +3275,7 @@ mod tests {
             start + STALL_LIMIT + nanosecond,
         ] {
             let pause = relay.paused(at);
-            let timer = relay.wake_in(at);
+            let timer = relay.wake_in(at, pause);
             assert_eq!(pause.is_some(), timer.is_some(), "{at:?}");
             if let Some(Pause::Client { until }) = pause {
                 assert_eq!(timer, Some(until - at));
@@ -3327,14 +3352,14 @@ mod tests {
         let now = Instant::now();
         relay.note_laggards(now);
         assert_eq!(relay.paused(now), None);
-        assert_eq!(relay.wake_in(now), None);
+        assert_eq!(timer(&relay, now), None);
         // Caught up after being behind: the count against it is gone.
         relay.journal.append(&vec![b'x'; 12 * 1024]);
         relay.note_laggards(now);
         relay.clients[0].attach.as_mut().unwrap().next = relay.journal.total();
         relay.note_laggards(now);
         assert_eq!(relay.clients[0].attach.as_ref().unwrap().waited_since, None);
-        assert_eq!(relay.wake_in(now), None);
+        assert_eq!(timer(&relay, now), None);
     }
 
     #[test]
@@ -3388,6 +3413,22 @@ mod tests {
             plain < 64 * 1024 && wide > 512 * 1024,
             "{plain} then {wide}"
         );
+    }
+
+    #[test]
+    fn a_pause_for_the_screen_keeps_its_timer_when_the_screen_catches_up_before_the_poll() {
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        relay.worker = Some(Worker::start(&relay.core).unwrap());
+        relay
+            .journal
+            .append(&vec![b'x'; usize::try_from(relay.behind_limit()).unwrap()]);
+        let now = Instant::now();
+        let pause = relay.paused(now);
+        assert_eq!(pause, Some(Pause::Parser));
+        // The worker moves between the look that left the terminal out and the `poll`.
+        relay.core.parsed_to(relay.journal.total());
+        assert_eq!(relay.paused(now), None);
+        assert_eq!(relay.wake_in(now, pause), Some(THROTTLE_WAIT));
     }
 
     #[test]
@@ -3496,12 +3537,12 @@ mod tests {
         // Nothing to tell yet: nothing is delivered and the relay waits for ever.
         relay.deliver_if_due(now);
         assert!(!relay.delivered_sent);
-        assert_eq!(relay.wake_in(now), None);
+        assert_eq!(timer(&relay, now), None);
 
         relay.drive(0);
         relay.deliver_if_due(now);
         assert!(relay.delivered_sent, "told, so the session may go");
-        assert_eq!(relay.wake_in(now), None);
+        assert_eq!(timer(&relay, now), None);
     }
 
     #[test]
@@ -3516,7 +3557,7 @@ mod tests {
         let now = Instant::now();
         relay.deliver_if_due(now);
         assert!(!relay.delivered_sent, "told, but one of them asked");
-        let due = relay.wake_in(now).unwrap();
+        let due = timer(&relay, now).unwrap();
         assert!(
             due > END_KEEP - Duration::from_secs(5) && due <= END_KEEP,
             "{due:?}"
@@ -3528,7 +3569,7 @@ mod tests {
         assert!(!relay.delivered_sent);
         relay.deliver_if_due(now + END_KEEP + Duration::from_secs(1));
         assert!(relay.delivered_sent);
-        assert_eq!(relay.wake_in(now), None, "it fired once");
+        assert_eq!(timer(&relay, now), None, "it fired once");
     }
 
     #[test]
@@ -3545,7 +3586,7 @@ mod tests {
         assert!(!relay.delivered_sent, "one that asked is still to be told");
         // The wait started with the telling of the other, so a connection that
         // is behind holds the session for it and no longer.
-        let due = relay.wake_in(now).unwrap();
+        let due = timer(&relay, now).unwrap();
         assert!(due <= END_KEEP, "{due:?}");
 
         // Told in time, the one that asked has what is left of it.
