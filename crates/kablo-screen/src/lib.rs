@@ -68,6 +68,7 @@ mod image;
 mod kept;
 mod keys;
 mod marks;
+mod skim;
 mod tail;
 mod text;
 

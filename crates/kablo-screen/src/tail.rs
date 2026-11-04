@@ -3,6 +3,7 @@
 
 use crate::kept::Kept;
 use crate::marks::Marks;
+use crate::skim;
 
 /// Where the parser stands, as far as [`Tail`] needs: vte's states folded into the ones
 /// that end a sequence alike (`vte-0.15.0/src/lib.rs`).
@@ -91,9 +92,55 @@ impl Default for Tail {
 
 impl Tail {
     /// Follows `bytes`, which the parser gets next and in this order.
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.step(byte);
+    ///
+    /// What [`Tail::skim`] can take at once it takes at once, the rest is stepped through
+    /// a byte at a time: every byte the relay reads comes through here, and most of it is
+    /// text or the body of a sequence.
+    pub(crate) fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let taken = self.skim(bytes);
+            bytes = bytes.get(taken..).unwrap_or_default();
+            if let Some((&byte, rest)) = bytes.split_first() {
+                self.step(byte);
+                bytes = rest;
+            }
+        }
+    }
+
+    /// Takes the bytes from the start of `bytes` that leave the state where it is, keeping
+    /// of them what [`Tail::step`] would keep, and says how many it took: 0 when the next
+    /// byte is one to step through. The same as stepping through them one by one.
+    fn skim(&mut self, bytes: &[u8]) -> usize {
+        match self.state {
+            Seq::Ground if self.utf8_need == 0 => ground_run(bytes),
+            Seq::Apc => {
+                let run = skim::until(bytes, |byte| matches!(byte, 0x18 | 0x1a | 0x1b));
+                let room = self.apc_keep.saturating_sub(self.bytes.len());
+                self.bytes
+                    .extend_from_slice(bytes.get(..run.min(room)).unwrap_or_default());
+                run
+            }
+            // Every byte from 0x20 up is the OSC's; below it, BEL, CAN, SUB and ESC end it
+            // and the other controls are dropped, all of which the step reads.
+            Seq::Osc => {
+                let run = skim::until(bytes, |byte| byte < 0x20);
+                self.bytes
+                    .extend_from_slice(bytes.get(..run).unwrap_or_default());
+                run
+            }
+            Seq::Ignored => {
+                let run = skim::until(bytes, |byte| matches!(byte, 0x18 | 0x1a | 0x1b));
+                self.bytes
+                    .extend_from_slice(bytes.get(..run).unwrap_or_default());
+                run
+            }
+            Seq::DcsBody => {
+                let run = skim::until(bytes, |byte| matches!(byte, 0x18 | 0x1a | 0x1b | 0x9c));
+                self.bytes
+                    .extend_from_slice(bytes.get(..run).unwrap_or_default());
+                run
+            }
+            _ => 0,
         }
     }
 
@@ -277,6 +324,32 @@ impl Tail {
     }
 }
 
+/// How far the ground state goes on unmoved, with no character half read: ASCII other than
+/// `ESC`, the bytes no character starts with, and whole characters of UTF-8, each of which
+/// [`Tail::step`] takes a byte at a time and comes back to the ground from with nothing
+/// kept. It stops at an `ESC` and at a character that is cut or malformed, which the step
+/// reads.
+fn ground_run(bytes: &[u8]) -> usize {
+    let mut at = 0;
+    loop {
+        let rest = bytes.get(at..).unwrap_or_default();
+        at += skim::until(rest, |byte| byte == 0x1b || byte >= 0x80);
+        let need = match bytes.get(at) {
+            None | Some(0x1b) => return at,
+            Some(0xc2..=0xdf) => 1,
+            Some(0xe0..=0xef) => 2,
+            Some(0xf0..=0xf4) => 3,
+            Some(_) => 0,
+        };
+        match bytes.get(at + 1..=at + need) {
+            Some(continuation) if continuation.iter().all(|&byte| byte & 0xc0 == 0x80) => {
+                at += 1 + need;
+            }
+            _ => return at,
+        }
+    }
+}
+
 #[cfg(test)]
 impl Tail {
     pub(crate) fn capacity(&self) -> usize {
@@ -294,3 +367,106 @@ impl Tail {
 
 #[cfg(test)]
 pub(crate) const KEEP_LIMITS: (usize, usize) = (TAIL_KEEP, APC_KEEP);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything a tail stands for, as one value to compare.
+    fn state(tail: &Tail) -> (Seq, u8, Vec<u8>, Kept, String) {
+        (
+            tail.state,
+            tail.utf8_need,
+            tail.bytes.clone(),
+            tail.kept,
+            format!("{:?}", tail.marks),
+        )
+    }
+
+    /// A stream that visits every state: text, whole and cut UTF-8, CSI that moves a mode,
+    /// OSC with marks, APC, DCS, SOS, and the bytes that cancel or restart each.
+    fn mixed() -> Vec<u8> {
+        let mut stream = Vec::new();
+        for part in [
+            "plain text\r\n\tand more \u{e7}ay \u{11f} \u{65e6}\u{6d77} \u{1f44d}",
+            "\x1b[1;31mred\x1b[0m\x1b[?1016h\x1b[?2048h\x1b[2J\x1b[?1016l\x1b[38:5:24m",
+            "\x1b]0;a title\x07\x1b]2;another\x1b\\\x1b]133;A\x07text\x1b]133;D;0\x07\x1b]7;file://h/p\x1b\\",
+            "\x1b]52;c;aGVsbG8=\x18after a cancel\x1b]6;\x01\x02ignored\x7f\x07",
+            "\x1b_Ga=t,m=1;QUJD\x1b\\\x1b_Gm=0;REVG\x1b\\\x1b_G\x1bcancelled\x1b_Gq;\x1a",
+            "\x1bP1$qm\x1b\\\x1bPq#0;1;2\u{9c}\x1bX sos body\x1b\\\x1b^ pm\x18x",
+            "\x1bc\x1b(B\x1b)0\x1b#8\x1b \x1b\x1b[\x1b]",
+        ] {
+            stream.extend_from_slice(part.as_bytes());
+        }
+        // A character cut off by an escape and by a plain byte, and stray continuations.
+        stream.extend_from_slice(b"\xe6\x97\x1b[m\xf0\x9f a\x80\xbf\xc2\xc2\xa9\xff\xf5z");
+        // Enough text on each side of a block edge for the block walk to run.
+        stream.extend_from_slice(&b"0123456789abcdef".repeat(2));
+        stream.extend_from_slice(b"\x1b]2;");
+        stream.extend_from_slice(&b"0123456789abcdef".repeat(2));
+        stream.extend_from_slice(b"\x07\x1bP1$q");
+        stream.extend_from_slice(&b"0123456789abcdef".repeat(2));
+        stream.extend_from_slice(b"\x1b\\");
+        stream
+    }
+
+    /// Skimming is stepping: however the stream is cut into reads, one cut or two, the tail
+    /// is the one a walk of its bytes one by one leaves.
+    #[test]
+    fn skimming_a_read_leaves_the_tail_stepping_through_it_leaves() {
+        let stream = mixed();
+        let step = |tail: &mut Tail, bytes: &[u8]| {
+            for &byte in bytes {
+                tail.step(byte);
+            }
+        };
+        let mut whole = Tail::default();
+        whole.feed(&stream);
+        let mut stepped = Tail::default();
+        step(&mut stepped, &stream);
+        assert_eq!(state(&whole), state(&stepped));
+        for first in 0..=stream.len() {
+            let (head, rest) = stream.split_at(first);
+            let (mut skimmed, mut walked) = (Tail::default(), Tail::default());
+            skimmed.feed(head);
+            step(&mut walked, head);
+            assert_eq!(state(&skimmed), state(&walked), "one cut at {first}");
+            for second in first..=stream.len() {
+                let (mut skimmed, mut walked) = (Tail::default(), Tail::default());
+                let (middle, last) = rest.split_at(second - first);
+                skimmed.feed(head);
+                skimmed.feed(middle);
+                step(&mut walked, head);
+                step(&mut walked, middle);
+                assert_eq!(
+                    state(&skimmed),
+                    state(&walked),
+                    "cuts at {first} and {second}"
+                );
+                skimmed.feed(last);
+                step(&mut walked, last);
+                assert_eq!(
+                    state(&skimmed),
+                    state(&walked),
+                    "cuts at {first} and {second}, then the rest"
+                );
+            }
+        }
+    }
+
+    /// An application program command past what the tail keeps is cut at the same byte
+    /// whether it arrives whole or a byte at a time.
+    #[test]
+    fn a_command_past_its_cap_is_cut_where_stepping_cuts_it() {
+        let mut stream = b"\x1b_G".to_vec();
+        stream.extend_from_slice(&b"0123456789abcdef".repeat(8));
+        for cap in [0, 3, 40, 70, 400] {
+            let (mut skimmed, mut walked) = (Tail::with_apc_keep(cap), Tail::with_apc_keep(cap));
+            skimmed.feed(&stream);
+            for &byte in &stream {
+                walked.step(byte);
+            }
+            assert_eq!(state(&skimmed), state(&walked), "cap {cap}");
+        }
+    }
+}
