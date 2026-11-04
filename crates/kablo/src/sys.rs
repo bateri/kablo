@@ -378,6 +378,35 @@ pub fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<u
     Ok(ready as usize)
 }
 
+/// The size asked for each way of a unix socket between a relay and a client.
+const SOCKET_BUFFER: libc::c_int = 1 << 20;
+
+/// Asks for [`SOCKET_BUFFER`] bytes of kernel buffer to send and to receive on `sock`,
+/// and takes what it is given: a refusal (or a smaller grant, as Linux limits it with
+/// `net.core.wmem_max`) leaves the socket as it was.
+///
+/// A macOS unix socket buffers 8 KiB by default (`net.local.stream.sendspace`), so a
+/// stream between a relay and a bridge moves 8 KiB at a time and each side waits for
+/// the other to take it: neither looks busy and the stream crawls. A buffer of a megabyte
+/// lets the relay write a frame and go back to the terminal while the client is still
+/// reading the one before.
+pub fn widen_buffers(sock: BorrowedFd<'_>) {
+    let size = SOCKET_BUFFER;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: a valid socket for the call and a pointer to a `c_int` of the size
+        // given; the kernel only reads it.
+        unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 /// A `pollfd` that asks about `events` on `fd`.
 pub fn want(fd: RawFd, events: libc::c_short) -> libc::pollfd {
     libc::pollfd {
@@ -909,6 +938,47 @@ pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    fn send_buffer(sock: BorrowedFd<'_>) -> libc::c_int {
+        let mut size: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a valid socket, and an `int` with its length for the kernel to fill.
+        let done = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw mut size).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(done, 0);
+        size
+    }
+
+    #[test]
+    fn widening_a_socket_never_makes_its_buffer_smaller() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let before = send_buffer(ours.as_fd());
+        widen_buffers(ours.as_fd());
+        widen_buffers(theirs.as_fd());
+        let after = send_buffer(ours.as_fd());
+        assert!(after >= before, "{before} then {after}");
+        // On macOS the whole of it is given, where the default is 8 KiB.
+        #[cfg(target_os = "macos")]
+        assert!(after >= SOCKET_BUFFER, "{after}");
+        // What it writes now is more than the old buffer took at once.
+        ours.set_nonblocking(true).unwrap();
+        let mut sent = 0;
+        let chunk = [0u8; 4096];
+        while let Ok(n) = io::Write::write(&mut &ours, &chunk) {
+            sent += n;
+            if sent > 4 << 20 {
+                break;
+            }
+        }
+        assert!(sent > 16 * 1024, "{sent}");
+    }
     use std::os::unix::net::UnixStream;
 
     fn shell(script: &str) -> Proc {

@@ -1211,6 +1211,7 @@ impl Relay {
         if !allowed || sock.set_nonblocking(true).is_err() {
             return;
         }
+        sys::widen_buffers(sock.as_fd());
         self.clients.push(Client {
             sock,
             open: false,
