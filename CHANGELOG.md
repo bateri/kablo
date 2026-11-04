@@ -38,6 +38,20 @@ section is not released.
 - **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**
   The session sends a flood of output in larger pieces and does less bookkeeping per read; a
   keystroke's echo or a line of output still goes out at once.
+### For apps
+
+- **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
+  `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
+  where the parser used to call `print` and `input` for each character; the parser hands every
+  maximal run of such bytes in a read to `print_ascii`, and everything else (DEL, controls,
+  anything outside ASCII) goes the way it always went. The defaults call `print` and `input` per
+  character, so a type that does not implement them behaves as before. A type that forwards
+  `Handler` method by method (bateri's does, with `clippy::missing_trait_methods`) must forward
+  `input_ascii` as well to get the gain: the default, which it would otherwise use, is the slow
+  per-character path. The emulator fork (`vendor/alacritty_terminal`) implements it for `Term`
+  and ends in the same state as `input` for each character would leave; it now needs the vte fork
+  to build (`input_ascii` is a method of the fork's `Handler`), which an app that takes both by
+  `rev` already has. See the two `FORK.md` files.
 
 ## [0.5.1] - 2026-10-31
 

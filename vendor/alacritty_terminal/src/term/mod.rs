@@ -1,8 +1,9 @@
 // Changed from alacritty_terminal 0.26.0 (Apache License 2.0, section 4(b)):
 // `Term::hidden_primary_grid` was added, and a test for it; a full keyboard mode stack drops
-// its own bottom entry, not the title stack's (upstream's later fix), and a test for it.
-// Nothing else in this file differs from the release; FORK.md lists the changes of the whole
-// package.
+// its own bottom entry, not the title stack's (upstream's later fix), and a test for it;
+// `Handler::input_ascii` was implemented for `Term` (a run of printable ASCII written in one
+// go), and the module `input_ascii_tests` was added. Nothing else in this file differs from the
+// release; FORK.md lists the changes of the whole package.
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
@@ -35,6 +36,9 @@ use crate::vte::ansi::{
 pub mod cell;
 pub mod color;
 pub mod search;
+
+#[cfg(test)]
+mod input_ascii_tests;
 
 /// Minimum number of columns.
 ///
@@ -1152,6 +1156,71 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.column += 1;
         } else {
             self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// A run of printable ASCII, written the way `input` writes it one character at a time.
+    ///
+    /// The result is the same as calling `input` for each character, down to the cursor,
+    /// `input_needs_wrap`, the rows' `occ` and the damage. What a run costs by `input` is paid
+    /// per character (width lookup, charset mapping, copying the template, the wide character
+    /// checks); here it is paid once per stretch of a line. Whatever makes a character depend
+    /// on more than the cell it lands on is left to `input`.
+    fn input_ascii(&mut self, s: &str) {
+        // Insert mode shifts the row, a charset other than ASCII maps the characters, line
+        // wrapping off makes every character at the last column overwrite the one before, and
+        // a template with `extra` (a hyperlink, an underline color) hands every cell its own
+        // copy of it.
+        let plain = !self.mode.contains(TermMode::INSERT)
+            && self.mode.contains(TermMode::LINE_WRAP)
+            && self.grid.cursor.template.extra.is_none()
+            && matches!(self.grid.cursor.charsets[self.active_charset], StandardCharset::Ascii);
+        if !plain {
+            s.chars().for_each(|c| self.input(c));
+            return;
+        }
+
+        let columns = self.columns();
+        let mut bytes = s.as_bytes();
+        while !bytes.is_empty() {
+            if self.grid.cursor.input_needs_wrap {
+                self.wrapline();
+            }
+
+            let line = self.grid.cursor.point.line;
+            let start = self.grid.cursor.point.column.0;
+            let count = (columns - start).min(bytes.len());
+            let (run, rest) = bytes.split_at(count);
+            bytes = rest;
+
+            // A fullwidth character, its spacer or a cell with `extra` in the way is cleaned
+            // up by `write_at_cursor` (the other half of the character, the leading spacer
+            // on the line above), so those cells are left to it.
+            let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+            let blocked = self.grid[line][Column(start)..Column(start + count)]
+                .iter()
+                .any(|cell| cell.flags.intersects(wide) || cell.extra.is_some());
+            if blocked {
+                run.iter().for_each(|&byte| self.input(byte as char));
+                continue;
+            }
+
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            let cells = &mut self.grid[line][Column(start)..Column(start + count)];
+            for (cell, &byte) in cells.iter_mut().zip(run) {
+                cell.c = byte as char;
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.flags = flags;
+            }
+
+            if start + count < columns {
+                self.grid.cursor.point.column = Column(start + count);
+            } else {
+                self.grid.cursor.point.column = Column(columns - 1);
+                self.grid.cursor.input_needs_wrap = true;
+            }
         }
     }
 

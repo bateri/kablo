@@ -62,6 +62,25 @@ workspace depends on).
   `pointer_shape_request_reaches_the_handler_as_written` and
   `pointer_shape_name_is_set_by_default` in `ansi.rs`.
 
+- **A run of printable ASCII reaches the handler whole.** `Perform::print_ascii(&str)` and
+  `ansi::Handler::input_ascii(&str)` are new; `ground_dispatch` hands every maximal run of
+  bytes `0x20..=0x7e` of a read to `print_ascii` and everything else (DEL, controls, C1
+  controls, characters outside ASCII) through the path it always took. Both defaults call
+  `print` and `input` for each character of the run, so anything that does not implement them
+  behaves as before; `ansi::Performer::print_ascii` calls `input_ascii` and leaves
+  `preceding_char` as the per-character path would, the run's last character, so REP repeats
+  the right one. A handler that implements `input_ascii` must end in the state `input` per
+  character would leave (`alacritty_terminal`'s fork does, and its differential test holds it
+  to that). A type that forwards `Handler` method by method must forward `input_ascii` too, or
+  it runs the per-character default. A run ends where a read ends, so the same stream cut
+  differently arrives as different runs. The reason is speed: the emulator pays its per-character
+  costs once per stretch of a line. Tests: `printable_ascii_arrives_in_maximal_runs` and
+  `printable_ascii_cut_anywhere_dispatches_what_the_whole_does` (every one- and two-way cut of
+  a stream mixing runs, controls, DEL, characters of two to four bytes, an escape sequence and
+  invalid bytes) in `lib.rs`, whose `Dispatcher` takes the runs for every other test there too;
+  `a_handler_without_input_ascii_gets_every_character_as_before` and
+  `repeating_after_a_run_repeats_its_last_character` in `ansi.rs`. A parser bump must carry it.
+
 ## When this directory changes
 
 bateri pins this repository's commit, so a commit that changes the fork reaches bateri

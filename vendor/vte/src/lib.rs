@@ -785,10 +785,27 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // A run of printable ASCII goes to the performer as one string: per-character
+            // work (a width lookup, a state check) is then paid once per run.
+            let start = i;
+            while i < bytes.len() && (0x20..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i > start {
+                performer.print_ascii(&text[start..i]);
+            }
+
+            // Everything else, DEL included, takes the path it always took. `i` is on a
+            // character boundary: the run before it is ASCII.
+            if let Some(c) = text[i..].chars().next() {
+                match c {
+                    '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+                    _ => performer.print(c),
+                }
+                i += c.len_utf8();
             }
         }
     }
@@ -828,6 +845,20 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Draw a run of printable ASCII (`0x20..=0x7e`, never empty) to the screen.
+    ///
+    /// The parser hands every maximal run of such bytes it finds in one read here instead
+    /// of calling [`print`](Self::print) for each. The default does exactly that, so a
+    /// performer that does not implement this behaves as before; one that can draw a run
+    /// faster than its characters one by one overrides it and must leave the same state.
+    /// A run ends where the read ends, so the same stream cut differently arrives as
+    /// different runs.
+    fn print_ascii(&mut self, s: &str) {
+        for c in s.chars() {
+            self.print(c);
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -934,6 +965,8 @@ mod tests {
     #[derive(Default)]
     struct Dispatcher {
         dispatched: Vec<Sequence>,
+        /// The runs of printable ASCII, as `print_ascii` got them.
+        runs: Vec<String>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -984,6 +1017,17 @@ mod tests {
 
         fn print(&mut self, c: char) {
             self.dispatched.push(Sequence::Print(c));
+        }
+
+        /// Takes the runs whole, and tells the same as `print` per character would, so every
+        /// test below that compares what was dispatched also holds the runs to it.
+        fn print_ascii(&mut self, s: &str) {
+            assert!(!s.is_empty());
+            assert!(s.bytes().all(|byte| (0x20..=0x7e).contains(&byte)), "{s:?}");
+            self.runs.push(s.to_owned());
+            for c in s.chars() {
+                self.dispatched.push(Sequence::Print(c));
+            }
         }
 
         fn execute(&mut self, byte: u8) {
@@ -1581,7 +1625,7 @@ mod tests {
     }
 
     /// `input` through one parser in the reads `cuts` marks, the way a terminal gets a stream.
-    fn dispatched_in_reads(input: &[u8], cuts: &[usize]) -> Vec<Sequence> {
+    fn dispatcher_after_reads(input: &[u8], cuts: &[usize]) -> Dispatcher {
         let mut dispatcher = Dispatcher::default();
         let mut parser = Parser::new();
 
@@ -1591,7 +1635,11 @@ mod tests {
             start = end;
         }
 
-        dispatcher.dispatched
+        dispatcher
+    }
+
+    fn dispatched_in_reads(input: &[u8], cuts: &[usize]) -> Vec<Sequence> {
+        dispatcher_after_reads(input, cuts).dispatched
     }
 
     #[test]
@@ -1618,6 +1666,56 @@ mod tests {
 
         let every_byte: Vec<usize> = (1..input.len()).collect();
         assert_eq!(dispatched_in_reads(input, &every_byte), whole);
+    }
+
+    #[test]
+    fn printable_ascii_arrives_in_maximal_runs() {
+        // Everything else, DEL and the characters outside ASCII included, is printed or
+        // executed one by one, as it always was, and ends the run before it.
+        const INPUT: &[u8] = b"ab c\r\nd\x7fe \xC3\xA9 f\x1b[1mg\x85h~";
+
+        let dispatcher = dispatcher_after_reads(INPUT, &[]);
+        assert_eq!(dispatcher.runs, ["ab c", "d", "e ", " f", "g", "h~"]);
+        assert_eq!(dispatcher.dispatched.iter().filter(|s| matches!(s, Sequence::Print(_))).count(), 14);
+        assert!(dispatcher.dispatched.contains(&Sequence::Print('\x7f')));
+        assert!(dispatcher.dispatched.contains(&Sequence::Print('é')));
+        assert!(dispatcher.dispatched.contains(&Sequence::Execute(0x85)));
+
+        // A read ends a run: what comes in the next one starts another.
+        let dispatcher = dispatcher_after_reads(b"abcdef", &[2, 3]);
+        assert_eq!(dispatcher.runs, ["ab", "c", "def"]);
+    }
+
+    #[test]
+    fn printable_ascii_cut_anywhere_dispatches_what_the_whole_does() {
+        // Runs next to controls, DEL, characters of two to four bytes, an escape sequence and
+        // invalid bytes, so a cut lands inside a run, at its ends and inside the characters
+        // around it. (No C1 control as UTF-8: a character cut inside it is printed, not
+        // executed, which is how upstream's `advance_partial_utf8` always took it.)
+        const INPUT: &[u8] =
+            b"abc def\r\n~ \x7fgh \xC3\xA9ij\xF0\x9F\x8E\x89 k\x1b[1mlm\x1b[0m\xFFno\xE2\x82 pq\x08r";
+
+        let whole = dispatched_in_reads(INPUT, &[]);
+        for first in 0..=INPUT.len() {
+            for second in first..=INPUT.len() {
+                let cut = dispatcher_after_reads(INPUT, &[first, second]);
+                assert_eq!(cut.dispatched, whole, "cut at {first} and {second}");
+
+                // What the runs add up to is what was dispatched, in order.
+                let printed: String = cut.runs.concat();
+                let ascii_printed: String = whole
+                    .iter()
+                    .filter_map(|s| match s {
+                        Sequence::Print(c) if (' '..='~').contains(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(printed, ascii_printed, "cut at {first} and {second}");
+            }
+        }
+
+        let every_byte: Vec<usize> = (1..INPUT.len()).collect();
+        assert_eq!(dispatched_in_reads(INPUT, &every_byte), whole);
     }
 
     #[test]
