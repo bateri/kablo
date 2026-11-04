@@ -88,6 +88,10 @@ pub struct Env {
     pub dir: PathBuf,
     tag: String,
     sessions: Vec<String>,
+    /// Sessions whose names other tests use too (`p4`, which a command takes for a terminal): ended
+    /// through their own socket and never found by name among the processes, as that would be
+    /// every test's.
+    named_alike: Vec<String>,
     /// Variables every `kablo` of this test runs with.
     vars: Vec<(String, String)>,
 }
@@ -108,6 +112,7 @@ impl Env {
             dir,
             tag,
             sessions: Vec::new(),
+            named_alike: Vec::new(),
             vars: Vec::new(),
         }
     }
@@ -162,6 +167,12 @@ impl Env {
     /// with [`Env::start`] (a bridge made it, say).
     pub fn track(&mut self, id: &str) {
         self.sessions.push(id.to_owned());
+    }
+
+    /// Like [`Env::track`], for a session whose name is not unique to this test: its end is asked
+    /// for over its own socket, and no process is killed for its name.
+    pub fn track_named_alike(&mut self, id: &str) {
+        self.named_alike.push(id.to_owned());
     }
 
     pub fn socket(&self, id: &str) -> PathBuf {
@@ -299,13 +310,19 @@ impl Drop for Env {
         // Politely first: a forced terminate over the socket ends the shell
         // and lets the warden clean up. A session that cannot be reached is
         // ended by pid below.
-        for id in &self.sessions {
+        for id in self.sessions.iter().chain(&self.named_alike) {
             if self.socket(id).exists() {
                 if let Ok(mut conn) = Conn::try_open(self.socket(id), id, Duration::from_secs(2)) {
                     conn.send(Message::Terminate { force: true });
                     conn.pump(Duration::from_millis(300));
                 }
             }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && self.named_alike.iter().any(|id| self.socket(id).exists())
+        {
+            std::thread::sleep(Duration::from_millis(50));
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline

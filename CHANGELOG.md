@@ -33,6 +33,20 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`kablo bateri VERB`, the `bateri` command of a terminal app, is a command of kablo.** The
+  verbs that open no terminal work: `send`, `send-key`, `capture` and `wait` (kablo's own, with
+  the checks of what a pane is called), `ls`, `notify`, `focus`, `zoom`, `swap`, `rename`,
+  `close`, `move` and `resize`, with `--help`. A verb the app answers (`ls`, `focus`, `move` and
+  the like) asks the app connected to this machine, over the conversation of `kablo app`, in the
+  text of the `kablo-bateri` crate, and prints what it says; with none connected it ends with 69,
+  except `ls`, which lists what the server has, `rename pane`, which labels the session, and
+  `close pane`, which ends it. A target is a terminal number (`p9`), never a bare number or a
+  label; a word of another kind (`t3`, a tab) is 64 with the command that was meant. The exit
+  codes are 0, 1, 64 (a mistake in the command), 69 (no app), 77 (the app refused), 124 (`wait`
+  ran out of time), 128 plus the signal, and 255 (kablo's own trouble).
+
 ### Changed
 
 - **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**

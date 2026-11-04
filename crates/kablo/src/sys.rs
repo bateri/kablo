@@ -940,6 +940,15 @@ pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
     Ok(read)
 }
 
+/// Gives `signals` back their default action, after [`signal_pipe`] took them for a while.
+pub fn release_signals(signals: &[libc::c_int]) {
+    for &signal in signals {
+        // SAFETY: the default action is always a valid disposition to set.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+    SIGNAL_PIPE.store(-1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

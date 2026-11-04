@@ -122,6 +122,52 @@ pub fn run(err: &mut dyn Write) -> u8 {
     talk(&dir, local, Some(signals.as_fd()), Patience::STANDARD, err)
 }
 
+/// One conversation for a program that is a part of this process, not a process of its own (the
+/// `bateri` command): hands `message` to the app and returns the status and the bytes the app said.
+/// What `kablo app` would have said on standard error is not said, since the caller has its own
+/// words for each status. A signal ends the conversation as it ends `kablo app`'s, and the
+/// signals are the process's own again once it is over.
+pub fn converse(message: &[u8]) -> (u8, Vec<u8>) {
+    let signals_pipe = sys::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]).ok();
+    let (status, said) = converse_with(message, signals_pipe.as_ref().map(AsFd::as_fd));
+    sys::release_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    (status, said)
+}
+
+fn converse_with(message: &[u8], signals: Option<BorrowedFd<'_>>) -> (u8, Vec<u8>) {
+    let mut unsaid = Vec::new();
+    let Ok(dir) = sockdir::socket_dir() else {
+        return (EXIT_TROUBLE, Vec::new());
+    };
+    let (Ok((input, to_app)), Ok((said, output)), Ok((errors_read, errors))) =
+        (sys::pipe(), sys::pipe(), sys::pipe())
+    else {
+        return (EXIT_TROUBLE, Vec::new());
+    };
+    let local = Local {
+        input,
+        output,
+        errors,
+    };
+    std::thread::scope(|scope| {
+        // The message and the answer each get a thread: neither fits a pipe's buffer for sure, and
+        // the conversation reads and writes by turns.
+        scope.spawn(move || {
+            let _ = std::fs::File::from(to_app).write_all(message);
+        });
+        let reading = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = io::Read::read_to_end(&mut std::fs::File::from(said), &mut bytes);
+            bytes
+        });
+        scope.spawn(move || {
+            let _ = io::copy(&mut std::fs::File::from(errors_read), &mut io::sink());
+        });
+        let status = talk(&dir, local, signals, Patience::STANDARD, &mut unsaid);
+        (status, reading.join().unwrap_or_default())
+    })
+}
+
 /// [`run`] for the mailboxes in `dir`, with `local` for the ends of the
 /// conversation and `signals` (the read end of a pipe of signal numbers, see
 /// [`sys::signal_pipe`]) to end it.

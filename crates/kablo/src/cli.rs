@@ -12,8 +12,8 @@ use kablo_proto::v1::{
 };
 
 use crate::{
-    app, bridge, connect, drive, exec, forward, inner, journal, launch, listing, relay, scan,
-    sockdir, sys, upgrade, warden,
+    app, bridge, command, connect, drive, exec, forward, inner, journal, launch, listing, relay,
+    scan, sockdir, sys, upgrade, warden,
 };
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
@@ -100,6 +100,7 @@ where
             Some("forward") => return command_forward(rest, out, err),
             Some("exec") => return command_exec(rest, err),
             Some("app") => return command_app(rest, err),
+            Some("bateri") => return command::run(rest, out, err),
             Some("upgrade") => return command_upgrade(rest, out, err),
             // The two halves of a session; `kablo new` starts the first and the
             // first starts the second. Not for people.
