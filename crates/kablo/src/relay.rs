@@ -262,8 +262,7 @@ impl EndKeep {
 /// A kernel read of a terminal is small (a macOS one returns at most a kibibyte), so a
 /// stream needs [`OUT_CHUNK`] over that many of them to fill a frame; twice as many, so
 /// that each may be followed by a wait for the next ([`REFILL_WAIT`]) and the turn still
-/// ends on the bytes and not on this. It is also what bounds a turn that a trickle of full
-/// reads would otherwise stretch.
+/// ends on the bytes and not on this.
 const READ_BUDGET: usize = 2 * (OUT_CHUNK / 1024);
 
 /// How long a turn that is gathering waits for the terminal to be readable again after a
@@ -273,6 +272,11 @@ const READ_BUDGET: usize = 2 * (OUT_CHUNK / 1024);
 /// the bytes do. A millisecond is the finest wait `poll` has. When nothing comes the stream
 /// has stopped, the turn ends and the relay sleeps with no timeout.
 const REFILL_WAIT: Duration = Duration::from_millis(1);
+
+/// How long a turn goes on gathering. A flood fills a frame well inside this. A program that
+/// writes a full read every so often does not: without a limit its bytes would sit here for
+/// as many waits as a frame has reads, which is a delay anyone watching it can see.
+const GATHER_LIMIT: Duration = Duration::from_millis(2);
 
 /// How much the screen may be behind the reads before the worker is woken from its rest.
 const WAKE_BACKLOG: u64 = (SCREEN_CHUNK / 2) as u64;
@@ -922,7 +926,11 @@ impl Relay {
                     // it in a moment: wait for it here, to send one frame and not many.
                     // Never a `read` again without a `poll` between: reading in a loop
                     // while the program is writing contends with it and is slower.
-                    if watched && last.is_some_and(|n| n >= FULL_READ) && self.refills() {
+                    if watched
+                        && last.is_some_and(|n| n >= FULL_READ)
+                        && now.elapsed() < GATHER_LIMIT
+                        && self.refills()
+                    {
                         last = None;
                         continue;
                     }
@@ -2685,6 +2693,32 @@ mod tests {
         assert_eq!(relay.wake_in(now), relay.settle.timeout(now));
         relay.settle.cancel();
         assert_eq!(relay.wake_in(now), None);
+    }
+
+    #[test]
+    fn a_program_that_writes_a_full_read_every_so_often_is_not_gathered_for_long() {
+        let (mut relay, write, far) = relay_over_a_pipe(1 << 20, FULL_READ);
+        let writer = std::thread::spawn(move || {
+            let data = vec![b'x'; FULL_READ];
+            for _ in 0..64 {
+                if sys::write_fd(write.as_fd(), &data).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1));
+        let turn = Instant::now();
+        relay.read_terminal();
+        let took = turn.elapsed();
+        // Reads a little under a millisecond apart: to the end of a frame that is tens of
+        // milliseconds, and the limit is a fraction of that. A loaded machine stretches the
+        // writer, not this bound's meaning: the turn gives up on time, not on bytes.
+        assert!(took < Duration::from_millis(25), "{took:?}");
+        let gathered = usize::try_from(relay.journal.total()).unwrap_or(usize::MAX);
+        assert!(gathered < FULL_READ * 64, "{gathered}");
+        assert_eq!(delivered(&mut relay, &far, gathered), gathered);
+        writer.join().unwrap();
     }
 
     #[test]
