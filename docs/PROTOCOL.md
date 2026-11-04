@@ -108,7 +108,7 @@ messages of channel 0, and the messages of channel 1 follow it.
 
 | kind | name | session | payload |
 |---|---|---|---|
-| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end, bit 3: take), then optionally the client's name: `length: u8` and that many bytes of UTF-8, at most 63 |
+| 0x01 | `attach` | yes | `offset: u64`, then optionally a view: `cols: u16, rows: u16, xpixel: u16, ypixel: u16, flags: u8` (bit 0: picture, bit 1: picture if answered, bit 2: keep after the end, bit 3: take, bit 4: every byte), then optionally the client's name: `length: u8` and that many bytes of UTF-8, at most 63 |
 | 0x02 | `detach` | yes | (empty) |
 | 0x03 | `resize` | yes | `cols: u16, rows: u16, xpixel: u16, ypixel: u16` |
 | 0x04 | `terminate` | yes | `flags: u8` (bit 0: force) |
@@ -558,6 +558,20 @@ has seen the program end (a terminal app, whose pane an agent on the server read
 a moment after the app shows that the program ended). It changes nothing about
 the attach itself and is described under Ending. A server from before the bit
 ignores it.
+
+**Every byte.** Bit 4 of the view's flags, every byte, is for a client that reads
+the stream as fast as it can and wants all of it (an app on the same machine, on a
+unix socket). Without it, a client that falls behind by more than the journal
+holds is sent a picture of the screen in place of the bytes it lost (`attached`
+with `truncated`), which is what a slow link wants: the program is never kept
+waiting for it. With it, while the client is behind by more than half the
+journal the server stops reading the program's output, so the program waits (in
+the terminal's own buffer, as it does for any slow reader) and nothing is lost.
+A client that stops reading does not hold the program for good: when its
+position has not moved for a second the server goes on reading and the client
+is dropped behind as without the bit, until it reads again. A bridge that
+carries the view on a connection that is made again sends the bit again. A server
+from before the bit ignores it.
 
 **Taking the terminal.** Bit 3 of the view's flags, take, makes the `attach` an
 act and not only a way to look: when the server has attached the client, every

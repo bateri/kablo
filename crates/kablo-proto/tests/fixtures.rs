@@ -1643,29 +1643,31 @@ fn an_attached_is_the_one_it_always_was_unless_it_carries_a_whole_answered_offse
 }
 
 #[test]
-fn the_four_bits_of_a_views_flags_are_each_their_own() {
+fn the_five_bits_of_a_views_flags_are_each_their_own() {
     let size = Size {
         cols: 80,
         rows: 24,
         xpixel: 0,
         ypixel: 0,
     };
-    let view = |picture, picture_if_answered, keep, take| {
+    let view = |picture, picture_if_answered, keep, take, every_byte| {
         let mut view = viewing(size, picture, picture_if_answered);
         view.keep_after_end = keep;
         view.take = take;
+        view.every_byte = every_byte;
         view
     };
-    for flags in 0u8..16 {
-        let (picture, if_answered, keep, take) = (
+    for flags in 0u8..32 {
+        let (picture, if_answered, keep, take, every_byte) = (
             flags & 1 != 0,
             flags & 2 != 0,
             flags & 4 != 0,
             flags & 8 != 0,
+            flags & 16 != 0,
         );
         let packet = work(Message::Attach {
             offset: 0,
-            view: Some(view(picture, if_answered, keep, take)),
+            view: Some(view(picture, if_answered, keep, take, every_byte)),
         });
         let frame = packet.to_frame().unwrap();
         assert_eq!(frame.payload.last(), Some(&flags));
@@ -1673,13 +1675,13 @@ fn the_four_bits_of_a_views_flags_are_each_their_own() {
     }
     // The bits it does not define are not its business.
     let mut payload = vec![0; 8];
-    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1111_0000]);
+    payload.extend([0, 80, 0, 24, 0, 0, 0, 0, 0b1110_0000]);
     let bytes = raw(kind::ATTACH, 0, "work", &payload);
     assert_eq!(
         read_packet(&mut bytes.as_slice()).unwrap(),
         Some(work(Message::Attach {
             offset: 0,
-            view: Some(view(false, false, false, false))
+            view: Some(view(false, false, false, false, false))
         }))
     );
 }

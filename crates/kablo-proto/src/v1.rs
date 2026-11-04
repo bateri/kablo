@@ -329,6 +329,18 @@ pub struct View {
     /// the first). A server from before the bit ignores it and attaches the client
     /// beside the others.
     pub take: bool,
+    /// The client wants every byte of the stream and reads it as fast as it can
+    /// (an app on the same machine, on a socket), so the terminal should wait for
+    /// it: while it is behind by more than half the server's journal, the server
+    /// stops reading the program's output until it has caught up, where it would
+    /// otherwise go on, write over what the client has not read, and send the
+    /// client a picture of the screen in place of the bytes it lost. A client that
+    /// stops reading does not stall the program for good: after a second without
+    /// progress the server reads on and the picture is what the client gets, as
+    /// without the flag. Leave it off on a slow link, where a picture is what is
+    /// wanted and a program that waits for the link is not. A server from before
+    /// the bit ignores it.
+    pub every_byte: bool,
     /// What the client calls itself, for the list of who is attached that
     /// `status` answers with. `None` says no name, as a client from before the
     /// name does. It is a property of the view, so a client that attaches again
@@ -348,12 +360,14 @@ impl View {
             picture_if_answered: false,
             keep_after_end: false,
             take: false,
+            every_byte: false,
             name: None,
         }
     }
 
     /// The wire form: a size and a flags byte (bit 0: picture, bit 1:
-    /// picture if answered, bit 2: keep after the end, bit 3: take), then, if the client has
+    /// picture if answered, bit 2: keep after the end, bit 3: take, bit 4: every
+    /// byte), then, if the client has
     /// a name, its length as a byte and its bytes. A view with no name ends at
     /// the flags, as it did before names.
     fn write(&self, out: &mut Vec<u8>) {
@@ -362,7 +376,8 @@ impl View {
             u8::from(self.picture)
                 | (u8::from(self.picture_if_answered) << 1)
                 | (u8::from(self.keep_after_end) << 2)
-                | (u8::from(self.take) << 3),
+                | (u8::from(self.take) << 3)
+                | (u8::from(self.every_byte) << 4),
         );
         if let Some(name) = &self.name {
             out.push(name.len);
@@ -390,6 +405,7 @@ impl View {
             picture_if_answered: flags & 2 != 0,
             keep_after_end: flags & 4 != 0,
             take: flags & 8 != 0,
+            every_byte: flags & 16 != 0,
             name,
         })
     }

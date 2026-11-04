@@ -1308,6 +1308,32 @@ impl Bridge {
         *self.seen(id).attached.last().unwrap()
     }
 
+    /// Attaches as an app on this machine that reads as fast as it can and wants every
+    /// byte, so the session should wait for it.
+    pub fn attach_every_byte(&mut self, id: &str, offset: u64) -> (u64, bool) {
+        let before = self.seen(id).attached.len();
+        let mut view = View::new(Size {
+            cols: 80,
+            rows: 24,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        view.every_byte = true;
+        self.send(
+            Some(id),
+            Message::Attach {
+                offset,
+                view: Some(view),
+            },
+        );
+        self.until("attached", |b| {
+            b.sessions
+                .get(id)
+                .is_some_and(|s| s.attached.len() > before)
+        });
+        *self.seen(id).attached.last().unwrap()
+    }
+
     pub fn type_in(&mut self, id: &str, text: &str) {
         self.send(Some(id), Message::Input(text.as_bytes().to_vec()));
     }

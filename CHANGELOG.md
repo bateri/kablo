@@ -41,6 +41,17 @@ section is not released.
 
 ### For apps
 
+- **Protocol: a client can ask not to be lapped.** The flags byte of the `attach` view gains bit
+  4, `every_byte` (`kablo-proto`: `v1::View::every_byte`, `false` from `View::new`, so this breaks
+  no one that builds one). An app that sets it reads the session's stream as fast as it can and
+  wants every byte of it: while it is behind by more than half the journal the relay stops
+  reading the program's output, so a program that writes faster than the app reads waits instead
+  of writing over what the app has not read, and the app is not sent a picture of the screen in
+  place of the bytes it lost (its scrollback with them). An app that stops reading releases the
+  program after a second, and is lapped as without the bit. Leave it off on a slow link, where
+  the picture is the right answer; the bridge keeps the bit across a resize and a new connection
+  as it does the others. A relay from before the bit ignores it, so an app reads `version` in
+  `status` before it relies on it (`docs/PROTOCOL.md`, Attach).
 - **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
   `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
   where the parser used to call `print` and `input` for each character; the parser hands every

@@ -734,6 +734,7 @@ mod tests {
         let mut view = View::new(size(80));
         view.picture_if_answered = true;
         view.keep_after_end = true;
+        view.every_byte = true;
         view.name = ClientName::new("MacBook");
         link.send(
             about(Message::Attach {
@@ -773,6 +774,10 @@ mod tests {
         assert_eq!(offset, 0x10);
         assert_eq!(view.size, size(100));
         assert!(view.keep_after_end && view.picture_if_answered && !view.picture);
+        assert!(
+            view.every_byte,
+            "the bit was dropped on the way to the new connection"
+        );
         assert_eq!(view.name, ClientName::new("MacBook"));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1316,3 +1316,58 @@ fn a_bridge_passes_a_refused_input_on_and_the_session_stays_askable_and_endable(
     });
     env.wait_gone(&id);
 }
+
+#[test]
+fn an_app_that_asks_for_every_byte_over_a_bridge_is_not_lapped_by_a_program_that_outruns_it() {
+    let mut env = Env::new();
+    // A ring that the lines turn over many times, and more of them than the sockets on the way hold.
+    let id = env.start(
+        "every-byte",
+        &[
+            "--journal-size",
+            "16K",
+            "--",
+            "/bin/sh",
+            "-c",
+            "stty -echo; echo ready; read go; seq 1 600000; sleep 300",
+        ],
+    );
+    let mut bridge = Bridge::start(&env);
+    let (_, truncated) = bridge.attach_every_byte(&id, 0);
+    assert!(!truncated);
+    bridge.wait_for(&id, "ready");
+    bridge.type_in(&id, "\n");
+    // The app does not read for a while: the program writes on, the session fills the
+    // bridge's socket and then waits instead of writing over what the app has not got.
+    std::thread::sleep(Duration::from_millis(300));
+    let last = "600000\r\n";
+    bridge.until("the last line", |b| {
+        b.sessions
+            .get(&id)
+            .is_some_and(|seen| seen.data.ends_with(last.as_bytes()))
+    });
+    let seen = bridge.seen(&id);
+    let wanted: String = std::iter::once("ready\r\n".to_owned())
+        .chain((1..=600000).map(|n| format!("{n}\r\n")))
+        .collect();
+    let at = seen
+        .data
+        .iter()
+        .zip(wanted.as_bytes())
+        .position(|(a, b)| a != b);
+    assert!(
+        seen.data == wanted.as_bytes(),
+        "not the bytes of the program, in order: {} bytes of {}, differing at {at:?}: {:?}",
+        seen.data.len(),
+        wanted.len(),
+        String::from_utf8_lossy(
+            &seen.data
+                [at.unwrap_or(0).saturating_sub(20)..(at.unwrap_or(0) + 20).min(seen.data.len())]
+        )
+    );
+    assert!(
+        seen.pictures.is_empty(),
+        "a picture came in place of the bytes"
+    );
+    assert_eq!(seen.attached.len(), 1);
+}

@@ -307,6 +307,14 @@ const BEHIND_LIMIT: u64 = 256 * 1024;
 /// with it: an idle session has none.
 const THROTTLE_WAIT: Duration = Duration::from_millis(1);
 
+/// How long a client that asked for every byte (`View::every_byte`) may be waited for
+/// without moving: the terminal is not read while it is behind by more than half the ring,
+/// and a client that has stopped reading (frozen, or stopped in a debugger) must not hold a
+/// program for good. Once its position has stood still this long it is not waited for any
+/// more, the ring laps it and it is sent a picture as any client is, until it reads again.
+/// The timer runs only while the relay is waiting for such a client.
+const STALL_LIMIT: Duration = Duration::from_secs(1);
+
 /// Reads of one client's socket in one turn, at most. A client that leaves
 /// with more than this many reads' worth unread is seen to have left a turn
 /// later, so a question asked in between still counts it.
@@ -388,6 +396,12 @@ struct Attach {
     /// The client asked for the session to be kept for a while once it has been
     /// told the program ended (`keep_after_end` in its view).
     keep_after_end: bool,
+    /// The client reads as fast as it can and wants every byte, so the terminal is not read
+    /// while it is behind by more than half the ring (`every_byte` in its view).
+    every_byte: bool,
+    /// When the relay began to wait for the client because it was behind, if it did and the
+    /// client has not moved since: the start of [`STALL_LIMIT`].
+    waited_since: Option<Instant>,
     /// What the client called itself in its view, for `status` to tell who is
     /// attached. It goes with the attach: a client that attaches again with no
     /// name has none, and one that detached is not listed.
@@ -405,6 +419,17 @@ struct Picture {
     bytes: Vec<u8>,
     /// How many of `bytes` are queued.
     sent: usize,
+}
+
+/// What the relay is waiting for instead of reading the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pause {
+    /// The screen's thread. It is no descriptor, so the relay looks again after
+    /// [`THROTTLE_WAIT`].
+    Parser,
+    /// A client that asked for every byte. Its socket taking bytes wakes the relay; `until` is
+    /// when it stops being waited for if it does not move ([`STALL_LIMIT`]).
+    Client { until: Instant },
 }
 
 struct Relay {
@@ -639,13 +664,16 @@ impl Relay {
                 sources.push(Source::Listener);
             }
             let mut events = 0;
-            // Not while the parser is too far behind: the program waits in the terminal's
-            // buffer and the timer in `wake_in` looks again.
-            let throttled = self.throttled();
-            if self.reading && !self.master_done && !throttled {
+            // Not while something is too far behind to be read past: the program waits in
+            // the terminal's own buffer, and whatever ends the wait wakes the poll (a
+            // client's socket taking bytes) or has a timer in `wake_in`.
+            let now = Instant::now();
+            self.note_laggards(now);
+            let pause = self.paused(now);
+            if self.reading && !self.master_done && pause.is_none() {
                 events |= libc::POLLIN;
             }
-            if throttled {
+            if matches!(pause, Some(Pause::Parser)) {
                 // Never leave the worker asleep with the relay waiting for it.
                 self.core.wake_worker();
             }
@@ -864,8 +892,9 @@ impl Relay {
         // that no `drive` follows would lap a client on a ring they fill in a turn.
         let turn_limit = (OUT_CHUNK as u64).min(self.journal.capacity() / 8);
         let mut read = 0u64;
+        let now = Instant::now();
         for _ in 0..READ_BUDGET {
-            if read >= turn_limit || self.throttled() {
+            if read >= turn_limit || self.paused(now).is_some() {
                 break;
             }
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
@@ -928,7 +957,7 @@ impl Relay {
     ///
     /// This thread never parses for it: when the screen falls [`Relay::behind_limit`]
     /// behind, the terminal is not read any more until the worker has brought it back
-    /// ([`Relay::throttled`]), which also keeps the ring from lapping the screen.
+    /// ([`Relay::paused`]), which also keeps the ring from lapping the screen.
     fn leave_to_the_worker(&mut self) {
         self.journal.set_answered(self.journal.total());
         if self.worker.is_none() {
@@ -954,12 +983,53 @@ impl Relay {
         BEHIND_LIMIT.min(self.journal.capacity() / 2)
     }
 
-    /// The terminal is not read: the worker has more to parse than [`Relay::behind_limit`].
-    fn throttled(&self) -> bool {
-        self.worker.is_some()
-            && self.reading
-            && !self.master_done
-            && self.journal.total().saturating_sub(self.core.parsed()) >= self.behind_limit()
+    /// Why the terminal is not read at `now`, if it is not: something is further behind the
+    /// reads than the ring can bear, and the program is made to wait in the terminal's own
+    /// buffer, as it does for any reader that is slower than it, rather than the relay
+    /// writing over what that has not got to or doing its work on the read path.
+    fn paused(&self, now: Instant) -> Option<Pause> {
+        if !self.reading || self.master_done {
+            return None;
+        }
+        let total = self.journal.total();
+        // The screen's thread has more to parse than [`Relay::behind_limit`].
+        if self.worker.is_some() && total.saturating_sub(self.core.parsed()) >= self.behind_limit()
+        {
+            return Some(Pause::Parser);
+        }
+        // A client that asked for every byte is behind by more than half the ring, and has
+        // not stood still for [`STALL_LIMIT`]: the reads that would lap it wait for it.
+        let half = self.journal.capacity() / 2;
+        self.clients
+            .iter()
+            .filter(|client| !client.dead)
+            .filter_map(|client| client.attach.as_ref())
+            .filter(|attach| attach.every_byte && total.saturating_sub(attach.next) > half)
+            .map(|attach| attach.waited_since.unwrap_or(now) + STALL_LIMIT)
+            .filter(|until| *until > now)
+            .min()
+            .map(|until| Pause::Client { until })
+    }
+
+    /// Notes at `now` which clients that asked for every byte the relay is waiting for: the
+    /// ones behind by more than half the ring begin to be counted against [`STALL_LIMIT`],
+    /// and the ones that are not behind (any more) stop.
+    fn note_laggards(&mut self, now: Instant) {
+        let total = self.journal.total();
+        let half = self.journal.capacity() / 2;
+        for attach in self
+            .clients
+            .iter_mut()
+            .filter(|client| !client.dead)
+            .filter_map(|client| client.attach.as_mut())
+            .filter(|attach| attach.every_byte)
+        {
+            if total.saturating_sub(attach.next) > half {
+                attach.waited_since.get_or_insert(now);
+            } else {
+                attach.waited_since = None;
+            }
+        }
     }
 
     /// The shell is gone: take what it left in the terminal and read no more.
@@ -1501,6 +1571,8 @@ impl Relay {
             client.attach = Some(Attach {
                 next: start,
                 keep_after_end: view.is_some_and(|view| view.keep_after_end),
+                every_byte: view.is_some_and(|view| view.every_byte),
+                waited_since: None,
                 name: view.and_then(|view| view.name),
                 picture,
             });
@@ -1953,6 +2025,8 @@ impl Relay {
                         data.truncate(n);
                         let offset = attach.next;
                         attach.next += n as u64;
+                        // It moved: whatever it was waited for is over.
+                        attach.waited_since = None;
                         let packet =
                             Packet::about(self.id.clone(), Message::Output { offset, data });
                         if packet.encode(&mut client.out).is_err() {
@@ -2017,16 +2091,19 @@ impl Relay {
     }
 
     /// How long a `poll` may wait at `now`: for ever unless a look at the
-    /// terminal, the end of a session's wait or the end of a pause for the parser
-    /// is due.
+    /// terminal, the end of a session's wait or the end of a pause (the screen's
+    /// thread, a client that is waited for) is due.
     fn wake_in(&self, now: Instant) -> Option<Duration> {
         let keep = if self.delivered_sent {
             None
         } else {
             self.keep.timeout(now)
         };
-        let throttle = self.throttled().then_some(THROTTLE_WAIT);
-        [self.settle.timeout(now), keep, throttle]
+        let pause = self.paused(now).map(|pause| match pause {
+            Pause::Parser => THROTTLE_WAIT,
+            Pause::Client { until } => until.saturating_duration_since(now),
+        });
+        [self.settle.timeout(now), keep, pause]
             .into_iter()
             .flatten()
             .min()
@@ -2476,7 +2553,7 @@ mod tests {
             );
             // As the loop of the relay does: a terminal that is not read is not waited on,
             // and the clock looks again.
-            if relay.throttled() {
+            if relay.paused(Instant::now()).is_some() {
                 std::thread::sleep(THROTTLE_WAIT);
                 continue;
             }
@@ -2526,6 +2603,10 @@ mod tests {
         relay.live = true;
         relay.reading = true;
         let (client, far) = client_of(false);
+        // As `seat` makes the sockets of a client: a relay that is quicker than a client
+        // that reads flat out has a megabyte to put bytes in, not eight kibibytes.
+        sys::widen_buffers(client.sock.as_fd());
+        sys::widen_buffers(far.as_fd());
         relay.clients.push(client);
         (relay, slave, far)
     }
@@ -2672,7 +2753,7 @@ mod tests {
                 start.elapsed() < Duration::from_secs(60),
                 "the stream stopped"
             );
-            if relay.throttled() {
+            if relay.paused(Instant::now()).is_some() {
                 std::thread::sleep(THROTTLE_WAIT);
                 continue;
             }
@@ -2836,7 +2917,7 @@ mod tests {
                 "the stream stopped"
             );
             let turn = Instant::now();
-            if relay.throttled() {
+            if relay.paused(Instant::now()).is_some() {
                 throttled += 1;
                 relay.core.wake_worker();
                 std::thread::sleep(THROTTLE_WAIT);
@@ -2896,7 +2977,7 @@ mod tests {
                     stream.len()
                 );
                 // One turn of the relay's loop, and then the client reads what it was sent.
-                if !relay.throttled() {
+                if relay.paused(Instant::now()).is_none() {
                     let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
                     if sys::poll(&mut set, Some(Duration::from_millis(1))).unwrap() > 0 {
                         relay.read_terminal();
@@ -2908,6 +2989,202 @@ mod tests {
             }
             writer.join().unwrap();
             assert_eq!(got, stream.len(), "{kib}K");
+        }
+    }
+
+    /// What a client's socket has brought, at most `limit` bytes of it: the bytes of program
+    /// output in order, and whether a picture came.
+    fn read_slowly(
+        far: &UnixStream,
+        decoder: &mut PacketDecoder,
+        limit: usize,
+        got: &mut Vec<u8>,
+        picture: &mut bool,
+    ) {
+        far.set_nonblocking(true).unwrap();
+        let mut buf = vec![0u8; limit];
+        if let Ok(n @ 1..) = (&*far).read(&mut buf) {
+            decoder.push(buf.get(..n).unwrap_or_default());
+        }
+        while let Ok(Some(packet)) = decoder.next_packet() {
+            match packet.message {
+                Message::Output { offset, data } => {
+                    assert_eq!(offset, got.len() as u64, "bytes out of order or missing");
+                    got.extend_from_slice(&data);
+                }
+                Message::Picture { .. } => *picture = true,
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_slow_client_that_asked_for_every_byte_is_not_lapped_and_gets_every_byte_in_order() {
+        for kib in [16u64, 64, 512] {
+            let capacity = kib * 1024;
+            let (mut relay, slave, far) = relay_with_a_client();
+            on_a_ring(&mut relay, capacity);
+            if let Some(attach) = relay.clients[0].attach.as_mut() {
+                attach.every_byte = true;
+            }
+            let wrote = usize::try_from(4 * capacity).unwrap().max(256 * 1024);
+            let stream: Vec<u8> = (0..wrote).map(|i| (i % 95) as u8 + 32).collect();
+            let writer = program_writes(&slave, stream.clone());
+            let (mut decoder, mut got, mut picture) = (PacketDecoder::new(), Vec::new(), false);
+            let start = Instant::now();
+            while got.len() < stream.len() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(60),
+                    "{kib}K: {} of {}",
+                    got.len(),
+                    stream.len()
+                );
+                let now = Instant::now();
+                relay.note_laggards(now);
+                if relay.paused(now).is_none() {
+                    let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+                    if sys::poll(&mut set, Some(Duration::from_millis(1))).unwrap() > 0 {
+                        relay.read_terminal();
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                relay.drive(0);
+                assert!(!relay.clients[0].dead, "{kib}K: lapped after {}", got.len());
+                // The client reads a little each turn: far slower than the program writes.
+                read_slowly(&far, &mut decoder, 2048, &mut got, &mut picture);
+            }
+            writer.join().unwrap();
+            assert!(got == stream, "{kib}K: not the bytes that were written");
+            assert!(!picture, "{kib}K: a picture in place of bytes");
+        }
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_is_lapped_by_a_program_that_outruns_it_and_gets_a_picture() {
+        let (mut relay, slave, _far) = relay_with_a_client();
+        on_a_ring(&mut relay, MIN_CAPACITY);
+        // Sockets as the kernel makes them, and more bytes than they hold.
+        let (client, _far) = client_of(false);
+        relay.clients = vec![client];
+        let stream = vec![b'x'; 4 << 20];
+        let writer = program_writes(&slave, stream.clone());
+        let start = Instant::now();
+        while relay.journal.total() < stream.len() as u64 {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the stream stopped"
+            );
+            let now = Instant::now();
+            relay.note_laggards(now);
+            // Nothing in the way of the reads, however far behind the client is.
+            assert!(relay.paused(now).is_none() || relay.worker.is_some());
+            let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
+            if relay.paused(now).is_none()
+                && sys::poll(&mut set, Some(Duration::from_millis(1))).unwrap() > 0
+            {
+                relay.read_terminal();
+            } else {
+                std::thread::sleep(THROTTLE_WAIT);
+            }
+            // The client is not reading at all.
+            relay.drive(0);
+        }
+        writer.join().unwrap();
+        assert!(relay.clients[0].dead, "the ring turned over under it");
+        // It comes back for what it missed and is sent a picture of the screen.
+        let (mut client, far) = client_of(false);
+        client.attach = None;
+        relay.clients = vec![client];
+        relay.attach(0, 0, None);
+        relay.drive(0);
+        let (mut decoder, mut got, mut picture) = (PacketDecoder::new(), Vec::new(), false);
+        read_slowly(&far, &mut decoder, 1 << 20, &mut got, &mut picture);
+        assert!(picture, "a client that is lapped gets a picture");
+    }
+
+    #[test]
+    fn a_client_that_asked_for_every_byte_and_froze_releases_the_program_after_the_limit() {
+        let (mut relay, _slave, far) = relay_with_a_client();
+        on_a_ring(&mut relay, MIN_CAPACITY);
+        relay.settle.cancel();
+        if let Some(attach) = relay.clients[0].attach.as_mut() {
+            attach.every_byte = true;
+        }
+        // Behind by more than half the ring.
+        relay.journal.append(&vec![b'x'; 12 * 1024]);
+        let start = Instant::now();
+        relay.note_laggards(start);
+        assert_eq!(
+            relay.paused(start),
+            Some(Pause::Client {
+                until: start + STALL_LIMIT
+            })
+        );
+        // The wait for it is the one timer, and it is for as long as is left.
+        assert_eq!(relay.wake_in(start), Some(STALL_LIMIT));
+        let later = start + STALL_LIMIT / 2;
+        relay.note_laggards(later);
+        assert_eq!(relay.wake_in(later), Some(STALL_LIMIT / 2));
+        // Not moving for the limit: the program is read again, and there is no timer.
+        let over = start + STALL_LIMIT;
+        relay.note_laggards(over);
+        assert_eq!(relay.paused(over), None);
+        assert_eq!(relay.wake_in(over), None);
+        // It reads again: the wait is for it once more, from now.
+        let mut decoder = PacketDecoder::new();
+        let (mut got, mut picture) = (Vec::new(), false);
+        for _ in 0..8 {
+            relay.drive(0);
+            read_slowly(&far, &mut decoder, 1 << 20, &mut got, &mut picture);
+        }
+        assert_eq!(got.len(), 12 * 1024);
+        relay.journal.append(&vec![b'y'; 12 * 1024]);
+        let again = over + Duration::from_millis(10);
+        relay.note_laggards(again);
+        assert_eq!(
+            relay.paused(again),
+            Some(Pause::Client {
+                until: again + STALL_LIMIT
+            })
+        );
+    }
+
+    #[test]
+    fn a_session_with_a_client_that_asked_for_every_byte_and_is_up_to_date_has_no_timeout() {
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        relay.settle.cancel();
+        if let Some(attach) = relay.clients[0].attach.as_mut() {
+            attach.every_byte = true;
+        }
+        let now = Instant::now();
+        relay.note_laggards(now);
+        assert_eq!(relay.paused(now), None);
+        assert_eq!(relay.wake_in(now), None);
+        // Caught up after being behind: the count against it is gone.
+        relay.journal.append(&vec![b'x'; 12 * 1024]);
+        relay.note_laggards(now);
+        relay.clients[0].attach.as_mut().unwrap().next = relay.journal.total();
+        relay.note_laggards(now);
+        assert_eq!(relay.clients[0].attach.as_ref().unwrap().waited_since, None);
+        assert_eq!(relay.wake_in(now), None);
+    }
+
+    #[test]
+    fn the_view_a_client_attaches_with_says_whether_it_wants_every_byte() {
+        for asked in [false, true] {
+            let (mut relay, _slave, _far) = relay_with_a_client();
+            relay.clients[0].attach = None;
+            let mut view = View::new(Size {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            });
+            view.every_byte = asked;
+            relay.attach(0, OFFSET_END, Some(view));
+            let attach = relay.clients[0].attach.as_ref().unwrap();
+            assert_eq!(attach.every_byte, asked);
         }
     }
 
@@ -2981,6 +3258,8 @@ mod tests {
             attach: Some(Attach {
                 next: 0,
                 keep_after_end: keeps,
+                every_byte: false,
+                waited_since: None,
                 name: None,
                 picture: None,
             }),
