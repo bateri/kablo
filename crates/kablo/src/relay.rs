@@ -17,8 +17,11 @@
 //! `truncated`, what it lost); it never slows the terminal's reading.
 //!
 //! **The relay keeps the screen too.** Every byte read from the terminal goes
-//! to the journal and, right after it, to a [`Screen`] (the parser bateri uses),
-//! so the screen is always the screen of exactly the journal's `total`. A client
+//! to the journal and to a [`Screen`] (the parser bateri uses): right after the
+//! read while nobody is attached, and behind it, by a thread of its own, while a
+//! client is (see [`crate::mirror`]), so the read-and-forward path never waits for
+//! the parser. Whatever looks at the screen first gives it what it has not had, so
+//! it is always the screen of exactly the journal's `total` when seen. A client
 //! that comes for bytes the ring has dropped, or asks for one, is sent a picture
 //! of that screen (VT bytes that build it) and then the journal from the
 //! picture's offset; the program is not asked to draw again. The terminal's own
@@ -82,6 +85,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kablo_proto::v1::{
@@ -95,6 +99,10 @@ use kablo_screen::Screen;
 use crate::handshake::{self, Step};
 use crate::inner::{self, ADOPT_DESCRIPTORS, Decoder, INNER, ToRelay, ToWarden};
 use crate::journal::Journal;
+use crate::mirror::{
+    Core, Feed, Piece, REPLAY_LIMIT, SCREEN_CHUNK, SCREEN_RESTARTS, ScreenState, Worker,
+    replay_start, replayed_mark,
+};
 use crate::procinfo;
 use crate::pty;
 use crate::sockdir;
@@ -250,39 +258,13 @@ impl EndKeep {
     }
 }
 
-/// Whose questions the bytes given to the screen may hold.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Feed {
-    /// Bytes this relay has just read: what the program asks in them is this
-    /// relay's to answer.
-    Live,
-    /// Bytes the journal held already: those after the offset it says it
-    /// answered up to were read while no relay was (by the warden, in the gap
-    /// before this relay or between two), and their questions are answered now;
-    /// the others were answered by whoever read them.
-    Held,
-    /// Bytes nobody is to answer (the last output of a program that has ended).
-    Spent,
-}
-
-/// Bytes of the journal given to the screen in one piece.
-const SCREEN_CHUNK: usize = 64 * 1024;
-
-/// How much of the journal a relay that takes over reads to build its screen:
-/// the last this many bytes. Replaying a journal of a gigabyte before the first
-/// client is served would be a pause the swap is meant not to have, and what
-/// the screen shows rarely depends on output that old.
-const REPLAY_LIMIT: u64 = 64 << 20;
-
-/// How many times the screen is begun again while a relay that is still
-/// writing laps it. Past it the screen goes on as it is: it may be wrong, and
-/// the next picture is the best there is.
-const SCREEN_RESTARTS: u32 = 8;
-
 /// Terminal reads in one turn before the other descriptors get a look. A kernel read of a
 /// terminal is small (a macOS one returns at most a kibibyte), so a stream needs many of
 /// them to fill one frame.
 const READ_BUDGET: usize = 64;
+
+/// How much the screen may be behind the reads before the worker is woken from its rest.
+const WAKE_BACKLOG: u64 = (SCREEN_CHUNK / 2) as u64;
 
 /// A terminal read of this many bytes is a full one: the kernel gave all it was willing
 /// to in a read (a macOS pseudo-terminal returns at most a kibibyte, a Linux one more), so
@@ -403,7 +385,7 @@ struct Relay {
     chan_out: Vec<u8>,
     decoder: Decoder<ToRelay>,
     master: OwnedFd,
-    journal: Journal,
+    journal: Arc<Journal>,
     listener: UnixListener,
     child_pid: u32,
     /// When the program `child_pid` is started (Unix seconds), read while it
@@ -431,27 +413,11 @@ struct Relay {
     /// holds and what the terminal has taken of it already). The terminal has
     /// taken `input_queued - input_pending()` of them.
     input_queued: u64,
-    /// The screen of the stream up to `screen_at`.
-    screen: Screen,
-    /// The offset after the last journal byte the screen has had.
-    screen_at: u64,
-    /// The journal's floor (where the past was last forgotten) that the screen has been
-    /// brought to: it forgot its scrollback on reaching it, or began after it and had
-    /// none from before to forget. A relay that starts builds its screen from what the ring
-    /// still holds and forgets at the floor on the way, as the one before it did when it was
-    /// asked.
-    forgotten: u64,
-    /// The end of the last stretch of output that held a question the terminal
-    /// had an answer for, whoever sent it to the program (this relay with
-    /// nobody attached, or a client's own terminal). A relay that takes over
-    /// finds it again by feeding the screen the journal it holds, and counts
-    /// what it cannot replay as answered: a picture costs less than a program
-    /// answered twice.
-    last_reply: u64,
-    /// The scrollback rows the screen keeps.
-    history: usize,
-    /// Reused to carry journal bytes to the screen.
-    scratch: Vec<u8>,
+    /// The screen of the stream, and the thread that parses it while a client is attached.
+    core: Arc<Core>,
+    /// Parses behind the reads while someone is attached; started by the first read that
+    /// finds one, and never when no thread could be started.
+    worker: Option<Worker>,
     clients: Vec<Client>,
     /// The end of the program has reached a client, so the warden may be told
     /// it can remove the session (when no wait stands in the way).
@@ -569,6 +535,11 @@ impl Relay {
         let screen = Screen::new(size.cols.min(MAX_COLS), size.rows.min(MAX_ROWS), history);
         let screen_at = replay_start(&journal, REPLAY_LIMIT);
         let last_reply = replayed_mark(&journal, screen_at);
+        let journal = Arc::new(journal);
+        let core = Core::new(
+            ScreenState::new(screen, screen_at, last_reply, history),
+            Arc::clone(&journal),
+        );
         inner::write(&mut &chan, &ToWarden::Ready)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
         // Which of its records this binary reads: what a warden that renews
@@ -607,12 +578,8 @@ impl Relay {
             input: Vec::new(),
             input_sent: 0,
             input_queued: 0,
-            screen,
-            screen_at,
-            forgotten: 0,
-            last_reply,
-            history,
-            scratch: vec![0; SCREEN_CHUNK],
+            core,
+            worker: None,
             clients: Vec::new(),
             ended_told: false,
             keep: EndKeep::default(),
@@ -731,6 +698,10 @@ impl Relay {
                 if self.leaving_for_good() {
                     self.forget_label();
                 }
+                // The screen has had all that was read before the relay goes, and the
+                // thread behind it is done.
+                self.catch_up();
+                self.worker = None;
                 let offset = self.journal.total();
                 self.send_warden(&ToWarden::Released { offset });
                 return 0;
@@ -861,21 +832,25 @@ impl Relay {
         if !self.reading || self.master_done {
             return;
         }
+        // Whether a client is shown what is read: its terminal answers the program's
+        // questions, and the screen is only a record that a thread can keep behind the
+        // reads. Nobody can attach in the middle of this.
+        let watched = self.attached() > 0;
         let mut last = None;
         for _ in 0..READ_BUDGET {
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) => {
                     self.master_done = true;
                     self.saturated = false;
-                    return;
+                    break;
                 }
-                // Before the next read: a read may lap a small ring.
                 Ok(n) => {
-                    self.feed_screen(Feed::Live);
-                    self.output_read = true;
-                    // The only clock this takes; what was read is not looked at.
-                    self.output_at = sys::unix_now();
-                    self.settle.arm(Instant::now());
+                    // Before the next read: a read may lap a small ring.
+                    if watched {
+                        self.leave_to_the_worker();
+                    } else {
+                        self.feed_screen(Feed::Live);
+                    }
                     last = Some(n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -883,12 +858,46 @@ impl Relay {
                 Err(_) => {
                     self.master_done = true;
                     self.saturated = false;
-                    return;
+                    break;
                 }
             }
         }
         if let Some(n) = last {
-            self.saturated = n >= FULL_READ;
+            self.output_read = true;
+            // The only clock this takes; what was read is not looked at.
+            self.output_at = sys::unix_now();
+            self.settle.arm(Instant::now());
+            if !self.master_done {
+                self.saturated = n >= FULL_READ;
+            }
+        }
+    }
+
+    /// What was just read goes to a client that is shown it: the client's terminal answers
+    /// its questions, which is to say the questions up to the end of it are answered, and
+    /// the worker parses it. The offset moves right after the read, as it does when the
+    /// relay feeds the screen itself, so a relay that takes over answers nothing twice.
+    ///
+    /// The screen may not fall further behind than the ring can bear: past half of it, and
+    /// a read is at most a quarter, the ring could lap the screen, so this thread gives
+    /// the screen what is missing before it reads again.
+    fn leave_to_the_worker(&mut self) {
+        self.journal.set_answered(self.journal.total());
+        if self.worker.is_none() {
+            match Worker::start(&self.core) {
+                Ok(worker) => self.worker = Some(worker),
+                // No thread to be had: the screen is fed here, as it is for nobody.
+                Err(_) => return self.catch_up(),
+            }
+        }
+        let behind = self.journal.total().saturating_sub(self.core.parsed());
+        if behind > self.journal.capacity() / 2 {
+            self.catch_up();
+        } else if behind >= WAKE_BACKLOG.min(self.journal.capacity() / 4) {
+            // Not for every kernel read: a wake-up per kibibyte costs the reads more than
+            // the parser's thread saves them, and what is left below this is small for
+            // whoever looks at the screen next to give it.
+            self.core.wake_worker();
         }
     }
 
@@ -896,6 +905,8 @@ impl Relay {
     /// (A background process that kept the terminal open may write later; the
     /// session is over and that is not part of it.)
     fn drain_to_the_end(&mut self) {
+        // What was read while a client was shown it comes first, in stream order.
+        self.catch_up();
         loop {
             match self.journal.fill_from(self.master.as_fd(), self.chunk) {
                 Ok(0) | Err(_) => break,
@@ -963,95 +974,38 @@ impl Relay {
 
     /// Gives the screen the journal bytes it has not had, and the program the
     /// terminal's answers to the questions in them that are its to hear (`mode`
-    /// says which).
+    /// says which), in stream order: whoever else is feeding the screen is waited for.
     fn feed_screen(&mut self, mode: Feed) {
+        let core = Arc::clone(&self.core);
+        let journal = Arc::clone(&self.journal);
+        let mut state = core.lock();
         let mut restarts = 0;
         loop {
-            let total = self.journal.total();
-            self.reach_floor();
-            if self.screen_at >= total {
-                return;
-            }
-            let mut wanted = usize::try_from(total - self.screen_at)
-                .unwrap_or(usize::MAX)
-                .min(self.scratch.len());
-            // Not past the floor in one piece: the screen forgets its scrollback at it.
-            let floor = self.journal.floor();
-            if self.forgotten < floor {
-                wanted = wanted.min(usize::try_from(floor - self.screen_at).unwrap_or(wanted));
-            }
-            let answers = match (mode, self.journal.answered()) {
-                (Feed::Live, _) => true,
-                (Feed::Spent, _) | (Feed::Held, None) => false,
-                (Feed::Held, Some(upto)) if self.screen_at >= upto => true,
-                // Up to where it was answered, and no further in one piece.
-                (Feed::Held, Some(upto)) => {
-                    wanted = wanted.min(usize::try_from(upto - self.screen_at).unwrap_or(wanted));
-                    false
-                }
-            };
-            let got = self
-                .scratch
-                .get_mut(..wanted)
-                .and_then(|room| self.journal.copy_out(self.screen_at, room));
-            match got {
-                Some(0) => return,
-                Some(n) => {
-                    self.screen.feed(self.scratch.get(..n).unwrap_or_default());
-                    self.screen_at += n as u64;
-                    if self.answer(answers) && mode != Feed::Spent {
-                        self.last_reply = self.last_reply.max(self.screen_at);
-                    }
-                    if answers || mode == Feed::Spent {
-                        self.journal.set_answered(self.screen_at);
+            match state.feed_piece(&journal, mode) {
+                Piece::Caught => break,
+                Piece::Fed { replies, answers } => {
+                    core.parsed_to(state.at);
+                    // The program that does not read what it is owed gets no more.
+                    if answers && !replies.is_empty() && self.exit.is_none() && self.attached() == 0
+                    {
+                        let _ = self.queue_input(&replies);
                     }
                 }
                 // The ring was lapped under the screen (a relay that is still
                 // writing, while this one catches up): begin again from what
                 // is left.
-                None if restarts < SCREEN_RESTARTS => {
+                Piece::Lapped if restarts < SCREEN_RESTARTS => {
                     restarts += 1;
-                    let (cols, rows) = self.screen.size();
-                    self.screen = Screen::new(cols, rows, self.history);
-                    self.screen_at = replay_start(&self.journal, REPLAY_LIMIT);
-                    self.forgotten = 0;
+                    state.restart(&journal);
+                    core.parsed_to(state.at);
                 }
-                None => {
-                    self.screen_at = total;
-                    return;
+                Piece::Lapped => {
+                    state.at = journal.total();
+                    core.parsed_to(state.at);
+                    break;
                 }
             }
         }
-    }
-
-    /// Has the screen forget its scrollback if it stands at the journal's floor, where
-    /// the past was forgotten: the rows before are gone from what a client is given, and
-    /// the picture of the screen must not bring them back. A screen that began after the
-    /// floor has none from before it.
-    fn reach_floor(&mut self) {
-        let floor = self.journal.floor();
-        if self.forgotten < floor && self.screen_at >= floor {
-            if self.screen_at == floor {
-                self.screen.forget_history();
-            }
-            self.forgotten = floor;
-        }
-    }
-
-    /// Sends the terminal's own answers to the program, when nobody else will:
-    /// a client attached answers with its terminal, and two answers to one
-    /// question would be typed into the program. Says whether the bytes just
-    /// given to the screen held a question it has an answer for, sent or not.
-    fn answer(&mut self, wanted: bool) -> bool {
-        let answers = self.screen.take_replies();
-        if answers.is_empty() {
-            return false;
-        }
-        if wanted && self.exit.is_none() && self.attached() == 0 {
-            // The program that does not read what it is owed gets no more.
-            let _ = self.queue_input(&answers);
-        }
-        true
     }
 
     /// How many clients are attached.
@@ -1062,26 +1016,31 @@ impl Relay {
             .count()
     }
 
-    /// The terminal takes this size, and so does the screen.
+    /// The terminal takes this size, and so does the screen, once it has all the program
+    /// wrote at the old one.
     fn set_size(&mut self, size: Size) {
         if self.exit.is_some() {
             return;
         }
         let _ = sys::set_window_size(self.master.as_fd(), size);
-        if self.screen.size() != (size.cols, size.rows) {
-            self.screen.resize(size.cols, size.rows);
+        self.catch_up();
+        let mut state = self.core.lock();
+        if state.screen.size() != (size.cols, size.rows) {
+            state.screen.resize(size.cols, size.rows);
         }
     }
 
     /// A picture of the screen as it is at the end of the journal.
     fn picture(&mut self) -> Picture {
+        self.catch_up();
         self.feed_screen(Feed::Spent);
-        let (cols, rows) = self.screen.size();
+        let mut state = self.core.lock();
+        let (cols, rows) = state.screen.size();
         Picture {
-            offset: self.screen_at,
+            offset: state.at,
             cols,
             rows,
-            bytes: self.screen.image(),
+            bytes: state.screen.image(),
             sent: 0,
         }
     }
@@ -1441,6 +1400,9 @@ impl Relay {
         if view.is_some_and(|view| !view.size.fits()) {
             return self.too_big(i);
         }
+        // The screen has all that was read, and `last_reply` says what was answered of it,
+        // before a client is added: it is told by them.
+        self.catch_up();
         let total = self.journal.total();
         if offset != OFFSET_END && offset > total {
             return self.error(
@@ -1461,8 +1423,9 @@ impl Relay {
         // for a terminal that answers what it is shown and cannot hold its
         // answers back, when the bytes hold a question that was answered
         // already: it would answer a second time.
+        let last_reply = self.core.lock().last_reply;
         let answered_twice = offset != OFFSET_END
-            && offset < self.last_reply
+            && offset < last_reply
             && view.is_some_and(|view| view.picture_if_answered);
         let truncated =
             (offset != OFFSET_END && offset < self.journal.retained_from()) || answered_twice;
@@ -1537,9 +1500,11 @@ impl Relay {
         }
         // The past is what the screen has had; its scrollback is forgotten at the offset
         // it stands at, which is also the floor.
+        self.catch_up();
         self.feed_screen(Feed::Spent);
-        self.journal.set_floor(self.screen_at);
-        self.reach_floor();
+        let mut state = self.core.lock();
+        self.journal.set_floor(state.at);
+        state.reach_floor(&self.journal);
     }
 
     /// A client asks the session to drop the input the program has not read: what the
@@ -1615,7 +1580,8 @@ impl Relay {
             return self.error(i, ErrorCode::ENDED, "the program has ended");
         }
         self.catch_up();
-        let typed = match typing::bytes(strokes, &self.screen.modes()) {
+        let modes = self.core.lock().screen.modes();
+        let typed = match typing::bytes(strokes, &modes) {
             Ok(typed) => typed,
             Err(why) => return self.error(i, ErrorCode::BAD_REQUEST, &why),
         };
@@ -1718,20 +1684,22 @@ impl Relay {
             return self.drop_client(i);
         }
         self.catch_up();
-        let (cols, rows) = self.screen.size();
-        let offset = self.screen_at;
+        let mut state = self.core.lock();
+        let (cols, rows) = state.screen.size();
+        let offset = state.at;
         let picture = capture.picture;
         let bytes = if picture {
-            self.screen.image()
+            state.screen.image()
         } else {
             let history = usize::try_from(capture.history).unwrap_or(usize::MAX);
             let mut text = String::new();
-            for line in self.screen.text(history, capture.unwrap) {
+            for line in state.screen.text(history, capture.unwrap) {
                 text.push_str(&line);
                 text.push('\n');
             }
             text.into_bytes()
         };
+        drop(state);
         let Some(client) = self.clients.get_mut(i) else {
             return;
         };
@@ -1769,7 +1737,9 @@ impl Relay {
         }
     }
 
-    /// Gives the screen what it has not had of the journal.
+    /// Gives the screen what it has not had of the journal, in stream order: what the worker
+    /// has not got to, and what was read while nobody could answer it. What was read while a
+    /// client was shown it is below the offset answered and nobody answers it again.
     fn catch_up(&mut self) {
         self.feed_screen(if self.reading { Feed::Live } else { Feed::Held });
     }
@@ -2113,30 +2083,6 @@ impl Relay {
     }
 }
 
-/// Where `last_reply` starts for a relay that feeds its screen from
-/// `replay_start` on: what it will not replay counts as answered, so does all
-/// of a journal that keeps no track of answers (an older warden's), and the
-/// replay moves the mark to the end of what held a question.
-fn replayed_mark(journal: &Journal, replay_start: u64) -> u64 {
-    match journal.answered() {
-        Some(_) => replay_start,
-        None => journal.total(),
-    }
-}
-
-/// Where the screen of a journal begins: the start of the stream when nothing
-/// was dropped and no more than `limit` bytes are there, else the first line
-/// break in the last `limit` bytes that are still in the ring, so that the
-/// screen does not start inside an escape sequence.
-fn replay_start(journal: &Journal, limit: u64) -> u64 {
-    let from = journal.total().saturating_sub(limit);
-    if from == 0 && journal.ring_from() == 0 {
-        0
-    } else {
-        journal.line_start_from(from)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2153,7 +2099,7 @@ mod tests {
     fn take_over(journal: Journal) -> (Vec<u8>, u64) {
         let (mut relay, slave) = relay_over(journal);
         relay.on_warden(ToRelay::Go);
-        (typed_to_the_program(&slave), relay.last_reply)
+        (typed_to_the_program(&slave), relay.core.lock().last_reply)
     }
 
     /// What the program finds waiting to be read: what was typed to it.
@@ -2173,6 +2119,7 @@ mod tests {
     /// A relay over a terminal whose program reads what arrives as it is, and
     /// the program's side of it; the relay has been told nothing yet.
     fn relay_over(journal: Journal) -> (Relay, OwnedFd) {
+        let journal = Arc::new(journal);
         let pty = pty::open(pty::DEFAULT_SIZE).unwrap();
         // The program's side reads what arrives as it is.
         // SAFETY: `slave` is an open terminal and `raw` a termios the kernel fills.
@@ -2198,12 +2145,16 @@ mod tests {
             chan_out: Vec::new(),
             decoder: Decoder::<ToRelay>::new(),
             master: pty.master,
-            screen: Screen::new(80, 24, 10),
-            screen_at: replay_start(&journal, REPLAY_LIMIT),
-            forgotten: 0,
-            last_reply: replayed_mark(&journal, replay_start(&journal, REPLAY_LIMIT)),
-            history: 10,
-            scratch: vec![0; SCREEN_CHUNK],
+            core: Core::new(
+                ScreenState::new(
+                    Screen::new(80, 24, 10),
+                    replay_start(&journal, REPLAY_LIMIT),
+                    replayed_mark(&journal, replay_start(&journal, REPLAY_LIMIT)),
+                    10,
+                ),
+                Arc::clone(&journal),
+            ),
+            worker: None,
             journal,
             listener,
             child_pid: 1,
@@ -2248,7 +2199,7 @@ mod tests {
         // reading would, so the question is answered, once, and the read finds
         // the cursor where the answer says it is. (Given as spent, they would
         // be marked answered and never answered.)
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"text\x1b[6n");
         let (mut relay, slave) = relay_over(journal);
         relay.live = true;
@@ -2258,7 +2209,7 @@ mod tests {
         relay.answer_read(0, Capture::default());
         assert_eq!(typed_to_the_program(&slave), b"\x1b[1;5R");
         assert_eq!(relay.journal.answered(), Some(relay.journal.total()));
-        assert_eq!(relay.screen_at, relay.journal.total());
+        assert_eq!(relay.core.lock().at, relay.journal.total());
         let answer = relay.clients.first().map(|client| client.out.clone());
         let mut decoder = PacketDecoder::new();
         decoder.push(&answer.unwrap());
@@ -2303,14 +2254,14 @@ mod tests {
     fn what_the_warden_read_while_no_relay_did_is_answered_by_the_relay_that_comes() {
         // The program asked at once, before any relay was serving: the journal
         // holds the question and says nobody answered anything.
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         assert_eq!(answers_after_taking_over(journal), b"\x1b[1;1R");
     }
 
     #[test]
     fn what_an_earlier_relay_answered_is_not_answered_again() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         journal.set_answered(journal.total());
         journal.append(b"text");
@@ -2319,7 +2270,7 @@ mod tests {
 
     #[test]
     fn only_the_part_after_what_was_answered_is_answered() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         journal.set_answered(journal.total());
         // Read by the warden afterwards, with one more question in it.
@@ -2330,7 +2281,7 @@ mod tests {
 
     #[test]
     fn a_journal_that_keeps_no_track_is_not_answered_late() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         journal.forget_answers();
         assert_eq!(answers_after_taking_over(journal), b"");
@@ -2338,7 +2289,7 @@ mod tests {
 
     #[test]
     fn a_relay_that_takes_over_finds_the_last_question_in_what_it_replays() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         journal.set_answered(journal.total());
         journal.append(b"text");
@@ -2349,7 +2300,7 @@ mod tests {
 
     #[test]
     fn the_mark_is_the_end_of_the_piece_of_output_that_held_the_question() {
-        let mut journal = Journal::create(1 << 18).unwrap();
+        let journal = Journal::create(1 << 18).unwrap();
         journal.append(b"\x1b[6n");
         journal.append(&vec![b'x'; SCREEN_CHUNK + 100]);
         let total = journal.total();
@@ -2363,21 +2314,21 @@ mod tests {
 
     #[test]
     fn a_question_the_relay_answers_moves_the_mark_to_the_end_of_what_it_read() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         assert_eq!(take_over(journal), (b"\x1b[1;1R".to_vec(), 4));
     }
 
     #[test]
     fn output_with_no_question_leaves_the_mark_where_it_was() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"nothing asked here");
         assert_eq!(take_over(journal), (Vec::new(), 0));
     }
 
     #[test]
     fn a_journal_that_keeps_no_track_counts_all_of_it_as_answered() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"\x1b[6n");
         journal.forget_answers();
         assert_eq!(take_over(journal), (Vec::new(), 4));
@@ -2385,14 +2336,14 @@ mod tests {
 
     #[test]
     fn a_screen_is_built_from_the_start_when_all_of_it_is_there() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"one\ntwo\nthree");
         assert_eq!(replay_start(&journal, 1 << 20), 0);
     }
 
     #[test]
     fn a_screen_is_built_from_the_last_of_a_long_journal_at_a_line() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"one\ntwo\nthree\nfour");
         // The last nine bytes are "hree\nfour": the next line is "four".
         assert_eq!(replay_start(&journal, 9), 14);
@@ -2402,7 +2353,7 @@ mod tests {
 
     #[test]
     fn a_screen_is_built_from_the_first_line_of_a_ring_that_wrapped() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         let cap = usize::try_from(MIN_CAPACITY).unwrap();
         let mut data = vec![b'x'; cap + 100];
         data[cap / 2] = b'\n';
@@ -2583,17 +2534,39 @@ mod tests {
 
     #[test]
     fn a_full_read_marks_the_stream_saturated_and_a_shorter_one_ends_it() {
-        let (mut relay, slave, _far) = relay_with_a_client();
+        // A pipe stands for the terminal: a read of it is as big as what was written.
+        let (mut relay, _slave, _far) = relay_with_a_client();
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` has room for the two descriptors `pipe` fills in.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just made and belong to nobody else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        sys::set_nonblocking(read.as_raw_fd()).unwrap();
+        relay.master = read;
         relay.chunk = 4096;
-        let flood = 64 * 1024;
-        let writer = program_writes(&slave, vec![b'x'; flood]);
-        // A stream that fills the terminal is read in full reads at some point.
-        assert!(read_until(&mut relay, flood as u64));
-        writer.join().unwrap();
-        // A byte on its own is not one, and ends it.
-        program_writes(&slave, b"y".to_vec());
-        read_until(&mut relay, flood as u64 + 1);
+        assert_eq!(
+            sys::write_fd(write.as_fd(), &[b'x'; FULL_READ]).unwrap(),
+            FULL_READ
+        );
+        relay.read_terminal();
+        assert!(relay.saturated, "a read of {FULL_READ} bytes is a full one");
+        assert_eq!(
+            sys::write_fd(write.as_fd(), &[b'y'; FULL_READ - 1]).unwrap(),
+            FULL_READ - 1
+        );
+        relay.read_terminal();
+        assert!(!relay.saturated, "a shorter read is not");
+        // The last read of the turn counts: a full one and then a short one.
+        sys::write_fd(write.as_fd(), &[b'z'; 4096]).unwrap();
+        relay.read_terminal();
+        assert!(relay.saturated);
+        sys::write_fd(write.as_fd(), b"a").unwrap();
+        relay.read_terminal();
         assert!(!relay.saturated);
+        // A turn that read nothing leaves it as it was.
+        relay.saturated = true;
+        relay.read_terminal();
+        assert!(relay.saturated);
     }
 
     /// A relay whose stream is saturated, with `bytes` written to the journal that the
@@ -2602,12 +2575,14 @@ mod tests {
         let (mut relay, slave, far) = relay_with_a_client();
         // The journal is the relay's own: write as the reads would have.
         let data = vec![b'x'; bytes];
-        let journal = Journal::create(MIN_CAPACITY * 8).unwrap();
+        let journal = Arc::new(Journal::create(MIN_CAPACITY * 8).unwrap());
+        relay.core = Core::new(
+            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
+            Arc::clone(&journal),
+        );
         relay.journal = journal;
-        relay.screen_at = 0;
         relay.journal.append(&data);
-        relay.screen.feed(&data);
-        relay.screen_at = bytes as u64;
+        relay.feed_screen(Feed::Live);
         relay.saturated = true;
         (relay, slave, far)
     }
@@ -2697,6 +2672,163 @@ mod tests {
             relay.wake_in(Instant::now()),
             relay.settle.timeout(Instant::now())
         );
+    }
+
+    /// A stream that scrolls, colours, moves the cursor and switches screens, `lines` lines
+    /// of it.
+    fn flood(lines: usize) -> Vec<u8> {
+        // A header that stays where it is while the region under it scrolls: a screen
+        // begun again part of the way through the stream does not have it.
+        let mut stream = b"\x1b[2J\x1b[1;1Hheader row\x1b[5;20r\x1b[5;1H".to_vec();
+        for n in 0..lines {
+            stream.extend_from_slice(
+                format!(
+                    "\x1b[3{}mline {n} of the flood \u{e7}ay \u{65e5}\x1b[0m\r\n",
+                    n % 8
+                )
+                .as_bytes(),
+            );
+            if n % 97 == 0 {
+                stream.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[5;7Halt\x1b[?1049l");
+            }
+            if n % 211 == 0 {
+                stream.extend_from_slice(b"\x1b[3;1H\x1b[K\x1b[2Aup\x1b]2;title\x07");
+            }
+        }
+        stream
+    }
+
+    fn reference_image(stream: &[u8]) -> Vec<u8> {
+        let mut screen = Screen::new(80, 24, 10);
+        screen.feed(stream);
+        screen.image()
+    }
+
+    #[test]
+    fn a_flood_through_the_smallest_ring_leaves_the_screen_of_the_same_bytes_fed_in_order() {
+        // 16 KiB of ring and 4 KiB reads: the ring turns over every few reads, and the
+        // screen is parsed behind them by another thread.
+        let (mut relay, slave, _far) = relay_with_a_client();
+        let stream = flood(12000);
+        assert!(stream.len() > 100 * MIN_CAPACITY as usize / 4);
+        // The parser is kept busy for a while (the lock is held), so that the reads
+        // run ahead of the screen by more than the ring holds, unless the relay stops
+        // them.
+        let core = Arc::clone(&relay.core);
+        let (held, locked) = std::sync::mpsc::channel();
+        let stall = std::thread::spawn(move || {
+            let guard = core.lock();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            drop(guard);
+        });
+        locked.recv().unwrap();
+        let writer = program_writes(&slave, stream.clone());
+        read_until(&mut relay, stream.len() as u64);
+        writer.join().unwrap();
+        stall.join().unwrap();
+        assert!(
+            relay.worker.is_some(),
+            "the screen was parsed behind the reads"
+        );
+        relay.catch_up();
+        let picture = relay.picture();
+        assert_eq!(picture.offset, stream.len() as u64);
+        assert!(picture.bytes == reference_image(&stream));
+    }
+
+    #[test]
+    fn a_picture_taken_during_a_flood_is_the_screen_of_the_bytes_before_it_fed_in_order() {
+        let (mut relay, slave, _far) = relay_with_a_client();
+        // A ring that keeps all of it, to build what the picture is compared with.
+        let journal = Arc::new(Journal::create(8 << 20).unwrap());
+        relay.core = Core::new(
+            ScreenState::new(Screen::new(80, 24, 10), 0, 0, 10),
+            Arc::clone(&journal),
+        );
+        relay.journal = journal;
+        let stream = flood(20000);
+        let writer = program_writes(&slave, stream.clone());
+        let mut taken = 0;
+        let mut next = 16 * 1024;
+        while relay.journal.total() < stream.len() as u64 {
+            read_until(&mut relay, next.min(stream.len()) as u64);
+            let picture = relay.picture();
+            let mut seen = vec![0u8; usize::try_from(picture.offset).unwrap()];
+            assert_eq!(relay.journal.copy_out(0, &mut seen), Some(seen.len()));
+            assert!(
+                picture.bytes == reference_image(&seen),
+                "at {}",
+                picture.offset
+            );
+            taken += 1;
+            next += 16 * 1024;
+        }
+        writer.join().unwrap();
+        assert!(taken >= 3, "{taken} pictures");
+    }
+
+    /// A program asked a question while a client was shown the stream; the client leaves
+    /// before the screen has been given those bytes, and the program asks again.
+    fn the_question_a_client_was_shown_is_not_answered_when_it_leaves(through_a_read: bool) {
+        let (mut relay, slave, _far) = relay_with_a_client();
+        if through_a_read {
+            program_writes(&slave, b"text\x1b[6n".to_vec());
+            read_until(&mut relay, 8);
+        } else {
+            // As the read leaves it: in the journal, answered, and not yet parsed.
+            relay.journal.append(b"text\x1b[6n");
+            relay.journal.set_answered(8);
+        }
+        assert!(relay.attached() > 0);
+        relay.clients[0].dead = true;
+        assert_eq!(relay.attached(), 0);
+        program_writes(&slave, b"more\x1b[6n".to_vec());
+        read_until(&mut relay, 16);
+        // One answer, for the question nobody was shown, from where the cursor is by then.
+        assert_eq!(typed_to_the_program(&slave), b"\x1b[1;9R");
+        assert_eq!(relay.journal.answered(), Some(16));
+        assert_eq!(relay.core.lock().last_reply, 16);
+    }
+
+    #[test]
+    fn a_question_in_a_backlog_when_the_client_leaves_is_not_answered_by_the_relay_and_not_lost_for_what_follows()
+     {
+        the_question_a_client_was_shown_is_not_answered_when_it_leaves(true);
+        the_question_a_client_was_shown_is_not_answered_when_it_leaves(false);
+    }
+
+    #[test]
+    fn the_worker_parses_only_what_a_client_was_shown_and_rests_when_it_has_caught_up() {
+        let (relay, _slave, _far) = relay_with_a_client();
+        relay.journal.append(b"abc\x1b[6n");
+        // Nothing is answered: the worker has nothing to do, and the relay's thread feeds.
+        relay.journal.set_answered(3);
+        let worker = Worker::start(&relay.core).unwrap();
+        relay.core.wake_worker();
+        let start = Instant::now();
+        while relay.core.parsed() < 3 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the worker did not parse"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(relay.core.lock().at, 3, "not past what was answered");
+        // More shown: it wakes, takes it, and stops again.
+        relay.journal.set_answered(7);
+        relay.core.wake_worker();
+        while relay.core.parsed() < 7 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the worker did not wake"
+            );
+            std::thread::yield_now();
+        }
+        // Dropped, it is gone and the screen is the relay's alone again.
+        drop(worker);
+        assert_eq!(relay.core.lock().at, 7);
     }
 
     #[test]
@@ -2867,7 +2999,7 @@ mod tests {
 
     #[test]
     fn a_forget_leaves_the_client_that_is_owed_bytes_attached_and_owed() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(&rows(1, 5));
         let (mut relay, _slave) = relay_over(journal);
         let (client, _far) = client_of(false);
@@ -2906,17 +3038,17 @@ mod tests {
 
     #[test]
     fn a_forget_from_a_connection_that_is_not_attached_changes_nothing() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(&rows(1, 40));
         let (mut relay, _slave) = relay_over(journal);
         let (mut client, _far) = client_of(false);
         client.attach = None;
         relay.clients.push(client);
         relay.feed_screen(Feed::Spent);
-        let before = relay.screen.text(10, false);
+        let before = relay.core.lock().screen.text(10, false);
         relay.forget(0);
         assert_eq!(relay.journal.floor(), 0);
-        assert_eq!(relay.screen.text(10, false), before);
+        assert_eq!(relay.core.lock().screen.text(10, false), before);
         let mut decoder = PacketDecoder::new();
         decoder.push(&relay.clients.first().unwrap().out);
         let packet = decoder.next_packet().unwrap().unwrap();
@@ -2939,39 +3071,40 @@ mod tests {
         // 10 rows of scrollback; the lines the floor passed are not among them, the ones
         // on the screen at the floor are, and a screen built from the floor would not
         // have those on it.
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(&rows(1, 40));
         journal.set_floor(journal.total());
         journal.append(&rows(41, 43));
         assert_eq!(replay_start(&journal, REPLAY_LIMIT), 0);
         let (mut relay, _slave) = relay_over(journal);
         relay.feed_screen(Feed::Spent);
-        let text = relay.screen.text(10, false);
-        assert_eq!(relay.forgotten, relay.journal.floor());
+        let text = relay.core.lock().screen.text(10, false);
+        assert_eq!(relay.core.lock().forgotten, relay.journal.floor());
         assert_eq!(text.len(), 24 + 3, "{text:?}");
         assert_eq!(text.first().map(String::as_str), Some("row18"), "{text:?}");
         assert!(text.iter().any(|row| row == "row40"), "{text:?}");
 
         // The same journal without the floor keeps the lines before it.
-        let mut plain = Journal::create(MIN_CAPACITY).unwrap();
+        let plain = Journal::create(MIN_CAPACITY).unwrap();
         plain.append(&rows(1, 43));
         let (mut relay, _slave) = relay_over(plain);
         relay.feed_screen(Feed::Spent);
-        assert_eq!(relay.screen.text(10, false).len(), 24 + 10);
+        assert_eq!(relay.core.lock().screen.text(10, false).len(), 24 + 10);
     }
 
     #[test]
     fn a_screen_that_begins_after_the_floor_has_nothing_from_before_it_to_forget() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(&rows(1, 10));
         journal.set_floor(journal.total());
         journal.append(&rows(11, 30));
         let (mut relay, _slave) = relay_over(journal);
         // The replay starts at a line past the floor (a long journal's limit).
-        relay.screen_at = relay.journal.line_start_from(relay.journal.floor() + 3);
+        let start = relay.journal.line_start_from(relay.journal.floor() + 3);
+        relay.core.lock().at = start;
         relay.feed_screen(Feed::Spent);
-        assert_eq!(relay.forgotten, relay.journal.floor());
-        assert_eq!(relay.screen_at, relay.journal.total());
+        assert_eq!(relay.core.lock().forgotten, relay.journal.floor());
+        assert_eq!(relay.core.lock().at, relay.journal.total());
     }
 
     /// Client 0 of `relay` sends `message` to it.

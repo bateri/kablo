@@ -219,7 +219,7 @@ impl Journal {
 
     /// Records that the questions up to `offset` are answered (the single writer
     /// that reads the terminal).
-    pub fn set_answered(&mut self, offset: u64) {
+    pub fn set_answered(&self, offset: u64) {
         self.answered_cell()
             .store(offset.saturating_add(1), Ordering::Release);
     }
@@ -227,7 +227,7 @@ impl Journal {
     /// Makes the journal one that keeps no track of answers, as one an older
     /// warden made (for a test).
     #[cfg(test)]
-    pub fn forget_answers(&mut self) {
+    pub fn forget_answers(&self) {
         self.answered_cell().store(0, Ordering::Release);
     }
 
@@ -271,7 +271,7 @@ impl Journal {
     /// Forgets the past before `offset`: from now on [`Journal::retained_from`] is no
     /// earlier. A floor only moves forward, and not past what has been written (the single
     /// writer).
-    pub fn set_floor(&mut self, offset: u64) {
+    pub fn set_floor(&self, offset: u64) {
         let offset = offset.min(self.total());
         if offset > self.floor() {
             self.floor_cell().store(offset, Ordering::Release);
@@ -279,7 +279,7 @@ impl Journal {
     }
 
     /// Appends `data` (the single writer).
-    pub fn append(&mut self, data: &[u8]) {
+    pub fn append(&self, data: &[u8]) {
         let mut total = self.total_cell().load(Ordering::Relaxed);
         let mut rest = data;
         while !rest.is_empty() {
@@ -306,7 +306,7 @@ impl Journal {
     /// Reading into the ring and not through a buffer is the only place a
     /// byte is in this process and not yet in the journal, and it is a single
     /// instruction wide.
-    pub fn fill_from(&mut self, source: BorrowedFd<'_>, max: usize) -> io::Result<usize> {
+    pub fn fill_from(&self, source: BorrowedFd<'_>, max: usize) -> io::Result<usize> {
         let total = self.total_cell().load(Ordering::Relaxed);
         let (head, room) = self.head_and_room(total);
         let want = room.min(max);
@@ -442,6 +442,16 @@ impl Journal {
     }
 }
 
+// SAFETY: the mapping is shared memory that is read and written through raw pointers and
+// atomics, and nothing in `Journal` is tied to the thread that made it. The ring has one
+// writer at a time by the owner protocol (the relay's reading thread, which alone fills it
+// and moves `total`, the answered offset and the floor), and a reader on any thread copies
+// and then checks that the writer did not lap what it copied (`copy_out`), exactly as a
+// reader in another process does; no reference into the ring outlives a call.
+unsafe impl Send for Journal {}
+// SAFETY: as above; every shared access is a raw copy or an atomic.
+unsafe impl Sync for Journal {}
+
 impl Drop for Journal {
     fn drop(&mut self) {
         // SAFETY: the mapping was made by `map` with this length and nothing
@@ -538,7 +548,7 @@ mod tests {
 
     #[test]
     fn what_is_appended_is_read_back_by_offset() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"hello ");
         journal.append(b"world");
         assert_eq!(journal.total(), 11);
@@ -554,7 +564,7 @@ mod tests {
 
     #[test]
     fn the_ring_wraps_and_drops_the_oldest() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         let cap = MIN_CAPACITY as usize;
         let data = pattern(0, cap + 1000);
         // In pieces that do not divide the capacity, so a piece straddles the end.
@@ -572,7 +582,7 @@ mod tests {
 
     #[test]
     fn a_second_mapping_sees_the_same_stream() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         journal.append(b"shared");
         let copy = unsafe { OwnedFd::from_raw_fd(libc::dup(journal.as_raw_fd())) };
         let other = Journal::open(copy).unwrap();
@@ -597,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_stream_may_start_after_the_first_line_break() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         let cap = MIN_CAPACITY as usize;
         let mut data = Vec::new();
         while data.len() < cap + 100 {
@@ -610,7 +620,7 @@ mod tests {
         assert_eq!(journal.copy_out(start - 1, &mut byte), Some(1));
         assert_eq!(byte, *b"\n");
 
-        let mut flat = Journal::create(MIN_CAPACITY).unwrap();
+        let flat = Journal::create(MIN_CAPACITY).unwrap();
         flat.append(&vec![b'a'; cap + 5]);
         assert_eq!(
             flat.line_start(),
@@ -623,7 +633,7 @@ mod tests {
     fn a_terminal_is_read_straight_into_the_ring() {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
         sys::set_nonblocking(reader.as_raw_fd()).unwrap();
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         use std::io::Write;
         (&writer).write_all(b"from the pty").unwrap();
         let n = journal.fill_from(reader.as_fd(), 4096).unwrap();
@@ -640,7 +650,7 @@ mod tests {
 
     #[test]
     fn what_was_answered_is_in_the_header() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         assert_eq!(journal.answered(), Some(0), "a new journal keeps track");
         journal.set_answered(1234);
         let again = Journal::open(dup_of(&journal)).unwrap();
@@ -674,7 +684,7 @@ mod tests {
 
     #[test]
     fn the_past_that_was_forgotten_is_in_the_header_and_the_ring_still_holds_it() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         assert_eq!(journal.floor(), 0, "nothing was forgotten");
         journal.append(b"before");
         journal.set_floor(6);
@@ -727,7 +737,7 @@ mod tests {
 
     #[test]
     fn the_ring_passing_the_floor_is_the_start_again() {
-        let mut journal = Journal::create(MIN_CAPACITY).unwrap();
+        let journal = Journal::create(MIN_CAPACITY).unwrap();
         let cap = MIN_CAPACITY as usize;
         journal.append(&pattern(0, 100));
         journal.set_floor(100);

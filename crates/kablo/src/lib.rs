@@ -24,6 +24,7 @@ pub mod launch;
 pub mod link;
 pub mod listing;
 pub mod mailbox;
+mod mirror;
 pub mod origin;
 pub mod outbound;
 pub mod peer;
