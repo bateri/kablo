@@ -658,35 +658,25 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// using SIMD search with [`memchr`].
     #[inline]
     fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
-        // Find the next escape character.
+        // Text is dispatched while it is checked to be UTF-8, in one pass that also finds the
+        // escape that ends it. What this does not take (invalid bytes, a character cut off by
+        // the end of the read) is left to the checks of `str::from_utf8`, which have always
+        // decided what becomes of it.
         let num_bytes = bytes.len();
-        let plain_chars = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
+        let done = Self::dispatch_text(performer, bytes);
+        if done == num_bytes {
+            return done;
+        }
 
         // If the next character is ESC, just process it and short-circuit.
-        if plain_chars == 0 {
+        if bytes[done] == 0x1B {
             self.state = State::Escape;
             self.reset_params();
-            return 1;
+            return done + 1;
         }
 
-        // Text is dispatched while it is checked to be UTF-8, in one pass. What this does not
-        // take (invalid bytes, a character cut off by the end of the read) is left to the
-        // checks of `str::from_utf8`, which have always decided what becomes of it.
-        let done = Self::dispatch_text(performer, &bytes[..plain_chars]);
-        if done == plain_chars {
-            let mut processed = plain_chars;
-
-            // If there's another character, it must be escape so process it directly.
-            if processed < num_bytes {
-                self.state = State::Escape;
-                self.reset_params();
-                processed += 1;
-            }
-
-            return processed;
-        }
-
-        done + self.advance_ground_checked(performer, &bytes[done..], plain_chars - done)
+        let plain_chars = memchr::memchr(0x1B, &bytes[done..]).unwrap_or(num_bytes - done);
+        done + self.advance_ground_checked(performer, &bytes[done..], plain_chars)
     }
 
     /// Advance the parser from ground over `bytes`, whose first `plain_chars` bytes hold no
@@ -813,9 +803,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
     }
 
-    /// Dispatch the printable text and the controls at the start of `bytes`, which holds no
-    /// escape, and return how many bytes that took: all of them unless a byte does not begin
-    /// a well-formed UTF-8 character or the character is cut off at the end.
+    /// Dispatch the printable text and the controls at the start of `bytes`, and return how many
+    /// bytes that took: all of them unless an escape comes first (it is left, at the returned
+    /// index), or a byte does not begin a well-formed UTF-8 character, or the character is cut
+    /// off at the end.
     ///
     /// What the performer is told is what [`ground_dispatch`](Self::ground_dispatch) would
     /// tell it about the same bytes once they were checked.
@@ -862,7 +853,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
             // What ended the run: a control, DEL, or a character that is not text.
             let byte = bytes[i];
-            if byte < 0x20 {
+            if byte == 0x1B {
+                return i;
+            } else if byte < 0x20 {
                 performer.execute(byte);
                 i += 1;
             } else if byte == 0x7f {
@@ -1883,7 +1876,7 @@ mod tests {
 
     /// The bytes of a read the way a program writes them: text, controls, DEL, C1 controls and
     /// bytes that are no valid UTF-8, in every way they can be cut off.
-    fn byte_soup(seed: u64, c1: bool) -> Vec<u8> {
+    fn byte_soup(seed: u64, c1: bool, esc: bool) -> Vec<u8> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut next = move |bound: usize| {
             state ^= state << 13;
@@ -1899,13 +1892,15 @@ mod tests {
             b"\xC1\xBF", b"\xE0\x80\x80", b"\xE0\x9F\xBF", b"\xED\xA0\x80", b"\xED\x9F\xBF",
             b"\xF0\x80\x80\x80", b"\xF0\x8F\xBF\xBF", b"\xF4\x90\x80\x80", b"\xF4\x8F\xBF\xBF",
             b"\xF5", b"\xFF", b"\x80", b"\xBF", b"\xC3", b"\xE6\x97", b"\xF0\x9F\x8E",
-            b"\xE6\x97\xA5\xE6", b"\xF0\x9F",
+            b"\xE6\x97\xA5\xE6", b"\xF0\x9F", b"\x1b[31m", b"\x1b[0m", b"\x1b", b"\x1b[",
+            b"\x1b[1;38;5;9m", b"\x1b[?25l", b"\x1b]0;t\x07", b"\x1b(B",
         ];
 
         let mut bytes = Vec::new();
         for _ in 0..(1 + next(24)) {
             let piece = PIECES[next(PIECES.len())];
-            if c1 || !matches!(piece, [0xC2, 0x80..=0x9F]) {
+            let is_c1 = matches!(piece, [0xC2, 0x80..=0x9F]);
+            if (c1 || !is_c1) && (esc || !piece.contains(&0x1B)) {
                 bytes.extend_from_slice(piece);
             }
         }
@@ -1919,7 +1914,7 @@ mod tests {
         // what is not. The faster way must tell the performer, and leave the parser, as that
         // does.
         for seed in 1..=20_000 {
-            let bytes = byte_soup(seed, true);
+            let bytes = byte_soup(seed, true, false);
 
             let mut fast = Dispatcher::default();
             let mut fast_parser = Parser::new();
@@ -1946,7 +1941,7 @@ mod tests {
     fn text_cut_anywhere_dispatches_what_the_whole_does() {
         // (Without C1 controls: a character cut inside one is printed, as it always was.)
         for seed in 1..=300 {
-            let bytes = byte_soup(seed, false);
+            let bytes = byte_soup(seed, false, true);
             let whole = dispatched_in_reads(&bytes, &[]);
             for first in 0..=bytes.len() {
                 for second in first..=bytes.len() {

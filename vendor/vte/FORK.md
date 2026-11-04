@@ -90,12 +90,15 @@ workspace depends on).
   when it is not; controls, DEL and C1 controls are told as before. Bytes that are not a
   well-formed character, or one cut off by the end of the read, stop that walk and are left to
   the old `str::from_utf8` code (`advance_ground_checked`, untouched), so what happens to invalid
-  input is exactly what happened. `Performer::print_text` calls `input_text` and leaves
+  input is exactly what happened. The same walk finds the escape that ends the text (it stops
+  there), where `advance_ground` used to look for it with `memchr` before validating, which
+  cost a call for every few bytes of text between color changes; `memchr` is left for the
+  rare case of invalid bytes. `Performer::print_text` calls `input_text` and leaves
   `preceding_char` as the last character of the run. Tests: `printable_text_arrives_in_maximal_runs`,
   `text_is_dispatched_as_checking_it_first_would` (twenty thousand random byte soups of valid and
   invalid UTF-8, controls and C1 controls through the new walk and through
   `advance_ground_checked`, same calls and same parser), `text_cut_anywhere_dispatches_what_the_whole_does`
-  (every one- and two-way cut of three hundred such soups), `well_formed_characters_are_what_std_calls_so`
+  (every one- and two-way cut of three hundred such soups, now with escape sequences in them), `well_formed_characters_are_what_std_calls_so`
   (`utf8_char_len` against `str::from_utf8`) in `lib.rs`, and
   `repeating_after_a_run_repeats_its_last_character` in `ansi.rs`. A parser bump must carry it.
 
