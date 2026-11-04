@@ -81,7 +81,9 @@ below) and with its default features, so upstream's reference tests run too.
   now also calls the new `Row::prefetch_for_reset` on the lines that will come up 32 scrolls
   later, which issues the CPU's prefetch hint (`prfm` on aarch64, `prefetcht0` on x86_64,
   nothing elsewhere) for the cache lines of their occupied cells. Nothing is read or written as
-  far as the program can tell: the cell, the storage and every result are as they were. Touches
+  far as the program can tell: the cell, the storage and every result are as they were. Only
+  while the history is full: until it is, a scroll grows it and recycles nothing, and the rows
+  asked for would not be the ones it comes to. Touches
   `src/grid/mod.rs`, `src/grid/row.rs` and `src/grid/tests.rs` (all carry the §4(b) notice).
   Test: `prefetching_for_a_reset_changes_nothing`.
 
@@ -112,7 +114,14 @@ below) and with its default features, so upstream's reference tests run too.
   ideographs, Hangul syllables and the fullwidth forms) and asks `unicode-width` for the
   rest. Test: `the_widths_text_skips_the_table_for_are_the_tables` compares the function with
   the table for every `char`, so a table that moves one of them fails here and not in
-  somebody's terminal.
+  somebody's terminal. The test runs on this package's own `Cargo.lock`, while kablo's and
+  bateri's resolve `unicode-width` for themselves, so `Cargo.toml` pins it with `=` (0.2.2, the
+  version both of their `Cargo.lock` files hold): without the pin a `cargo update` there would
+  move the table the fork ships to a version nobody ran the test on. Moving the pin is a
+  deliberate step: change it here, re-run the test (`make check` runs it), and only then let
+  kablo's and bateri's locks follow. The pin is `=` and bateri asks for `"0.2"`, so a
+  dependency of either that needs a newer `unicode-width` fails to resolve and says so,
+  which is the cue for that step. `Cargo.toml` carries the §4(b) notice for it.
 
 - **`input_text` writes through a slice of the row.** It takes the row as a slice once per
   stretch, and puts the row's `occ` back to what `input` for each character would have left

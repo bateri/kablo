@@ -674,8 +674,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             self.reset_params();
 
             // `ESC [` is by far the most common escape (every color change is one), and its
-            // numbers need no step of the state machine each.
-            if bytes.get(done + 1) == Some(&b'[') {
+            // numbers need no step of the state machine each. Not when the performer asked to
+            // stop in the text before it: the byte after the one that asked is for the next
+            // call, as it is when the machine takes one byte at a time (the `ESC` itself is
+            // taken, which is the progress a caller that never stops needs).
+            if bytes.get(done + 1) == Some(&b'[') && !performer.terminated() {
                 self.state = State::CsiEntry;
                 return done + 2 + self.advance_csi_numbers(performer, &bytes[done + 2..]);
             }
@@ -1140,7 +1143,7 @@ mod tests {
         texts: Vec<String>,
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum Sequence {
         Osc(Vec<Vec<u8>>, bool),
         Csi(Vec<Vec<u16>>, Vec<u8>, bool, char),
@@ -2081,6 +2084,97 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A performer that asks the parser to stop once `stop` has been told, as a handler does
+    /// that wants to do something outside the parser after one byte, and goes on once
+    /// `asked` is cleared.
+    struct Halting {
+        told: Dispatcher,
+        stop: Sequence,
+        asked: bool,
+    }
+
+    impl Halting {
+        fn new(stop: Sequence) -> Halting {
+            Halting { told: Dispatcher::default(), stop, asked: false }
+        }
+
+        fn after(&mut self) {
+            if self.told.dispatched.last() == Some(&self.stop) {
+                self.asked = true;
+            }
+        }
+    }
+
+    impl Perform for Halting {
+        fn print(&mut self, c: char) {
+            self.told.print(c);
+            self.after();
+        }
+
+        fn print_ascii(&mut self, s: &str) {
+            self.told.print_ascii(s);
+            self.after();
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.told.execute(byte);
+            self.after();
+        }
+
+        fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            self.told.csi_dispatch(params, intermediates, ignore, c);
+            self.after();
+        }
+
+        fn terminated(&self) -> bool {
+            self.asked
+        }
+    }
+
+    /// What had been told each time the parser stopped, and in the end, for `bytes` given
+    /// whole, or a byte to a call (where nothing can be taken past the byte that asked).
+    fn told_at_each_stop(bytes: &[u8], stop: &Sequence, one_at_a_time: bool) -> (Vec<usize>, Vec<Sequence>) {
+        let mut performer = Halting::new(stop.clone());
+        let mut parser = Parser::new();
+        let mut stops = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let end = if one_at_a_time { 1 } else { rest.len() };
+            let used = parser.advance_until_terminated(&mut performer, &rest[..end]);
+            rest = &rest[used..];
+            if performer.asked {
+                stops.push(performer.told.dispatched.len());
+                performer.asked = false;
+            }
+        }
+        (stops, performer.told.dispatched)
+    }
+
+    #[test]
+    fn a_stop_asked_for_in_text_is_taken_before_the_sequence_that_follows() {
+        // The byte that asks is the last of its run of text, so the sequence that follows
+        // is the first thing a parser that takes one byte at a time would not have reached.
+        // (A run is told whole: a byte in the middle of one that asks takes effect at its
+        // end, as it did when the text was dispatched in one call.)
+        let cases: &[(&[u8], Sequence)] = &[
+            (b"B\x07\x1b[K", Sequence::Execute(7)),
+            (b"\x07\x1b[1;2m", Sequence::Execute(7)),
+            (b"AB\x1b[Km", Sequence::Print('B')),
+            (b"\xc3\xa9\x1b[1m", Sequence::Print('\u{e9}')),
+            (b"x\x1b[K\x07\x1b[m\x07\x1b[3m", Sequence::Execute(7)),
+            (b"a\n\x1b[Kb\n\x1b[1;32mc", Sequence::Execute(b'\n')),
+            (b"B\x07\x1b[", Sequence::Execute(7)),
+            (b"B\x07\x1b", Sequence::Execute(7)),
+            (b"B\x07\x1b[K\x1b[m", Sequence::Execute(7)),
+        ];
+        for (bytes, stop) in cases {
+            let whole = told_at_each_stop(bytes, stop, false);
+            let by_byte = told_at_each_stop(bytes, stop, true);
+            assert!(!by_byte.0.is_empty(), "{bytes:02x?} never stops");
+            assert_eq!(whole, by_byte, "{bytes:02x?}");
         }
     }
 

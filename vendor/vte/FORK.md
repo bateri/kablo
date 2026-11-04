@@ -42,7 +42,10 @@ workspace depends on).
   SOS and PM (`ESC X`, `ESC ^`) are still dropped. Unlike DCS, `0x9C` is no terminator:
   the state machine takes no 8-bit controls and a UTF-8 body may hold the byte.
 - **The parser can halt right after a command.** `Handler::halt_requested` (false by
-  default) is asked after every byte; while it is true `Processor::advance_until_halt`
+  default) is asked after every byte (a run of text is told whole, as it always was, so a
+  request raised by a byte in it takes effect at the end of the run, and before the escape
+  sequence that follows it is told: `Perform::terminated` is asked before the `ESC [` that
+  `advance_ground` takes in one step); while it is true `Processor::advance_until_halt`
   returns the number of bytes it took, and `Processor::advance` (unchanged) never asks.
   The handler owns the request: it is raised in `apc_end` and the caller takes it back
   after doing what it wanted outside the parser (decoding an image without the terminal's
@@ -52,7 +55,9 @@ workspace depends on).
   only after the last pause. `Processor::stop_sync_until_halt` is `stop_sync` that can
   halt. Tests: the `apc_*`, `sos_and_pm_are_dropped` tests in `lib.rs` and the
   `*halt*` tests in `ansi.rs` (every one- and two-way cut of streams with commands, with
-  and without a synchronized update, the 2 MiB overflow, a timed-out update).
+  and without a synchronized update, the 2 MiB overflow, a timed-out update), and
+  `a_stop_asked_for_in_text_is_taken_before_the_sequence_that_follows` in `lib.rs` (a stop
+  asked for by the last byte of a run of text, whole and a byte to a call).
 - **The pointer shape request (OSC 22) reaches the handler as written.** Upstream reads
   the payload as one CSS name and drops anything else, so kitty's protocol (an empty
   request resets the shape, `>` and `<` push and pop, `?` queries, a comma-separated list)

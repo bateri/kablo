@@ -1080,8 +1080,9 @@ impl<T> Dimensions for Term<T> {
 
 /// `c.width()` for the characters of the scripts most text is written in, without the table
 /// lookup: the ranges are the ones where the table says one thing for every character (a test
-/// holds the function to the table for every `char`, so a newer table cannot make them differ
-/// unnoticed). The soft hyphen, `U+00AD`, is in none of them: it has no width.
+/// holds the function to the table for every `char`, and `unicode-width` is pinned in
+/// `Cargo.toml`, so a newer table reaches a build only by moving the pin, which is a step that
+/// runs the test). The soft hyphen, `U+00AD`, is in none of them: it has no width.
 #[inline(always)]
 pub fn text_width(c: char) -> Option<usize> {
     match c as u32 {

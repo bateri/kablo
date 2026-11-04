@@ -317,10 +317,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // cache, and the ones to follow are the oldest now. Ask for the cells of the lines
         // `PREFETCH_AHEAD` turns from the end of the history, so they are close when it comes
         // to them (a program printing without pause scrolls one line per few hundred
-        // nanoseconds, and waiting for memory is most of what a reset costs).
+        // nanoseconds, and waiting for memory is most of what a reset costs). While the history
+        // is still growing nothing is recycled, and the rows asked for are not the ones a scroll
+        // will come to.
         if region.start == 0 {
             let history = self.history_size();
-            if history > PREFETCH_AHEAD + positions {
+            if history == self.max_scroll_limit && history > PREFETCH_AHEAD + positions {
                 for i in 0..positions {
                     let line = Line(PREFETCH_AHEAD as i32 + i as i32 - history as i32);
                     self.raw[line].prefetch_for_reset();
