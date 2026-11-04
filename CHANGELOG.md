@@ -73,6 +73,8 @@ section is not released.
   parser now checks UTF-8 while it dispatches, and tells the performer what it always told it
   about the same bytes; a character cut off by the end of a read is still printed whole when the
   next read completes it.
+  `alacritty_terminal::term::text_width` is public: a type that wraps the handler and asks a
+  character's width gets the same answer without the table.
 
 ## [0.5.1] - 2026-10-31
 

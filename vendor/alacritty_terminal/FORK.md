@@ -105,8 +105,9 @@ below) and with its default features, so upstream's reference tests run too.
   from 2 to 12, every place in a line a run can start, wide characters and marks underneath, and
   the modes. Touches `src/term/mod.rs` and `src/term/input_ascii_tests.rs`, as before.
 
-- **Text skips the width table for the scripts most of it is in.** `input_text` asks a private
-  `text_width` for each character's width, which answers from three ranges where the table says
+- **Text skips the width table for the scripts most of it is in.** `input_text` asks
+  `term::text_width` for each character's width (public, so an app that wraps the handler and
+  has the same question asks the same function), which answers from three ranges where the table says
   one thing for every character (the printable ASCII and Latin ranges but the soft hyphen, CJK
   ideographs, Hangul syllables and the fullwidth forms) and asks `unicode-width` for the
   rest. Test: `the_widths_text_skips_the_table_for_are_the_tables` compares the function with

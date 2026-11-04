@@ -1083,7 +1083,7 @@ impl<T> Dimensions for Term<T> {
 /// holds the function to the table for every `char`, so a newer table cannot make them differ
 /// unnoticed). The soft hyphen, `U+00AD`, is in none of them: it has no width.
 #[inline(always)]
-fn text_width(c: char) -> Option<usize> {
+pub fn text_width(c: char) -> Option<usize> {
     match c as u32 {
         0x20..=0x7E | 0xA0..=0xAC | 0xAE..=0x2FF => Some(1),
         0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xFF01..=0xFF60 => Some(2),
