@@ -99,7 +99,19 @@ enum Try {
 /// Starts session `id` in socket directory `dir`. `Ok` means the session is
 /// up and its socket answers, with the label the request asked for.
 pub fn launch(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Failure> {
-    start(dir, id, request)?;
+    launch_without(dir, id, request, &[])
+}
+
+/// [`launch`] for a session whose program does not get the variables `unset` names, whatever this
+/// process has: the keeper is started without them and the program inherits the keeper's
+/// environment. (`--env` can set a variable but not take one away.)
+pub fn launch_without(
+    dir: &Path,
+    id: &SessionId,
+    request: &NewSession,
+    unset: &[&str],
+) -> Result<(), Failure> {
+    start(dir, id, request, unset)?;
     // The session is new, which is what only this knows: the file of a label
     // that an earlier session of the same name left behind (a relay that was
     // killed does not remove its own) is not this one's, and what the request
@@ -114,19 +126,19 @@ pub fn launch(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Fa
 }
 
 /// Starts the warden of session `id`; the label is not looked at.
-fn start(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Failure> {
+fn start(dir: &Path, id: &SessionId, request: &NewSession, unset: &[&str]) -> Result<(), Failure> {
     sockdir::ensure_dir(dir).map_err(|e| Failure::Other(e.to_string()))?;
     let exe =
         std::env::current_exe().map_err(|e| Failure::Other(format!("cannot find myself: {e}")))?;
     if let Some(runner) = scope_runner() {
-        match attempt(&exe, Some(&runner), dir, id, request) {
+        match attempt(&exe, Some(&runner), dir, id, request, unset) {
             Try::Ready => return Ok(()),
             Try::Refused(why) => return Err(why),
             // `systemd-run` did not start the warden: do without it.
             Try::Silent(_) => {}
         }
     }
-    match attempt(&exe, None, dir, id, request) {
+    match attempt(&exe, None, dir, id, request, unset) {
         Try::Ready => Ok(()),
         Try::Refused(why) => Err(why),
         Try::Silent(why) => Err(Failure::Other(why)),
@@ -135,7 +147,13 @@ fn start(dir: &Path, id: &SessionId, request: &NewSession) -> Result<(), Failure
 
 /// The command that starts the warden, under `runner` (a `systemd-run`) if
 /// there is one.
-fn command(exe: &Path, runner: Option<&Path>, dir: &Path, id: &SessionId) -> Command {
+fn command(
+    exe: &Path,
+    runner: Option<&Path>,
+    dir: &Path,
+    id: &SessionId,
+    unset: &[&str],
+) -> Command {
     let mut command = match runner {
         Some(runner) => {
             let mut command = Command::new(runner);
@@ -154,6 +172,9 @@ fn command(exe: &Path, runner: Option<&Path>, dir: &Path, id: &SessionId) -> Com
         .arg(id.as_str())
         .arg("--dir")
         .arg(dir);
+    for name in unset {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -163,12 +184,13 @@ fn attempt(
     dir: &Path,
     id: &SessionId,
     request: &NewSession,
+    unset: &[&str],
 ) -> Try {
     let (ours, theirs) = match UnixStream::pair() {
         Ok(pair) => pair,
         Err(e) => return Try::Refused(Failure::Other(e.to_string())),
     };
-    let mut child = match command(exe, runner, dir, id)
+    let mut child = match command(exe, runner, dir, id, unset)
         .stdin(Stdio::from(OwnedFd::from(theirs)))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -311,7 +333,7 @@ mod tests {
     #[test]
     fn the_warden_runs_under_systemd_run_only_when_there_is_one() {
         let id = SessionId::new("work").unwrap();
-        let plain = command(Path::new("/bin/kablo"), None, Path::new("/tmp/d"), &id);
+        let plain = command(Path::new("/bin/kablo"), None, Path::new("/tmp/d"), &id, &[]);
         let args: Vec<_> = plain.get_args().collect();
         assert_eq!(plain.get_program(), "/bin/kablo");
         assert_eq!(args, ["warden", "--id", "work", "--dir", "/tmp/d"]);
@@ -321,6 +343,7 @@ mod tests {
             Some(Path::new("/usr/bin/systemd-run")),
             Path::new("/tmp/d"),
             &id,
+            &[],
         );
         assert_eq!(scoped.get_program(), "/usr/bin/systemd-run");
         let args: Vec<_> = scoped.get_args().map(|a| a.to_str().unwrap()).collect();

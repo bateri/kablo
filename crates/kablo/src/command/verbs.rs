@@ -9,8 +9,9 @@ use kablo_bateri::message::{
 };
 use kablo_bateri::{Anchor, Id, IdKind, Side};
 
+use super::machine;
 use super::words::{
-    KINDS, check_id, check_label, clean, is_kind, is_terminal, reads_as_id, wrong_kind,
+    KINDS, address, check_id, check_label, clean, is_kind, is_terminal, reads_as_id, wrong_kind,
 };
 use super::{Asked, Ctx, Done, Exit, Io, failure, finish, kablo, unread};
 use crate::drive;
@@ -948,9 +949,55 @@ fn first_target(io: &mut Io<'_>, words: &[String]) -> Result<bool, Exit> {
     Ok(false)
 }
 
-pub fn send(io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+/// When the first word of a command is a pane of another machine (`p9@prod`), the command is run
+/// where the pane is, with the pane's plain id: its status, or `None` when the word is no such pane.
+fn carry_first(ctx: &Ctx, io: &mut Io<'_>, verb: &str, words: &[String]) -> Option<Done> {
+    let (id, Some(via)) = words.first().and_then(|word| address(word))? else {
+        return None;
+    };
+    let mut carried = vec![verb.to_owned(), id.to_owned()];
+    carried.extend(words.iter().skip(1).cloned());
+    Some(machine::carry(ctx, io, via, &carried))
+}
+
+/// The same for `capture` and `wait`, whose pane is the first word that is no option (nor the value
+/// of one).
+fn carry_target(ctx: &Ctx, io: &mut Io<'_>, verb: &str, words: &[String]) -> Option<Done> {
+    let mut skip = false;
+    let mut via = None;
+    let mut carried = vec![verb.to_owned()];
+    for word in words {
+        if skip {
+            skip = false;
+            carried.push(word.clone());
+        } else if word == "--history" || word == "--for" {
+            skip = true;
+            carried.push(word.clone());
+        } else if word.starts_with('-') {
+            carried.push(word.clone());
+        } else if via.is_none() {
+            match address(word) {
+                Some((id, Some(machine))) => {
+                    via = Some(machine);
+                    carried.push(id.to_owned());
+                }
+                _ => carried.push(word.clone()),
+            }
+        } else {
+            carried.push(word.clone());
+        }
+    }
+    Some(machine::carry(ctx, io, via?, &carried))
+}
+
+pub fn send(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
     match words {
-        [first, _, ..] => need_terminal(io, first)?,
+        [first, _, ..] => {
+            if let Some(done) = carry_first(ctx, io, "send", words) {
+                return done;
+            }
+            need_terminal(io, first)?;
+        }
         // Alone it would be the text, typed into this very terminal.
         [only] if is_kind('p', only) => {
             return Err(Exit::mistake(format!(
@@ -962,22 +1009,31 @@ pub fn send(io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
     finish(drive::send(rest, io.err))
 }
 
-pub fn send_key(io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+pub fn send_key(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
     let Some(first) = words.first() else {
         return Err(Exit::mistake("send-key takes keys to press"));
     };
     if !is_key(first) {
+        if let Some(done) = carry_first(ctx, io, "send-key", words) {
+            return done;
+        }
         need_terminal(io, first)?;
     }
     finish(drive::send_key(rest, io.err))
 }
 
-pub fn capture(io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+pub fn capture(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+    if let Some(done) = carry_target(ctx, io, "capture", words) {
+        return done;
+    }
     first_target(io, words)?;
     finish(drive::capture(rest, io.out, io.err))
 }
 
-pub fn wait(io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+pub fn wait(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> Done {
+    if let Some(done) = carry_target(ctx, io, "wait", words) {
+        return done;
+    }
     if !first_target(io, words)? {
         return Err(Exit::mistake("wait takes the pane to wait for (wait p4)"));
     }

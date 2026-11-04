@@ -16,6 +16,7 @@
 )]
 
 mod common;
+mod stage;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -26,7 +27,9 @@ use common::{
     Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, signal,
     whole,
 };
+use kablo_bateri::message::{Reach, Reply};
 use kablo_proto::v1::{ErrorCode, Message, NewSession, Size, State};
+use stage::Stage;
 
 /// The port of the TCP echo server inside the container (tests/e2e/Dockerfile),
 /// which only the server's own `127.0.0.1` reaches.
@@ -1119,4 +1122,87 @@ fn an_app_that_connects_again_is_given_the_conversations_not_the_half_dead_conne
 
     drop((old, new));
     server.clean_up(&prefix);
+}
+
+#[test]
+#[ignore = "needs the sshd container of `make e2e`"]
+fn the_bateri_command_starts_a_terminal_on_the_server_and_reaches_its_panes_over_the_real_ssh() {
+    let server = server();
+    // The command as bateri's bootstrap leaves it on a server: one line in the user's own
+    // directory that hands what it is given to kablo.
+    let installed = server
+        .ssh(
+            "mkdir -p .local/share/bateri/shell/bin && \
+             printf '#!/bin/sh\\nexec kablo bateri \"$@\"\\n' > .local/share/bateri/shell/bin/bateri && \
+             chmod 755 .local/share/bateri/shell/bin/bateri",
+        )
+        .output()
+        .unwrap();
+    assert!(installed.status.success(), "{}", said(&installed.stderr));
+
+    // This machine is the Mac of the scenario: what a window answers to the question how `prod` is
+    // reached is the words of the ssh command that reaches the container.
+    let mut words: Vec<String> = server
+        .ssh_options()
+        .get_args()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    words.push("tester@127.0.0.1".to_owned());
+    let reply = Reply::Text(Reach::Words(words).text()).encode();
+    let mut mac = Stage::with_mac(&reply);
+
+    // A terminal started on the server, and the number its own machine gave it. The login shell
+    // of the account talks before the command runs (the file `bashrc` of the image): the number is
+    // the last line.
+    let started = mac.run(&["split", "-S", "prod", "--", "cat"]);
+    assert_eq!(started.status, 0, "{}", started.err);
+    let cat = started.out.trim().to_owned();
+    assert!(cat.ends_with("@prod"), "{started:?}");
+    let number = cat.trim_end_matches("@prod").to_owned();
+    let one = mac.run(&["split", "-S", "prod", "--", "sh", "-c", "exit 7"]);
+    assert_eq!(one.status, 0, "{}", one.err);
+    let exits = one.out.trim().to_owned();
+    assert_ne!(cat, exits, "a number is never given twice");
+
+    // Its panes are reached the same way: what is sent arrives as it was written, and what the
+    // terminal shows is read back.
+    let sent = mac.run(&["send", &cat, "it's $HOME; (ok)"]);
+    assert_eq!(sent.status, 0, "{}", sent.err);
+    let start = Instant::now();
+    loop {
+        let shown = mac.run(&["capture", &cat, "--trim"]);
+        assert_eq!(shown.status, 0, "{}", shown.err);
+        if shown.out.contains("it's $HOME; (ok)") {
+            break;
+        }
+        assert!(start.elapsed() < PATIENCE, "{shown:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The program's own status comes back through the connection.
+    let waited = mac.run(&["wait", &exits, "--for", "20s"]);
+    assert_eq!(waited.status, 7, "{}", waited.err);
+
+    // Nothing was started on this machine, and the Mac was asked how, once for each.
+    assert!(mac.running().is_empty(), "{:?}", mac.running());
+    assert!(
+        mac.told
+            .iter()
+            .all(|text| text.starts_with("bateri 2\nssh\n")),
+        "{:?}",
+        mac.told
+    );
+
+    // What the scenario left on the server goes.
+    let cleaned = server
+        .ssh(&format!(
+            "kablo end {number} --force; kablo end {} --force; rm -rf .local/share/bateri",
+            exits.trim_end_matches("@prod")
+        ))
+        .output()
+        .unwrap();
+    assert!(cleaned.status.success(), "{}", said(&cleaned.stderr));
+    let start = Instant::now();
+    while server.count("kablo warden --id p") > 0 && start.elapsed() < PATIENCE {
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

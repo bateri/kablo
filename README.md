@@ -710,6 +710,20 @@ memory of where its relay comes from (see *Limits*).
   answer. The exit status of `kablo app` is `0`, `69` (no app that takes mail:
   the app has not said so, or the bridge is from a kablo that had no mailbox),
   `1`, or 128 and a signal's number.
+- **`kablo bateri VERB`** is the command a terminal app puts on the `PATH` of the
+  terminals it opens, for the programs (a coding agent, a build script) that run in
+  them: `split`, `tab` and `window` start a terminal and ask the app where its pane
+  goes, and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `focus`, `zoom`,
+  `swap`, `rename`, `close`, `move` and `resize` drive the others (`kablo bateri
+  --help`). What needs the app's windows is one text message of the `kablo-bateri`
+  crate, which the app reads with the same code, over the mailbox above; the
+  terminals themselves are kablo's. A pane of another machine is written `p9@prod`, and
+  `-S prod` starts a terminal there: the app says how that machine is reached, and
+  the command runs there over the connection the app keeps. `kablo bateri
+  --next-number` gives the next terminal number of the machine (the app's own
+  bootstrap and the command count with the same file, so no number is given twice),
+  and the exit status is `0`, `1`, `64` (a mistake in the command), `69` (no app) or
+  `77` (the app refused).
 - **Taking a terminal** is bit 3 of the view an app attaches with (`take` in
   `kablo-proto`): the other clients attached to the session are let go, each with
   the error `TAKEN` (code 9) whose text is the name the app gave itself in its

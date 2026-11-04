@@ -55,6 +55,12 @@ pub struct Stage {
     runners: Vec<String>,
     /// The next run ends the terminal it is run in: what is waited for is that.
     ending: bool,
+    /// Variables every run has.
+    vars: Vec<(String, String)>,
+    /// The umask the runs in a terminal have.
+    umask: Option<String>,
+    /// The terminals the command started, which are ended with the stage.
+    adopted: std::collections::HashSet<String>,
 }
 
 impl Stage {
@@ -73,6 +79,9 @@ impl Stage {
             runs: 0,
             runners: Vec::new(),
             ending: false,
+            vars: Vec::new(),
+            umask: None,
+            adopted: std::collections::HashSet::new(),
         }
     }
 
@@ -138,6 +147,136 @@ impl Stage {
         self.env.track_named_alike(id);
     }
 
+    /// Every run has the variable `name`.
+    pub fn set_var(&mut self, name: &str, value: &str) {
+        self.vars.push((name.to_owned(), value.to_owned()));
+    }
+
+    /// The runs in a terminal have this umask.
+    pub fn set_umask(&mut self, mask: &str) {
+        self.umask = Some(mask.to_owned());
+    }
+
+    /// The terminals the command started are this stage's to end.
+    fn adopt(&mut self) {
+        let Ok(entries) = std::fs::read_dir(&self.env.dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".sock") {
+                if self.adopted.insert(id.to_owned()) && !self.runners.iter().any(|r| r == id) {
+                    self.env.track_named_alike(id);
+                }
+            }
+        }
+    }
+
+    /// The command as the bootstrap writes it: one line that hands what it is given to `kablo`.
+    pub fn install_command(&mut self) {
+        let bin = self.state().join("shell/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = bin.join("bateri");
+        std::fs::write(
+            &file,
+            format!(
+                "#!/bin/sh\nexec '{}' bateri \"$@\"\n",
+                env!("CARGO_BIN_EXE_kablo")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// The bootstrap of a server's terminal: a program that says what it was started with and
+    /// holds the terminal open.
+    pub fn install_bootstrap(&mut self) {
+        let dir = self.state().join("shell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("boot.sh"),
+            format!(
+                "printf '%s|' \"$@\" > '{0}/boot.args'\nprintf '%s' \"$SHELL\" > '{0}/boot.shell'\nexec cat\n",
+                self.home.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// What the bootstrap was started with: its arguments joined by `|`, and the `SHELL` it had.
+    pub fn bootstrap_saw(&self) -> Option<(String, String)> {
+        Some((
+            std::fs::read_to_string(self.home.join("boot.args")).ok()?,
+            std::fs::read_to_string(self.home.join("boot.shell")).ok()?,
+        ))
+    }
+
+    /// The message that waits for a Mac under `id`.
+    pub fn note(&self, id: &str) -> Option<String> {
+        std::fs::read_to_string(self.state().join("placing").join(id)).ok()
+    }
+
+    /// Who opened `id`, as the command wrote it.
+    pub fn record(&self, id: &str) -> Option<String> {
+        std::fs::read_to_string(self.state().join("terminals").join(id)).ok()
+    }
+
+    /// The terminals of this machine that run, by id.
+    pub fn running(&self) -> Vec<String> {
+        let listed = self.env.kablo().arg("list").output().unwrap();
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .skip(1)
+            .filter(|line| !line.contains("ended"))
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect()
+    }
+
+    /// This stage reaches `prod` over a fake `ssh`: it logs the arguments it is given and hands the
+    /// line (its last argument) to `shell -c` in the home of `prod`, as a server's sshd hands it to
+    /// the person's login shell. Every run of this stage has the fake on its `PATH`.
+    pub fn ssh_to(&mut self, prod: &Stage, shell: &str) {
+        let bin = self.env.dir.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = bin.join("ssh");
+        std::fs::write(
+            &file,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=$a; printf '%s\\n' \"$a\" >> '{log}'; done\nprintf -- '--\\n' >> '{log}'\ncd '{home}' || exit 255\nexec env HOME='{home}' KABLO_DIR='{dir}' SHELL='{shell}' '{shell}' -c \"$last\"\n",
+                log = self.env.dir.join("ssh.log").display(),
+                home = prod.home.display(),
+                dir = prod.env.dir.display(),
+                shell = shell,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        self.vars.retain(|(name, _)| name != "PATH");
+        self.vars.push(("PATH".to_owned(), path));
+    }
+
+    /// What the fake `ssh` was given, one call after another.
+    pub fn ssh_calls(&self) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(self.env.dir.join("ssh.log")).unwrap_or_default();
+        let mut calls = vec![Vec::new()];
+        for line in text.lines() {
+            if line == "--" {
+                calls.push(Vec::new());
+            } else if let Some(call) = calls.last_mut() {
+                call.push(line.to_owned());
+            }
+        }
+        calls.pop();
+        calls
+    }
+
     /// `bateri ARGS` run in no terminal.
     pub fn run(&mut self, args: &[&str]) -> Said {
         self.go(&Run {
@@ -178,13 +317,15 @@ impl Stage {
         std::fs::create_dir(&jobs).unwrap();
         let script = self.env.script(
             &format!("runner-{here}.sh"),
-            "#!/bin/sh\ntrap '' INT\ncd \"$1\" || exit 1\nwhile :; do\n  for f in job.*.sh; do\n    [ -f \"$f\" ] || continue\n    mv \"$f\" \"running.$f\"\n    sh \"running.$f\"\n    rm -f \"running.$f\"\n  done\n  sleep 0.02\ndone\n",
+            "#!/bin/sh\ntrap '' INT\njobs=$1\nwhile :; do\n  for f in \"$jobs\"/job.*.sh; do\n    [ -f \"$f\" ] || continue\n    run=\"$jobs/running.${f##*/}\"\n    mv \"$f\" \"$run\"\n    sh \"$run\"\n    rm -f \"$run\"\n  done\n  sleep 0.02\ndone\n",
         );
         let kablo = env!("CARGO_BIN_EXE_kablo");
         let started = self
             .env
             .kablo()
             .args(["new", "--id", here])
+            .arg("--cwd")
+            .arg(&self.home)
             .args(["--env", &format!("HOME={}", self.home.display())])
             .args(["--env", &format!("KABLO={kablo}")])
             .args(["--env", &format!("KABLO_DIR={}", self.env.dir.display())])
@@ -217,10 +358,13 @@ impl Stage {
             None => {
                 let mut command = Command::new(kablo);
                 command
+                    .current_dir(&self.home)
+                    .env("PWD", &self.home)
                     .arg("bateri")
                     .args(run.args)
                     .env("KABLO_DIR", &self.env.dir)
                     .env("HOME", &self.home)
+                    .envs(self.vars.iter().map(|(n, v)| (n, v)))
                     .envs(run.vars.iter().copied())
                     .stdin(Stdio::from(File::open(&input).unwrap()))
                     .stdout(Stdio::from(File::create(&out).unwrap()))
@@ -230,10 +374,14 @@ impl Stage {
             Some(here) => {
                 let jobs = self.runner(here);
                 let mut job = String::from("\"$KABLO\" bateri");
+                let mask = self.umask.clone();
                 for arg in run.args {
                     job.push_str(&format!(" '{}'", arg.replace('\'', "'\\''")));
                 }
                 for (name, value) in run.vars {
+                    job = format!("{name}='{value}' {job}");
+                }
+                for (name, value) in &self.vars {
                     job = format!("{name}='{value}' {job}");
                 }
                 job.push_str(&format!(
@@ -245,6 +393,9 @@ impl Stage {
                     code.display(),
                     code.display()
                 ));
+                if let Some(mask) = mask {
+                    job = format!("umask {mask}\n{job}");
+                }
                 let name = format!("job.{}.sh", self.runs);
                 std::fs::write(jobs.join(format!("{name}.tmp")), job).unwrap();
                 std::fs::rename(jobs.join(format!("{name}.tmp")), jobs.join(&name)).unwrap();
@@ -256,6 +407,7 @@ impl Stage {
             }
         };
         let status = self.serve(&mut waiting, run.turns);
+        self.adopt();
         Said {
             status,
             out: std::fs::read_to_string(&out).unwrap_or_default(),

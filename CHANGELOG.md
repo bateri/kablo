@@ -46,6 +46,21 @@ section is not released.
   label; a word of another kind (`t3`, a tab) is 64 with the command that was meant. The exit
   codes are 0, 1, 64 (a mistake in the command), 69 (no app), 77 (the app refused), 124 (`wait`
   ran out of time), 128 plus the signal, and 255 (kablo's own trouble).
+- **`kablo bateri split`, `tab` and `window` start the terminal and ask the app where its pane goes.**
+  The terminal is started by kablo itself (numbered `p1`, `p2`, … by a counter in
+  `~/.local/share/bateri/next`, which `kablo bateri --next-number` also gives to a program that
+  numbers terminals of its own), in the caller's directory and with the caller's umask, and what
+  the app answers is printed as the pane's number or, with `--json`, where it stands. With no
+  program, or a shell named alone, the app is asked first and says who starts the terminal: it
+  makes the pane itself, or answers `ok start` and the command starts the terminal with the
+  bootstrap of a server's pane; with no app connected, a machine that has the bootstrap starts it
+  and leaves the message in `~/.local/share/bateri/placing` for the app to read when it connects,
+  and one that has not ends with 69. `--keep-open` follows the program with the login shell on
+  every machine. `-S SERVER` starts the terminal on another machine, and `p9@prod` names one of
+  its terminals to `send`, `send-key`, `capture` and `wait`: the app says how that machine is
+  reached (`ssh` words, or `relay` from a program on a server, or `here` when it is this one).
+  `kablo bateri --hex` takes the words of a command written in hex, as the other machine's
+  command line does.
 
 ### Changed
 

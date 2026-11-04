@@ -353,6 +353,35 @@ impl Drop for Env {
                 unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
             }
         }
+        // What is left of every session of this test, however it came to be (a test that fails before
+        // it has told which terminals it started leaves none to name): a warden is this test's
+        // by its directory, which no other test has (`--dir /tmp/ktPID-N`), and so are its relay and
+        // the program, which hang up with it.
+        {
+            let dir = self.dir.display().to_string();
+            let processes = self.processes();
+            let wardens: Vec<u32> = processes
+                .iter()
+                .filter(|(_, _, command)| {
+                    let mut words = command.split_whitespace();
+                    command.contains("kablo warden --id")
+                        && words.any(|word| word == "--dir")
+                        && command
+                            .split_whitespace()
+                            .skip_while(|w| *w != "--dir")
+                            .nth(1)
+                            == Some(dir.as_str())
+                })
+                .map(|(pid, _, _)| *pid)
+                .collect();
+            for (pid, ppid, _) in &processes {
+                if wardens.contains(pid) || (wardens.contains(ppid) && *pid > 1) {
+                    // SAFETY: a signal to a warden found by this test's own directory, or to a child
+                    // of one.
+                    unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

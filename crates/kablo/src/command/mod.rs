@@ -11,6 +11,9 @@
 //! 77 (refused), 128+n, and for `wait` the program's own, 124 when the time ran out, 255 for
 //! kablo's trouble.
 
+mod machine;
+mod open;
+mod state;
 mod verbs;
 mod words;
 
@@ -76,6 +79,8 @@ impl Io<'_> {
 
 /// What a command knows of where it runs.
 pub struct Ctx {
+    /// `$HOME`.
+    home: PathBuf,
     /// The state this keeps: `~/.local/share/bateri`, under `$HOME` and not `XDG_DATA_HOME`, since
     /// the Mac and a cron job do not have a login shell's environment.
     pub state: PathBuf,
@@ -102,7 +107,18 @@ impl Ctx {
             .ok_or_else(|| Exit::failed("HOME is not set"))?;
         Ok(Ctx {
             state: home.join(".local/share/bateri"),
+            home,
         })
+    }
+
+    /// `$HOME`.
+    pub fn home(&self) -> PathBuf {
+        self.home.clone()
+    }
+
+    /// What is kept under `~/.local/share/bateri`.
+    pub fn state(&self) -> state::State {
+        state::State::new(self.state.clone())
     }
 
     /// One conversation with the Mac: `text` is a message, as it is written.
@@ -214,6 +230,41 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
 
 fn dispatch(args: &[OsString], io: &mut Io<'_>) -> Done {
     let ctx = Ctx::new()?;
+    // The counter: the number of the next terminal, for whoever else numbers terminals on this
+    // machine (the Mac does, for the ones it opens itself), so that no number is given twice.
+    if args.first().is_some_and(|arg| arg == "--next-number") {
+        if args.len() != 1 {
+            return Err(Exit::mistake("--next-number takes nothing"));
+        }
+        return match ctx.state().next_number() {
+            Some(number) => {
+                let _ = writeln!(io.out, "{number}");
+                Ok(())
+            }
+            None => Err(Exit::status(1)),
+        };
+    }
+    // The words as another machine's command wrote them: `x` and the hex of their bytes, so that no
+    // shell on the way reads what the caller wrote.
+    if args.first().is_some_and(|arg| arg == "--hex") {
+        let hexed: Vec<String> = args
+            .iter()
+            .skip(1)
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect();
+        let words = machine::unhex_words(&hexed)?;
+        return run_words(&ctx, io, &words);
+    }
+    dispatch_with(&ctx, args, io)
+}
+
+/// The command of `words`.
+pub fn run_words(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
+    let args: Vec<OsString> = words.iter().map(OsString::from).collect();
+    dispatch_with(ctx, &args, io)
+}
+
+fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
     let Some((verb, rest)) = args.split_first() else {
         let _ = write!(io.err, "{USAGE}");
         return Err(Exit::status(64));
@@ -238,19 +289,22 @@ fn dispatch(args: &[OsString], io: &mut Io<'_>) -> Done {
         .map(|word| word.to_string_lossy().into_owned())
         .collect();
     match verb.as_str() {
-        "close" => verbs::close(&ctx, io, &words),
-        "focus" => verbs::focus(&ctx, io, &words),
-        "zoom" => verbs::zoom(&ctx, io, &words),
-        "swap" => verbs::swap(&ctx, io, &words),
-        "rename" => verbs::rename(&ctx, io, &words),
-        "move" => verbs::moving(&ctx, io, &words),
-        "resize" => verbs::resize(&ctx, io, &words),
-        "ls" => verbs::ls(&ctx, io, &words),
-        "notify" => verbs::notify(&ctx, &words),
-        "send" => verbs::send(io, rest, &words),
-        "send-key" => verbs::send_key(io, rest, &words),
-        "capture" => verbs::capture(io, rest, &words),
-        "wait" => verbs::wait(io, rest, &words),
+        "split" => open::open(ctx, io, open::Mode::Split, &words),
+        "tab" => open::open(ctx, io, open::Mode::Tab, &words),
+        "window" => open::open(ctx, io, open::Mode::Window, &words),
+        "close" => verbs::close(ctx, io, &words),
+        "focus" => verbs::focus(ctx, io, &words),
+        "zoom" => verbs::zoom(ctx, io, &words),
+        "swap" => verbs::swap(ctx, io, &words),
+        "rename" => verbs::rename(ctx, io, &words),
+        "move" => verbs::moving(ctx, io, &words),
+        "resize" => verbs::resize(ctx, io, &words),
+        "ls" => verbs::ls(ctx, io, &words),
+        "notify" => verbs::notify(ctx, &words),
+        "send" => verbs::send(ctx, io, rest, &words),
+        "send-key" => verbs::send_key(ctx, io, rest, &words),
+        "capture" => verbs::capture(ctx, io, rest, &words),
+        "wait" => verbs::wait(ctx, io, rest, &words),
         "help" | "-h" | "--help" => {
             let _ = write!(io.out, "{USAGE}");
             Ok(())
