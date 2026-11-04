@@ -1321,7 +1321,6 @@ impl Relay {
         if !allowed || sock.set_nonblocking(true).is_err() {
             return;
         }
-        sys::widen_buffers(sock.as_fd());
         self.clients.push(Client {
             sock,
             open: false,
@@ -1608,6 +1607,15 @@ impl Relay {
             None => offset,
         };
         if let Some(client) = self.clients.get_mut(i) {
+            // A client that reads flat out and wants every byte is quicker than a relay that
+            // can put only 8 KiB at a time in a macOS socket: the relay's end holds a
+            // megabyte, so a frame is written and the terminal read again while the client
+            // is still on the one before. (The client's end does not matter for what the
+            // relay writes, and a client that did not ask is not given the room: on a slow
+            // link it would be what the link carries before the prompt after a `^C`.)
+            if view.is_some_and(|view| view.every_byte) {
+                sys::widen_send_buffer(client.sock.as_fd());
+            }
             client.attach = Some(Attach {
                 next: start,
                 keep_after_end: view.is_some_and(|view| view.keep_after_end),
@@ -2647,10 +2655,6 @@ mod tests {
         relay.live = true;
         relay.reading = true;
         let (client, far) = client_of(false);
-        // As `seat` makes the sockets of a client: a relay that is quicker than a client
-        // that reads flat out has a megabyte to put bytes in, not eight kibibytes.
-        sys::widen_buffers(client.sock.as_fd());
-        sys::widen_buffers(far.as_fd());
         relay.clients.push(client);
         (relay, slave, far)
     }
@@ -3261,7 +3265,7 @@ mod tests {
         let chunk = usize::try_from(MIN_CAPACITY / 4).unwrap();
         let (mut relay, write, far) = relay_over_a_pipe(MIN_CAPACITY, chunk);
         let half = usize::try_from(MIN_CAPACITY / 2).unwrap();
-        sys::widen_buffers(relay.clients[0].sock.as_fd());
+        sys::widen_send_buffer(relay.clients[0].sock.as_fd());
         if let Some(attach) = relay.clients[0].attach.as_mut() {
             attach.every_byte = true;
         }
@@ -3349,6 +3353,41 @@ mod tests {
             let attach = relay.clients[0].attach.as_ref().unwrap();
             assert_eq!(attach.every_byte, asked);
         }
+    }
+
+    #[test]
+    fn only_a_client_that_asked_for_every_byte_is_given_a_wide_socket() {
+        // How much of a stream the relay's end of the socket takes before it is full.
+        let room_after_attach = |asked: bool| {
+            let (mut relay, _slave, _far) = relay_with_a_client();
+            relay.clients[0].attach = None;
+            let mut view = View::new(Size {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            });
+            view.every_byte = asked;
+            relay.attach(0, OFFSET_END, Some(view));
+            let mut room = 0;
+            let chunk = [0u8; 4096];
+            while let Ok(n) = (&relay.clients[0].sock).write(&chunk) {
+                room += n;
+                if room > 4 << 20 {
+                    break;
+                }
+            }
+            room
+        };
+        let (plain, wide) = (room_after_attach(false), room_after_attach(true));
+        // Linux grants no more than `net.core.wmem_max`, which may be what it already was.
+        assert!(wide >= plain, "{plain} then {wide}");
+        // Where the default is 8 KiB, a megabyte is given.
+        #[cfg(target_os = "macos")]
+        assert!(
+            plain < 64 * 1024 && wide > 512 * 1024,
+            "{plain} then {wide}"
+        );
     }
 
     #[test]

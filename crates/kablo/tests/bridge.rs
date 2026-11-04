@@ -576,22 +576,6 @@ impl Tty {
         }
     }
 
-    /// Types `text` until the terminal stops taking it for a while, or all of it is taken.
-    fn type_until_refused(&self, mut text: &[u8]) {
-        while !text.is_empty() {
-            let mut set = [kablo::sys::want(self.master.as_raw_fd(), libc::POLLOUT)];
-            kablo::sys::poll(&mut set, Some(Duration::from_secs(1))).unwrap();
-            if set[0].revents == 0 {
-                return;
-            }
-            match kablo::sys::write_fd(self.master.as_fd(), text) {
-                Ok(n) => text = &text[n..],
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("typing failed: {e}"),
-            }
-        }
-    }
-
     /// Reads whatever the terminal shows in the next `wait`.
     fn drain(&mut self, wait: Duration) {
         let mut buf = [0u8; 4096];
@@ -1262,16 +1246,12 @@ fn connect_holds_its_typing_while_the_session_cannot_take_it_and_loses_none_of_i
 fn connect_ends_when_the_session_takes_nothing_for_good() {
     let env = Env::new();
     let id = env.name("never-connect");
-    // More than the socket, the link and `connect` itself will hold for a session that
-    // reads nothing, whatever the kernel's buffer is (a megabyte each way on macOS where
-    // it used to be eight kibibytes): the terminal stops taking what is typed, and
-    // that is the point.
-    let total = 8_000_000;
+    let total = 1_800_000;
     let typed: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
     let deaf = Deaf::at(env.socket(&id));
     let mut tty = Tty::run(&env, &["connect", &id]);
     deaf.wait_for_the_client();
-    tty.type_until_refused(&typed);
+    tty.type_all(&typed);
     // A session that does not make room within the patience is stuck, and
     // the person is told as before.
     tty.show("too many requests are waiting");

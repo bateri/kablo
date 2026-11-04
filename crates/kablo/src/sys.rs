@@ -378,32 +378,38 @@ pub fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<u
     Ok(ready as usize)
 }
 
-/// The size asked for each way of a unix socket between a relay and a client.
+/// The size asked for a unix socket's send buffer, in bytes.
 const SOCKET_BUFFER: libc::c_int = 1 << 20;
 
-/// Asks for [`SOCKET_BUFFER`] bytes of kernel buffer to send and to receive on `sock`,
-/// and takes what it is given: a refusal (or a smaller grant, as Linux limits it with
-/// `net.core.wmem_max`) leaves the socket as it was.
+/// Asks for [`SOCKET_BUFFER`] bytes of send buffer on `sock`, and takes what it is given: a
+/// refusal (or a smaller grant, as Linux limits it with `net.core.wmem_max`) leaves the
+/// socket as it was.
 ///
-/// A macOS unix socket buffers 8 KiB by default (`net.local.stream.sendspace`), so a
-/// stream between a relay and a bridge moves 8 KiB at a time and each side waits for
-/// the other to take it: neither looks busy and the stream crawls. A buffer of a megabyte
-/// lets the relay write a frame and go back to the terminal while the client is still
-/// reading the one before.
-pub fn widen_buffers(sock: BorrowedFd<'_>) {
+/// What a unix stream socket holds in flight is bounded by its sender's send buffer; the
+/// receiver's receive buffer does not enter into it (on macOS a socket pair whose
+/// receiving end alone is widened still takes 8 KiB before a write blocks). So this is for
+/// the end that writes. A macOS unix socket buffers 8 KiB by default
+/// (`net.local.stream.sendspace`), so a stream that fills it moves 8 KiB at a time and each
+/// side waits for the other to take it: neither looks busy and the stream crawls. A buffer
+/// of a megabyte lets the writer put a frame down and go back to its work while the reader
+/// is still on the one before.
+///
+/// It is for a client that asked for every byte, not for every socket. On a slow link a
+/// megabyte in the socket is a megabyte of output the link still has to carry before what
+/// the program wrote next (the prompt after a `^C`); without it the client falls behind
+/// the ring sooner and is sent a picture of the screen, which is what a slow link wants.
+pub fn widen_send_buffer(sock: BorrowedFd<'_>) {
     let size = SOCKET_BUFFER;
-    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // SAFETY: a valid socket for the call and a pointer to a `c_int` of the size
-        // given; the kernel only reads it.
-        unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_SOCKET,
-                option,
-                (&raw const size).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+    // SAFETY: a valid socket for the call and a pointer to a `c_int` of the size given;
+    // the kernel only reads it.
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw const size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 
@@ -958,10 +964,9 @@ mod tests {
 
     #[test]
     fn widening_a_socket_never_makes_its_buffer_smaller() {
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         let before = send_buffer(ours.as_fd());
-        widen_buffers(ours.as_fd());
-        widen_buffers(theirs.as_fd());
+        widen_send_buffer(ours.as_fd());
         let after = send_buffer(ours.as_fd());
         assert!(after >= before, "{before} then {after}");
         // On macOS the whole of it is given, where the default is 8 KiB.
@@ -978,6 +983,43 @@ mod tests {
             }
         }
         assert!(sent > 16 * 1024, "{sent}");
+    }
+
+    /// How many bytes a write end takes before the socket is full and nobody reads.
+    fn fill(sock: &std::os::unix::net::UnixStream) -> usize {
+        sock.set_nonblocking(true).unwrap();
+        let mut sent = 0;
+        let chunk = [0u8; 4096];
+        while let Ok(n) = io::Write::write(&mut &*sock, &chunk) {
+            sent += n;
+            if sent > 8 << 20 {
+                break;
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn what_a_socket_holds_is_the_writers_buffer_and_not_the_readers() {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let plain = fill(&ours);
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let size = SOCKET_BUFFER;
+        // SAFETY: a valid socket and a pointer to a `c_int` of the size given.
+        unsafe {
+            libc::setsockopt(
+                theirs.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        assert_eq!(fill(&ours), plain);
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        widen_send_buffer(ours.as_fd());
+        // Linux grants no more than `net.core.wmem_max`, which may be what it already was.
+        assert!(fill(&ours) >= plain);
     }
     use std::os::unix::net::UnixStream;
 

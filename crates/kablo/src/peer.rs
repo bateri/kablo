@@ -44,7 +44,6 @@ pub enum Gone {
 /// check is made in one place.
 pub fn connect_ours(path: &Path) -> io::Result<OwnedFd> {
     let sock = sys::connect_nonblocking(path)?;
-    sys::widen_buffers(sock.as_fd());
     let own = sys::effective_uid();
     if !sys::peer_uid(sock.as_fd()).is_ok_and(|peer| sys::uid_allowed(peer, own)) {
         return Err(io::Error::new(
