@@ -67,6 +67,20 @@ section is not released.
 - **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**
   The session sends a flood of output in larger pieces and does less bookkeeping per read; a
   keystroke's echo or a line of output still goes out at once.
+- **`kablo connect` in a terminal on the session's own machine shows all of a flood.** A program
+  that writes faster than the terminal draws waits for it, as it would in that terminal without a
+  session, where it could have left you with a reset and a picture of the screen in place of what
+  it wrote. With several terminals on that machine the quickest sets the pace. Over `ssh` (`SSH_CONNECTION` or
+  `SSH_TTY` in the environment) the program is not kept waiting for a link that may be slow, and
+  that picture is what you get.
+
+### Fixed
+
+- **A key pressed while a program's output outruns your connection reaches the program.** `^C`
+  during a big `cat` over a slow link could be lost: the session had already let go of a
+  connection that fell too far behind, and the connection did not know yet. The session now reads
+  what you typed until the connection has noticed. The output that was on its way still comes
+  first, so on a slow link the prompt can take seconds to show.
 
 ### For apps
 
@@ -81,6 +95,11 @@ section is not released.
   terminal the machine that asks has not started, answered by a Mac that is not that machine's: start
   it and ask again) and `here` as the text of an `ssh` reply (the server named is the machine that
   asked).
+- **A client that falls behind the journal now reads the end of the stream with its own side
+  still open.** The server closes only its side, and reads what the client types (`input`,
+  `write`) until the client closes; nothing else it sends is acted on or answered. A client that
+  closes when it reads the end has nothing to change. One that has not closed in 30 seconds has
+  its connection closed, and what it writes after that is lost (`docs/PROTOCOL.md`, A slow reader).
 - **Protocol: a client can ask not to be lapped.** The flags byte of the `attach` view gains bit
   4, `every_byte` (`kablo-proto`: `v1::View::every_byte`, `false` from `View::new`, so this breaks
   no one that builds one). An app that sets it reads the session's stream as fast as it can and
@@ -88,15 +107,20 @@ section is not released.
   reading the program's output, so a program that writes faster than the app reads waits instead
   of writing over what the app has not read, and the app is not sent a picture of the screen in
   place of the bytes it lost (its scrollback with them). An app that stops reading releases the
-  program after a second, and is lapped as without the bit. Leave it off on a slow link, where
+  program after a second, and is lapped as without the bit, and so is one slower than another
+  client that set it: the one furthest along sets the pace, and a client without the bit has no
+  say. Leave it off on a slow link, where
   the picture is the right answer; the bridge keeps the bit across a resize and a new connection
   as it does the others. A relay from before the bit ignores it, and so does a bridge from before
   it (a `kablo attach` still running from before the upgrade decodes the view and encodes it
   again without the bit, while `status` already reports the new relay), so an app reads `version`
   in `status` and goes through a bridge started after the upgrade before it relies on it
   (`docs/PROTOCOL.md`, Attach). The relay gives the socket of a client that sets the bit a larger
-  send buffer (a megabyte where the system allows) so it can write ahead of a client that reads
-  flat out; one that does not set it gets the system's.
+  send buffer (a megabyte where the system allows), for as long as the connection lasts, so it can
+  write ahead of a client that reads flat out; a connection on which the bit was never set has the
+  system's. An app on the session's machine that leaves the bit off is lapped sooner than it was:
+  the relay reads a flood faster than a macOS socket of 8 KiB carries, and a lap closes the
+  connection (`docs/PROTOCOL.md`, A slow reader), with whatever was typed in that moment. Set it.
 - **The vte fork's handler gained two methods, with defaults.** `Perform::print_ascii(&str)` and
   `ansi::Handler::input_ascii(&str)` take a run of printable ASCII (`0x20..=0x7e`, never empty)
   where the parser used to call `print` and `input` for each character; the parser hands every
@@ -120,6 +144,9 @@ section is not released.
   next read completes it.
   `alacritty_terminal::term::text_width` is public: a type that wraps the handler and asks a
   character's width gets the same answer without the table.
+- **The emulator fork pins `unicode-width` to exactly `0.2.2`**, the table `text_width` was made
+  from. An app that takes the fork by `rev` takes that version with it, and a requirement elsewhere
+  in the app's tree that rules out `0.2.2` does not resolve.
 
 ## [0.5.1] - 2026-10-31
 

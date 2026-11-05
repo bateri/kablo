@@ -337,7 +337,8 @@ pub struct View {
     /// client a picture of the screen in place of the bytes it lost. A client that
     /// stops reading does not stall the program for good: after a second without
     /// progress the server reads on and the picture is what the client gets, as
-    /// without the flag. Leave it off on a slow link, where a picture is what is
+    /// without the flag, and so it does when another client with the flag is further
+    /// along: that one sets the pace, and clients without the flag have no say. Leave it off on a slow link, where a picture is what is
     /// wanted and a program that waits for the link is not. A server from before
     /// the bit ignores it, and so does a bridge from before it: a `kablo attach` that
     /// is already running decodes the view and encodes it again without the bit,

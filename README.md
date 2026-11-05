@@ -136,6 +136,14 @@ and tries again (a few seconds at most, then it says why and exits); when the
 program is not reading its input at all, the terminal rings its bell for the
 keys that were refused and `connect` stays, so Ctrl-\ still works.
 
+A program that writes faster than your terminal draws waits for it, as it would
+in that terminal without a session, and all of it reaches the screen; a terminal
+that stops drawing for a second is no longer waited for. With several terminals on
+this machine connected the quickest sets the pace, and one that falls too far behind
+it gets a picture of the screen in place of what it missed. Over `ssh` (`SSH_CONNECTION` or
+`SSH_TTY` in the environment) the program is not kept waiting for a link that may
+be slow, and that picture is what you get.
+
 `kablo list` is a table for people and `kablo list --json` is JSON for
 programs (keys are added to it, never removed; `label` is the session's label
 or `null`). `AGE` is how long the session has been open and `QUIET` how long
