@@ -209,7 +209,7 @@ memory of where its relay comes from (see *Limits*).
   and environment are not written to any log.
 - The journal holds everything the program wrote, secrets it printed
   included. It is kept in memory (a `memfd` on Linux, anonymous shared memory
-  on macOS), not in a file, up to `--journal-size` per session, and it goes
+  on macOS), not in a file, up to a limit per session, and it goes
   when the session does.
 
 ## Limits

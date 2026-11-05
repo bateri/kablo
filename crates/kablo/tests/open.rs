@@ -821,6 +821,105 @@ fn words_another_machines_app_relayed_start_a_terminal_with_no_program_where_the
     assert_eq!(seen, format!("||{VERSION}|-|"));
 }
 
+/// The words of `split` and what follows, as the app of this machine relays them for a program
+/// on a server.
+fn here_args(words: &[&str]) -> Vec<String> {
+    let mut args = vec!["--hex-here".to_owned()];
+    args.extend(words.iter().map(|word| hex_word(word)));
+    args
+}
+
+#[test]
+fn words_the_app_of_this_machine_relayed_start_their_program_and_never_the_bootstrap() {
+    // This machine is the app's own, not its server: a program is started as it is, a shell too
+    // (it is the program asked for, with no integration of ours to give it), whether the home has a
+    // bootstrap left from some server's time or not.
+    for bootstrap in [false, true] {
+        let mut stage = stage();
+        stage.in_pane(Pane::Bare);
+        if bootstrap {
+            stage.install_bootstrap();
+        }
+        let program = recorder(&stage).display().to_string();
+        let out = stage.env.dir.join("here");
+        let args = here_args(&[
+            "split",
+            "--keep-open",
+            "--",
+            &program,
+            &out.display().to_string(),
+        ]);
+        let said = stage.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(said.status, 0, "bootstrap {bootstrap}: {}", said.err);
+        assert_eq!(said.out, "p1\n");
+        assert_eq!(
+            said.err, "",
+            "the caller says what there is to say, not the relay"
+        );
+        assert!(stage.told.is_empty());
+        assert_eq!(recorded(&out).args, Vec::<String>::new());
+        assert!(stage.bootstrap_saw().is_none(), "bootstrap {bootstrap}");
+        assert_eq!(stage.running(), ["p1"]);
+
+        // A shell bateri has an integration for, named alone, is the program like any other.
+        let shells = stage.env.dir.join("shells");
+        std::fs::create_dir_all(&shells).unwrap();
+        let marker = stage.env.dir.join("zsh.ran");
+        let shell = stage.env.script(
+            "shells/zsh",
+            &format!("#!/bin/sh\n: > '{}'\nexec cat\n", marker.display()),
+        );
+        let args = here_args(&["split", "--", &shell.display().to_string()]);
+        let said = stage.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(said.status, 0, "bootstrap {bootstrap}: {}", said.err);
+        assert_eq!(said.out, "p2\n");
+        let start = Instant::now();
+        while !marker.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "the shell did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stage.bootstrap_saw().is_none(), "bootstrap {bootstrap}");
+        assert_eq!(stage.running(), ["p1", "p2"]);
+    }
+}
+
+#[test]
+fn words_the_app_of_this_machine_relayed_with_no_program_start_nothing_and_say_what_to_do() {
+    for bootstrap in [false, true] {
+        let mut stage = stage();
+        stage.in_pane(Pane::Bare);
+        if bootstrap {
+            stage.install_bootstrap();
+        }
+        for words in [&["split"][..], &["split", "--keep-open"], &["tab"]] {
+            let args = here_args(words);
+            let said = stage.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            let which = format!("{words:?}, bootstrap {bootstrap}");
+            assert_eq!(said.status, 1, "{which}: {}", said.err);
+            assert_eq!(said.out, "", "{which}");
+            assert!(
+                said.err.contains("needs a program") && said.err.contains("after --"),
+                "{which}: {}",
+                said.err
+            );
+            assert!(
+                !said.err.contains("bateri terminal"),
+                "{which}: {}",
+                said.err
+            );
+            assert!(!said.err.contains("Mac"), "{which}: {}", said.err);
+        }
+        assert!(stage.running().is_empty(), "nothing was started");
+        assert!(!stage.state().join("terminals/p1").exists());
+        assert_eq!(stage.note("p1"), None);
+        assert!(stage.bootstrap_saw().is_none());
+        assert!(stage.told.is_empty());
+    }
+}
+
 #[test]
 fn a_mistake_in_the_command_is_64_before_anything_is_started() {
     let mut stage = stage();

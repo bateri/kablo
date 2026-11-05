@@ -22,7 +22,7 @@ use kablo_proto::v1::NewSession;
 
 use super::state::State;
 use super::words::{check_label, clean, is_name, is_terminal};
-use super::{Asked, Ctx, Done, Exit, Io, failure, finish, json_name, machine};
+use super::{Asked, Ctx, Done, Exit, Io, Words, failure, finish, json_name, machine};
 use crate::launch::{self, Failure};
 use crate::{drive, sockdir};
 
@@ -44,7 +44,8 @@ const NOT_PASSED_ON: [&str; 3] = [PANE_CARRIED, PANE_HERE, "TERM_SESSION_ID"];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Asker {
     /// A pane of the app on this machine: the app makes the pane of a terminal with no program,
-    /// or nobody does.
+    /// or nobody does. The words the app of this machine wrote for a program on a server
+    /// (`--hex-here`) are its too, with no pane to go beside.
     LocalApp,
     /// A pane of the app on another machine, which reached this one as its server: the terminal
     /// is this machine's to start, with the bootstrap its files hold, and the pane waits for
@@ -55,14 +56,13 @@ enum Asker {
 }
 
 impl Asker {
-    /// The asker of this command: another machine's app when its words came from there
-    /// (`--hex`), whatever its environment says; otherwise what the environment of this process
-    /// says.
+    /// The asker of this command: the app that wrote its words (`--hex`, `--hex-here`), whatever
+    /// its environment says; otherwise what the environment of this process says.
     fn of_ctx(ctx: &Ctx) -> Asker {
-        if ctx.afar {
-            Asker::RemoteApp
-        } else {
-            Asker::of(|name| std::env::var_os(name))
+        match ctx.words() {
+            Words::OfAppAfar => Asker::RemoteApp,
+            Words::OfAppHere => Asker::LocalApp,
+            Words::Own => Asker::of(|name| std::env::var_os(name)),
         }
     }
 
@@ -537,6 +537,13 @@ impl Job<'_> {
                         "--wait needs a program here: name one after --",
                     ));
                 }
+                // Words the app of this machine wrote for a program on a server have no pane of
+                // this machine to go beside: what is to run is for that program to name.
+                if self.ctx.words() == Words::OfAppHere {
+                    return Err(Exit::failed(
+                        "a terminal on this computer needs a program: name the one to run after --",
+                    ));
+                }
                 return Err(Exit::failed(
                     "a pane with no program goes beside a pane: run this in a bateri terminal, or name one",
                 ));
@@ -905,9 +912,9 @@ impl Job<'_> {
         match landing.landed {
             Landed::Waiting => {
                 if self.anchor.is_none() {
-                    // A command another machine's app relayed (`--hex`) does not say it: the caller
+                    // A command an app relayed (`--hex`, `--hex-here`) does not say it: the caller
                     // says it once, for the address it gives.
-                    if !self.ctx.afar {
+                    if self.ctx.words() == Words::Own {
                         io.say(&format!(
                             "{id} waits in the bateri app's list of terminals running in the background: this ran in no terminal, so it has no pane to go beside"
                         ));

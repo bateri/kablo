@@ -83,9 +83,21 @@ pub struct Ctx {
     home: PathBuf,
     /// The state this keeps: `~/.local/share/bateri` ([`kablo_bateri::paths`]).
     pub state: PathBuf,
-    /// The command's words came from the app of another machine (`--hex`): what it asks, that
-    /// app is asked.
-    afar: bool,
+    /// Whose words the command runs.
+    words: Words,
+}
+
+/// Whose words a command runs: what it asks of an app decides which app is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Words {
+    /// The caller's own: the app its terminal belongs to is asked.
+    Own,
+    /// Written by the app of another machine (`--hex`): this machine is that app's server, and
+    /// that app is asked.
+    OfAppAfar,
+    /// Written by the app of this machine for a program that runs on a server (`--hex-here`):
+    /// this machine is the app's own, not its server, and the app is asked.
+    OfAppHere,
 }
 
 /// What the bateri app made of a request.
@@ -125,8 +137,13 @@ impl Ctx {
         Ok(Ctx {
             state: home.join(kablo_bateri::paths::DIR),
             home,
-            afar: false,
+            words: Words::Own,
         })
+    }
+
+    /// Whose words the command runs.
+    pub fn words(&self) -> Words {
+        self.words
     }
 
     /// `$HOME`.
@@ -254,11 +271,17 @@ fn dispatch(args: &[OsString], io: &mut Io<'_>) -> Done {
             None => Err(Exit::status(1)),
         };
     }
-    // The words as another machine's app wrote them: `x` and the hex of their bytes, so that no
-    // shell on the way reads what the caller wrote. What such a command asks of an app, the app of
-    // that machine is asked ([`open::Asker::RemoteApp`]).
-    if args.first().is_some_and(|arg| arg == "--hex") {
-        let ctx = Ctx { afar: true, ..ctx };
+    // The words as an app wrote them: `x` and the hex of their bytes, so that no shell on the way
+    // reads what the caller wrote. `--hex` is the app of another machine, which this one is the
+    // server of ([`open::Asker::RemoteApp`]); `--hex-here` is the app of this machine, for a
+    // program on a server ([`open::Asker::LocalApp`]).
+    let hexed_by = match args.first().and_then(|arg| arg.to_str()) {
+        Some("--hex") => Some(Words::OfAppAfar),
+        Some("--hex-here") => Some(Words::OfAppHere),
+        _ => None,
+    };
+    if let Some(words) = hexed_by {
+        let ctx = Ctx { words, ..ctx };
         let hexed: Vec<String> = args
             .iter()
             .skip(1)

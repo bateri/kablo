@@ -60,7 +60,9 @@ section is not released.
   keeps (kablo starts no `ssh` for it), or `here` when it is this one.
   `kablo bateri --hex` takes the words of a command written in hex, as the app of another machine
   writes them; a command that came that way asks that app, whatever its pane's environment says,
-  and says nothing of a pane it has no anchor for.
+  and says nothing of a pane it has no anchor for. `--hex-here` is the same for the app of this
+  machine relaying a command of a program on a server (`-S @local`): the program it names is
+  started as it is, and a terminal with no program is an error that says to name one.
 - **`kablo-proto` gains `tune` and `v1::Packet::error`.** `tune` is the rule for how large a
   stream's window is (`Rtt`, `Tuner`, `START`, `LEAST`, `GAIN`, `RATES`), which both ends of a
   stream apply: it was inside `kablo`, and a client that opens streams of its own takes it from
