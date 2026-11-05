@@ -1,5 +1,5 @@
 //! `kablo bateri split`, `tab` and `window` on this machine, run for real: the real `kablo` starts
-//! real terminals and asks a test in the place of the Mac where their panes go (`stage`). What it
+//! real terminals and asks a test in the place of the bateri app where their panes go (`stage`). What it
 //! asks is read back with the window's own reader (`kablo-bateri`).
 
 // Test support: a failure here is a failed test.
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kablo_bateri::message::{Home, Place, Request, WindowHome};
+use kablo_bateri::message::{Home, Place, Request, WindowHome, hex_word};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
 use stage::{Pane, Run, Stage, parse_told};
 
@@ -96,9 +96,9 @@ fn stage() -> Stage {
 }
 
 #[test]
-fn a_split_starts_the_terminal_and_tells_the_mac_where_the_pane_goes() {
+fn a_split_starts_the_terminal_and_tells_the_app_where_the_pane_goes() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage);
     let out = stage.env.dir.join("one");
     let program = program.display().to_string();
@@ -113,7 +113,7 @@ fn a_split_starts_the_terminal_and_tells_the_mac_where_the_pane_goes() {
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "p1\n");
     assert_eq!(said.err, "", "a pane that landed as asked is silent");
-    // The message is the one the Mac reads, and the one it writes.
+    // The message is the one the bateri app reads, and the one it writes.
     let wanted = Place {
         side: Some(Side::Below),
         ratio: Some(30),
@@ -132,7 +132,7 @@ fn a_split_starts_the_terminal_and_tells_the_mac_where_the_pane_goes() {
         stage.record("p1").as_deref(),
         Some("opener p40\nkeep-open no\n")
     );
-    // Nothing waits: the Mac took it.
+    // Nothing waits: the bateri app took it.
     assert_eq!(stage.note("p1"), None);
     // The record is for its owner alone.
     let mode = std::os::unix::fs::PermissionsExt::mode(
@@ -146,7 +146,7 @@ fn a_split_starts_the_terminal_and_tells_the_mac_where_the_pane_goes() {
 #[test]
 fn a_caller_with_the_command_on_its_path_hands_that_path_on_as_it_is() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage).display().to_string();
     let bin = stage.state().join("shell/bin").display().to_string();
     // The command is on `PATH` already: it is not put there twice.
@@ -175,13 +175,13 @@ fn a_caller_with_the_command_on_its_path_hands_that_path_on_as_it_is() {
 }
 
 #[test]
-fn a_split_with_no_program_asks_for_a_pane_of_the_macs_own_and_starts_nothing() {
+fn a_split_with_no_program_asks_for_a_pane_of_the_apps_own_and_starts_nothing() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let said = stage.run_in("p40", &["split", "--right", "--cwd", "~"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "p1\n");
-    // No terminal was started: the Mac opens the pane under the number.
+    // No terminal was started: the bateri app opens the pane under the number.
     assert!(stage.running().iter().all(|id| id == "p40"));
     let wanted = Place {
         side: Some(Side::Right),
@@ -201,8 +201,8 @@ fn a_split_with_no_program_asks_for_a_pane_of_the_macs_own_and_starts_nothing() 
     assert!(said.err.contains("beside a pane"), "{}", said.err);
     assert_eq!(stage.told.len(), 1);
 
-    // The Mac refuses: the number is spent, and nothing is left behind.
-    stage.mac_says("bateri 2\nerror failed no room\n");
+    // The bateri app refuses: the number is spent, and nothing is left behind.
+    stage.app_says("bateri 2\nerror failed no room\n");
     let said = stage.run_in("p40", &["tab"]);
     assert_eq!(said.status, 1, "{}", said.err);
     assert!(!stage.state().join("terminals/p2").exists());
@@ -211,7 +211,7 @@ fn a_split_with_no_program_asks_for_a_pane_of_the_macs_own_and_starts_nothing() 
 #[test]
 fn a_program_kept_open_is_followed_by_the_login_shell_in_its_terminal() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     // The login shell that follows the program says it was started, with the words of one.
     let shell = stage.env.script(
         "login.sh",
@@ -249,8 +249,8 @@ fn a_program_kept_open_is_followed_by_the_login_shell_in_its_terminal() {
 }
 
 #[test]
-fn without_a_mac_the_message_waits_on_the_machine_and_the_command_still_answers() {
-    // A server: its bootstrap starts what has no program, and the message waits for a Mac.
+fn without_an_app_the_message_waits_on_the_machine_and_the_command_still_answers() {
+    // A server: its bootstrap starts what has no program, and the message waits for the bateri app.
     let mut stage = stage();
     stage.in_pane(Pane::Carried);
     stage.install_bootstrap();
@@ -288,7 +288,7 @@ fn without_a_mac_the_message_waits_on_the_machine_and_the_command_still_answers(
         assert_eq!(said.out, format!("{id}\n"));
         assert_eq!(
             said.err,
-            format!("bateri: {id} will take its place when a Mac connects\n")
+            format!("bateri: {id} will take its place when the bateri app connects\n")
         );
         // The note is the message, whole — the anchor included, since nobody names its sender when
         // it is read — and is read as one.
@@ -310,12 +310,12 @@ fn without_a_mac_the_message_waits_on_the_machine_and_the_command_still_answers(
 }
 
 #[test]
-fn a_mac_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
+fn an_app_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
     let mut stage = stage();
     stage.in_pane(Pane::Carried);
     stage.install_bootstrap();
     // Version 1 of the text, which nothing here reads.
-    stage.mac_says("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n");
+    stage.app_says("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n");
     let said = stage.run_in("p40", &["split", "--json"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(
@@ -331,7 +331,7 @@ fn a_mac_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
     assert!(stage.note("p1").is_some());
     // A reply that is read whole or not at all: one with a name of another kind in it is not read,
     // and nothing of it is taken.
-    stage.mac_says(
+    stage.app_says(
         "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\ntab g1\n",
     );
     let said = stage.run_in("p40", &["split", "--json"]);
@@ -373,7 +373,7 @@ fn an_app_that_does_not_say_leaves_the_start_to_the_pane_that_asked_with_a_boots
                     stage.install_bootstrap();
                 }
                 if let Some(reply) = reply {
-                    stage.mac_says(reply);
+                    stage.app_says(reply);
                 }
                 let said = stage.run_in("p40", &["split"]);
                 let which = format!("{pane:?}, bootstrap {bootstrap}, reply {reply:?}");
@@ -395,8 +395,10 @@ fn an_app_that_does_not_say_leaves_the_start_to_the_pane_that_asked_with_a_boots
                 }
                 assert_eq!(said.status, 69, "{which}: {}", said.err);
                 let wanted = match (pane, reply) {
-                    (Pane::Local, None) => "no Mac is connected",
-                    (Pane::Local, Some(_)) => "it is the Mac that makes a pane with no program",
+                    (Pane::Local, None) => "the bateri app is not connected",
+                    (Pane::Local, Some(_)) => {
+                        "it is the bateri app that makes a pane with no program"
+                    }
                     _ => "nothing says which bateri app this terminal belongs to",
                 };
                 assert!(said.err.contains(wanted), "{which}: {}", said.err);
@@ -433,7 +435,7 @@ fn a_start_the_app_says_is_obeyed_in_any_pane() {
         stage.in_pane(pane);
         stage.install_bootstrap();
         stage.set_var("LC_TERMINAL_VERSION", VERSION);
-        stage.connect_mac();
+        stage.connect_app();
         let bin = shells(&stage);
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         stage.set_var("PATH", &path);
@@ -459,8 +461,8 @@ fn a_pane_that_landed_says_its_tab_group_and_window() {
         let out = stage.env.dir.join(format!("st{n}")).display().to_string();
         stage.run_in("p40", &["split", "--json", "--", &program, &out])
     };
-    // The Mac says where the pane stands, and the object has the four names always.
-    stage.mac_says(
+    // The bateri app says where the pane stands, and the object has the four names always.
+    stage.app_says(
         "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\ntab t3\ngroup g1\nwindow w1\n",
     );
     let said = run(&mut stage, 1);
@@ -470,7 +472,7 @@ fn a_pane_that_landed_says_its_tab_group_and_window() {
         "{\"pane\":\"p1\",\"tab\":\"t3\",\"group\":\"g1\",\"window\":\"w1\",\"landed\":\"as_asked\",\"next_to\":\"p40\",\"squeezed\":false,\"hidden\":false}\n"
     );
     // A tab in no group: `null` for the group, the other two as given.
-    stage.mac_says(
+    stage.app_says(
         "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\ntab t8\nwindow w2\n",
     );
     let said = run(&mut stage, 2);
@@ -496,7 +498,7 @@ fn a_pane_that_did_not_land_as_asked_is_told_on_one_line() {
         words.extend(["--", &program, &out]);
         stage.run_in("p40", &words)
     };
-    stage.mac_says("bateri 2\nok placed\nlanded new_tab\nnext-to p40\nsqueezed yes\nhidden no\n");
+    stage.app_says("bateri 2\nok placed\nlanded new_tab\nnext-to p40\nsqueezed yes\nhidden no\n");
     let said = run(&mut stage, &["split", "--json", "--below"]);
     assert_eq!(said.status, 0);
     assert_eq!(
@@ -507,8 +509,8 @@ fn a_pane_that_did_not_land_as_asked_is_told_on_one_line() {
         said.err,
         "bateri: p1 is in a tab of its own: there was no room beside p40\n"
     );
-    // The Mac has it, waiting for the anchor to be on screen: that is not "when a Mac connects".
-    stage.mac_says("bateri 2\nok placed\nlanded waiting\nnext-to p40\nsqueezed no\nhidden no\n");
+    // The bateri app has it, waiting for the anchor to be on screen: that is not "when the bateri app connects".
+    stage.app_says("bateri 2\nok placed\nlanded waiting\nnext-to p40\nsqueezed no\nhidden no\n");
     let said = run(&mut stage, &["split", "--json"]);
     assert_eq!(said.status, 0);
     assert_eq!(
@@ -517,28 +519,28 @@ fn a_pane_that_did_not_land_as_asked_is_told_on_one_line() {
     );
     assert_eq!(
         said.err,
-        "bateri: p2 waits in the Mac's list of terminals running in the background, until p40 is on screen\n"
+        "bateri: p2 waits in the bateri app's list of terminals running in the background, until p40 is on screen\n"
     );
     assert_eq!(
         stage.note("p2"),
         None,
-        "the Mac has it; nothing waits on the machine"
+        "the bateri app has it; nothing waits on the machine"
     );
-    // The Mac could not make the pane just now and kept nothing to place it by: it does not say
+    // The bateri app could not make the pane just now and kept nothing to place it by: it does not say
     // the pane will come when the anchor is on screen.
-    stage.mac_says("bateri 2\nok placed\nlanded waiting\nsqueezed no\nhidden no\n");
+    stage.app_says("bateri 2\nok placed\nlanded waiting\nsqueezed no\nhidden no\n");
     let said = run(&mut stage, &["split"]);
     assert_eq!(said.out, "p3\n");
     assert_eq!(
         said.err,
-        "bateri: p3 waits in the Mac's list of terminals running in the background: the Mac could not make its pane now\n"
+        "bateri: p3 waits in the bateri app's list of terminals running in the background: the bateri app could not make its pane now\n"
     );
-    stage.mac_says("bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden yes\n");
+    stage.app_says("bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden yes\n");
     let said = run(&mut stage, &["split"]);
     assert_eq!(said.out, "p4\n");
     assert_eq!(said.err, "bateri: p4 is behind a pane that fills its tab\n");
     // A pane that did not take the keyboard says so on one line.
-    stage.mac_says(
+    stage.app_says(
         "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\nkeyboard stayed\n",
     );
     let said = run(&mut stage, &["split"]);
@@ -550,7 +552,7 @@ fn a_pane_that_did_not_land_as_asked_is_told_on_one_line() {
     );
 }
 
-/// A terminal the Mac opened before the numbers existed, and one a person made with kablo.
+/// A terminal the bateri app opened before the numbers existed, and one a person made with kablo.
 const MADE: &str = "b-0123456789abcdef0123456789abcdef";
 
 #[test]
@@ -561,14 +563,14 @@ fn the_callers_own_terminal_is_the_anchor_whatever_it_is_called() {
     for here in [MADE, "mine", "build.2", "t9"] {
         n += 1;
         stage.forget_told();
-        stage.mac_says(&format!(
+        stage.app_says(&format!(
             "bateri 2\nok placed\nlanded as_asked\nnext-to {here}\nsqueezed no\nhidden no\n"
         ));
         let out = stage.env.dir.join(format!("an{n}")).display().to_string();
         let said = stage.run_in(here, &["split", "--below", "--json", "--", &program, &out]);
         assert_eq!(said.status, 0, "{here}: {}", said.err);
         let id = said.out.split('"').nth(3).unwrap().to_owned();
-        // The Mac is told the anchor by the name kablo gave the terminal, in a message it reads,
+        // The bateri app is told the anchor by the name kablo gave the terminal, in a message it reads,
         // and says the same name back.
         let wanted = Place {
             terminal: Terminal::parse(&id).expect("a number"),
@@ -591,7 +593,7 @@ fn the_callers_own_terminal_is_the_anchor_whatever_it_is_called() {
         );
     }
     // A `tab` from such a terminal has the same anchor; one named is still only a number.
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let out = stage.env.dir.join("anx").display().to_string();
     let said = stage.run_in(MADE, &["tab", "--", &program, &out]);
     assert_eq!(said.status, 0, "{}", said.err);
@@ -604,18 +606,18 @@ fn the_callers_own_terminal_is_the_anchor_whatever_it_is_called() {
 fn a_pane_that_waits_for_the_terminal_that_asked_says_so_without_its_long_name() {
     let mut stage = stage();
     let program = recorder(&stage).display().to_string();
-    // The Mac has it, waiting for the anchor to be on screen.
-    stage.mac_says(&format!(
+    // The bateri app has it, waiting for the anchor to be on screen.
+    stage.app_says(&format!(
         "bateri 2\nok placed\nlanded waiting\nnext-to {MADE}\nsqueezed no\nhidden no\n"
     ));
     let out = stage.env.dir.join("w1").display().to_string();
     let said = stage.run_in(MADE, &["split", "--", &program, &out]);
     assert_eq!(
         said.err,
-        "bateri: p1 waits in the Mac's list of terminals running in the background, until this terminal is on screen\n"
+        "bateri: p1 waits in the bateri app's list of terminals running in the background, until this terminal is on screen\n"
     );
-    // No Mac: the note is the message, anchor and all, and is read as one.
-    stage.no_mac();
+    // No bateri app: the note is the message, anchor and all, and is read as one.
+    stage.no_app();
     let out = stage.env.dir.join("w2").display().to_string();
     let said = stage.run_in(
         MADE,
@@ -623,7 +625,7 @@ fn a_pane_that_waits_for_the_terminal_that_asked_says_so_without_its_long_name()
     );
     assert_eq!(
         said.err,
-        "bateri: p2 will take its place when a Mac connects\n"
+        "bateri: p2 will take its place when the bateri app connects\n"
     );
     let wanted = Place {
         terminal: Terminal(2),
@@ -636,14 +638,14 @@ fn a_pane_that_waits_for_the_terminal_that_asked_says_so_without_its_long_name()
     assert_eq!(note, encoded(wanted.clone()));
     assert_eq!(parse_told(&note), Request::Place(wanted));
     // A terminal that has a number is called by it.
-    stage.mac_says("bateri 2\nok placed\nlanded new_tab\nnext-to p40\nsqueezed no\nhidden no\n");
+    stage.app_says("bateri 2\nok placed\nlanded new_tab\nnext-to p40\nsqueezed no\nhidden no\n");
     let out = stage.env.dir.join("w3").display().to_string();
     let said = stage.run_in("p40", &["tab", "--", &program, &out]);
     assert_eq!(
         said.err,
         "bateri: p3 is in a tab of its own: there was no room beside p40\n"
     );
-    stage.mac_says(&format!(
+    stage.app_says(&format!(
         "bateri 2\nok placed\nlanded new_tab\nnext-to {MADE}\nsqueezed no\nhidden no\n"
     ));
     let out = stage.env.dir.join("w4").display().to_string();
@@ -657,7 +659,7 @@ fn a_pane_that_waits_for_the_terminal_that_asked_says_so_without_its_long_name()
 #[test]
 fn run_in_no_terminal_a_pane_with_no_anchor_leaves_the_terminal_in_the_list() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage).display().to_string();
     for (n, mode) in [(1, "split"), (2, "tab")] {
         let out = stage.env.dir.join(format!("cr{n}")).display().to_string();
@@ -667,7 +669,7 @@ fn run_in_no_terminal_a_pane_with_no_anchor_leaves_the_terminal_in_the_list() {
         assert_eq!(
             said.err,
             format!(
-                "bateri: p{n} waits in the Mac's list of terminals running in the background: this ran in no terminal, so it has no pane to go beside\n"
+                "bateri: p{n} waits in the bateri app's list of terminals running in the background: this ran in no terminal, so it has no pane to go beside\n"
             )
         );
         // The terminal runs, nobody is asked where to put a pane and no note waits.
@@ -705,10 +707,10 @@ fn run_in_no_terminal_a_pane_with_no_anchor_leaves_the_terminal_in_the_list() {
 }
 
 #[test]
-fn a_request_the_mac_refuses_leaves_no_terminal_running() {
+fn a_request_the_app_refuses_leaves_no_terminal_running() {
     let mut stage = stage();
     let program = recorder(&stage).display().to_string();
-    stage.mac_says("bateri 2\nerror refused the user said no\n");
+    stage.app_says("bateri 2\nerror refused the user said no\n");
     let out = stage.env.dir.join("rf1").display().to_string();
     let said = stage.run_in("p40", &["split", "--", &program, &out]);
     assert_eq!(said.status, 77);
@@ -721,7 +723,7 @@ fn a_request_the_mac_refuses_leaves_no_terminal_running() {
         .into_iter()
         .enumerate()
     {
-        stage.mac_says(&format!("bateri 2\nerror {kind} it went wrong\n"));
+        stage.app_says(&format!("bateri 2\nerror {kind} it went wrong\n"));
         let out = stage
             .env
             .dir
@@ -736,7 +738,7 @@ fn a_request_the_mac_refuses_leaves_no_terminal_running() {
 #[test]
 fn the_terminal_it_starts_has_the_callers_umask_and_none_of_the_callers_tab() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     stage.set_umask("027");
     let program = recorder(&stage).display().to_string();
     let out = stage.env.dir.join("um");
@@ -749,7 +751,6 @@ fn the_terminal_it_starts_has_the_callers_umask_and_none_of_the_callers_tab() {
             ("LC_BATERI_TAB_URL", "tab://1"),
             ("BATERI_TAB_URL", "tab://1"),
             ("TERM_SESSION_ID", "w0t0p0"),
-            ("BATERI_QUIET_ORPHAN", "1"),
             ("BATERI_DOCK", "off"),
         ],
     });
@@ -759,12 +760,7 @@ fn the_terminal_it_starts_has_the_callers_umask_and_none_of_the_callers_tab() {
     // the state is written with.
     assert_eq!(seen.umask.trim_start_matches('0'), "27");
     // And not the tab the caller stands in: that tab's pane is not this terminal's.
-    for name in [
-        "LC_BATERI_TAB_URL",
-        "BATERI_TAB_URL",
-        "TERM_SESSION_ID",
-        "BATERI_QUIET_ORPHAN",
-    ] {
+    for name in ["LC_BATERI_TAB_URL", "BATERI_TAB_URL", "TERM_SESSION_ID"] {
         assert!(!seen.env.contains_key(name), "{name}");
     }
     // The dock's tier travels, where the shell it runs in has it.
@@ -779,9 +775,56 @@ fn the_terminal_it_starts_has_the_callers_umask_and_none_of_the_callers_tab() {
 }
 
 #[test]
+fn words_another_machines_app_relayed_say_nothing_of_a_pane_they_have_no_anchor_for() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let program = recorder(&stage).display().to_string();
+    let out = stage.env.dir.join("hx1").display().to_string();
+    let hexed = |words: &[&str]| -> Vec<String> { words.iter().map(|w| hex_word(w)).collect() };
+    let words = hexed(&["split", "--keep-open", "--", &program, &out]);
+    let mut args = vec!["--hex"];
+    args.extend(words.iter().map(String::as_str));
+    let said = stage.run(&args);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p1\n");
+    // The relaying app is the one that tells where the pane goes: no note from here.
+    assert_eq!(said.err, "");
+    assert!(stage.told.is_empty());
+    // The same words, as the caller's own command, say it.
+    let out = stage.env.dir.join("hx2").display().to_string();
+    let said = stage.run(&["split", "--keep-open", "--", &program, &out]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(
+        said.err.contains("waits in the bateri app's list"),
+        "{}",
+        said.err
+    );
+}
+
+#[test]
+fn words_another_machines_app_relayed_start_a_terminal_with_no_program_where_the_environment_would_refuse()
+ {
+    // A pane of the app on this machine, whose app is not there, would be refused (69); words
+    // that came from another machine's app are that app's, which this machine is the server of.
+    let mut stage = stage();
+    stage.install_bootstrap();
+    stage.set_var("LC_TERMINAL_VERSION", VERSION);
+    let refused = stage.run_in("p40", &["split", "--keep-open"]);
+    assert_eq!(refused.status, 69, "{}", refused.err);
+    let words = ["split", "--keep-open"].map(hex_word);
+    let mut args = vec!["--hex"];
+    args.extend(words.iter().map(String::as_str));
+    let said = stage.run_in("p40", &args);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p2\n", "the refused one had its number");
+    let (seen, _) = stage.bootstrap_saw().expect("the bootstrap ran");
+    assert_eq!(seen, format!("||{VERSION}|-|"));
+}
+
+#[test]
 fn a_mistake_in_the_command_is_64_before_anything_is_started() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage).display().to_string();
     let tries: [&[&str]; 14] = [
         &["split", "--ratio", "0"],
@@ -817,7 +860,7 @@ fn a_mistake_in_the_command_is_64_before_anything_is_started() {
     assert_eq!(stage.record("p1").unwrap(), "opener -\nkeep-open no\n");
     assert!(
         stage.told.is_empty(),
-        "no pane to place, so the Mac is told nothing"
+        "no pane to place, so the bateri app is told nothing"
     );
 }
 
@@ -851,7 +894,7 @@ fn a_number_is_never_given_twice_and_one_a_hand_made_terminal_holds_is_skipped()
 fn a_pane_or_a_tab_opens_where_it_is_told_and_what_contradicts_is_64() {
     let id = |kind: IdKind, number: u64| Id::new(kind, number);
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage).display().to_string();
     let tries: Vec<(Vec<&str>, Option<Side>, Home)> = vec![
         (
@@ -1003,9 +1046,9 @@ fn a_pane_or_a_tab_opens_where_it_is_told_and_what_contradicts_is_64() {
 }
 
 #[test]
-fn a_label_is_kablos_for_a_pane_and_the_macs_for_a_tab() {
+fn a_label_is_kablos_for_a_pane_and_the_apps_for_a_tab() {
     let mut stage = stage();
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     let program = recorder(&stage).display().to_string();
     // A pane's label rides on the terminal and is not in the message.
     let out = stage.env.dir.join("lb1").display().to_string();
@@ -1035,10 +1078,10 @@ fn a_label_is_kablos_for_a_pane_and_the_macs_for_a_tab() {
 }
 
 #[test]
-fn a_window_waits_for_a_mac_as_a_tab_does_and_a_place_the_mac_refuses_ends_the_terminal() {
+fn a_window_waits_for_an_app_as_a_tab_does_and_a_place_the_app_refuses_ends_the_terminal() {
     let mut stage = stage();
     let program = recorder(&stage).display().to_string();
-    // No Mac: the number is given, the message waits with its fields, and the command says so on
+    // No bateri app: the number is given, the message waits with its fields, and the command says so on
     // one line.
     let out = stage.env.dir.join("wi1").display().to_string();
     let said = stage.run_in("p40", &["window", "--json", "--", &program, &out]);
@@ -1047,7 +1090,7 @@ fn a_window_waits_for_a_mac_as_a_tab_does_and_a_place_the_mac_refuses_ends_the_t
     assert!(said.out.contains("\"window\":null"), "{}", said.out);
     assert_eq!(
         said.err,
-        "bateri: p1 will take its place when a Mac connects\n"
+        "bateri: p1 will take its place when the bateri app connects\n"
     );
     let note = stage.note("p1").expect("a note");
     let Request::Place(waiting) = parse_told(&note) else {
@@ -1061,9 +1104,9 @@ fn a_window_waits_for_a_mac_as_a_tab_does_and_a_place_the_mac_refuses_ends_the_t
             ..Home::default()
         }
     );
-    // The Mac that does not have the place the pane asked for refuses it: the terminal the command
-    // started ends and no note is left, with the code the Mac's kind says.
-    stage.mac_says("bateri 2\nerror unknown there is no tab t9\n");
+    // The bateri app that does not have the place the pane asked for refuses it: the terminal the command
+    // started ends and no note is left, with the code the bateri app's kind says.
+    stage.app_says("bateri 2\nerror unknown there is no tab t9\n");
     let out = stage.env.dir.join("wi2").display().to_string();
     let said = stage.run_in("p40", &["split", "--tab", "t9", "--", &program, &out]);
     assert_eq!(
@@ -1071,7 +1114,7 @@ fn a_window_waits_for_a_mac_as_a_tab_does_and_a_place_the_mac_refuses_ends_the_t
         (1, "bateri: there is no tab t9\n")
     );
     assert_eq!(stage.note("p2"), None);
-    stage.mac_says("bateri 2\nerror refused this holds a pane of another machine\n");
+    stage.app_says("bateri 2\nerror refused this holds a pane of another machine\n");
     let out = stage.env.dir.join("wi3").display().to_string();
     let said = stage.run_in("p40", &["tab", "--group", "g1", "--", &program, &out]);
     assert_eq!(said.status, 77, "{}", said.err);
@@ -1091,7 +1134,7 @@ fn a_split_with_no_pane_to_go_beside_prints_the_number_and_waits_with_the_progra
     assert_eq!(said.out, "p1\n");
 }
 
-// ─── who starts it: the Mac says ─────────────────────────────────────────
+// ─── who starts it: the bateri app says ─────────────────────────────────────────
 
 const START: &str = "bateri 2\nok start\n";
 
@@ -1124,10 +1167,10 @@ fn a_shell_bateri_has_an_integration_for_named_alone_is_a_shell_and_any_other_a_
     let bin = shells(&stage);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     stage.set_var("PATH", &path);
-    stage.mac_says(PLACED);
+    stage.app_says(PLACED);
     // The terminal the runs are made in exists before anything is counted.
     assert_eq!(stage.run_in("p40", &["help"]).status, 0);
-    // The Mac makes the pane, with that shell: nothing is started here.
+    // The bateri app makes the pane, with that shell: nothing is started here.
     for (args, program) in [
         (&["split", "--", "zsh"][..], "zsh"),
         (&["tab", "--", "fish"], "fish"),
@@ -1137,7 +1180,7 @@ fn a_shell_bateri_has_an_integration_for_named_alone_is_a_shell_and_any_other_a_
         let before = listed(&stage);
         let said = stage.run_in("p40", args);
         assert_eq!(said.status, 0, "{args:?}: {}", said.err);
-        assert_eq!(listed(&stage), before, "{args:?}: the Mac makes it");
+        assert_eq!(listed(&stage), before, "{args:?}: the bateri app makes it");
         let wanted = format!("shell {}\n", bin.join(program).display());
         assert!(
             stage.told[0].contains("fresh "),
@@ -1180,20 +1223,20 @@ fn a_shell_bateri_has_an_integration_for_named_alone_is_a_shell_and_any_other_a_
             stage.told[0]
         );
     }
-    // In no terminal there is no pane for the Mac to make it beside: a program.
+    // In no terminal there is no pane for the bateri app to make it beside: a program.
     let before = listed(&stage).len();
     assert_eq!(stage.run(&["split", "--", "zsh"]).status, 0);
     assert_eq!(listed(&stage).len(), before + 1);
 
     // A bootstrap left in this home (someone ran `ssh` to it once) does not make it a server: the
-    // Mac says what it is, and it makes the pane.
+    // bateri app says what it is, and it makes the pane.
     stage.install_bootstrap();
     for (args, shell) in [(&["split", "--", "zsh"][..], true), (&["split"], false)] {
         stage.forget_told();
         let before = listed(&stage);
         let said = stage.run_in("p40", args);
         assert_eq!(said.status, 0, "{args:?}: {}", said.err);
-        assert_eq!(listed(&stage), before, "{args:?}: the Mac makes it");
+        assert_eq!(listed(&stage), before, "{args:?}: the bateri app makes it");
         assert!(
             stage.told[0].contains("fresh "),
             "{args:?}: {}",
@@ -1209,7 +1252,7 @@ fn a_server_is_told_to_start_it_and_does_so_with_its_bootstrap_and_asks_again_fo
     stage.in_pane(Pane::Carried);
     stage.install_bootstrap();
     stage.set_var("LC_TERMINAL_VERSION", VERSION);
-    stage.connect_mac();
+    stage.connect_app();
     let bin = shells(&stage);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     stage.set_var("PATH", &path);
@@ -1293,7 +1336,7 @@ fn a_server_is_told_to_start_it_and_does_so_with_its_bootstrap_and_asks_again_fo
     assert_eq!(shell, format!("{}/fish", bin.display()));
 
     // The pane it asks for the second time is refused: the terminal it started ends, with the
-    // Mac's words.
+    // bateri app's words.
     let said = stage.go(&Run {
         here: Some("p40"),
         args: &["split"],
@@ -1323,7 +1366,7 @@ fn with_no_app_the_pane_says_whose_it_is_a_servers_starts_and_the_rest_end_with_
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(
         said.err,
-        "bateri: p1 will take its place when a Mac connects\n"
+        "bateri: p1 will take its place when the bateri app connects\n"
     );
     let note = stage.note("p1").unwrap();
     assert!(
@@ -1349,7 +1392,7 @@ fn with_no_app_the_pane_says_whose_it_is_a_servers_starts_and_the_rest_end_with_
     // none: nobody makes a pane with no program, and the number is spent for nothing that was left
     // behind.
     for (pane, wanted) in [
-        (Pane::Local, "no Mac is connected"),
+        (Pane::Local, "the bateri app is not connected"),
         (
             Pane::Bare,
             "nothing says which bateri app this terminal belongs to",

@@ -1,8 +1,8 @@
 //! Where bateri keeps its files on a machine, under the home directory: one place, the same on a
-//! Mac and on a server, for the one that writes them (bateri, when it sets a server up) and for the
+//! computer and on a server, for the one that writes them (bateri, when it sets a server up) and for the
 //! ones that read them (`kablo bateri`).
 //!
-//! No environment variable moves them. The Mac and a cron job do not have a login shell's
+//! No environment variable moves them. The bateri app and a cron job do not have a login shell's
 //! environment, and a counter that two environments place in two directories would give the same
 //! number twice.
 
@@ -15,7 +15,7 @@ pub const COUNTER: &str = "next";
 /// Who opened which terminal, one file per terminal, in [`DIR`].
 pub const TERMINALS: &str = "terminals";
 
-/// The messages that wait for a Mac to place a pane, one file per terminal, in [`DIR`].
+/// The messages that wait for the bateri app to place a pane, one file per terminal, in [`DIR`].
 pub const PLACING: &str = "placing";
 
 /// What the bootstrap of a terminal writes, in [`DIR`].

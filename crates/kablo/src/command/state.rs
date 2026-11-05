@@ -1,5 +1,5 @@
 //! What the command keeps on this machine, under `~/.local/share/bateri`: the counter that gives
-//! the terminals their numbers, who opened which terminal, and the message that waits for a Mac.
+//! the terminals their numbers, who opened which terminal, and the message that waits for the bateri app.
 //!
 //! The state is under `$HOME` ([`kablo_bateri::paths`]). Everything is written for its owner alone;
 //! the terminal the command starts is another matter and keeps the umask of whoever asked.
@@ -60,7 +60,7 @@ impl State {
         self.dir.join(paths::TERMINALS).join(id)
     }
 
-    /// `~/.local/share/bateri/placing/pN`, where a message waits for a Mac.
+    /// `~/.local/share/bateri/placing/pN`, where a message waits for the bateri app.
     pub fn note_of(&self, id: &str) -> PathBuf {
         self.dir.join(paths::PLACING).join(id)
     }
@@ -108,7 +108,7 @@ impl State {
         let _ = State::write_whole(&self.record_of(id), &text);
     }
 
-    /// Puts the message of `id` in the line for a Mac; whether it could be.
+    /// Puts the message of `id` in the line for the bateri app; whether it could be.
     pub fn note(&self, id: &str, message: &str) -> bool {
         State::write_whole(&self.note_of(id), message).is_ok()
     }

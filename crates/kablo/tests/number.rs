@@ -1,6 +1,6 @@
 //! `kablo bateri --next-number` and `--hex`, the two words that are not a verb: the counter that
-//! gives the terminals their numbers (the Mac's bootstrap and the agents' command both count with
-//! it, and must never give one number twice), and the words a Mac sends a server, written in hex so
+//! gives the terminals their numbers (the bateri app's bootstrap and the agents' command both count with
+//! it, and must never give one number twice), and the words the bateri app sends a server, written in hex so
 //! that no shell on the way can read them.
 
 // Test support: a failure here is a failed test.

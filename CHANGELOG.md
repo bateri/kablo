@@ -56,9 +56,11 @@ section is not released.
   it. `--keep-open` follows the program with the login shell on every machine. `-S SERVER` starts
   the terminal on another machine, and `p9@prod` names one of
   its terminals to `send`, `send-key`, `capture` and `wait`: the app says how that machine is
-  reached (`ssh` words, or `relay` from a program on a server, or `here` when it is this one).
-  `kablo bateri --hex` takes the words of a command written in hex, as the other machine's
-  command line does.
+  reached: `relay`, and the command is handed to the app, which runs it there over the connection it
+  keeps (kablo starts no `ssh` for it), or `here` when it is this one.
+  `kablo bateri --hex` takes the words of a command written in hex, as the app of another machine
+  writes them; a command that came that way asks that app, whatever its pane's environment says,
+  and says nothing of a pane it has no anchor for.
 - **`kablo-proto` gains `tune` and `v1::Packet::error`.** `tune` is the rule for how large a
   stream's window is (`Rtt`, `Tuner`, `START`, `LEAST`, `GAIN`, `RATES`), which both ends of a
   stream apply: it was inside `kablo`, and a client that opens streams of its own takes it from
@@ -78,9 +80,9 @@ section is not released.
   side, a shell). It is not part of kablo's frozen wire: it changes with bateri, and an app takes it
   from the same revision as `kablo-proto`. Version 2 of the text gains two words, both only ever
   sent in answer to a request that could not have been made before: `ok start` (a `place` of a
-  terminal the machine that asks has not started, answered by a Mac that is not that machine's: start
+  terminal the machine that asks has not started, answered by an app that is not that machine's: start
   it and ask again) and `here` as the text of an `ssh` reply (the server named is the machine that
-  asked).
+  asked; any other is `relay`).
 - **A client that falls behind the journal now reads the end of the stream with its own side
   still open.** The server closes only its side, and reads what the client types (`input`,
   `write`) until the client closes; nothing else it sends is acted on or answered. A client that

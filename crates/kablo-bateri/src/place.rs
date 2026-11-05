@@ -43,7 +43,7 @@ pub enum Landed {
     /// In a tab of its own because this tab had no room (a tab asked for is [`Landed::AsAsked`]).
     NewTab,
     /// In no tab yet: the anchor is in none, and the terminal waits in the list of what runs in
-    /// the background until it is. Only the Mac can say so.
+    /// the background until it is. Only the bateri app can say so.
     Waiting,
 }
 

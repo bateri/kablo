@@ -34,12 +34,12 @@ impl fmt::Display for Terminal {
 
 /// The terminal a pane is placed beside: kablo's name for it. An agent *writes* a terminal as its
 /// number (`p4`, [`Terminal`]); the terminal it runs in is the caller's whatever it is called, and
-/// a request that defaults to it names it so — a terminal the Mac opened before the numbers
+/// a request that defaults to it names it so — a terminal the bateri app opened before the numbers
 /// existed is `b-` and 32 digits, one a person made with `kablo new` is what they typed. Reading
 /// takes every name kablo allows ([`kablo_proto::SessionId`]'s alphabet and length, so a name is
 /// never a path), which includes every `pN`.
 ///
-/// A terminal of another machine is written with the machine after an `@` — `p9@prod`, this Mac
+/// A terminal of another machine is written with the machine after an `@` — `p9@prod`, this computer
 /// `p9@local`, as `bateri ls` says them ([`Anchor::address`]). The `@` is no part of kablo's
 /// alphabet, so a name and an address never read as one another.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -65,10 +65,10 @@ pub fn is_machine(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
 }
 
-/// The machine of this Mac in an address.
+/// The machine of this computer in an address.
 pub const LOCAL_MACHINE: &str = "local";
 
-/// This Mac as `-S` and a `server` line name it: the word `@local`, which is no host `ssh` could be
+/// This computer as `-S` and a `server` line name it: the word `@local`, which is no host `ssh` could be
 /// given (a host starts with a letter or a digit), so it cannot be a server of that name.
 pub const LOCAL_SERVER: &str = "@local";
 

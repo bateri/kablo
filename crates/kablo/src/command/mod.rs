@@ -2,12 +2,12 @@
 //! panes, run as a part of kablo and not as a program of its own.
 //!
 //! **Who does what.** The terminal is the machine's: `kablo new` starts it here, it gets a number
-//! (`p9`), and `send`, `send-key`, `capture` and `wait` are kablo's own, with no Mac anywhere. The
-//! Mac only decides where a pane that shows the terminal goes, and every verb that needs its
+//! (`p9`), and `send`, `send-key`, `capture` and `wait` are kablo's own, with no bateri app anywhere. The
+//! bateri app only decides where a pane that shows the terminal goes, and every verb that needs its
 //! windows (`focus`, `zoom`, `swap`, `move`, `resize`, `rename tab`, `close tab`) is asked of it as
 //! one `bateri 2` message on kablo's app channel ([`crate::app::converse`], the text is
 //! `kablo-bateri`'s). The words of every verb, and the exit codes, are the ones the command has
-//! always had: 0, 1, 64 (a mistake in the command), 69 (what needs a Mac, with none connected),
+//! always had: 0, 1, 64 (a mistake in the command), 69 (what needs the bateri app, with none connected),
 //! 77 (refused), 128+n, and for `wait` the program's own, 124 when the time ran out, 255 for
 //! kablo's trouble.
 
@@ -83,22 +83,25 @@ pub struct Ctx {
     home: PathBuf,
     /// The state this keeps: `~/.local/share/bateri` ([`kablo_bateri::paths`]).
     pub state: PathBuf,
+    /// The command's words came from the app of another machine (`--hex`): what it asks, that
+    /// app is asked.
+    afar: bool,
 }
 
-/// What the Mac made of a request.
+/// What the bateri app made of a request.
 #[derive(Debug)]
 pub enum Asked {
     /// It answered, and the reply is one this build reads.
     Reply(Reply),
     /// It answered with something that is no reply.
     Unreadable,
-    /// No Mac is connected (69).
-    NoMac,
+    /// The bateri app is not connected (69).
+    NoApp,
     /// The conversation did not come to an answer.
     Silent,
 }
 
-/// What a conversation's status and reply come to: the Mac's answer, no Mac (69), a conversation
+/// What a conversation's status and reply come to: the bateri app's answer, no bateri app (69), a conversation
 /// that did not come to an answer, or the signal that ended it (128 and its number: the command
 /// ends with it).
 fn asked_of(status: u8, reply: &[u8]) -> Result<Asked, Exit> {
@@ -107,7 +110,7 @@ fn asked_of(status: u8, reply: &[u8]) -> Result<Asked, Exit> {
             Ok(reply) => Asked::Reply(reply),
             Err(_) => Asked::Unreadable,
         }),
-        app::EXIT_NO_APP => Ok(Asked::NoMac),
+        app::EXIT_NO_APP => Ok(Asked::NoApp),
         signal if signal > 128 => Err(Exit::status(signal)),
         _ => Ok(Asked::Silent),
     }
@@ -122,6 +125,7 @@ impl Ctx {
         Ok(Ctx {
             state: home.join(kablo_bateri::paths::DIR),
             home,
+            afar: false,
         })
     }
 
@@ -135,7 +139,7 @@ impl Ctx {
         state::State::new(self.state.clone())
     }
 
-    /// One conversation with the Mac: `text` is a message, as it is written. A signal that ends
+    /// One conversation with the bateri app: `text` is a message, as it is written. A signal that ends
     /// the wait ends the command with the signal's status (128 and its number), and nothing else
     /// is done after it: a `split` that is interrupted does not go on to start a terminal.
     pub fn ask_text(&self, text: &str) -> Result<Asked, Exit> {
@@ -143,7 +147,7 @@ impl Ctx {
         asked_of(status, &reply)
     }
 
-    /// One conversation with the Mac, for a request.
+    /// One conversation with the bateri app, for a request.
     pub fn ask(&self, request: &Request) -> Result<Asked, Exit> {
         let text = encode(request)?;
         self.ask_text(&text)
@@ -171,7 +175,7 @@ pub fn encode(request: &Request) -> Result<String, Exit> {
         .map_err(|failure| Exit::mistake(words::clean(&failure.text)))
 }
 
-/// The end of a command the Mac answered with an error: the kind says the status.
+/// The end of a command the bateri app answered with an error: the kind says the status.
 pub fn failure(failure: &Failure) -> Exit {
     let code = match failure.kind {
         Kind::Usage => 64,
@@ -183,7 +187,7 @@ pub fn failure(failure: &Failure) -> Exit {
 
 /// What a reply that is no answer to the request says.
 pub fn unread() -> Exit {
-    Exit::failed("the Mac answered with something this does not read")
+    Exit::failed("the bateri app answered with something this does not read")
 }
 
 const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--above|--below] [--ratio PERCENT]
@@ -215,7 +219,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane is p and its number (p7); with none named it is the one this runs in. One of another
 machine is written with the machine after an @ (p9@prod), as bateri ls writes it; -S starts a
-terminal on a server, or on this Mac from a server (-S @local) (full level only).
+terminal on a server, or on this computer from a server (-S @local) (full level only).
 Without a program, split, tab and window open a shell. A shell named alone (-- zsh, -- fish) is
 the same, with its dock where bateri has an integration for it. bateri ls lists what is open.
 ";
@@ -237,7 +241,7 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
 fn dispatch(args: &[OsString], io: &mut Io<'_>) -> Done {
     let ctx = Ctx::new()?;
     // The counter: the number of the next terminal, for whoever else numbers terminals on this
-    // machine (the Mac does, for the ones it opens itself), so that no number is given twice.
+    // machine (the bateri app does, for the ones it opens itself), so that no number is given twice.
     if args.first().is_some_and(|arg| arg == "--next-number") {
         if args.len() != 1 {
             return Err(Exit::mistake("--next-number takes nothing"));
@@ -250,9 +254,11 @@ fn dispatch(args: &[OsString], io: &mut Io<'_>) -> Done {
             None => Err(Exit::status(1)),
         };
     }
-    // The words as another machine's command wrote them: `x` and the hex of their bytes, so that no
-    // shell on the way reads what the caller wrote.
+    // The words as another machine's app wrote them: `x` and the hex of their bytes, so that no
+    // shell on the way reads what the caller wrote. What such a command asks of an app, the app of
+    // that machine is asked ([`open::Asker::RemoteApp`]).
     if args.first().is_some_and(|arg| arg == "--hex") {
+        let ctx = Ctx { afar: true, ..ctx };
         let hexed: Vec<String> = args
             .iter()
             .skip(1)
@@ -323,7 +329,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
     }
 }
 
-/// A name as a JSON value: quoted, or `null` where there is none (the Mac has not said).
+/// A name as a JSON value: quoted, or `null` where there is none (the bateri app has not said).
 pub fn json_name(name: Option<impl std::fmt::Display>) -> String {
     name.map_or_else(|| "null".to_owned(), |name| format!("\"{name}\""))
 }
@@ -341,11 +347,11 @@ pub fn finish(code: u8) -> Done {
 mod tests {
     use super::*;
 
-    /// What a conversation's status is: an answer, no Mac, silence, or a signal that ends the
-    /// command with its own status (a Ctrl-C during the wait is 130, not "the Mac did not answer").
+    /// What a conversation's status is: an answer, no bateri app, silence, or a signal that ends the
+    /// command with its own status (a Ctrl-C during the wait is 130, not "the bateri app did not answer").
     #[test]
     fn a_signal_that_ends_the_wait_ends_the_command_with_its_status() {
-        assert!(matches!(asked_of(69, b""), Ok(Asked::NoMac)));
+        assert!(matches!(asked_of(69, b""), Ok(Asked::NoApp)));
         assert!(matches!(asked_of(1, b""), Ok(Asked::Silent)));
         assert!(matches!(asked_of(0, b"not a reply"), Ok(Asked::Unreadable)));
         for signal in [129u8, 130, 143] {

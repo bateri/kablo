@@ -1,7 +1,7 @@
 //! `kablo bateri` for a pane of a machine other than this one (`-S prod`, `p9@prod`), run for real.
-//! The Mac is a test that answers the way the window does: the words of an `ssh` (which is a fake
+//! The bateri app is a test that answers the way the window does: the words of an `ssh` (which is a fake
 //! `ssh` that hands the line to a login shell in the home of "prod", a machine of its own with its
-//! own terminals), `relay`, or `here`. What the command says to the Mac is read back with the
+//! own terminals), `relay`, or `here`. What the command says to the bateri app is read back with the
 //! window's own reader (`kablo-bateri`).
 
 // Test support: a failure here is a failed test.
@@ -18,9 +18,11 @@ mod stage;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kablo_bateri::message::{Arrange, Home, Place, Reach, Relay, Relayed, Reply, Request, Subject};
+use kablo_bateri::message::{
+    Arrange, Home, Place, Reach, Relay, Relayed, Reply, Request, Subject, hex_word,
+};
 use kablo_bateri::{Anchor, Side, Terminal};
-use stage::{Run, Stage, parse_told};
+use stage::{Run, Said, Stage, parse_told};
 
 const PLACED: &str = "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n";
 const MOVED: &str =
@@ -49,35 +51,22 @@ fn encoded(place: Place) -> String {
     Request::Place(place).encode().unwrap()
 }
 
-/// The Mac's answer to the question how to reach `prod`: the words of an `ssh` command.
-fn ssh_words() -> String {
-    Reply::Text(
-        Reach::Words(
-            ["-T", "-o", "BatchMode=yes", "prod"]
-                .map(str::to_owned)
-                .to_vec(),
-        )
-        .text(),
-    )
-    .encode()
-}
-
-/// The Mac's answer to a program on a server that asks how: `relay`.
+/// The bateri app's answer to a program on a server that asks how: `relay`.
 fn relay_word() -> String {
     Reply::Text(Reach::Relay.text()).encode()
 }
 
-/// The Mac's answer when the machine asked about is the asker's own.
+/// The bateri app's answer when the machine asked about is the asker's own.
 fn here_word() -> String {
     Reply::Text(Reach::Here.text()).encode()
 }
 
-/// The Mac's answer to a relay: how the command ended and what it said.
+/// The bateri app's answer to a relay: how the command ended and what it said.
 fn relayed(status: u8, stderr: &str, stdout: &str) -> String {
     Reply::Relayed(Relayed::of(status, stderr, stdout)).encode()
 }
 
-/// What a program asks of the Mac to run `words` on `server`.
+/// What a program asks of the bateri app to run `words` on `server`.
 fn relay_text(server: &str, words: &[&str]) -> String {
     Request::Relay(Relay {
         server: server.to_owned(),
@@ -91,39 +80,23 @@ fn ssh_text(server: &str) -> String {
     Request::Ssh(server.to_owned()).encode().unwrap()
 }
 
-/// The shells a person's login may be, those this machine has: the line an `ssh` carries is
-/// handed to one of them, and is read the same by each.
-fn login_shells() -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    let mut real: Vec<PathBuf> = Vec::new();
-    for shell in [
-        "/bin/sh",
-        "/bin/dash",
-        "/bin/bash",
-        "/bin/zsh",
-        "/usr/bin/zsh",
-        "/usr/bin/fish",
-        "/opt/homebrew/bin/fish",
-        "/usr/local/bin/fish",
-    ] {
-        if let Ok(path) = std::fs::canonicalize(shell) {
-            if !real.contains(&path) {
-                real.push(path);
-                found.push(shell.to_owned());
-            }
-        }
-    }
-    found
-}
-
-/// A Mac that reaches a server `prod` over a fake `ssh` whose far end is `shell`.
-fn mac_and_prod(shell: &str) -> (Stage, Stage) {
+/// A server that has the command, with nothing running on it.
+fn server() -> Stage {
     let mut prod = Stage::new();
     prod.install_command();
-    let mut mac = Stage::new();
-    mac.ssh_to(&prod, shell);
-    mac.connect_mac();
-    (mac, prod)
+    prod
+}
+
+/// What the bateri app does with a `relay` it is handed: runs the words on the server as
+/// `bateri --hex` with their bytes in hex, and the command there says how it ended.
+fn run_there(prod: &mut Stage, relay: &str) -> Said {
+    let Request::Relay(relay) = parse_told(relay) else {
+        panic!("not a relay: {relay}");
+    };
+    let hexed: Vec<String> = relay.words.iter().map(|word| hex_word(word)).collect();
+    let mut args = vec!["--hex"];
+    args.extend(hexed.iter().map(String::as_str));
+    prod.run(&args)
 }
 
 /// A program that says how it was started, its words NUL after NUL, into the files named by its
@@ -191,129 +164,155 @@ fn address(text: &str) -> Anchor {
 }
 
 #[test]
-fn a_split_on_a_server_asks_the_mac_how_to_reach_it_starts_the_terminal_there_and_asks_for_the_pane()
- {
-    for shell in login_shells() {
-        let (mut mac, prod) = mac_and_prod(&shell);
-        let program = recorder(&prod);
-        let out = prod.env.dir.join("one");
-        let out_name = out.display().to_string();
-        let ssh = ssh_words();
-        let said = mac.go(&Run {
-            here: Some("p40"),
-            args: &[
-                "split", "--below", "-S", "prod", "--", &program, &out_name, "make", "it's", "ok",
-            ],
-            input: None,
-            turns: &[&ssh, PLACED],
-            vars: &[],
-        });
-        assert_eq!(said.status, 0, "{shell}: {}", said.err);
-        // The terminal is the server's `p1`, written by its machine.
-        assert_eq!(said.out, "p1@prod\n", "{shell}: {}", said.err);
-        assert_eq!(said.err, "", "a pane that landed as asked is silent");
+fn a_split_on_a_server_asks_the_app_how_to_reach_it_hands_it_the_start_and_asks_for_the_pane() {
+    let mut app = Stage::with_app(OK);
+    let mut prod = server();
+    let program = recorder(&prod);
+    let out = prod.env.dir.join("one");
+    let out_name = out.display().to_string();
+    let said = app.go(&Run {
+        here: Some("p40"),
+        args: &[
+            "split", "--below", "-S", "prod", "--", &program, &out_name, "make", "it's", "ok",
+        ],
+        input: None,
+        turns: &[&relay_word(), &relayed(0, "", "p1\n"), PLACED],
+        vars: &[],
+    });
+    assert_eq!(said.status, 0, "{}", said.err);
+    // The terminal is the server's `p1`, written by its machine.
+    assert_eq!(said.out, "p1@prod\n", "{}", said.err);
+    assert_eq!(said.err, "", "a pane that landed as asked is silent");
 
-        // The Mac was asked how, then for the pane: a terminal of the server, beside this Mac's.
-        assert_eq!(mac.told.len(), 2, "{:?}", mac.told);
-        assert_eq!(mac.told[0], ssh_text("prod"));
-        let wanted = Place {
-            side: Some(Side::Below),
-            server: Some("prod".to_owned()),
-            ..place(1, 40)
-        };
-        assert_eq!(mac.told[1], encoded(wanted));
+    // The bateri app was asked how, then handed the start, then asked for the pane: a terminal
+    // of the server, beside this computer's.
+    assert_eq!(app.told.len(), 3, "{:?}", app.told);
+    assert_eq!(app.told[0], ssh_text("prod"));
+    assert_eq!(
+        app.told[1],
+        relay_text(
+            "prod",
+            &["split", "--", &program, &out_name, "make", "it's", "ok"]
+        )
+    );
+    let wanted = Place {
+        side: Some(Side::Below),
+        server: Some("prod".to_owned()),
+        ..place(1, 40)
+    };
+    assert_eq!(app.told[2], encoded(wanted));
+    // Nothing was started or recorded here.
+    assert!(!running(&app).contains(&"p1".to_owned()));
+    assert!(app.record("p1").is_none());
 
-        // ssh got the Mac's words and one command line.
-        let calls = mac.ssh_calls();
-        assert_eq!(calls.len(), 1, "{calls:?}");
-        assert_eq!(calls[0][..4], ["-T", "-o", "BatchMode=yes", "prod"]);
-        assert_eq!(calls[0].len(), 5, "{calls:?}");
-
-        // The server started the terminal, in its home, the program's words as they were written;
-        // nothing was started or recorded on the Mac.
-        let (words, cwd) = recorded(&out);
-        assert_eq!(words, ["make", "it's", "ok"], "{shell}");
-        assert_eq!(cwd, prod.home.display().to_string());
-        assert!(running(&prod).contains(&"p1".to_owned()));
-        assert!(!running(&mac).contains(&"p1".to_owned()));
-        assert!(mac.record("p1").is_none());
-        assert!(prod.record("p1").is_some());
-        // The server was not asked to place anything: it ran in no terminal.
-        assert!(prod.told.is_empty(), "{:?}", prod.told);
-    }
+    // What the server does with it: the terminal starts in its home with the program's words as
+    // they were written, and asks nobody where its pane goes.
+    let ran = run_there(&mut prod, &app.told[1]);
+    assert_eq!((ran.status, ran.out.as_str()), (0, "p1\n"), "{}", ran.err);
+    assert_eq!(
+        ran.err, "",
+        "a command another machine's app relayed says nothing of a pane"
+    );
+    let (words, cwd) = recorded(&out);
+    assert_eq!(words, ["make", "it's", "ok"]);
+    assert_eq!(cwd, prod.home.display().to_string());
+    assert!(running(&prod).contains(&"p1".to_owned()));
+    assert!(prod.record("p1").is_some());
+    assert!(prod.told.is_empty(), "{:?}", prod.told);
 }
 
 #[test]
 fn a_server_that_cannot_be_reached_is_said_so_before_or_after_anything_is_started() {
-    let shell = login_shells().remove(0);
-    let (mut mac, prod) = mac_and_prod(&shell);
+    let mut app = Stage::new();
+    app.connect_app();
 
-    // A name that is not a name is a mistake before the Mac is asked.
+    // A name that is not a name is a mistake before the bateri app is asked.
     for bad in ["-oProxyCommand=x", "a b", "a;b", "", "p9@"] {
-        let said = mac.run_in("p40", &["split", "-S", bad]);
+        let said = app.run_in("p40", &["split", "-S", bad]);
         assert_eq!(said.status, 64, "{bad:?}: {}", said.err);
     }
-    let said = mac.run_in("p40", &["split", "-S"]);
+    let said = app.run_in("p40", &["split", "-S"]);
     assert_eq!(said.status, 64, "{}", said.err);
-    let said = mac.run_in("p40", &["split", "-S", "prod", "-S", "web"]);
+    let said = app.run_in("p40", &["split", "-S", "prod", "-S", "web"]);
     assert_eq!(said.status, 64, "{}", said.err);
-    assert!(mac.told.is_empty(), "{:?}", mac.told);
+    assert!(app.told.is_empty(), "{:?}", app.told);
 
-    // The level, the server's own `commands` and the gate of `ssh prod` are the Mac's: its words are
-    // the command's, and nothing is started.
-    mac.mac_says(REFUSED);
-    let said = mac.run_in("p40", &["split", "-S", "prod", "--", "make"]);
+    // The level, the server's own `commands` and the gate of `ssh prod` are the bateri app's: its
+    // words are the command's, and nothing is started.
+    app.app_says(REFUSED);
+    let said = app.run_in("p40", &["split", "-S", "prod", "--", "make"]);
     assert_eq!(said.status, 77, "{}", said.err);
     assert!(said.err.contains("only \"full\""), "{}", said.err);
     assert_eq!(said.out, "");
-    mac.mac_says("bateri 2\nerror failed prod is not a server bateri keeps terminals on\n");
-    let said = mac.run_in("p40", &["split", "-S", "prod", "--", "make"]);
+    app.app_says("bateri 2\nerror failed prod is not a server bateri keeps terminals on\n");
+    let said = app.run_in("p40", &["split", "-S", "prod", "--", "make"]);
     assert_eq!(said.status, 1, "{}", said.err);
     assert!(said.err.contains("keeps terminals on"), "{}", said.err);
-    assert_eq!(mac.ssh_calls().len(), 0);
-    assert!(running(&prod).is_empty());
 
-    // A Mac that says something that is no answer.
-    mac.mac_says("bateri 2\nok text\nnot this\n");
-    let said = mac.run_in("p40", &["split", "-S", "prod", "--", "make"]);
+    // The bateri app that says something that is no answer.
+    app.app_says("bateri 2\nok text\nnot this\n");
+    let said = app.run_in("p40", &["split", "-S", "prod", "--", "make"]);
     assert_eq!(said.status, 1, "{}", said.err);
     assert_eq!(said.out, "");
-
-    // No Mac.
-    mac.no_mac();
-    let said = mac.run_in("p40", &["split", "-S", "prod"]);
-    assert_eq!(said.status, 69, "{}", said.err);
-    assert_eq!(mac.ssh_calls().len(), 0);
-
-    // A server bateri never opened has no command: it is told to be, with nothing installed.
-    std::fs::remove_file(prod.state().join("shell/bin/bateri")).unwrap();
-    mac.mac_says(&ssh_words());
-    let said = mac.run_in("p40", &["split", "-S", "prod", "--", "make"]);
+    // The words of an `ssh` command are no answer any more.
+    app.app_says("bateri 2\nok text\narg -T\narg prod\n");
+    let said = app.run_in("p40", &["split", "-S", "prod", "--", "make"]);
     assert_eq!(said.status, 1, "{}", said.err);
+
+    // No bateri app.
+    app.no_app();
+    let said = app.run_in("p40", &["split", "-S", "prod"]);
+    assert_eq!(said.status, 69, "{}", said.err);
     assert!(
-        said.err.contains("not set up on prod") && said.err.contains("first"),
+        said.err.contains("the bateri app is not connected"),
         "{}",
         said.err
     );
-    assert!(running(&prod).is_empty());
+
+    // The bateri app could not reach the server, or the command there says why it did not run:
+    // what it ended with is the status, and the person is told which server.
+    app.connect_app();
+    let said = app.go(&Run {
+        here: Some("p40"),
+        args: &["split", "-S", "prod", "--", "make"],
+        input: None,
+        turns: &[&relay_word(), &relayed(255, "", "")],
+        vars: &[],
+    });
+    assert_eq!(said.status, 255, "{}", said.err);
+    assert!(said.err.contains("could not reach prod"), "{}", said.err);
+    let said = app.go(&Run {
+        here: Some("p40"),
+        args: &["split", "-S", "prod", "--", "make"],
+        input: None,
+        turns: &[&relay_word(), &relayed(127, "bateri: not here", "")],
+        vars: &[],
+    });
+    assert_eq!(said.status, 1, "{}", said.err);
+    assert!(said.err.contains("bateri: not here"), "{}", said.err);
 }
 
 #[test]
-fn a_pane_the_mac_refuses_ends_the_terminal_the_server_started() {
-    let shell = login_shells().remove(0);
-    let (mut mac, prod) = mac_and_prod(&shell);
+fn a_pane_the_app_refuses_ends_the_terminal_the_server_started() {
+    let mut app = Stage::with_app(OK);
+    let mut prod = server();
     let program = recorder(&prod);
     let out = prod.env.dir.join("one");
     let out_name = out.display().to_string();
-    let ssh = ssh_words();
-    // The pane is refused, and the Mac is asked no more: the terminal is ended where it is.
-    let said = mac.go(&Run {
+    // The pane is refused, and the bateri app is asked no more of it: the terminal is ended where
+    // it is, by the server's own command, handed to the app as the start was.
+    let said = app.go(&Run {
         here: Some("p40"),
         args: &[
             "split", "--tab", "t9", "-S", "prod", "--", &program, &out_name,
         ],
         input: None,
-        turns: &[&ssh, NO_TAB],
+        turns: &[
+            &relay_word(),
+            &relayed(0, "", "p1\n"),
+            NO_TAB,
+            &relayed(0, "", ""),
+        ],
         vars: &[],
     });
     assert_eq!(
@@ -323,12 +322,20 @@ fn a_pane_the_mac_refuses_ends_the_terminal_the_server_started() {
         said.err
     );
     assert_eq!(said.out, "");
-    // The terminal was made (the server's counter went past `p1`) and is gone, and the program need
-    // not have got as far as running.
+    assert_eq!(app.told.len(), 4, "{:?}", app.told);
+    assert_eq!(
+        app.told[3],
+        relay_text("prod", &["close", "pane", "p1", "--force"])
+    );
+    // What the server does with the two: the terminal is made (its counter went past `p1`) and
+    // is gone, and the program need not have got as far as running.
+    assert_eq!(run_there(&mut prod, &app.told[1]).status, 0);
     assert_eq!(
         std::fs::read_to_string(prod.state().join("next")).unwrap(),
         "2\n"
     );
+    let ended = run_there(&mut prod, &app.told[3]);
+    assert_eq!(ended.status, 0, "{}", ended.err);
     let start = Instant::now();
     while running(&prod).contains(&"p1".to_owned()) {
         assert!(
@@ -338,81 +345,108 @@ fn a_pane_the_mac_refuses_ends_the_terminal_the_server_started() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(prod.record("p1").is_none());
-    // It was the server's own command that ended it, over the same ssh: two calls.
-    assert_eq!(mac.ssh_calls().len(), 2, "{:?}", mac.ssh_calls());
 }
 
 #[test]
-fn send_capture_and_wait_for_a_pane_of_a_server_run_there_and_keep_their_status() {
-    for shell in login_shells() {
-        let (mut mac, mut prod) = mac_and_prod(&shell);
-        prod.terminal("p9");
-        prod.terminal_running("p8", &["/bin/sh", "-c", "exit 7"]);
-        mac.mac_says(&ssh_words());
-
-        let said = mac.run_in("p40", &["send", "p9@prod", "echo 'hi' $HOME; ls"]);
-        assert_eq!(said.status, 0, "{shell}: {}", said.err);
-        // The text arrives as it was written: nothing of it is read by any shell on the way.
-        assert!(
-            shows(&prod, "p9", "echo 'hi' $HOME; ls"),
-            "{shell}: {}",
-            shown(&prod, "p9")
-        );
-        let said = mac.run_in("p40", &["send-key", "p9@prod", "Enter"]);
-        assert_eq!(said.status, 0, "{}", said.err);
-
-        // A key first is the caller's own terminal's: no machine is named, nobody is asked.
-        let before = mac.told.len();
-        let said = mac.run_in("p40", &["send-key", "Enter"]);
-        assert_eq!(said.status, 0, "{}", said.err);
-        assert_eq!(mac.told.len(), before);
-
-        let said = mac.run_in("p40", &["capture", "--history", "20", "p9@prod", "--trim"]);
-        assert_eq!(said.status, 0, "{}", said.err);
-        assert!(said.out.contains("echo 'hi' $HOME; ls"), "{}", said.out);
-
-        // The program's own status comes back through ssh.
-        let said = mac.run_in("p40", &["wait", "p8@prod", "--for", "20s"]);
-        assert_eq!(said.status, 7, "{shell}: {}", said.err);
-
-        // Each went to the Mac for the connection first.
-        assert!(
-            mac.told
-                .iter()
-                .all(|text| text.starts_with("bateri 2\nssh\n")),
-            "{:?}",
-            mac.told
-        );
-
-        // This Mac's own pane written out is this Mac's, when the Mac says the machine is this one:
-        // no ssh.
-        let before = mac.ssh_calls().len();
-        let here = here_word();
-        let said = mac.go(&Run {
+fn send_capture_and_wait_for_a_pane_of_a_server_are_relayed_there_and_keep_their_status() {
+    let mut app = Stage::with_app(OK);
+    let mut prod = server();
+    prod.terminal("p9");
+    prod.terminal_running("p8", &["/bin/sh", "-c", "exit 7"]);
+    let relay = relay_word();
+    // One command of the caller, with the answer the bateri app gives to the relay.
+    let through = |app: &mut Stage, args: &[&str], answer: String| {
+        app.forget_told();
+        let said = app.go(&Run {
             here: Some("p40"),
-            args: &["capture", "p40@local"],
+            args,
             input: None,
-            turns: &[&here],
+            turns: &[&relay, &answer],
             vars: &[],
         });
-        assert_eq!(said.status, 0, "{}", said.err);
-        assert_eq!(mac.ssh_calls().len(), before);
-        assert_eq!(mac.told.last().unwrap(), &ssh_text("@local"));
+        (said, app.told.clone())
+    };
 
-        // A malformed address is no pane, and an unreachable server is the Mac's word.
-        let said = mac.run_in("p40", &["capture", "p9@pr od"]);
-        assert_eq!(said.status, 64, "{}", said.err);
-        mac.mac_says(REFUSED);
-        let said = mac.run_in("p40", &["wait", "p9@prod"]);
-        assert_eq!(said.status, 77, "{}", said.err);
-        assert!(said.err.contains("only \"full\""), "{}", said.err);
-    }
+    let text = "echo 'hi' $HOME; ls";
+    let (said, told) = through(&mut app, &["send", "p9@prod", text], relayed(0, "", ""));
+    assert_eq!(said.status, 0, "{}", said.err);
+    // The bateri app is asked how, then handed the command with the pane's plain id.
+    assert_eq!(
+        told,
+        [ssh_text("prod"), relay_text("prod", &["send", "p9", text])]
+    );
+    // The text arrives as it was written: nothing of it is read by any shell on the way.
+    assert_eq!(run_there(&mut prod, &told[1]).status, 0);
+    assert!(shows(&prod, "p9", text), "{}", shown(&prod, "p9"));
+    let (said, told) = through(
+        &mut app,
+        &["send-key", "p9@prod", "Enter"],
+        relayed(0, "", ""),
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(told[1], relay_text("prod", &["send-key", "p9", "Enter"]));
+    assert_eq!(run_there(&mut prod, &told[1]).status, 0);
+
+    // A key first is the caller's own terminal's: no machine is named, nobody is asked.
+    app.forget_told();
+    let said = app.run_in("p40", &["send-key", "Enter"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(app.told.is_empty(), "{:?}", app.told);
+
+    // What the command there prints is printed here as it would have been.
+    let (said, told) = through(
+        &mut app,
+        &["capture", "--history", "20", "p9@prod", "--trim"],
+        relayed(0, "", "what the pane shows\n"),
+    );
+    assert_eq!(
+        (said.status, said.out.as_str()),
+        (0, "what the pane shows\n")
+    );
+    assert_eq!(
+        told[1],
+        relay_text("prod", &["capture", "--history", "20", "p9", "--trim"])
+    );
+    let there = run_there(&mut prod, &told[1]);
+    assert_eq!(there.status, 0, "{}", there.err);
+    assert!(there.out.contains(text), "{}", there.out);
+
+    // The program's own status comes back.
+    let (said, told) = through(
+        &mut app,
+        &["wait", "p8@prod", "--for", "20s"],
+        relayed(7, "", ""),
+    );
+    assert_eq!(said.status, 7, "{}", said.err);
+    assert_eq!(told[1], relay_text("prod", &["wait", "p8", "--for", "20s"]));
+    assert_eq!(run_there(&mut prod, &told[1]).status, 7);
+
+    // This computer's own pane written out is this computer's, when the bateri app says the
+    // machine is this one: nothing is relayed.
+    app.forget_told();
+    let said = app.go(&Run {
+        here: Some("p40"),
+        args: &["capture", "p40@local"],
+        input: None,
+        turns: &[&here_word()],
+        vars: &[],
+    });
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(app.told, [ssh_text("@local")]);
+
+    // A malformed address is no pane, and an unreachable server is the bateri app's word.
+    let said = app.run_in("p40", &["capture", "p9@pr od"]);
+    assert_eq!(said.status, 64, "{}", said.err);
+    app.app_says(REFUSED);
+    let said = app.run_in("p40", &["wait", "p9@prod"]);
+    assert_eq!(said.status, 77, "{}", said.err);
+    assert!(said.err.contains("only \"full\""), "{}", said.err);
 }
 
 #[test]
-fn focus_close_and_the_layout_verbs_hand_the_address_of_a_pane_of_another_machine_to_the_mac() {
+fn focus_close_and_the_layout_verbs_hand_the_address_of_a_pane_of_another_machine_to_the_app() {
     let mut stage = Stage::new();
-    stage.mac_says(OK);
+    stage.app_says(OK);
     for args in [
         &["focus", "pane", "p9@prod"][..],
         &["zoom", "p9@prod"],
@@ -421,13 +455,13 @@ fn focus_close_and_the_layout_verbs_hand_the_address_of_a_pane_of_another_machin
         let said = stage.run_in("p40", args);
         assert_eq!(said.status, 0, "{args:?}: {}", said.err);
     }
-    stage.mac_says(MOVED);
+    stage.app_says(MOVED);
     let said = stage.run_in(
         "p40",
         &["move", "pane", "p9@prod", "--beside", "p3@local", "--right"],
     );
     assert_eq!(said.status, 0, "{}", said.err);
-    stage.mac_says(OK);
+    stage.app_says(OK);
     let said = stage.run_in("p40", &["resize", "p9@prod", "--left"]);
     assert_eq!(said.status, 0, "{}", said.err);
     let said = stage.run_in("p40", &["close", "pane", "p9@prod"]);
@@ -456,10 +490,10 @@ fn focus_close_and_the_layout_verbs_hand_the_address_of_a_pane_of_another_machin
         ]
     );
 
-    // A pane of another machine is closed by the Mac or by nobody: with none, this machine's own
+    // A pane of another machine is closed by the bateri app or by nobody: with none, this machine's own
     // `kablo end` would end another terminal of the same number.
     stage.terminal("p9");
-    stage.no_mac();
+    stage.no_app();
     let said = stage.run_in("p40", &["close", "pane", "p9@prod"]);
     assert_eq!(said.status, 69, "{}", said.err);
     assert!(stage.running().contains(&"p9".to_owned()));
@@ -475,73 +509,84 @@ fn focus_close_and_the_layout_verbs_hand_the_address_of_a_pane_of_another_machin
 }
 
 #[test]
-fn the_line_a_mac_sends_a_server_is_read_the_same_by_whatever_shell_and_its_words_arrive_whole() {
-    let dir_of = |stage: &Stage| stage.env.dir.display().to_string();
-    for shell in login_shells() {
-        let (mut mac, prod) = mac_and_prod(&shell);
-        let program = recorder(&prod);
-        let out = prod.env.dir.join("odd");
-        let out_name = out.display().to_string();
-        let never = format!("{}/never", dir_of(&prod));
-        let injected = format!("$(touch {never})");
-        let backticks = format!("`touch {never}`");
-        let odd = [
-            "echo 'hi' $HOME; `x` \"y\" \\z",
-            "C:\\",
-            "\\';echo INJECTED;#",
-            "two\nlines\n",
-            injected.as_str(),
-            backticks.as_str(),
-            "",
-            "-",
-            "--",
-            "ünï ✓",
-            "  spaced  ",
-        ];
-        let mut args = vec![
-            "split",
-            "-S",
-            "prod",
-            "--",
-            program.as_str(),
-            out_name.as_str(),
-        ];
-        args.extend(odd);
-        let ssh = ssh_words();
-        let said = mac.go(&Run {
-            here: Some("p40"),
-            args: &args,
-            input: None,
-            turns: &[&ssh, PLACED],
-            vars: &[],
-        });
-        assert_eq!(said.status, 0, "{shell}: {}", said.err);
-        assert_eq!(said.out, "p1@prod\n", "{shell}");
-        let (words, _) = recorded(&out);
-        assert_eq!(words, odd, "{shell}");
-        assert!(!Path::new(&never).exists(), "{shell}: a word was run");
+fn the_words_of_a_command_for_a_server_cross_the_app_whole_and_are_read_whole_there() {
+    let mut app = Stage::with_app(OK);
+    let mut prod = server();
+    let program = recorder(&prod);
+    let out = prod.env.dir.join("odd");
+    let out_name = out.display().to_string();
+    let never = format!("{}/never", prod.env.dir.display());
+    let injected = format!("$(touch {never})");
+    let backticks = format!("`touch {never}`");
+    let odd = [
+        "echo 'hi' $HOME; `x` \"y\" \\z",
+        "C:\\",
+        "\\';echo INJECTED;#",
+        "two\nlines\n",
+        injected.as_str(),
+        backticks.as_str(),
+        "",
+        "-",
+        "--",
+        "ünï ✓",
+        "  spaced  ",
+    ];
+    let mut args = vec![
+        "split",
+        "-S",
+        "prod",
+        "--",
+        program.as_str(),
+        out_name.as_str(),
+    ];
+    args.extend(odd);
+    let said = app.go(&Run {
+        here: Some("p40"),
+        args: &args,
+        input: None,
+        turns: &[&relay_word(), &relayed(0, "", "p1\n"), PLACED],
+        vars: &[],
+    });
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p1@prod\n");
+    // The words the bateri app is handed are the ones written, each whole.
+    let Request::Relay(relay) = parse_told(&app.told[1]) else {
+        panic!("not a relay: {}", app.told[1]);
+    };
+    let mut wanted = vec!["split", "--", program.as_str(), out_name.as_str()];
+    wanted.extend(odd);
+    assert_eq!(relay.words, wanted);
+    // And the command there reads them whole: no shell on the way read any of them.
+    let ran = run_there(&mut prod, &app.told[1]);
+    assert_eq!(ran.status, 0, "{}", ran.err);
+    let (words, _) = recorded(&out);
+    assert_eq!(words, odd);
+    assert!(!Path::new(&never).exists(), "a word was run");
+}
+
+#[test]
+fn hex_takes_words_written_as_x_and_their_bytes_and_nothing_else() {
+    let mut prod = server();
+    for words in [
+        &["--hex", "split"][..],
+        &["--hex", "x7"],
+        &["--hex", "xzz"],
+        &["--hex", "x00"],
+    ] {
+        let said = prod.run(words);
+        assert_eq!(said.status, 64, "{words:?}: {}", said.err);
     }
+    let said = prod.run(&["--hex", &hex_word("--next-number")]);
+    assert_eq!(said.status, 64, "{}", said.err);
 }
 
-#[test]
-fn the_remote_line_says_what_is_wrong_when_the_server_has_no_command() {
-    let shell = login_shells().remove(0);
-    let (mut mac, prod) = mac_and_prod(&shell);
-    std::fs::remove_file(prod.state().join("shell/bin/bateri")).unwrap();
-    mac.mac_says(&ssh_words());
-    // Carried verbs say the same, and the status is the line's own (127), not 255.
-    let said = mac.run_in("p40", &["send", "p9@prod", "x"]);
-    assert_eq!(said.status, 127, "{}", said.err);
-    assert!(said.err.contains("not set up on prod"), "{}", said.err);
-}
-
-// ─── from a server that has `full`: the Mac relays ───────────────────────────────────────────────
+// ─── from a server that has `full`: the bateri app relays ───────────────────────────────────────────────
 
 #[test]
-fn a_server_given_full_hands_the_commands_for_another_machine_to_the_mac_and_prints_what_comes_back()
+fn a_server_given_full_hands_the_commands_for_another_machine_to_the_app_and_prints_what_comes_back()
  {
     let mut a = Stage::new();
-    a.connect_mac();
+    a.connect_app();
     let relay = relay_word();
     let run = |a: &mut Stage, args: &[&str], turns: &[&str], input: Option<&[u8]>| {
         a.go(&Run {
@@ -553,7 +598,7 @@ fn a_server_given_full_hands_the_commands_for_another_machine_to_the_mac_and_pri
         })
     };
 
-    // capture: the Mac is asked how (`relay`), then to run it; stdout comes back as it was.
+    // capture: the bateri app is asked how (`relay`), then to run it; stdout comes back as it was.
     let first = relayed(0, "", "first\n\ntrail");
     let said = run(
         &mut a,
@@ -570,7 +615,6 @@ fn a_server_given_full_hands_the_commands_for_another_machine_to_the_mac_and_pri
         a.told[1],
         relay_text("rasp", &["capture", "--history", "20", "p9", "--trim"])
     );
-    assert!(a.ssh_calls().is_empty());
 
     // send: the text with a line break and a quote arrives as one word.
     a.forget_told();
@@ -624,7 +668,7 @@ fn a_server_given_full_hands_the_commands_for_another_machine_to_the_mac_and_pri
         relay_text("rasp", &["wait", "p9", "--for", "5s"])
     );
 
-    // This Mac is `@local` to a server, and asked for under that word.
+    // This computer is `@local` to a server, and asked for under that word.
     a.forget_told();
     let said = run(&mut a, &["send", "p3@local", "hi"], &[&relay, &ok], None);
     assert_eq!(said.status, 0, "{}", said.err);
@@ -645,9 +689,9 @@ fn a_server_given_full_hands_the_commands_for_another_machine_to_the_mac_and_pri
 }
 
 #[test]
-fn a_server_that_is_not_given_full_is_told_77_and_a_mac_that_is_gone_or_odd_is_said_so() {
+fn a_server_that_is_not_given_full_is_told_77_and_an_app_that_is_gone_or_odd_is_said_so() {
     let mut a = Stage::new();
-    a.connect_mac();
+    a.connect_app();
     let relay = relay_word();
     let run = |a: &mut Stage, args: &[&str], turns: &[&str]| {
         a.go(&Run {
@@ -659,7 +703,7 @@ fn a_server_that_is_not_given_full_is_told_77_and_a_mac_that_is_gone_or_odd_is_s
         })
     };
 
-    // The first question is the Mac's to refuse: nothing more is asked, nothing is run here.
+    // The first question is the bateri app's to refuse: nothing more is asked, nothing is run here.
     let said = run(&mut a, &["send", "p9@rasp", "x"], &[REFUSED]);
     assert_eq!(said.status, 77, "{}", said.err);
     assert!(said.err.contains("only \"full\""), "{}", said.err);
@@ -679,7 +723,7 @@ fn a_server_that_is_not_given_full_is_told_77_and_a_mac_that_is_gone_or_odd_is_s
     assert_eq!(said.status, 1, "{}", said.err);
     assert!(said.err.contains("keeps terminals on"), "{}", said.err);
 
-    // A command the Mac could not run in time, an answer this does not read, no Mac.
+    // A command the bateri app could not run in time, an answer this does not read, no bateri app.
     let said = run(
         &mut a,
         &["wait", "p9@rasp"],
@@ -697,20 +741,20 @@ fn a_server_that_is_not_given_full_is_told_77_and_a_mac_that_is_gone_or_odd_is_s
     );
     assert_eq!(said.status, 1, "{}", said.err);
     assert_eq!(said.out, "");
-    a.no_mac();
+    a.no_app();
     let said = run(&mut a, &["send", "p9@rasp", "x"], &[]);
     assert_eq!(said.status, 69, "{}", said.err);
 }
 
 #[test]
-fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_mac_and_asks_for_its_pane()
+fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_app_and_asks_for_its_pane()
 {
     let mut a = Stage::new();
-    a.connect_mac();
+    a.connect_app();
     let relay = relay_word();
     let ok = relayed(0, "", "");
 
-    // The terminal is started there by the command the Mac runs; the pane is asked for beside this
+    // The terminal is started there by the command the bateri app runs; the pane is asked for beside this
     // machine's own, with the server's name.
     let started = relayed(0, "", "p7\n");
     let said = a.go(&Run {
@@ -760,10 +804,9 @@ fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_mac_and_
     assert_eq!(a.told[2], encoded(wanted));
     // Nothing was started or recorded here, and no ssh was run.
     assert!(a.record("p7").is_none());
-    assert!(a.ssh_calls().is_empty());
     assert!(!a.running().contains(&"p7".to_owned()));
 
-    // This Mac is `@local`.
+    // This computer is `@local`.
     a.forget_told();
     let started = relayed(0, "", "p2\n");
     let said = a.go(&Run {
@@ -783,7 +826,7 @@ fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_mac_and_
     };
     assert_eq!(a.told[2], encoded(wanted));
 
-    // `--wait` waits there, through the Mac, and ends with the program's status.
+    // `--wait` waits there, through the bateri app, and ends with the program's status.
     a.forget_told();
     let started = relayed(0, "", "p8\n");
     let waited = relayed(5, "", "");
@@ -797,7 +840,7 @@ fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_mac_and_
     assert_eq!(said.status, 5, "{}", said.err);
     assert_eq!(a.told[3], relay_text("rasp", &["wait", "p8"]));
 
-    // A pane the Mac refuses ends the terminal that was started there, through the Mac.
+    // A pane the bateri app refuses ends the terminal that was started there, through the bateri app.
     a.forget_told();
     let started = relayed(0, "", "p9\n");
     let said = a.go(&Run {
@@ -837,17 +880,17 @@ fn a_server_given_full_starts_a_terminal_on_another_machine_through_the_mac_and_
 }
 
 #[test]
-fn on_this_mac_at_local_is_the_plain_terminal_and_pane_and_nobody_is_asked_for_a_relay() {
-    let mut mac = Stage::new();
-    mac.install_command();
-    mac.connect_mac();
-    let program = recorder(&mac);
-    let out = mac.env.dir.join("local");
+fn on_this_computer_at_local_is_the_plain_terminal_and_pane_and_nobody_is_asked_for_a_relay() {
+    let mut app = Stage::new();
+    app.install_command();
+    app.connect_app();
+    let program = recorder(&app);
+    let out = app.env.dir.join("local");
     let out_name = out.display().to_string();
     let here = here_word();
-    // The Mac says the machine is this one: the terminal is this Mac's own, started here, written
-    // without a machine, and the Mac is asked for a plain pane.
-    let said = mac.go(&Run {
+    // The bateri app says the machine is this one: the terminal is this computer's own, started here, written
+    // without a machine, and the bateri app is asked for a plain pane.
+    let said = app.go(&Run {
         here: Some("p40"),
         args: &["split", "-S", "@local", "--", &program, &out_name, "make"],
         input: None,
@@ -856,20 +899,20 @@ fn on_this_mac_at_local_is_the_plain_terminal_and_pane_and_nobody_is_asked_for_a
     });
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "p1\n", "{}", said.err);
-    assert_eq!(mac.told.len(), 2, "{:?}", mac.told);
-    assert_eq!(mac.told[0], ssh_text("@local"));
-    assert_eq!(mac.told[1], encoded(place(1, 40)));
+    assert_eq!(app.told.len(), 2, "{:?}", app.told);
+    assert_eq!(app.told[0], ssh_text("@local"));
+    assert_eq!(app.told[1], encoded(place(1, 40)));
     let (words, _) = recorded(&out);
     assert_eq!(words, ["make"]);
-    assert!(mac.running().contains(&"p1".to_owned()));
-    // Two machines are a mistake before the Mac is asked.
-    let before = mac.told.len();
-    let said = mac.run_in("p40", &["split", "-S", "@local", "-S", "prod"]);
+    assert!(app.running().contains(&"p1".to_owned()));
+    // Two machines are a mistake before the bateri app is asked.
+    let before = app.told.len();
+    let said = app.run_in("p40", &["split", "-S", "@local", "-S", "prod"]);
     assert_eq!(said.status, 64, "{}", said.err);
-    assert_eq!(mac.told.len(), before);
-    // A pane of this Mac written out is this Mac's own.
-    mac.terminal("p3");
-    let said = mac.go(&Run {
+    assert_eq!(app.told.len(), before);
+    // A pane of this computer written out is this computer's own.
+    app.terminal("p3");
+    let said = app.go(&Run {
         here: Some("p40"),
         args: &["send", "p3@local", "hi"],
         input: None,
@@ -877,9 +920,9 @@ fn on_this_mac_at_local_is_the_plain_terminal_and_pane_and_nobody_is_asked_for_a
         vars: &[],
     });
     assert_eq!(said.status, 0, "{}", said.err);
-    assert!(shows(&mac, "p3", "hi"));
-    // With no Mac there is nobody to say it is this one.
-    mac.no_mac();
-    let said = mac.run_in("p40", &["send", "p3@local", "again"]);
+    assert!(shows(&app, "p3", "hi"));
+    // With no bateri app there is nobody to say it is this one.
+    app.no_app();
+    let said = app.run_in("p40", &["send", "p3@local", "again"]);
     assert_eq!(said.status, 69, "{}", said.err);
 }

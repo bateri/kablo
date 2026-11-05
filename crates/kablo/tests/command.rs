@@ -1,5 +1,5 @@
 //! `kablo bateri`, the verbs that open no terminal, run for real: the real `kablo` against a test in
-//! the place of the Mac (`stage`). What each verb tells the Mac is read back with the window's own
+//! the place of the bateri app (`stage`). What each verb tells the bateri app is read back with the window's own
 //! reader (`kablo-bateri`), so the command and the window cannot drift apart without a test saying so.
 
 // Test support: a failure here is a failed test.
@@ -39,7 +39,7 @@ fn runs(stage: &Stage, id: &str) -> bool {
         .any(|line| line.split_whitespace().next() == Some(id) && !line.contains("ended"))
 }
 
-/// What a request of the Mac tells, one of them: the single message of a run.
+/// What a request of the bateri app tells, one of them: the single message of a run.
 fn told_one(stage: &Stage) -> &str {
     assert_eq!(stage.told.len(), 1, "{:?}", stage.told);
     &stage.told[0]
@@ -47,7 +47,7 @@ fn told_one(stage: &Stage) -> &str {
 
 #[test]
 fn only_a_plain_terminal_number_is_a_target() {
-    let mut stage = Stage::with_mac(OK);
+    let mut stage = Stage::with_app(OK);
     stage.terminal("p1");
     // Labels, bare numbers, a leading zero, a made-up id, and the `t7` the numbers were called
     // before panes: none reaches kablo, all are 64.
@@ -143,7 +143,7 @@ fn the_commands_that_are_kablos_own_pass_on_with_their_words_and_their_status() 
 }
 
 #[test]
-fn close_goes_to_the_mac_and_without_one_ends_any_terminal_of_the_machine() {
+fn close_goes_to_the_app_and_without_one_ends_any_terminal_of_the_machine() {
     let mut stage = Stage::new();
     for n in 1..=4 {
         stage.terminal(&format!("p{n}"));
@@ -155,7 +155,7 @@ fn close_goes_to_the_mac_and_without_one_ends_any_terminal_of_the_machine() {
         std::fs::write(path.join(name), "x\n").unwrap();
     }
 
-    // No Mac: kablo ends it, nobody is asked, the records go.
+    // No bateri app: kablo ends it, nobody is asked, the records go.
     let said = stage.run_in("p9", &["close", "pane", "p1"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(!runs(&stage, "p1"));
@@ -170,9 +170,9 @@ fn close_goes_to_the_mac_and_without_one_ends_any_terminal_of_the_machine() {
         "a note of a closed terminal goes with it"
     );
 
-    // With a Mac the question is its, whoever opened it: it closes the pane and the terminal, and
+    // With the bateri app the question is its, whoever opened it: it closes the pane and the terminal, and
     // the command ends nothing itself unless it was told to kill.
-    stage.mac_says(OK);
+    stage.app_says(OK);
     let said = stage.run_in("p9", &["close", "pane", "p3"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(stage.told, ["bateri 2\nclose\nterminal p3\n"]);
@@ -180,34 +180,34 @@ fn close_goes_to_the_mac_and_without_one_ends_any_terminal_of_the_machine() {
         parse_told(&stage.told[0]),
         Request::Close(Anchor::of(Terminal(3)))
     );
-    assert!(runs(&stage, "p3"), "the Mac closes it, not this");
+    assert!(runs(&stage, "p3"), "the bateri app closes it, not this");
     let said = stage.run_in("p9", &["close", "pane", "p3", "--force"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(!runs(&stage, "p3"), "a kill is kablo's to do");
 
-    // The Mac refuses by the level it has for this machine, and says which and how to change it; it
+    // The bateri app refuses by the level it has for this machine, and says which and how to change it; it
     // does not know the pane; it could not tell.
     stage.forget_told();
-    stage.mac_says("bateri 2\nerror refused this holds a pane of another machine, which \"own\" does not change on rasp (level \"own\"); set `commands` in the [remote] hosts entry for rasp to \"screen\" in settings.toml to allow it\n");
+    stage.app_says("bateri 2\nerror refused this holds a pane of another machine, which \"own\" does not change on rasp (level \"own\"); set `commands` in the [remote] hosts entry for rasp to \"screen\" in settings.toml to allow it\n");
     let said = stage.run_in("p9", &["close", "pane", "p4"]);
     assert_eq!(said.status, 77);
     assert!(said.err.contains("\"screen\""), "{}", said.err);
     assert!(runs(&stage, "p4"));
-    stage.mac_says("bateri 2\nerror unknown p4 is no pane on this server\n");
+    stage.app_says("bateri 2\nerror unknown p4 is no pane on this server\n");
     let said = stage.run_in("p9", &["close", "pane", "p4"]);
     assert_eq!(
         (said.status, said.err.as_str()),
         (1, "bateri: p4 is no pane on this server\n")
     );
     assert!(runs(&stage, "p4"));
-    // The Mac could not tell: the terminal is this machine's own all the same.
-    stage.mac_says("bateri 2\nerror failed the server did not answer\n");
+    // The bateri app could not tell: the terminal is this machine's own all the same.
+    stage.app_says("bateri 2\nerror failed the server did not answer\n");
     let said = stage.run_in("p9", &["close", "pane", "p4"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(!runs(&stage, "p4"));
 
-    // A pane of another machine is the Mac's to close, or nobody's.
-    stage.no_mac();
+    // A pane of another machine is the bateri app's to close, or nobody's.
+    stage.no_app();
     let said = stage.run_in("p9", &["close", "pane", "p7@prod"]);
     assert_eq!(said.status, 69, "{}", said.err);
     assert!(
@@ -225,8 +225,8 @@ fn close_goes_to_the_mac_and_without_one_ends_any_terminal_of_the_machine() {
 fn a_terminal_named_nothing_is_the_callers_own_whatever_it_is_called() {
     let made = format!("b-{}", "0123456789abcdef".repeat(2));
     let mut stage = Stage::new();
-    // With a Mac the Mac is told which terminal, so that it closes the pane that shows it.
-    stage.mac_says(OK);
+    // With the bateri app the bateri app is told which terminal, so that it closes the pane that shows it.
+    stage.app_says(OK);
     let said = stage.run_in(&made, &["close", "pane"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(
@@ -239,29 +239,29 @@ fn a_terminal_named_nothing_is_the_callers_own_whatever_it_is_called() {
     let said = stage.run_in("p4", &["close", "pane", &made]);
     assert_eq!(said.status, 64);
     assert!(stage.told.is_empty());
-    // No Mac: kablo ends it by the name it has.
+    // No bateri app: kablo ends it by the name it has.
     let mut stage = Stage::new();
     stage.run_ending_in(&made, &["close", "pane"]);
     assert!(!runs(&stage, &made));
 }
 
 #[test]
-fn ls_prints_what_the_mac_says_and_without_one_what_the_server_has() {
+fn ls_prints_what_the_app_says_and_without_one_what_the_server_has() {
     let mut stage =
-        Stage::with_mac("bateri 2\nok text\nWindow 1\n  Tab 1.1\n\u{1b}[31mred\u{7}\n\n");
-    // The Mac's text, byte for byte but for the bytes a terminal would act on.
+        Stage::with_app("bateri 2\nok text\nWindow 1\n  Tab 1.1\n\u{1b}[31mred\u{7}\n\n");
+    // The bateri app's text, byte for byte but for the bytes a terminal would act on.
     let said = stage.run_in("p4", &["ls"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "Window 1\n  Tab 1.1\n[31mred\n\n");
     assert_eq!(stage.told, ["bateri 2\nls\n"]);
     stage.forget_told();
-    stage.mac_says("bateri 2\nok text\n[]\n");
+    stage.app_says("bateri 2\nok text\n[]\n");
     let said = stage.run_in("p4", &["ls", "--json"]);
     assert_eq!(said.out, "[]\n");
     assert_eq!(stage.told, ["bateri 2\nls\nformat json\n"]);
 
-    // No Mac: kablo's own list and what waits to be placed.
-    stage.no_mac();
+    // No bateri app: kablo's own list and what waits to be placed.
+    stage.no_app();
     stage.terminal("p1");
     let note = stage.state().join("placing");
     std::fs::create_dir_all(&note).unwrap();
@@ -275,28 +275,29 @@ fn ls_prints_what_the_mac_says_and_without_one_what_the_server_has() {
     assert!(said.out.starts_with("ID"), "{}", said.out);
     assert!(
         said.out
-            .ends_with("\nWaiting for a Mac to place:\n  p1  below p4 (30%)\n"),
+            .ends_with("\nWaiting for the bateri app to place:\n  p1  below p4 (30%)\n"),
         "{}",
         said.out
     );
     assert!(
-        said.err.starts_with("bateri: no Mac is connected"),
+        said.err
+            .starts_with("bateri: the bateri app is not connected"),
         "{}",
         said.err
     );
     let said = stage.run_in("p4", &["ls", "--json"]);
     assert!(said.out.starts_with('['), "{}", said.out);
-    // The Mac's mistakes are the status, as for any request...
-    stage.mac_says("bateri 2\nerror usage no such format\n");
+    // The bateri app's mistakes are the status, as for any request...
+    stage.app_says("bateri 2\nerror usage no such format\n");
     assert_eq!(stage.run_in("p4", &["ls"]).status, 64);
     // ...but one that is only that it could not tell now leaves the server's own list.
-    stage.mac_says("bateri 2\nerror failed the server did not give its terminals in time\n");
+    stage.app_says("bateri 2\nerror failed the server did not give its terminals in time\n");
     let said = stage.run_in("p4", &["ls"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(said.out.starts_with("ID"), "{}", said.out);
     assert!(
         said.err
-            .starts_with("bateri: the Mac could not tell what is on screen:"),
+            .starts_with("bateri: the bateri app could not tell what is on screen:"),
         "{}",
         said.err
     );
@@ -304,12 +305,15 @@ fn ls_prints_what_the_mac_says_and_without_one_what_the_server_has() {
 }
 
 #[test]
-fn notify_needs_a_mac_and_sends_one_line() {
+fn notify_needs_an_app_and_sends_one_line() {
     let mut stage = Stage::new();
     let said = stage.run_in("p4", &["notify", "the build is done"]);
     assert_eq!(said.status, 69);
-    assert_eq!(said.err, "bateri: no Mac is connected to show it\n");
-    stage.mac_says(OK);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected to show it\n"
+    );
+    stage.app_says(OK);
     let said = stage.run_in("p4", &["notify", "3 tests\nfailed:", "\u{1b}[31mx\ty"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(
@@ -319,13 +323,13 @@ fn notify_needs_a_mac_and_sends_one_line() {
     let long = "x".repeat(1001);
     assert_eq!(stage.run_in("p4", &["notify", &long]).status, 64);
     assert_eq!(stage.run_in("p4", &["notify"]).status, 64);
-    assert_eq!(stage.told.len(), 1, "nothing else reached the Mac");
+    assert_eq!(stage.told.len(), 1, "nothing else reached the bateri app");
 }
 
 #[test]
-fn the_layout_verbs_are_the_macs_alone_and_say_what_they_asked() {
+fn the_layout_verbs_are_the_apps_alone_and_say_what_they_asked() {
     let mut stage = Stage::new();
-    // With no Mac they are 69, and the words say what is missing.
+    // With no bateri app they are 69, and the words say what is missing.
     for args in [
         &["focus", "tab", "t3"][..],
         &["zoom", "p9"],
@@ -335,9 +339,12 @@ fn the_layout_verbs_are_the_macs_alone_and_say_what_they_asked() {
     ] {
         let said = stage.run_in("p4", args);
         assert_eq!(said.status, 69, "{args:?}: {}", said.err);
-        assert_eq!(said.err, "bateri: no Mac is connected to do it\n");
+        assert_eq!(
+            said.err,
+            "bateri: the bateri app is not connected to do it\n"
+        );
     }
-    stage.mac_says(OK);
+    stage.app_says(OK);
     let tries: Vec<(Vec<&str>, Arrange)> = vec![
         (
             vec!["focus", "tab", "t3"],
@@ -393,7 +400,7 @@ fn the_layout_verbs_are_the_macs_alone_and_say_what_they_asked() {
     ];
     for (args, arrange) in &tries {
         stage.forget_told();
-        stage.mac_says(if args[0] == "move" { MOVED } else { OK });
+        stage.app_says(if args[0] == "move" { MOVED } else { OK });
         let said = stage.run_in("p4", args);
         assert_eq!(said.status, 0, "{args:?}: {}", said.err);
         assert_eq!(said.out, "");
@@ -404,33 +411,33 @@ fn the_layout_verbs_are_the_macs_alone_and_say_what_they_asked() {
         );
     }
     // Run in no terminal the caller's own is nothing; a named one is still fine.
-    stage.mac_says(OK);
+    stage.app_says(OK);
     let said = stage.run(&["focus", "tab"]);
     assert_eq!(said.status, 64, "{}", said.err);
     assert!(said.err.contains("run in no terminal"), "{}", said.err);
     let said = stage.run(&["focus", "tab", "t3"]);
     assert_eq!(said.status, 0, "{}", said.err);
-    // The Mac refuses what would take the keyboard: 77, and its words.
-    stage.mac_says("bateri 2\nerror refused the keyboard is in another pane\n");
+    // The bateri app refuses what would take the keyboard: 77, and its words.
+    stage.app_says("bateri 2\nerror refused the keyboard is in another pane\n");
     let said = stage.run_in("p4", &["focus", "pane", "p9"]);
     assert_eq!(said.status, 77, "{}", said.err);
     assert_eq!(said.err, "bateri: the keyboard is in another pane\n");
-    stage.mac_says("bateri 2\nerror unknown t9 is no tab\n");
+    stage.app_says("bateri 2\nerror unknown t9 is no tab\n");
     let said = stage.run_in("p4", &["focus", "tab", "t9"]);
     assert_eq!(said.status, 1, "{}", said.err);
-    // A Mac that answers something that is no reply is said so.
-    stage.mac_says("what is this\n");
+    // The bateri app that answers something that is no reply is said so.
+    stage.app_says("what is this\n");
     let said = stage.run_in("p4", &["focus", "tab", "t9"]);
     assert_eq!(said.status, 1);
     assert_eq!(
         said.err,
-        "bateri: the Mac answered with something this does not read\n"
+        "bateri: the bateri app answered with something this does not read\n"
     );
 }
 
 #[test]
 fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
-    let mut stage = Stage::with_mac(OK);
+    let mut stage = Stage::with_app(OK);
     let said = stage.run_in("p4", &["focus", "group", "t3"]);
     assert_eq!(said.status, 64, "{}", said.err);
     assert_eq!(
@@ -480,16 +487,16 @@ fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
     }
     assert!(
         stage.told.is_empty(),
-        "nothing reached the Mac: {:?}",
+        "nothing reached the bateri app: {:?}",
         stage.told
     );
 }
 
 #[test]
-fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_macs_alone() {
+fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_apps_alone() {
     let mut stage = Stage::new();
     // No kind, or an id where the kind goes: 64, and what to write. Nothing is asked of kablo or of
-    // the Mac.
+    // the bateri app.
     for (args, hint) in [
         (&["close"][..], "Did you mean: bateri close pane"),
         (&["close", "p9"], "Did you mean: bateri close pane p9"),
@@ -518,7 +525,7 @@ fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_macs_alone() {
         assert_eq!(said.status, 64, "{args:?}: {}", said.err);
         assert!(said.err.contains(hint), "{args:?}: {}", said.err);
     }
-    // No Mac: a tab, a group and a window belong to its windows, so they are 69.
+    // No bateri app: a tab, a group and a window belong to its windows, so they are 69.
     for args in [
         &["close", "tab", "t3"][..],
         &["close", "group", "g1"],
@@ -528,8 +535,8 @@ fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_macs_alone() {
         let said = stage.run_in("p4", args);
         assert_eq!(said.status, 69, "{args:?}: {}", said.err);
     }
-    // With one the Mac is told which layer, or none: the caller's own.
-    stage.mac_says(OK);
+    // With one the bateri app is told which layer, or none: the caller's own.
+    stage.app_says(OK);
     let tries: Vec<(Vec<&str>, Arrange)> = vec![
         (
             vec!["close", "tab", "t3"],
@@ -565,9 +572,9 @@ fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_macs_alone() {
     // Run in no terminal the caller's own is nothing.
     assert_eq!(stage.run(&["close", "tab"]).status, 64);
     // The level for this machine refuses (77); a tab that is not there is 1.
-    stage.mac_says("bateri 2\nerror refused this holds a pane of another machine\n");
+    stage.app_says("bateri 2\nerror refused this holds a pane of another machine\n");
     assert_eq!(stage.run_in("p4", &["close", "tab", "t3"]).status, 77);
-    stage.mac_says("bateri 2\nerror unknown there is no tab t9\n");
+    stage.app_says("bateri 2\nerror unknown there is no tab t9\n");
     let said = stage.run_in("p4", &["close", "tab", "t9"]);
     assert_eq!(
         (said.status, said.err.as_str()),
@@ -576,10 +583,10 @@ fn close_names_its_kind_and_a_tab_a_group_or_a_window_is_the_macs_alone() {
 }
 
 #[test]
-fn rename_gives_a_tab_or_a_group_a_label_through_the_mac_and_a_pane_one_through_kablo() {
+fn rename_gives_a_tab_or_a_group_a_label_through_the_app_and_a_pane_one_through_kablo() {
     let mut stage = Stage::new();
     stage.terminal("p9");
-    // A pane's label is kablo's: the Mac is not asked, an empty one clears.
+    // A pane's label is kablo's: the bateri app is not asked, an empty one clears.
     let labelled = |stage: &Stage| {
         let listed = stage.env.kablo().args(["list", "--json"]).output().unwrap();
         String::from_utf8_lossy(&listed.stdout).into_owned()
@@ -639,10 +646,10 @@ fn rename_gives_a_tab_or_a_group_a_label_through_the_mac_and_a_pane_one_through_
     }
     assert!(stage.told.is_empty());
 
-    // A tab's and a group's are the Mac's: 69 with none.
+    // A tab's and a group's are the bateri app's: 69 with none.
     let said = stage.run_in("p4", &["rename", "tab", "t3", "web"]);
     assert_eq!(said.status, 69, "{}", said.err);
-    stage.mac_says(OK);
+    stage.app_says(OK);
     let tries: Vec<(Vec<&str>, Arrange)> = vec![
         (
             vec!["rename", "tab", "t3", "web"],
@@ -818,12 +825,15 @@ fn move_takes_a_pane_or_a_tab_where_it_says_and_prints_what_it_made() {
         assert_eq!(said.status, 64, "{args:?}: {}", said.err);
         assert!(said.err.contains(hint), "{args:?}: {}", said.err);
     }
-    // With no Mac nothing was made, and the words say what is missing.
+    // With no bateri app nothing was made, and the words say what is missing.
     let said = stage.run_in("p4", &["move", "pane", "p9", "--new-tab"]);
     assert_eq!(said.status, 69, "{}", said.err);
-    assert_eq!(said.err, "bateri: no Mac is connected to do it\n");
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected to do it\n"
+    );
 
-    stage.mac_says(AT);
+    stage.app_says(AT);
     let tries: Vec<(Vec<&str>, Arrange, &str, &str)> = vec![
         (
             vec!["move", "pane", "p9", "--new-tab"],
@@ -1009,16 +1019,16 @@ fn move_takes_a_pane_or_a_tab_where_it_says_and_prints_what_it_made() {
             "{args:?}"
         );
     }
-    // A tab in no group: `null` where the Mac said nothing.
-    stage.mac_says(MOVED);
+    // A tab in no group: `null` where the bateri app said nothing.
+    stage.app_says(MOVED);
     let said = stage.run_in("p4", &["move", "pane", "p9", "--new-tab", "--json"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(
         said.out,
         "{\"pane\":\"p9\",\"tab\":\"t7\",\"group\":null,\"window\":\"w1\"}\n"
     );
-    // What the Mac refuses is said, and exits as a refusal does.
-    stage.mac_says("bateri 2\nerror refused the person is typing there\n");
+    // What the bateri app refuses is said, and exits as a refusal does.
+    stage.app_says("bateri 2\nerror refused the person is typing there\n");
     let said = stage.run_in("p4", &["move", "tab", "t3", "--new-group", "api"]);
     assert_eq!(said.status, 77, "{}", said.err);
     assert_eq!(said.out, "");
@@ -1070,7 +1080,7 @@ fn move_tab_goes_into_a_group_or_a_window_and_nothing_else() {
     let said = stage.run_in("p4", &["move", "tab", "t3", "--group", "g1"]);
     assert_eq!(said.status, 69, "{}", said.err);
 
-    stage.mac_says(MOVED);
+    stage.app_says(MOVED);
     let tab = id(IdKind::Tab, 3).expect("an id");
     let tries: Vec<(Vec<&str>, Arrange)> = vec![
         (

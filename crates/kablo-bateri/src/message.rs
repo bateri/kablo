@@ -1,4 +1,4 @@
-//! The text the `bateri` command and the Mac say to each other on kablo's app channel.
+//! The text the `bateri` command and the bateri app say to each other on kablo's app channel.
 //!
 //! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `focus`, `zoom`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
@@ -17,17 +17,17 @@
 //! ```
 //!
 //! The `terminal` is the one just started, and an agent's number (with `fresh DIRECTORY`, one
-//! that is not started yet: the Mac opens an ordinary pane of this Mac under that name, its shell
+//! that is not started yet: the bateri app opens an ordinary pane of this computer under that name, its shell
 //! started in the directory). The `anchor` is a terminal as
 //! kablo names it: `p4` when the agent wrote one, and the caller's own name, whatever it is, when
-//! it did not (a terminal the Mac opened before the numbers existed is `b-` and 32 digits). The
+//! it did not (a terminal the bateri app opened before the numbers existed is `b-` and 32 digits). The
 //! `terminal` of a `close` is named the same way, because a `close` that names none closes the
 //! caller's own.
 //!
 //! The verbs that move the keyboard or change the layout (`focus`, `zoom`, `swap`, `move`,
 //! `resize`) name panes the same way and a tab, a group or a window by its id (`t3`, `g1`, `w1`);
 //! a `focus` that names no id means the one the caller stands in. A pane of another machine is
-//! named with the machine after an `@` (`p9@prod`, this Mac `p9@local`: [`Anchor::address`]),
+//! named with the machine after an `@` (`p9@prod`, this computer `p9@local`: [`Anchor::address`]),
 //! in `close`, `focus`, `zoom`, `swap`, `move` and `resize`. A `move` of a pane with `tab` joins
 //! that tab; with `side tab` and no `beside` it makes the pane a tab of its own, in the place a
 //! new tab's lines name. A `move` of a tab with no `id` is the caller's. Every `move` is answered
@@ -35,21 +35,20 @@
 //!
 //! A pane for a terminal that runs on another machine than the caller's is a `place` with the
 //! `server` line (`server prod`: the name `ssh` takes), and the `ssh` verb asks how to reach that
-//! server (`ssh`, then `server prod`); its reply is the text of one `arg` line for each word of the
-//! `ssh` command, which the one who asked runs itself ([`Reach`]); for the machine that asked itself
-//! (`server @local` from this Mac) the one word `here` says there is nothing to reach. A program on a
-//! server cannot run that `ssh`: its `ssh` verb is answered with the one word `relay`, and what it would have run on the
-//! other machine it hands to the window in a `relay` (`server prod` or `server @local` for this
-//! Mac, then `words`: the words of the `bateri` command, each as `x` and the hex of its bytes, so
-//! that a line break in a `send` survives the line that frames it). The window runs the command
+//! server (`ssh`, then `server prod`); its reply is the one word `relay` ([`Reach`]), or `here`
+//! when the machine named is the one that asked (`server @local` from this computer): nothing to
+//! reach, the asker does it itself. What the asker would have run on the other machine it hands
+//! to the app in a `relay` (`server prod` or `server @local`, then `words`: the words of the
+//! `bateri` command, each as `x` and the hex of its bytes, so
+//! that a line break in a `send` survives the line that frames it). The app runs the command
 //! there and answers `ok relayed`: a `status` line, a `stderr` line that counts the lines of
 //! stderr that follow, and the rest as stdout (text: a byte that is none is replaced). Only a server given `full` is
 //! relayed for, and only `split`, `send`, `send-key`, `capture`, `wait` and `close`.
 //!
 //! **A reply** starts with `bateri 2` too and then says `ok` (`ok placed` and the lines that
 //! tell how and where, `ok text` and the rest of the message as the text to print, `ok start`:
-//! this terminal is not the Mac's to start, start it and ask again) or `error KIND TEXT`
-//! on one line. The command turns the kind into an exit code; the Mac builds the text of an `ls`,
+//! this terminal is not the bateri app's to start, start it and ask again) or `error KIND TEXT`
+//! on one line. The command turns the kind into an exit code; the bateri app builds the text of an `ls`,
 //! the command prints it.
 //!
 //! **Reading is strict and never panics**: a wrong greeting, an unknown verb or key, a key twice,
@@ -104,7 +103,7 @@ pub enum Kind {
     Usage,
     /// The message is of a version this build does not read; an older one may be tried.
     Version,
-    /// The terminal is none the Mac or the server knows.
+    /// The terminal is none the bateri app or the server knows.
     Unknown,
     /// The user was asked and said no, or the request is not the sender's to make (77).
     Refused,
@@ -193,9 +192,9 @@ pub struct Place {
     pub focus: bool,
     /// Where else than beside the anchor, and the label.
     pub home: Home,
-    /// The terminal is not started: the Mac opens an ordinary pane of this Mac, its shell started
+    /// The terminal is not started: the bateri app opens an ordinary pane of this computer, its shell started
     /// in this directory, under the name `terminal` gives it (`bateri split` with no program on a
-    /// machine that has no bootstrap — this Mac). A directory and a name are all the message has
+    /// machine that has no bootstrap — this computer). A directory and a name are all the message has
     /// to say of it; no program is carried.
     pub fresh: Option<String>,
     /// The shell a `fresh` pane is for, by its absolute path, one bateri has an integration for
@@ -203,7 +202,7 @@ pub struct Place {
     /// anything else this way: what is not one of those is a program, which the command starts.
     pub shell: Option<String>,
     /// The terminal runs on this server, not on the machine that asks: the name `ssh` takes for it
-    /// (`prod`). The Mac makes the pane that shows it, which connects by its own path (`-S`).
+    /// (`prod`). The bateri app makes the pane that shows it, which connects by its own path (`-S`).
     pub server: Option<String>,
 }
 
@@ -222,7 +221,7 @@ pub enum Request {
     /// Say what is open: the windows and tabs, then the terminals.
     Ls(Format),
     /// Close a terminal: an agent's number, or — the one a request that names none means, the
-    /// caller's own — the name kablo has for it, whatever that is (a terminal the Mac opened
+    /// caller's own — the name kablo has for it, whatever that is (a terminal the bateri app opened
     /// before the numbers existed is `b-` and 32 digits).
     Close(Anchor),
     /// Tell the user something.
@@ -239,7 +238,7 @@ pub enum Request {
 /// A `bateri` command the window runs on another machine for a program on a server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Relay {
-    /// The machine: the name `ssh` takes for a server, or [`LOCAL_SERVER`] for this Mac.
+    /// The machine: the name `ssh` takes for a server, or [`LOCAL_SERVER`] for this computer.
     pub server: String,
     /// The words of the command, the first one of [`RELAYED`].
     pub words: Vec<String>,
@@ -481,12 +480,12 @@ pub struct Placed {
     pub keyboard_stayed: bool,
 }
 
-/// What the Mac answers.
+/// What the bateri app answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
     /// Done, and nothing to tell.
     Done,
-    /// Not done, and not refused: this machine's terminal is not started yet and the Mac cannot
+    /// Not done, and not refused: this machine's terminal is not started yet and the bateri app cannot
     /// start it, so the one who asked starts it (`ok start`: the answer to a `place` with `fresh`
     /// from a machine that is a server) and then asks again, with the terminal made.
     Start,
@@ -498,14 +497,12 @@ pub enum Reply {
     Failed(Failure),
 }
 
-/// What the Mac says to an `ssh` request, as the text of an `ok text` reply: how the asker reaches
-/// the server it named.
+/// What the app says to an `ssh` request, as the text of an `ok text` reply: how the asker gets
+/// a command run on the server it named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// The words of the `ssh` command that rides the connection the Mac keeps, one `arg` line each.
-    Words(Vec<String>),
-    /// The asker is a program on a server, which has no `ssh` to the other machine: it hands what
-    /// it would have run there to the window in a `relay`.
+    /// The asker hands what it would have run there to the app in a `relay`, and the app runs it
+    /// over the connection it keeps to that server.
     Relay,
     /// The server named is the machine that asks: nothing to reach, the asker does it itself.
     Here,
@@ -517,29 +514,15 @@ impl Reach {
         match self {
             Reach::Relay => "relay\n".to_owned(),
             Reach::Here => "here\n".to_owned(),
-            Reach::Words(words) => words.iter().map(|word| format!("arg {word}\n")).collect(),
         }
     }
 
     /// What a reply's text says; a line that is none of these words is not read.
     pub fn parse(text: &str) -> Result<Reach, Failure> {
-        let mut lines = text.lines();
-        match lines.clone().next() {
-            Some("relay") => return Ok(Reach::Relay),
-            Some("here") => return Ok(Reach::Here),
-            _ => {}
-        }
-        let words: Vec<String> = lines
-            .by_ref()
-            .filter_map(|line| line.strip_prefix("arg "))
-            .map(str::to_owned)
-            .collect();
-        if words.is_empty() {
-            Err(Failure::usage(
-                "an `ssh` reply is `relay`, `here` or the words of the command, one `arg` line each",
-            ))
-        } else {
-            Ok(Reach::Words(words))
+        match text.lines().next() {
+            Some("relay") => Ok(Reach::Relay),
+            Some("here") => Ok(Reach::Here),
+            _ => Err(Failure::usage("an `ssh` reply is `relay` or `here`")),
         }
     }
 }
@@ -926,7 +909,7 @@ const SERVER_MAX: usize = 253;
 
 /// A server as `ssh` is given it: a host or an alias, `user@host` too — letters, digits and
 /// `. _ - : @`, starting with a letter or a digit, so that it can never be read as an option; or
-/// the word that stands for this Mac ([`LOCAL_SERVER`]).
+/// the word that stands for this computer ([`LOCAL_SERVER`]).
 fn check_server(key: &str, name: &str) -> Result<(), Failure> {
     if name == LOCAL_SERVER {
         return Ok(());
@@ -973,8 +956,8 @@ fn check_relayed(words: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A word as the `words` line writes it: `x` and the hex of its bytes.
-pub(super) fn hex_word(word: &str) -> String {
+/// A word as the `words` line and `bateri --hex` write it: `x` and the hex of its bytes.
+pub fn hex_word(word: &str) -> String {
     let mut out = String::with_capacity(1 + word.len() * 2);
     out.push('x');
     for byte in word.bytes() {
@@ -983,8 +966,8 @@ pub(super) fn hex_word(word: &str) -> String {
     out
 }
 
-/// The word a token of the `words` line stands for.
-fn word_of_hex(token: &str) -> Result<String, Failure> {
+/// The word a token of the `words` line, or of `bateri --hex`, stands for.
+pub fn word_of_hex(token: &str) -> Result<String, Failure> {
     let digits = token
         .strip_prefix('x')
         .ok_or_else(|| Failure::usage("a word of `words` is `x` and the hex of its bytes"))?;
@@ -1559,7 +1542,7 @@ fn id_of(fields: &Fields<'_>, key: &str, kind: IdKind) -> Result<Option<Id>, Fai
 mod tests {
     use super::*;
 
-    // Version 2, frozen: the text the command and the Mac speak. These are never edited; a later
+    // Version 2, frozen: the text the command and the bateri app speak. These are never edited; a later
     // version gets its own constants.
     const V2_PLACE: &str =
         "bateri 2\nplace\nterminal p9\nanchor p4\nside below\nratio 30\nkeep-open yes\nfocus yes\n";
@@ -2429,7 +2412,7 @@ mod tests {
         let twice =
             "bateri 2\nok placed\nlanded as_asked\nsqueezed no\nhidden no\ntab t1\ntab t2\n";
         assert!(Reply::parse(twice).is_err());
-        // What the Mac writes for a pane no window has yet: no line of the three.
+        // What the bateri app writes for a pane no window has yet: no line of the three.
         let waiting = Reply::Placed(Placed {
             landed: Landed::Waiting,
             next_to: None,
@@ -2551,32 +2534,17 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_that_says_start_has_nothing_after_it_and_an_ssh_reply_is_words_relay_or_here() {
+    fn a_reply_that_says_start_has_nothing_after_it_and_an_ssh_reply_is_relay_or_here() {
         assert_eq!(Reply::parse("bateri 2\nok start\nextra\n").ok(), None);
-        for reach in [
-            Reach::Relay,
-            Reach::Here,
-            Reach::Words(vec![
-                "ssh".to_owned(),
-                "-S".to_owned(),
-                "/tmp/x y".to_owned(),
-            ]),
-        ] {
+        for reach in [Reach::Relay, Reach::Here] {
             let reply = Reply::Text(reach.text());
             assert_eq!(Reply::parse(&reply.encode()).as_ref(), Ok(&reply));
             assert_eq!(Reach::parse(&reach.text()).as_ref(), Ok(&reach));
         }
         assert_eq!(Reach::Relay.text(), "relay\n");
         assert_eq!(Reach::Here.text(), "here\n");
-        assert_eq!(
-            Reach::Words(vec!["ssh".to_owned(), "-p".to_owned()]).text(),
-            "arg ssh\narg -p\n"
-        );
-        // A word of the command may be a word of this protocol.
-        assert_eq!(
-            Reach::parse("arg here\narg relay\n"),
-            Ok(Reach::Words(vec!["here".to_owned(), "relay".to_owned()]))
-        );
+        // The words of an `ssh` command are no reply any more.
+        assert!(Reach::parse("arg ssh\narg -p\n").is_err());
         assert!(Reach::parse("").is_err());
         assert!(Reach::parse("nothing\n").is_err());
     }
@@ -2820,7 +2788,7 @@ mod tests {
     }
 
     #[test]
-    fn this_mac_is_named_by_the_word_that_no_host_can_be() {
+    fn this_computer_is_named_by_the_word_that_no_host_can_be() {
         assert_eq!(
             Request::parse("bateri 2\nssh\nserver @local\n"),
             Ok(Request::Ssh("@local".to_owned()))

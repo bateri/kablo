@@ -1,6 +1,6 @@
 //! The verbs that open no terminal: what is kablo's own (`send`, `send-key`, `capture`, `wait`,
-//! `rename pane`, and `close pane` with no Mac to ask) is run in this process, and what is about
-//! the Mac's windows is asked of the Mac.
+//! `rename pane`, and `close pane` with no bateri app to ask) is run in this process, and what is about
+//! the bateri app's windows is asked of the bateri app.
 
 use std::ffi::OsString;
 
@@ -54,25 +54,29 @@ fn id_of(word: &str) -> Option<Id> {
     Id::parse(word)
 }
 
-// ─── asking the Mac ──────────────────────────────────────────────────────
+// ─── asking the bateri app ──────────────────────────────────────────────────────
 
-/// A request only the Mac can carry out, since it is about its windows.
-fn mac_does(ctx: &Ctx, request: &Request) -> Done {
+/// A request only the bateri app can carry out, since it is about its windows.
+fn app_does(ctx: &Ctx, request: &Request) -> Done {
     match ctx.ask(request)? {
         Asked::Reply(Reply::Done) => Ok(()),
         Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
-        Asked::NoMac | Asked::Silent => Err(Exit::new(69, "no Mac is connected to do it")),
+        Asked::NoApp | Asked::Silent => {
+            Err(Exit::new(69, "the bateri app is not connected to do it"))
+        }
     }
 }
 
-/// A move, which the Mac answers with where the pane's or the tab's tab stands.
-fn mac_moves(ctx: &Ctx, arrange: Arrange) -> Result<Placed, Exit> {
+/// A move, which the bateri app answers with where the pane's or the tab's tab stands.
+fn app_moves(ctx: &Ctx, arrange: Arrange) -> Result<Placed, Exit> {
     match ctx.ask(&Request::Arrange(arrange))? {
         Asked::Reply(Reply::Placed(placed)) => Ok(placed),
         Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
-        Asked::NoMac | Asked::Silent => Err(Exit::new(69, "no Mac is connected to do it")),
+        Asked::NoApp | Asked::Silent => {
+            Err(Exit::new(69, "the bateri app is not connected to do it"))
+        }
     }
 }
 
@@ -97,7 +101,7 @@ pub fn close(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     if kind == "pane" {
         return close_pane(ctx, io, rest);
     }
-    // A tab, a group or a window belongs to the Mac's windows: with none connected it ends with 69.
+    // A tab, a group or a window belongs to the bateri app's windows: with none connected it ends with 69.
     if rest.len() > 1 {
         return Err(Exit::mistake(format!("close {kind} names one id")));
     }
@@ -119,7 +123,7 @@ pub fn close(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         "group" => Subject::Group(named),
         _ => Subject::Window(named),
     };
-    mac_does(ctx, &Request::Arrange(Arrange::Close(subject)))
+    app_does(ctx, &Request::Arrange(Arrange::Close(subject)))
 }
 
 fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
@@ -153,7 +157,7 @@ fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             let _ = std::fs::remove_file(state.join(dir).join(&target));
         }
     };
-    // The Mac closes it (the pane and the terminal as one); it refuses (77) with the level it has
+    // The bateri app closes it (the pane and the terminal as one); it refuses (77) with the level it has
     // for this machine and the setting that changes it.
     let asked = match anchor_of(&target) {
         Some(anchor) => ctx.ask(&Request::Close(anchor))?,
@@ -178,13 +182,13 @@ fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         Asked::Reply(Reply::Failed(failed)) => return Err(failure(&failed)),
         _ => {}
     }
-    // No Mac to ask, or it could not tell: the terminal is this machine's own and kablo ends it. A
-    // pane of another machine is the Mac's to close, or nobody's.
+    // No bateri app to ask, or it could not tell: the terminal is this machine's own and kablo ends it. A
+    // pane of another machine is the bateri app's to close, or nobody's.
     if target.contains('@') {
         return Err(Exit::new(
             69,
             format!(
-                "no Mac is connected to close {target}: a pane of another machine is closed through it"
+                "the bateri app is not connected to close {target}: a pane of another machine is closed through it"
             ),
         ));
     }
@@ -204,23 +208,23 @@ pub fn ls(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             return Err(Exit::mistake(format!("ls takes no '{}'", clean(arg))));
         }
     }
-    let mut why = "no Mac is connected";
+    let mut why = "the bateri app is not connected";
     match ctx.ask(&Request::Ls(format))? {
         Asked::Reply(Reply::Text(body)) => {
             let _ = io.out.write_all(clean(&body).as_bytes());
             return Ok(());
         }
         // It could not tell just now (the server's list did not come in time): what the server has
-        // is better than nothing, as it is with no Mac.
+        // is better than nothing, as it is with no bateri app.
         Asked::Reply(Reply::Failed(failed))
             if failed.kind == kablo_bateri::message::Kind::Failed =>
         {
-            why = "the Mac could not tell what is on screen";
+            why = "the bateri app could not tell what is on screen";
         }
         Asked::Reply(Reply::Failed(failed)) => return Err(failure(&failed)),
         _ => {}
     }
-    // No Mac: what the server has, and what waits to be placed.
+    // No bateri app: what the server has, and what waits to be placed.
     io.say(&format!(
         "{why}: these are the panes on this server, and none says where it is"
     ));
@@ -253,7 +257,7 @@ pub fn ls(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             }
         }
         if !header {
-            let _ = write!(io.out, "\nWaiting for a Mac to place:\n");
+            let _ = write!(io.out, "\nWaiting for the bateri app to place:\n");
             header = true;
         }
         let share = if ratio.is_empty() {
@@ -294,7 +298,9 @@ pub fn notify(ctx: &Ctx, words: &[String]) -> Done {
         Asked::Reply(Reply::Done) => Ok(()),
         Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
-        Asked::NoMac | Asked::Silent => Err(Exit::new(69, "no Mac is connected to show it")),
+        Asked::NoApp | Asked::Silent => {
+            Err(Exit::new(69, "the bateri app is not connected to show it"))
+        }
     }
 }
 
@@ -339,7 +345,7 @@ pub fn focus(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         "group" => Subject::Group(id_of(&id)),
         _ => Subject::Window(id_of(&id)),
     };
-    mac_does(ctx, &Request::Arrange(Arrange::Focus(subject)))
+    app_does(ctx, &Request::Arrange(Arrange::Focus(subject)))
 }
 
 pub fn zoom(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
@@ -356,7 +362,7 @@ pub fn zoom(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
             None
         }
     };
-    mac_does(ctx, &Request::Arrange(Arrange::Zoom(pane)))
+    app_does(ctx, &Request::Arrange(Arrange::Zoom(pane)))
 }
 
 pub fn swap(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
@@ -371,11 +377,11 @@ pub fn swap(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     let (Some(pane), Some(other)) = (anchor_of(first), anchor_of(second)) else {
         return Err(unread());
     };
-    mac_does(ctx, &Request::Arrange(Arrange::Swap { pane, other }))
+    app_does(ctx, &Request::Arrange(Arrange::Swap { pane, other }))
 }
 
 /// `rename pane|tab|group ID LABEL`: an empty label takes it away. A pane's label is kablo's own
-/// (the Mac is not asked); a tab's and a group's are the Mac's.
+/// (the bateri app is not asked); a tab's and a group's are the bateri app's.
 pub fn rename(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     let Some((kind, rest)) = words.split_first() else {
         return Err(Exit::mistake(
@@ -433,7 +439,7 @@ pub fn rename(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         Subject::Group(id_of(id))
     };
     let label = (!label.is_empty()).then_some(label);
-    mac_does(ctx, &Request::Arrange(Arrange::Rename { subject, label }))
+    app_does(ctx, &Request::Arrange(Arrange::Rename { subject, label }))
 }
 
 pub fn resize(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
@@ -482,7 +488,7 @@ pub fn resize(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
             None
         }
     };
-    mac_does(
+    app_does(
         ctx,
         &Request::Arrange(Arrange::Resize { pane, side, steps }),
     )
@@ -666,7 +672,7 @@ fn move_tab(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             None => return Err(unread()),
         }
     };
-    let placed = mac_moves(
+    let placed = app_moves(
         ctx,
         Arrange::MoveTab {
             tab: id_of(&tab),
@@ -857,7 +863,7 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             side,
         }
     };
-    let placed = mac_moves(ctx, arrange)?;
+    let placed = app_moves(ctx, arrange)?;
     if place.json {
         let _ = writeln!(
             io.out,

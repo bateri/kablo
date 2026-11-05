@@ -1,7 +1,7 @@
 //! The `bateri` command run for real: the real `kablo` binary, in a temporary home and socket
-//! directory, against a test in the place of the Mac (a connection to `kablo attach`, as the Mac
-//! is a program with one, the method of `app.rs`). What the command says to the Mac is read back
-//! and compared with `kablo-bateri`'s own reading, and what the Mac says back is whatever the test
+//! directory, against a test in the place of the bateri app (a connection to `kablo attach`, as the bateri app
+//! is a program with one, the method of `app.rs`). What the command says to the bateri app is read back
+//! and compared with `kablo-bateri`'s own reading, and what the bateri app says back is whatever the test
 //! says it does, so the command and the window cannot drift apart without a test saying so.
 
 // Test support: a failure here is a failed test.
@@ -54,7 +54,7 @@ pub struct Run<'a> {
     pub here: Option<&'a str>,
     pub args: &'a [&'a str],
     pub input: Option<&'a [u8]>,
-    /// The Mac's answer to the conversation of this turn (from 0), else the stage's.
+    /// The bateri app's answer to the conversation of this turn (from 0), else the stage's.
     pub turns: &'a [&'a str],
     /// Variables of the command.
     pub vars: &'a [(&'a str, &'a str)],
@@ -65,7 +65,7 @@ pub struct Stage {
     pub home: PathBuf,
     app: Option<Bridge>,
     served: usize,
-    /// Every message the Mac was told, in order.
+    /// Every message the bateri app was told, in order.
     pub told: Vec<String>,
     reply: Option<String>,
     runs: usize,
@@ -81,7 +81,7 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// A stage with no Mac connected.
+    /// A stage with no bateri app connected.
     pub fn new() -> Stage {
         let env = Env::new();
         let home = env.dir.join("home");
@@ -102,16 +102,16 @@ impl Stage {
         }
     }
 
-    /// A stage whose Mac says `reply` to whatever it is asked.
-    pub fn with_mac(reply: &str) -> Stage {
+    /// A stage whose bateri app says `reply` to whatever it is asked.
+    pub fn with_app(reply: &str) -> Stage {
         let mut stage = Stage::new();
-        stage.connect_mac();
-        stage.mac_says(reply);
+        stage.connect_app();
+        stage.app_says(reply);
         stage
     }
 
-    /// The Mac connects.
-    pub fn connect_mac(&mut self) {
+    /// The bateri app connects.
+    pub fn connect_app(&mut self) {
         if self.app.is_none() {
             let mut app = Bridge::start(&self.env);
             app.take_tickets();
@@ -119,15 +119,15 @@ impl Stage {
         }
     }
 
-    /// The Mac goes away.
-    pub fn no_mac(&mut self) {
+    /// The bateri app goes away.
+    pub fn no_app(&mut self) {
         self.app = None;
         self.served = 0;
     }
 
-    /// From now on the Mac says `reply` to each conversation.
-    pub fn mac_says(&mut self, reply: &str) {
-        self.connect_mac();
+    /// From now on the bateri app says `reply` to each conversation.
+    pub fn app_says(&mut self, reply: &str) {
+        self.connect_app();
         self.reply = Some(reply.to_owned());
     }
 
@@ -136,7 +136,7 @@ impl Stage {
         self.home.join(".local/share/bateri")
     }
 
-    /// Forgets what the Mac was told so far.
+    /// Forgets what the bateri app was told so far.
     pub fn forget_told(&mut self) {
         self.told.clear();
     }
@@ -248,7 +248,7 @@ impl Stage {
         ))
     }
 
-    /// The message that waits for a Mac under `id`.
+    /// The message that waits for the bateri app under `id`.
     pub fn note(&self, id: &str) -> Option<String> {
         std::fs::read_to_string(self.state().join("placing").join(id)).ok()
     }
@@ -267,50 +267,6 @@ impl Stage {
             .filter(|line| !line.contains("ended"))
             .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
             .collect()
-    }
-
-    /// This stage reaches `prod` over a fake `ssh`: it logs the arguments it is given and hands the
-    /// line (its last argument) to `shell -c` in the home of `prod`, as a server's sshd hands it to
-    /// the person's login shell. Every run of this stage has the fake on its `PATH`.
-    pub fn ssh_to(&mut self, prod: &Stage, shell: &str) {
-        let bin = self.env.dir.join("fakebin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let file = bin.join("ssh");
-        std::fs::write(
-            &file,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do last=$a; printf '%s\\n' \"$a\" >> '{log}'; done\nprintf -- '--\\n' >> '{log}'\ncd '{home}' || exit 255\nexec env HOME='{home}' KABLO_DIR='{dir}' SHELL='{shell}' '{shell}' -c \"$last\"\n",
-                log = self.env.dir.join("ssh.log").display(),
-                home = prod.home.display(),
-                dir = prod.env.dir.display(),
-                shell = shell,
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        self.vars.retain(|(name, _)| name != "PATH");
-        self.vars.push(("PATH".to_owned(), path));
-    }
-
-    /// What the fake `ssh` was given, one call after another.
-    pub fn ssh_calls(&self) -> Vec<Vec<String>> {
-        let text = std::fs::read_to_string(self.env.dir.join("ssh.log")).unwrap_or_default();
-        let mut calls = vec![Vec::new()];
-        for line in text.lines() {
-            if line == "--" {
-                calls.push(Vec::new());
-            } else if let Some(call) = calls.last_mut() {
-                call.push(line.to_owned());
-            }
-        }
-        calls.pop();
-        calls
     }
 
     /// `bateri ARGS` run in no terminal.
@@ -381,7 +337,7 @@ impl Stage {
         jobs
     }
 
-    /// A run with its own turns of the Mac's.
+    /// A run with its own turns of the bateri app's.
     pub fn go(&mut self, run: &Run<'_>) -> Said {
         self.runs += 1;
         let work = self.env.dir.join(format!("run{}", self.runs));
@@ -456,7 +412,7 @@ impl Stage {
         }
     }
 
-    /// Answers the Mac's conversations until the run is over, and returns its status.
+    /// Answers the bateri app's conversations until the run is over, and returns its status.
     fn serve(&mut self, waiting: &mut Waiting, turns: &[&str]) -> i32 {
         let start = Instant::now();
         let mut turn = 0;

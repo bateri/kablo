@@ -1,13 +1,13 @@
 //! `split`, `tab` and `window`: start a terminal on this machine, or on a server (`-S`), and tell
-//! the Mac where its pane goes.
+//! the bateri app where its pane goes.
 //!
 //! The terminal is the machine's own: `kablo new` starts it, it gets a number (`p9`) from the
-//! counter, and the Mac only decides where a pane that shows it goes. What the machine is — the Mac
-//! itself, or a server — is not something this knows: the Mac says it, in its answer. A terminal that
+//! counter, and the bateri app only decides where a pane that shows it goes. What the machine is — the bateri app
+//! itself, or a server — is not something this knows: the bateri app says it, in its answer. A terminal that
 //! is a program is started right away and its pane asked for; one with no program (`split`, or a
-//! shell named alone) is asked for first, as a pane of the Mac's own (`fresh`): the Mac makes it when
-//! the asker is the Mac itself, and says `ok start` when the asker is a server, which then starts
-//! the terminal with its bootstrap (`boot.sh`) and asks again. When no Mac is there to say, or it
+//! shell named alone) is asked for first, as a pane of the bateri app's own (`fresh`): the bateri app makes it when
+//! the asker is the bateri app itself, and says `ok start` when the asker is a server, which then starts
+//! the terminal with its bootstrap (`boot.sh`) and asks again. When no bateri app is there to say, or it
 //! says nothing that is read, the pane that asked is what says ([`Asker`]): one of the app on this
 //! machine has nobody to make the pane, and one of no app has none to ask, so the command fails;
 //! one of another machine's app is a server's, which starts the terminal with its bootstrap and
@@ -35,12 +35,7 @@ const PANE_CARRIED: &str = "LC_BATERI_TAB_URL";
 
 /// What the terminal a command starts does not get from the one that asked: the tab it stands in
 /// (that tab's pane is not the new terminal's), and what only the command reads.
-const NOT_PASSED_ON: [&str; 4] = [
-    PANE_CARRIED,
-    PANE_HERE,
-    "TERM_SESSION_ID",
-    "BATERI_QUIET_ORPHAN",
-];
+const NOT_PASSED_ON: [&str; 3] = [PANE_CARRIED, PANE_HERE, "TERM_SESSION_ID"];
 
 /// Whose app a terminal that asks belongs to, which is what says who starts a terminal with no
 /// program when the app does not answer. The terminal's own environment says it, not the system
@@ -60,9 +55,15 @@ enum Asker {
 }
 
 impl Asker {
-    /// The asker the environment of this process says.
-    fn of_env() -> Asker {
-        Asker::of(|name| std::env::var_os(name))
+    /// The asker of this command: another machine's app when its words came from there
+    /// (`--hex`), whatever its environment says; otherwise what the environment of this process
+    /// says.
+    fn of_ctx(ctx: &Ctx) -> Asker {
+        if ctx.afar {
+            Asker::RemoteApp
+        } else {
+            Asker::of(|name| std::env::var_os(name))
+        }
     }
 
     fn of(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Asker {
@@ -118,7 +119,7 @@ struct Wants {
 }
 
 impl Wants {
-    /// A pane's label is kablo's own; a tab's is the Mac's.
+    /// A pane's label is kablo's own; a tab's is the bateri app's.
     fn pane_label(&self) -> Option<&str> {
         match self.mode {
             Mode::Split => self.label.as_deref(),
@@ -136,7 +137,7 @@ impl Wants {
 
 /// Whether `word` names a server as `-S` takes it: as `ssh` is given it (`prod`, an alias or a
 /// host of `~/.ssh/config`), starting with a letter or a digit so that it can never be read as an
-/// option; or `@local`, this Mac. No `user@`: a pane of another machine is written with the host
+/// option; or `@local`, this computer. No `user@`: a pane of another machine is written with the host
 /// alone (`p9@prod`).
 fn is_server(word: &str) -> bool {
     word == "@local" || is_machine(word)
@@ -332,7 +333,7 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
     if mode == Mode::Window {
         wants.window = Some(WindowHome::New);
     }
-    // What does not go together is a mistake here, before anything is started (the Mac reads the
+    // What does not go together is a mistake here, before anything is started (the bateri app reads the
     // same rules).
     if wants.tab.is_some() && wants.anchor.is_some() {
         return Err(Exit::mistake(
@@ -359,7 +360,7 @@ pub fn open(ctx: &Ctx, io: &mut Io<'_>, mode: Mode, args: &[String]) -> Done {
     // The pane goes beside the one named or, with none named, the one this runs in, whatever that
     // is called. What the agent writes is a number: a name that is no number is no target, and most
     // often it is the program, written where a pane goes. Run in no terminal (cron) with none named
-    // there is nothing to go beside: the terminal starts and waits in the Mac's list of terminals
+    // there is nothing to go beside: the terminal starts and waits in the bateri app's list of terminals
     // running in the background, which is where a terminal no pane shows goes.
     let anchor = match (&wants.anchor, &me) {
         (Some(named), _) => {
@@ -380,7 +381,7 @@ pub fn open(ctx: &Ctx, io: &mut Io<'_>, mode: Mode, args: &[String]) -> Done {
         wants,
         me,
         anchor,
-        asker: Asker::of_env(),
+        asker: Asker::of_ctx(ctx),
         state: ctx.state(),
     };
     job.run(io)
@@ -403,7 +404,7 @@ struct Landing {
     /// The terminal as it is written: `p9`, or `p9@prod`.
     id: String,
     landed: Landed,
-    mac_waits: bool,
+    app_waits: bool,
     next: Option<String>,
     squeezed: bool,
     hidden: bool,
@@ -418,7 +419,7 @@ impl Landing {
         Landing {
             id: id.to_owned(),
             landed: Landed::Waiting,
-            mac_waits: false,
+            app_waits: false,
             next: None,
             squeezed: false,
             hidden: false,
@@ -429,11 +430,11 @@ impl Landing {
         }
     }
 
-    /// What the Mac said of a pane that was placed.
+    /// What the bateri app said of a pane that was placed.
     fn placed(&mut self, placed: &Placed) {
         self.landed = placed.landed;
-        // The Mac has it: it waits for its anchor to be on screen.
-        self.mac_waits = placed.landed == Landed::Waiting;
+        // The bateri app has it: it waits for its anchor to be on screen.
+        self.app_waits = placed.landed == Landed::Waiting;
         self.next = placed
             .next_to
             .as_ref()
@@ -470,7 +471,7 @@ impl Job<'_> {
             match machine::reach(self.ctx, &server)? {
                 // This machine is the one named: the plain terminal, and the plain pane.
                 Reach::Here => {}
-                way => return self.on_server(io, &server, &way),
+                Reach::Relay => return self.on_server(io, &server),
             }
         }
         self.here(io)
@@ -510,8 +511,8 @@ impl Job<'_> {
         // A shell bateri has an integration for, with nothing to run: a shell to work in, the same
         // as no program, but that one.
         let shell = work_shell(&wants.program);
-        // Whether the Mac can be asked who starts it: there is a pane to go beside, and nothing to
-        // wait for (a pane the Mac makes is no terminal to wait on).
+        // Whether the bateri app can be asked who starts it: there is a pane to go beside, and nothing to
+        // wait for (a pane the bateri app makes is no terminal to wait on).
         let askable = self.anchor.is_some() && !wants.wait;
         // Only the pane of another machine's app starts what has no program here, with the
         // bootstrap of this machine; its files hold that bootstrap, and the command does not look.
@@ -542,7 +543,7 @@ impl Job<'_> {
             }
             program = self.bootstrap();
         } else if wants.keep {
-            // No Mac pipe holds this terminal after its program, on any machine: the terminal itself
+            // No bateri app pipe holds this terminal after its program, on any machine: the terminal itself
             // carries on with the user's login shell.
             let mut wrapped = vec![
                 "sh".to_owned(),
@@ -588,7 +589,7 @@ impl Job<'_> {
         Ok(())
     }
 
-    /// A terminal with no program, or a shell named alone: the Mac is asked for a pane of its own
+    /// A terminal with no program, or a shell named alone: the bateri app is asked for a pane of its own
     /// first (`fresh`), and says who starts it.
     fn ask_first(&self, io: &mut Io<'_>, cwd: &str, shell: Option<&str>) -> Done {
         if clean(cwd) != cwd {
@@ -606,7 +607,7 @@ impl Job<'_> {
         match self.ctx.ask(&Request::Place(place.clone()))? {
             Asked::Reply(Reply::Placed(placed)) => landing.placed(&placed),
             // The asker is a server: the terminal is its own to start, with the bootstrap, and the
-            // Mac is asked again for the pane that shows it.
+            // bateri app is asked again for the pane that shows it.
             Asked::Reply(Reply::Start) => {
                 self.start_or_forget(&id, cwd, shell)?;
                 let place = self.place(&id, None, None, None);
@@ -619,9 +620,9 @@ impl Job<'_> {
             // The app does not say who starts it, and the pane that asked says whose app it is.
             unanswered => {
                 let said = match unanswered {
-                    Asked::Silent => Some("the Mac did not answer"),
-                    Asked::NoMac => None,
-                    _ => Some("the Mac answered with something this does not read"),
+                    Asked::Silent => Some("the bateri app did not answer"),
+                    Asked::NoApp => None,
+                    _ => Some("the bateri app answered with something this does not read"),
                 };
                 match self.asker {
                     // The app of another machine: the terminal is started here, with the
@@ -643,9 +644,9 @@ impl Job<'_> {
                         return Err(Exit::new(
                             69,
                             match said {
-                                None => "no Mac is connected: it is the Mac that makes a pane with no program".to_owned(),
+                                None => "the bateri app is not connected: it is the bateri app that makes a pane with no program".to_owned(),
                                 Some(said) => format!(
-                                    "{said}, and it is the Mac that makes a pane with no program"
+                                    "{said}, and it is the bateri app that makes a pane with no program"
                                 ),
                             },
                         ));
@@ -749,7 +750,7 @@ impl Job<'_> {
                 .env
                 .push((b"SHELL".to_vec(), shell.as_bytes().to_vec()));
         }
-        // The dock's tier (the Mac's `"blocks"`) goes on to the new terminal: its shell reads it.
+        // The dock's tier (the bateri app's `"blocks"`) goes on to the new terminal: its shell reads it.
         if std::env::var("BATERI_DOCK").is_ok_and(|tier| tier == "off") {
             request.env.push((b"BATERI_DOCK".to_vec(), b"off".to_vec()));
         }
@@ -811,7 +812,7 @@ impl Job<'_> {
         }
     }
 
-    /// Asks the Mac for the pane and tells what it said; one that refuses leaves no terminal running.
+    /// Asks the bateri app for the pane and tells what it said; one that refuses leaves no terminal running.
     fn place_it(
         &self,
         io: &mut Io<'_>,
@@ -826,7 +827,7 @@ impl Job<'_> {
                 return Ok(());
             }
             Asked::Reply(Reply::Failed(failed)) => {
-                // The Mac refused: nothing is left running for a request that failed. (On a
+                // The bateri app refused: nothing is left running for a request that failed. (On a
                 // server it is the server's terminal, which the caller ends.)
                 if !remote {
                     let _ = drive::end_session(id, true, &mut std::io::sink());
@@ -834,25 +835,25 @@ impl Job<'_> {
                 }
                 return Err(failure(&failed));
             }
-            Asked::NoMac => {}
+            Asked::NoApp => {}
             Asked::Silent => {
-                io.say("the Mac did not answer; its pane will be placed when it next connects");
+                io.say("the bateri app did not answer; its pane will be placed when it next connects");
             }
             _ => io.say(
-                "the Mac answered with something this does not read; its pane will be placed when it next connects",
+                "the bateri app answered with something this does not read; its pane will be placed when it next connects",
             ),
         }
         if remote {
-            // The terminal runs on the server and is in its list; the Mac has no pane for it yet.
+            // The terminal runs on the server and is in its list; the bateri app has no pane for it yet.
             landing.landed = Landed::Waiting;
-            landing.mac_waits = true;
+            landing.app_waits = true;
         } else {
             self.wait_note(io, landing, place);
         }
         Ok(())
     }
 
-    /// No Mac to place it: the message waits on this machine.
+    /// No bateri app to place it: the message waits on this machine.
     fn wait_note(
         &self,
         io: &mut Io<'_>,
@@ -866,13 +867,13 @@ impl Job<'_> {
             .is_ok_and(|text| self.state.note(&id, &text));
         if !written {
             io.say(&format!(
-                "{id} could not be put in the line for a Mac ({} is not writable); it runs, and the Mac lists it",
+                "{id} could not be put in the line for the bateri app ({} is not writable); it runs, and the bateri app lists it",
                 self.state.dir().display()
             ));
         }
     }
 
-    /// The answer: the number, or the object (every key always there, `null` where the Mac has not
+    /// The answer: the number, or the object (every key always there, `null` where the bateri app has not
     /// said: the pane waits for a window, or its tab is in no group); and one line when the pane is
     /// not where it was asked to be.
     fn report(&self, io: &mut Io<'_>, landing: &Landing) {
@@ -904,24 +905,26 @@ impl Job<'_> {
         match landing.landed {
             Landed::Waiting => {
                 if self.anchor.is_none() {
-                    // A server's command that `-S` started is told not to say it: the caller says it
-                    // once, for the address it gives.
-                    if std::env::var_os("BATERI_QUIET_ORPHAN").is_none() {
+                    // A command another machine's app relayed (`--hex`) does not say it: the caller
+                    // says it once, for the address it gives.
+                    if !self.ctx.afar {
                         io.say(&format!(
-                            "{id} waits in the Mac's list of terminals running in the background: this ran in no terminal, so it has no pane to go beside"
+                            "{id} waits in the bateri app's list of terminals running in the background: this ran in no terminal, so it has no pane to go beside"
                         ));
                     }
-                } else if landing.mac_waits && landing.next.is_none() {
-                    // The Mac kept nothing to place it by: it could not make the pane just now.
+                } else if landing.app_waits && landing.next.is_none() {
+                    // The bateri app kept nothing to place it by: it could not make the pane just now.
                     io.say(&format!(
-                        "{id} waits in the Mac's list of terminals running in the background: the Mac could not make its pane now"
+                        "{id} waits in the bateri app's list of terminals running in the background: the bateri app could not make its pane now"
                     ));
-                } else if landing.mac_waits {
+                } else if landing.app_waits {
                     io.say(&format!(
-                        "{id} waits in the Mac's list of terminals running in the background, until {said} is on screen"
+                        "{id} waits in the bateri app's list of terminals running in the background, until {said} is on screen"
                     ));
                 } else {
-                    io.say(&format!("{id} will take its place when a Mac connects"));
+                    io.say(&format!(
+                        "{id} will take its place when the bateri app connects"
+                    ));
                 }
             }
             Landed::NewTab => io.say(&format!(
@@ -945,9 +948,9 @@ impl Job<'_> {
     // ─── on another machine ──────────────────────────────────────────────
 
     /// The terminal is started on `server` by its own `bateri split`, run in no terminal there,
-    /// which numbers it and says the number; then the Mac is asked for the pane, beside this
+    /// which numbers it and says the number; then the bateri app is asked for the pane, beside this
     /// machine's own.
-    fn on_server(&self, io: &mut Io<'_>, server: &str, way: &Reach) -> Done {
+    fn on_server(&self, io: &mut Io<'_>, server: &str) -> Done {
         let wants = &self.wants;
         let mut words = vec!["split".to_owned()];
         if let Some(cwd) = &wants.cwd {
@@ -963,18 +966,10 @@ impl Job<'_> {
         }
         words.push("--".to_owned());
         words.extend(wants.program.iter().cloned());
-        let ran = machine::remote(
-            self.ctx,
-            io,
-            way,
-            server,
-            &words,
-            machine::Output::Capture,
-            false,
-        )?;
+        let ran = machine::remote(self.ctx, io, server, &words, machine::Output::Capture)?;
         if ran.status != 0 {
             if ran.status == 255 {
-                io.say(&format!("could not reach {server} over ssh"));
+                io.say(&format!("could not reach {server}"));
             }
             return Err(Exit::status(if ran.status == 127 { 1 } else { ran.status }));
         }
@@ -993,8 +988,8 @@ impl Job<'_> {
             let place = self.place(number, None, None, Some(server.to_owned()));
             if let Err(exit) = self.place_it(io, &mut landing, &place, number, true) {
                 // The pane could not be made, so the terminal that was started goes with it; the
-                // failure the person is told is the Mac's.
-                self.end_over(io, server, way, number);
+                // failure the person is told is the bateri app's.
+                self.end_over(io, server, number);
                 return Err(exit);
             }
         }
@@ -1003,34 +998,24 @@ impl Job<'_> {
             let ran = machine::remote(
                 self.ctx,
                 io,
-                way,
                 server,
                 &["wait".to_owned(), number.to_owned()],
                 machine::Output::Print,
-                false,
             )?;
             return finish(ran.status);
         }
         Ok(())
     }
 
-    /// Ends the terminal that was started on `server`, quietly: the Mac refused its pane.
-    fn end_over(&self, io: &mut Io<'_>, server: &str, way: &Reach, number: &str) {
+    /// Ends the terminal that was started on `server`, quietly: the bateri app refused its pane.
+    fn end_over(&self, io: &mut Io<'_>, server: &str, number: &str) {
         let words = [
             "close".to_owned(),
             "pane".to_owned(),
             number.to_owned(),
             "--force".to_owned(),
         ];
-        let _ = machine::remote(
-            self.ctx,
-            io,
-            way,
-            server,
-            &words,
-            machine::Output::Quiet,
-            false,
-        );
+        let _ = machine::remote(self.ctx, io, server, &words, machine::Output::Quiet);
     }
 }
 
