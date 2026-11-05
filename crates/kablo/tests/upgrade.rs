@@ -288,10 +288,10 @@ fn the_command_says_what_it_did_and_to_whom() {
     let two = env.start("two", &SH);
     let newer = env.newer_kablo("d");
 
-    // Everything on the machine.
+    // One session, and not the other.
     let said = env
         .kablo()
-        .args(["upgrade", "--all"])
+        .args(["upgrade", &one])
         .arg(&newer)
         .output()
         .unwrap();
@@ -301,10 +301,11 @@ fn the_command_says_what_it_did_and_to_whom() {
         "{}",
         String::from_utf8_lossy(&said.stderr)
     );
-    for id in [&one, &two] {
-        assert!(stdout.contains(&format!("{id}: replaced (now")), "{stdout}");
-        relay_from(&env, id, &newer);
-    }
+    assert!(
+        stdout.contains(&format!("{one}: replaced (now")),
+        "{stdout}"
+    );
+    relay_from(&env, &one, &newer);
 
     // One that is not there, a path that is not one, and a line that is not
     // a command.
@@ -329,11 +330,7 @@ fn the_command_says_what_it_did_and_to_whom() {
         )),
         "{stderr}"
     );
-    for args in [
-        &["upgrade"][..],
-        &["upgrade", "--all"],
-        &["upgrade", "a", "b", "c"],
-    ] {
+    for args in [&["upgrade"][..], &["upgrade", "a", "b", "c"]] {
         let said = env.kablo().args(args).output().unwrap();
         assert_eq!(said.status.code(), Some(64), "{args:?}");
     }

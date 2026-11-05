@@ -1975,23 +1975,6 @@ fn errors_and_ends_belong_to_commands_and_not_to_connections() {
 }
 
 #[test]
-fn only_a_bridge_that_says_it_runs_commands_is_asked_to() {
-    let with = Features::default().with_commands();
-    assert_eq!(
-        judge_commands(&SessionMessage::FeaturesReply(with.clone())),
-        Some(with)
-    );
-    // Streams off, commands on: the administrator's switch is not theirs.
-    let off = Features::streams_off("no".to_owned()).with_commands();
-    assert!(judge_commands(&SessionMessage::FeaturesReply(off)).is_some());
-    assert_eq!(
-        judge_commands(&SessionMessage::FeaturesReply(Features::default())),
-        None
-    );
-    assert_eq!(judge_commands(&SessionMessage::Pong(Vec::new())), None);
-}
-
-#[test]
 fn errors_that_cannot_be_written_are_dropped_with_credit_and_the_program_goes_on() {
     let (local, term) = terminal();
     // Nobody reads the errors.

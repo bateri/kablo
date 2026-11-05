@@ -1,4 +1,4 @@
-//! The bridge, `kablo list` and `kablo connect`, with real sessions.
+//! The bridge and `kablo list`, with real sessions.
 
 // Test support: a failure here is a failed test.
 #![allow(
@@ -19,9 +19,7 @@ use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE};
 use kablo::link::{self, Link};
-use kablo_proto::v1::{
-    ErrorCode, Message, NewSession, OFFSET_END, Packet, PacketDecoder, Size, State,
-};
+use kablo_proto::v1::{ErrorCode, Message, NewSession, Packet, PacketDecoder, Size, State};
 use kablo_proto::{SessionId, WIRE};
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
@@ -500,14 +498,9 @@ fn list_prints_a_table_for_people_and_json_for_programs() {
 }
 
 #[test]
-fn list_and_connect_take_only_what_they_know() {
+fn list_and_attach_take_only_what_they_know() {
     let env = Env::new();
-    for args in [
-        &["list", "--bogus"][..],
-        &["connect"],
-        &["connect", "a b"],
-        &["attach", "x"],
-    ] {
+    for args in [&["list", "--bogus"][..], &["attach", "x"]] {
         let said = env.kablo().args(args).output().unwrap();
         assert_eq!(said.status.code(), Some(64), "{args:?}");
         assert!(
@@ -517,7 +510,7 @@ fn list_and_connect_take_only_what_they_know() {
     }
 }
 
-// --- kablo connect, on a terminal of its own ------------------------------
+// --- on a terminal of its own ---------------------------------------------
 
 /// A terminal for a program under test: a pty with the program as its session
 /// leader, so that the program has it for a controlling terminal. It is read
@@ -556,26 +549,6 @@ impl Tty {
         }
     }
 
-    fn type_in(&self, text: &[u8]) {
-        let mut set = [kablo::sys::want(self.master.as_raw_fd(), libc::POLLOUT)];
-        kablo::sys::poll(&mut set, Some(PATIENCE)).unwrap();
-        kablo::sys::write_fd(self.master.as_fd(), text).unwrap();
-    }
-
-    /// Types all of `text`, waiting for the terminal to take it.
-    fn type_all(&self, mut text: &[u8]) {
-        while !text.is_empty() {
-            let mut set = [kablo::sys::want(self.master.as_raw_fd(), libc::POLLOUT)];
-            kablo::sys::poll(&mut set, Some(PATIENCE)).unwrap();
-            assert!(set[0].revents != 0, "the terminal stopped taking input");
-            match kablo::sys::write_fd(self.master.as_fd(), text) {
-                Ok(n) => text = &text[n..],
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("typing failed: {e}"),
-            }
-        }
-    }
-
     /// Reads whatever the terminal shows in the next `wait`.
     fn drain(&mut self, wait: Duration) {
         let mut buf = [0u8; 4096];
@@ -599,19 +572,6 @@ impl Tty {
             assert!(
                 start.elapsed() < PATIENCE,
                 "waiting for {needle:?}, the terminal showed {:?}",
-                self.text()
-            );
-            self.drain(Duration::from_millis(50));
-        }
-    }
-
-    /// Waits for a shell's prompt (`$ `, or `# ` for root).
-    fn prompt(&mut self) {
-        let start = Instant::now();
-        while !(self.text().contains("$ ") || self.text().contains("# ")) {
-            assert!(
-                start.elapsed() < PATIENCE,
-                "no prompt; the terminal showed {:?}",
                 self.text()
             );
             self.drain(Duration::from_millis(50));
@@ -644,223 +604,10 @@ impl Drop for Tty {
 }
 
 #[test]
-fn connect_puts_a_session_on_a_terminal_and_a_detach_leaves_it_running() {
-    let mut env = Env::new();
-    let id = env.start("connected", &SH);
-    let mut tty = Tty::run(&env, &["connect", &id]);
-
-    // What is typed reaches the session, what it writes reaches the screen.
-    let mut control = env.connect(&id);
-    let start = Instant::now();
-    while control.status().clients == 0 {
-        assert!(start.elapsed() < PATIENCE, "never attached");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // Typing ahead of a shell that has not started reading loses the bytes
-    // (it flushes the terminal as it sets it up): wait for its prompt.
-    tty.prompt();
-    tty.type_in(b"echo $((6*7))\n");
-    tty.show("42\r\n");
-
-    // Resizing the window resizes the session's terminal.
-    kablo::sys::set_window_size(
-        std::os::fd::AsFd::as_fd(&tty.master),
-        Size {
-            cols: 101,
-            rows: 33,
-            xpixel: 0,
-            ypixel: 0,
-        },
-    )
-    .unwrap();
-    let start = Instant::now();
-    while control.status().size.cols != 101 {
-        assert!(start.elapsed() < PATIENCE, "the size never followed");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    // Ctrl-\ leaves the session running.
-    tty.type_in(&[0x1c]);
-    let status = tty.wait();
-    assert_eq!(status.code(), Some(0));
-    tty.show("detached");
-    assert_eq!(control.status().clients, 0);
-    assert!(env.find("warden", &id).is_some());
-
-    // And coming back shows what happened meanwhile: the journal is replayed.
-    control.attach(OFFSET_END);
-    control.type_in("echo while-away\n");
-    control.wait_for("while-away\r\n", 0);
-    let mut again = Tty::run(&env, &["connect", &id]);
-    again.show("while-away\r\n");
-    again.show("42\r\n");
-    again.type_in(&[0x1c]);
-    assert_eq!(again.wait().code(), Some(0));
-}
-
-#[test]
-fn connect_is_shown_a_picture_and_not_a_question_the_session_answered_while_it_was_away() {
-    let mut env = Env::new();
-    // The program asks where the cursor is, with nobody to answer but the
-    // session, and sends back whatever it is told: every answer it gets shows
-    // in the stream (the question is 4 bytes, the session's answer 6).
-    let id = env.start(
-        "asked-while-away",
-        &[
-            "--",
-            "/bin/sh",
-            "-c",
-            "stty raw -echo; printf '\\033[6n'; exec cat",
-        ],
-    );
-    let mut control = env.connect(&id);
-    let start = Instant::now();
-    while control.status().offset < 10 {
-        assert!(start.elapsed() < PATIENCE, "the session never answered");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    // Shown the bytes, this terminal would answer too and the program would be
-    // answered twice; it is shown the screen instead (after a reset, as every
-    // picture is).
-    let mut tty = Tty::run(&env, &["connect", &id]);
-    tty.show("\x1bc");
-    while control.status().clients == 0 {
-        assert!(start.elapsed() < PATIENCE, "never attached");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // What a terminal does with a question when it is shown one.
-    let mut answers = 0;
-    for _ in 0..10 {
-        tty.drain(Duration::from_millis(50));
-        if tty.text().matches("\x1b[6n").count() > answers {
-            answers += 1;
-            tty.type_in(b"\x1b[1;1R");
-        }
-    }
-    assert_eq!(answers, 0, "shown the question: {:?}", tty.text());
-    assert_eq!(
-        control.status().offset,
-        10,
-        "something more reached the program"
-    );
-    tty.type_in(&[0x1c]);
-    assert_eq!(tty.wait().code(), Some(0));
-}
-
-#[test]
-fn connect_ends_with_the_programs_own_status_when_it_ends() {
-    let mut env = Env::new();
-    let id = env.start("finishes", &SH);
-    let mut tty = Tty::run(&env, &["connect", &id]);
-    tty.prompt();
-    tty.type_in(b"echo up\n");
-    tty.show("up\r\n");
-    tty.type_in(b"exit 7\n");
-    let status = tty.wait();
-    assert_eq!(status.code(), Some(7));
-    tty.show("the session ended (exit status 7)");
-}
-
-#[test]
-fn connect_can_take_the_terminal_and_is_told_when_it_is_taken() {
-    use common::Conn;
-    let mut env = Env::new();
-    let id = env.start("taken-tty", &SH);
-    let mut observer = env.connect(&id);
-    let mut imac = Tty::run(&env, &["connect", "--name", "iMac", &id]);
-    imac.prompt();
-
-    // `--take` attaches as the client that takes the terminal; `--name` is what
-    // the one let go is told.
-    let mut macbook = Tty::run(&env, &["connect", "--take", "--name", "MacBook", &id]);
-    imac.show("taken by MacBook; the session keeps running");
-    assert_eq!(imac.wait().code(), Some(0));
-    let status = observer.status();
-    assert_eq!(status.clients, 1);
-    assert_eq!(
-        status.clients_named[0].map(|name| name.as_str().to_owned()),
-        Some("MacBook".to_owned())
-    );
-    // The session is the one that took's, and it goes on.
-    macbook.prompt();
-    macbook.type_in(b"echo mine-$((6*7))\n");
-    macbook.show("mine-42\r\n");
-
-    // A client that gives no name takes it from there; the person is told that
-    // it was another client.
-    let mut other = Conn::open(env.socket(&id), &id);
-    other.attach_taking(
-        kablo_proto::v1::OFFSET_END,
-        Size {
-            cols: 80,
-            rows: 24,
-            xpixel: 0,
-            ypixel: 0,
-        },
-        None,
-    );
-    macbook.show("taken by another client; the session keeps running");
-    assert_eq!(macbook.wait().code(), Some(0));
-    assert!(env.find("warden", &id).is_some());
-}
-
-#[test]
-fn connect_takes_a_name_of_a_length_a_session_will_read() {
-    let env = Env::new();
-    let long = "m".repeat(64);
-    for args in [
-        &["connect", "--name"][..],
-        &["connect", "--name", "", "x"],
-        &["connect", "--name", &long, "x"],
-        &["connect", "--take", "--bogus", "x"],
-    ] {
-        let said = env.kablo().args(args).output().unwrap();
-        assert_eq!(said.status.code(), Some(64), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&said.stderr).starts_with("kablo: "),
-            "{args:?}"
-        );
-    }
-}
-
-#[test]
-fn connect_to_a_session_that_is_not_there_says_so() {
-    let env = Env::new();
-    let mut tty = Tty::run(&env, &["connect", "nothing-here"]);
-    tty.show("no such session");
-    assert_eq!(tty.wait().code(), Some(1));
-}
-
-#[test]
-fn connect_survives_its_relay_being_replaced() {
-    let mut env = Env::new();
-    let id = env.start("replaced", &SH);
-    let mut tty = Tty::run(&env, &["connect", &id]);
-    tty.prompt();
-    tty.type_in(b"echo one\n");
-    tty.show("one\r\n");
-    kill(env.find("relay", &id).unwrap());
-    // Typing does not reach a relay that is gone for a moment; try until it
-    // goes through, which is the person's own experience.
-    let start = Instant::now();
-    while !tty.text().contains("two-2\r\n") {
-        assert!(start.elapsed() < PATIENCE);
-        tty.type_in(b"echo two-$((1+1))\n");
-        let probe = Instant::now();
-        while probe.elapsed() < Duration::from_millis(300) && !tty.text().contains("two-2\r\n") {
-            tty.drain(Duration::from_millis(50));
-        }
-    }
-    tty.type_in(&[0x1c]);
-    assert_eq!(tty.wait().code(), Some(0));
-}
-
-#[test]
 fn attach_will_not_speak_binary_to_a_terminal() {
     let env = Env::new();
     let mut tty = Tty::run(&env, &["attach"]);
-    tty.show("kablo connect");
+    tty.show("for programs");
     assert_eq!(tty.wait().code(), Some(64));
 }
 
@@ -1199,64 +946,6 @@ fn a_link_with_too_many_requests_waiting_hands_the_next_one_back_untouched() {
         heard == expected,
         "what the session heard is not what was taken"
     );
-}
-
-#[test]
-fn connect_holds_its_typing_while_the_session_cannot_take_it_and_loses_none_of_it() {
-    let env = Env::new();
-    let id = env.name("crowded-connect");
-    // More than the link lets wait for a session (a megabyte), typed at a
-    // session that reads nothing for a while.
-    let total = 1_800_000;
-    let typed: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
-    let deaf = Deaf::at(env.socket(&id));
-    let mut tty = Tty::run(&env, &["connect", &id]);
-    deaf.wait_for_the_client();
-    tty.type_all(&typed);
-    // Time enough for the link to fill and the rest to be held: connect used
-    // to give up here, with "too many requests are waiting".
-    std::thread::sleep(Duration::from_millis(500));
-    tty.drain(Duration::from_millis(50));
-    assert!(
-        tty.child.try_wait().unwrap().is_none(),
-        "connect ended; the terminal showed {:?}",
-        tty.text()
-    );
-
-    deaf.listen(total);
-    let start = Instant::now();
-    let heard = loop {
-        assert!(
-            start.elapsed() < PATIENCE,
-            "the session never heard it all; the terminal showed {:?}",
-            tty.text()
-        );
-        if let Some(heard) = deaf.try_heard() {
-            break heard;
-        }
-        tty.drain(Duration::from_millis(20));
-    };
-    assert!(heard == typed, "typing arrived lost or out of order");
-    assert!(!tty.text().contains("too many"), "{:?}", tty.text());
-    tty.type_in(&[0x1c]);
-    assert_eq!(tty.wait().code(), Some(0));
-}
-
-#[test]
-fn connect_ends_when_the_session_takes_nothing_for_good() {
-    let env = Env::new();
-    let id = env.name("never-connect");
-    let total = 1_800_000;
-    let typed: Vec<u8> = (0..total).map(|i| b'a' + (i % 26) as u8).collect();
-    let deaf = Deaf::at(env.socket(&id));
-    let mut tty = Tty::run(&env, &["connect", &id]);
-    deaf.wait_for_the_client();
-    tty.type_all(&typed);
-    // A session that does not make room within the patience is stuck, and
-    // the person is told as before.
-    tty.show("too many requests are waiting");
-    assert_eq!(tty.wait().code(), Some(1));
-    drop(deaf);
 }
 
 #[test]

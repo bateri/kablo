@@ -1,5 +1,5 @@
-//! `kablo upgrade`: replace the relay of a session, or of every session on
-//! this machine, with the one in another binary, without ending anything. The
+//! `kablo upgrade`: replace the relay of a session with the one in another
+//! binary, without ending anything. The
 //! warden of the session renews itself into the same binary right after, when
 //! it can.
 //!
@@ -44,48 +44,25 @@ pub const RENEWAL_WAIT: Duration = Duration::from_secs(3);
 /// that takes the connection and says nothing has nobody serving it.
 const OPEN_WAIT: Duration = Duration::from_secs(3);
 
-/// Which sessions to replace the relay of.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Target {
-    /// Every session this user has on this machine.
-    All,
-    /// One.
-    One(SessionId),
-}
-
-/// Replaces the relays and says how each went. Returns the exit status: 0 when
-/// every session was replaced (also when there were none), 1 otherwise.
+/// Replaces the relay of the session `id` and says how it went. Returns the
+/// exit status: 0 when it was replaced, 1 otherwise.
 pub fn run(
     dir: &Path,
-    target: Target,
+    id: &SessionId,
     binary: &Path,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let ids = match target {
-        Target::One(id) => vec![id],
-        Target::All => match sockdir::session_ids(dir) {
-            Ok(ids) => ids,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                let _ = writeln!(err, "kablo: {e}");
-                return 1;
-            }
-        },
-    };
-    let mut status = 0;
-    for id in ids {
-        match replace(dir, &id, binary) {
-            Ok(now) => {
-                let _ = writeln!(out, "{}", report(&id, &now));
-            }
-            Err(why) => {
-                let _ = writeln!(err, "kablo: {id}: {why}");
-                status = 1;
-            }
+    match replace(dir, id, binary) {
+        Ok(now) => {
+            let _ = writeln!(out, "{}", report(id, &now));
+            0
+        }
+        Err(why) => {
+            let _ = writeln!(err, "kablo: {id}: {why}");
+            1
         }
     }
-    status
 }
 
 /// Replaces the relay of `id`; the status the relay that took over gave.

@@ -1,6 +1,8 @@
-//! `kablo app`, the program that hands bytes to the app: the real binary against
-//! real bridges, with a test in the place of the app (a connection to
-//! `kablo attach`, as the app is a program with one).
+//! The conversation a program has with the app, `app::talk`, against real
+//! bridges, with a test in the place of the app (a connection to `kablo attach`,
+//! as the app is a program with one). The program is this test's own thread,
+//! with pipes where a process has its standard streams; what it is to the
+//! shell of a session (`kablo bateri`) is in the scenarios that type it there.
 
 // Test support: a failure here is a failed test.
 #![allow(
@@ -13,9 +15,10 @@
 mod common;
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::fd::OwnedFd;
-use std::process::{Child, Command, Output, Stdio};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE, signal};
@@ -26,28 +29,114 @@ use kablo_proto::v1::stream::FailCode;
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
 
-/// `kablo app` with its input and output piped, in `env`'s directory, outside
-/// every session.
-fn spawn(env: &Env) -> Child {
-    env.kablo()
-        .arg("app")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+/// What a program that talked ended with.
+struct Output {
+    status: u8,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
-/// What `kablo app` did, run to its end with `input` as its input. With no app
-/// to talk to it ends without reading its input, and it may be gone before the
+/// A program that hands its input to the app and takes what the app says: the
+/// conversation of `app::talk` on a thread of its own, with a pipe for each of
+/// the standard streams and one for the signals that end it.
+struct Program {
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    signals: File,
+    talking: JoinHandle<u8>,
+}
+
+impl Program {
+    /// Talks to the app through the mailboxes in `dir`.
+    fn start(dir: &Path) -> Program {
+        let pipe = || {
+            let (read, write) = std::io::pipe().unwrap();
+            (OwnedFd::from(read), OwnedFd::from(write))
+        };
+        let ((input, stdin), (stdout, output), (stderr, errors)) = (pipe(), pipe(), pipe());
+        let (signals, signal_writer) = pipe();
+        let said = File::from(errors.try_clone().unwrap());
+        let local = Local {
+            input,
+            output,
+            errors,
+        };
+        let dir = dir.to_owned();
+        let talking = std::thread::spawn(move || {
+            let mut said = said;
+            app::talk(
+                &dir,
+                local,
+                Some(signals.as_fd()),
+                Patience::STANDARD,
+                &mut said,
+            )
+        });
+        Program {
+            stdin: Some(File::from(stdin)),
+            stdout: Some(File::from(stdout)),
+            stderr: Some(File::from(stderr)),
+            signals: File::from(signal_writer),
+            talking,
+        }
+    }
+
+    /// Ends the conversation the way `signal` would end the process of a
+    /// program.
+    fn signal(&mut self, signal: libc::c_int) {
+        self.signals
+            .write_all(&[u8::try_from(signal).unwrap()])
+            .unwrap();
+    }
+
+    /// Whether it has ended.
+    fn ended(&self) -> bool {
+        self.talking.is_finished()
+    }
+
+    /// Its status, once it has ended.
+    fn wait(self) -> u8 {
+        self.wait_with_output().status
+    }
+
+    /// Its status and everything it said, once it has ended; the input it was
+    /// given is over.
+    fn wait_with_output(mut self) -> Output {
+        drop(self.stdin.take());
+        let read = |stream: Option<File>| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut stream) = stream {
+                    let _ = stream.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let (stdout, stderr) = (read(self.stdout.take()), read(self.stderr.take()));
+        let status = self.talking.join().unwrap();
+        Output {
+            status,
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        }
+    }
+}
+
+fn spawn(env: &Env) -> Program {
+    Program::start(&env.dir)
+}
+
+/// What a program did, run to its end with `input` as its input. With no app to
+/// talk to it ends without reading its input, and it may be gone before the
 /// input is written: the broken pipe is then the input it never wanted.
 fn run_app(env: &Env, input: &[u8]) -> Output {
-    let mut child = spawn(env);
-    match child.stdin.take().unwrap().write_all(input) {
+    let mut program = spawn(env);
+    match program.stdin.take().unwrap().write_all(input) {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
         written => written.unwrap(),
     }
-    child.wait_with_output().unwrap()
+    program.wait_with_output()
 }
 
 fn said(output: &[u8]) -> String {
@@ -80,8 +169,8 @@ fn what_the_program_writes_reaches_the_app_and_what_the_app_says_comes_out_as_it
 
     app.stream_send(a, b"answer \x1b[0m\r\n\x00end", 5);
     app.stream_close(a);
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(0), "{}", said(&output.stderr));
+    let output = child.wait_with_output();
+    assert_eq!(output.status, 0, "{}", said(&output.stderr));
     assert_eq!(output.stdout, b"answer \x1b[0m\r\n\x00end");
     assert_eq!(said(&output.stderr), "");
 }
@@ -98,14 +187,14 @@ fn the_program_ending_its_input_and_the_app_ending_its_output_end_the_conversati
     let a = app.take_ticket(0, 4096);
     app.until("the question", |b| b.flows[&a].data == b"question");
     // The program has more to say until it ends its input.
-    assert!(child.try_wait().unwrap().is_none());
+    assert!(!child.ended());
     app.stream_send(a, b"first", 5);
     drop(stdin);
     app.until("the eof", |b| b.flows[&a].eof);
     app.stream_send(a, b" and last", 9);
     app.stream_eof(a);
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(0), "{}", said(&output.stderr));
+    let output = child.wait_with_output();
+    assert_eq!(output.status, 0, "{}", said(&output.stderr));
     assert_eq!(said(&output.stdout), "first and last");
     assert!(!app.flows[&a].closed, "nobody closed it");
 }
@@ -125,9 +214,9 @@ fn what_the_app_says_just_before_it_closes_is_not_lost() {
     let down = common::pattern(window, 11);
     app.stream_send(a, &down, 16 * 1024);
     app.stream_close(a);
-    let output = child.wait_with_output().unwrap();
+    let output = child.wait_with_output();
     drop(stdin);
-    assert_eq!(output.status.code(), Some(0), "{}", said(&output.stderr));
+    assert_eq!(output.status, 0, "{}", said(&output.stderr));
     assert!(
         output.stdout == down,
         "{} of {} bytes",
@@ -149,7 +238,7 @@ fn megabytes_go_both_ways_whole() {
     let writer = std::thread::spawn(move || {
         stdin.write_all(&input).unwrap();
     });
-    let reader = std::thread::spawn(move || child.wait_with_output().unwrap());
+    let reader = std::thread::spawn(move || child.wait_with_output());
 
     let a = app.take_ticket(0, 64 * 1024);
     let mut sent = 0;
@@ -173,7 +262,7 @@ fn megabytes_go_both_ways_whole() {
     assert!(app.flows[&a].data == up, "what the program wrote");
     app.stream_close(a);
     let output = reader.join().unwrap();
-    assert_eq!(output.status.code(), Some(0), "{}", said(&output.stderr));
+    assert_eq!(output.status, 0, "{}", said(&output.stderr));
     assert!(output.stdout == down, "what the app said");
 }
 
@@ -187,7 +276,7 @@ fn shell_of(env: &Env, id: &str) -> common::Conn {
 }
 
 #[test]
-fn from_a_session_the_ticket_names_it_and_the_status_is_the_apps_to_give() {
+fn from_a_session_the_ticket_names_it_and_the_reply_is_the_apps_to_give() {
     let mut env = Env::new();
     let id = env.start("app-in", &SH);
     let mut app = app_that_takes_mail(&env);
@@ -195,7 +284,7 @@ fn from_a_session_the_ticket_names_it_and_the_status_is_the_apps_to_give() {
     let exe = env!("CARGO_BIN_EXE_kablo");
 
     let command = format!(
-        "printf 'from the shell' | KABLO_DIR={} {exe} app; echo \"[status=$?]\"\n",
+        "KABLO_DIR={} {exe} bateri ls; echo \"[status=$?]\"\n",
         env.dir.display()
     );
     let before = shell.data.len();
@@ -203,9 +292,9 @@ fn from_a_session_the_ticket_names_it_and_the_status_is_the_apps_to_give() {
     let a = app.take_ticket(0, 4096);
     assert_eq!(app.tickets[0].0.as_deref(), Some(id.as_str()));
     app.until("what was written", |b| {
-        b.flows[&a].data == b"from the shell" && b.flows[&a].eof
+        b.flows[&a].data == b"bateri 2\nls\n" && b.flows[&a].eof
     });
-    app.stream_send(a, b"seen\r\n", 6);
+    app.stream_send(a, b"bateri 2\nok text\nseen\n", 22);
     app.stream_close(a);
     shell.until("the status", |c| {
         String::from_utf8_lossy(c.data.get(before..).unwrap_or_default()).contains("[status=0]")
@@ -232,7 +321,7 @@ fn with_two_apps_the_one_at_the_terminal_wins_and_away_from_a_terminal_the_one_u
     // later.
     let mut shell = shell_of(&env, &first);
     let command = format!(
-        "echo x | KABLO_DIR={} {exe} app; echo \"[done=$?]\"\n",
+        "KABLO_DIR={} {exe} bateri ls; echo \"[done=$?]\"\n",
         env.dir.display()
     );
     shell.type_in(&command);
@@ -248,7 +337,7 @@ fn with_two_apps_the_one_at_the_terminal_wins_and_away_from_a_terminal_the_one_u
     assert_eq!(at_second.tickets[0].0, None);
     assert_eq!(at_first.tickets.len(), 1);
     at_second.stream_close(b);
-    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(child.wait(), 0);
 }
 
 #[test]
@@ -265,7 +354,7 @@ fn an_app_that_comes_back_through_a_new_bridge_gets_it_before_the_half_dead_one_
     let mut shell = shell_of(&env, &id);
     let exe = env!("CARGO_BIN_EXE_kablo");
     let command = format!(
-        "echo x | KABLO_DIR={} {exe} app; echo \"[done=$?]\"\n",
+        "KABLO_DIR={} {exe} bateri ls; echo \"[done=$?]\"\n",
         env.dir.display()
     );
     shell.type_in(&command);
@@ -284,7 +373,7 @@ fn an_app_that_does_not_take_mail_is_passed_over() {
     drop(child.stdin.take());
     let a = app.take_ticket(0, 4096);
     app.stream_close(a);
-    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(child.wait(), 0);
     quiet.pump(Duration::from_millis(50));
     assert!(quiet.tickets.is_empty());
 }
@@ -295,7 +384,7 @@ fn an_app_that_does_not_take_mail_is_passed_over() {
 fn with_no_bridge_it_is_69_and_the_words_name_the_version_that_has_no_mailbox() {
     let env = Env::new();
     let output = run_app(&env, b"anyone?");
-    assert_eq!(output.status.code(), Some(69));
+    assert_eq!(output.status, 69);
     let words = said(&output.stderr);
     assert!(words.contains("no app is connected"), "{words}");
     assert!(
@@ -305,13 +394,8 @@ fn with_no_bridge_it_is_69_and_the_words_name_the_version_that_has_no_mailbox() 
     assert_eq!(output.stdout, b"");
 
     // Nor is a directory that is not there anything but no bridge.
-    let output = Command::new(env!("CARGO_BIN_EXE_kablo"))
-        .arg("app")
-        .env("KABLO_DIR", env.dir.join("not-there"))
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(69), "{}", said(&output.stderr));
+    let output = Program::start(&env.dir.join("not-there")).wait_with_output();
+    assert_eq!(output.status, 69, "{}", said(&output.stderr));
 }
 
 #[test]
@@ -319,7 +403,7 @@ fn with_no_app_that_takes_mail_it_is_69() {
     let env = Env::new();
     let mut quiet = Bridge::start(&env);
     let output = run_app(&env, b"anyone?");
-    assert_eq!(output.status.code(), Some(69));
+    assert_eq!(output.status, 69);
     assert!(
         said(&output.stderr).contains("no app that takes mail is connected"),
         "{}",
@@ -378,9 +462,9 @@ fn an_app_that_declines_is_1_with_its_own_words() {
             text: "not now\x1b[2J, I am busy".to_owned(),
         },
     );
-    let output = child.wait_with_output().unwrap();
+    let output = child.wait_with_output();
     drop(stdin);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status, 1);
     let words = said(&output.stderr);
     assert!(
         words.contains("the app declined: not now[2J, I am busy"),
@@ -442,9 +526,9 @@ fn an_app_that_goes_away_in_the_middle_is_1_and_so_is_one_whose_connection_ends(
     let a = app.take_ticket(0, 4096);
     app.until("the bytes", |b| b.flows[&a].data == b"half");
     app.hang_up();
-    let output = child.wait_with_output().unwrap();
+    let output = child.wait_with_output();
     drop(stdin);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status, 1);
     assert!(
         said(&output.stderr).contains("the app went away"),
         "{}",
@@ -460,11 +544,11 @@ fn ctrl_c_closes_the_conversation_and_ends_with_130() {
     let mut child = spawn(&env);
     let stdin = child.stdin.take().unwrap();
     let a = app.take_ticket(0, 4096);
-    signal(child.id(), libc::SIGINT);
+    child.signal(libc::SIGINT);
     app.until("the close", |b| b.flows[&a].closed);
-    let output = child.wait_with_output().unwrap();
+    let output = child.wait_with_output();
     drop(stdin);
-    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(output.status, 130);
 }
 
 #[test]
@@ -479,15 +563,7 @@ fn a_reader_of_its_output_that_goes_away_ends_it_quietly_with_141_and_closes_the
     drop(stdout);
     app.stream_send(a, b"to nobody", 9);
     app.until("the close", |b| b.flows[&a].closed);
-    let output = child.wait_with_output().unwrap();
+    let output = child.wait_with_output();
     drop(stdin);
-    assert_eq!(output.status.code(), Some(141));
-}
-
-#[test]
-fn it_takes_no_arguments() {
-    let env = Env::new();
-    let output = env.kablo().args(["app", "now"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(64));
-    assert!(said(&output.stderr).contains("takes no arguments"));
+    assert_eq!(output.status, 141);
 }

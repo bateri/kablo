@@ -1053,7 +1053,7 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   to each, to see where it stands before it sends anything: `ask_reply` says the
   terminal the sender runs in (found by the bridge, never by the sender), whether
   the client is attached to it, how long since the client used it and whether the
-  client takes tickets. The choice among the bridges is the sender's: `kablo app`
+  client takes tickets. The choice among the bridges is the sender's: the sender
   takes, among the clients that take tickets, the least idle of those attached
   to the terminal, and when there is none, the least idle of all. A sender that
   runs in no terminal has `attached` clear on every answer and gets the second.
@@ -1135,8 +1135,8 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
   ends the client's attachment, and the server has ended it already when it sends
   the code. A client from before the code reads it as an error about a session it
   is attached to that it has no request of its own to answer, and the safe reading
-  of that is that the attachment is over, which `kablo connect` does and has
-  since 0.1.0 (it leaves the terminal with the text). The bridge of `kablo attach` from
+  of that is that the attachment is over, which a client has done since 0.1.0
+  (it leaves the terminal with the text). The bridge of `kablo attach` from
   before the code passes the error on to its client but keeps the attach it
   remembers for a relay that starts anew, so for that bridge the client is listed
   again as attached when the relay is replaced or restarted (README, Limits). That

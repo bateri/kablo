@@ -1,5 +1,5 @@
 //! The commands that drive a session without attaching to it (`send`,
-//! `send-key`, `capture`, `wait`, `label`, `end`, `new --wait`) and `here`, run
+//! `send-key`, `capture`, `wait`, `label`, `end`) and `here`, run
 //! as the real binary against real sessions.
 
 // Test support: a failure here is a failed test.
@@ -209,53 +209,6 @@ fn a_session_kept_for_a_client_that_asked_is_read_and_waited_for_after_that_clie
     // Then it goes, with nobody here.
     env.wait_gone(&id);
     assert!(!kablo(&env, &["list"]).out.contains(&id));
-}
-
-#[test]
-fn wait_ends_with_the_programs_status_and_new_wait_takes_the_session_with_it() {
-    let mut env = Env::new();
-    let id = env.name("new-wait");
-    env.track(&id);
-    let ran = kablo(
-        &env,
-        &[
-            "new", "--id", &id, "--wait", "--", "/bin/sh", "-c", "exit 3",
-        ],
-    );
-    assert_eq!(ran.code, 3, "{ran:?}");
-    assert_eq!(ran.out.trim(), id);
-    // kablo's own failure is 255 when the status is the program's, and 1 when not.
-    let taken = env.start("taken", &["--", "/bin/sh"]);
-    assert_eq!(
-        kablo(&env, &["new", "--id", &taken, "--wait", "--", "/bin/sh"]).code,
-        255
-    );
-    assert_eq!(
-        kablo(&env, &["new", "--id", &taken, "--", "/bin/sh"]).code,
-        1
-    );
-    // It was heard, so it is gone: not kept for a day for a client that has
-    // heard it.
-    env.wait_gone(&id);
-    assert!(!kablo(&env, &["list"]).out.contains(&id));
-
-    // A signal is 128 plus its number, as `kablo connect` ends.
-    let signalled = env.name("new-signal");
-    env.track(&signalled);
-    let ran = kablo(
-        &env,
-        &[
-            "new",
-            "--id",
-            &signalled,
-            "--wait",
-            "--",
-            "/bin/sh",
-            "-c",
-            "kill -9 $$",
-        ],
-    );
-    assert_eq!(ran.code, 137, "{ran:?}");
 }
 
 #[test]

@@ -863,43 +863,6 @@ pub fn is_tty(fd: BorrowedFd<'_>) -> bool {
     unsafe { libc::isatty(fd.as_raw_fd()) == 1 }
 }
 
-/// A terminal put in raw mode; the settings it had come back when this is
-/// dropped.
-pub struct RawMode {
-    fd: RawFd,
-    saved: libc::termios,
-}
-
-impl RawMode {
-    /// Puts the terminal `fd` in raw mode.
-    pub fn enter(fd: BorrowedFd<'_>) -> io::Result<RawMode> {
-        // SAFETY: an all-zero `termios` is a valid value; the kernel fills it.
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is open and `saved` is a valid out-pointer.
-        cvt(unsafe { libc::tcgetattr(fd.as_raw_fd(), &raw mut saved) })?;
-        let mut raw = saved;
-        // SAFETY: `raw` is a valid `termios`.
-        unsafe { libc::cfmakeraw(&raw mut raw) };
-        // SAFETY: `fd` is open and `raw` is a valid `termios`.
-        cvt(unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, &raw const raw) })?;
-        Ok(RawMode {
-            fd: fd.as_raw_fd(),
-            saved,
-        })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        // Now, not after the output has drained: a terminal that has stopped
-        // reading (a window being closed, flow control) must not keep this
-        // process from leaving.
-        // SAFETY: the descriptor is the terminal this was made for, still
-        // open (standard input outlives the guard) and `saved` is valid.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.saved) };
-    }
-}
-
 /// The write end of the pipe the signal handler uses.
 static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -948,6 +911,15 @@ pub fn signal_pipe(signals: &[libc::c_int]) -> io::Result<OwnedFd> {
         TAKEN.fetch_or(1u64 << signal, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(read)
+}
+
+/// A signal waiting in the signal pipe, if one is.
+pub fn signal_in(signals: BorrowedFd<'_>) -> Option<i32> {
+    let mut byte = [0u8; 1];
+    match read_fd(signals, &mut byte) {
+        Ok(1) => byte.first().map(|&signal| i32::from(signal)),
+        _ => None,
+    }
 }
 
 /// The signals [`signal_pipe`] took (bit `n` is signal `n`), which [`release_signals`] gives back.

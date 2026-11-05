@@ -110,14 +110,17 @@ fn output_errors_and_the_end_come_apart_and_in_order() {
     let mut bridge = Bridge::start(&env);
 
     let (said, window) = bridge
-        .run_command(command(&["/bin/echo", "hello", "$HOME;", "*"]), MAX_WINDOW)
+        .run_command(
+            command(&["/bin/echo", "hello", "--", "two words", "$HOME;", "*", "-x"]),
+            MAX_WINDOW,
+        )
         .unwrap();
     // A bridge that has not measured the link yet starts a stream at the start.
     assert_eq!(window, tune::START);
     bridge.until("the end", |b| b.flows[&said].closed);
     let flow = &bridge.flows[&said];
     // The arguments were nobody's to read as a shell would.
-    assert_eq!(flow.data, b"hello $HOME; *\n");
+    assert_eq!(flow.data, b"hello -- two words $HOME; * -x\n");
     assert!(flow.stderr.is_empty());
     assert_eq!(flow.exited, Some(Exit::Code(0)));
     assert_eq!(flow.ends, ["eof", "exited", "close"]);

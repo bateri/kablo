@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use common::{Bridge, Env, PATIENCE, closed_port, echo, pattern, target};
-use kablo::streams::{self as engine, Verdict};
+use kablo::streams as engine;
 use kablo_proto::tlv;
 use kablo_proto::v1::stream::{self, FailCode, MAX_STREAMS, MAX_WINDOW};
 use kablo_proto::v1::{Message, Packet, PacketDecoder};
@@ -438,9 +438,10 @@ fn a_client_asks_before_it_relies_on_streams() {
         messages.as_slice(),
         [Message::FeaturesReply(_), Message::Pong(_)]
     ));
-    let Verdict::Streams(features) = engine::judge(&messages[0]) else {
+    let Message::FeaturesReply(features) = &messages[0] else {
         panic!("{:?}", messages[0]);
     };
+    assert!(features.streams);
     assert_eq!(features.max_streams, MAX_STREAMS);
     assert_eq!(features.max_window, MAX_WINDOW);
     assert_eq!(features.max_data as usize, stream::MAX_DATA);
@@ -449,8 +450,8 @@ fn a_client_asks_before_it_relies_on_streams() {
 #[test]
 fn a_bridge_that_does_not_know_a_request_says_nothing_of_it_and_answers_the_ping() {
     // What a bridge from before streams does with `features` is what this one
-    // does with a kind nobody has: it skips it. The client's reading of the
-    // answer (nothing before the pong) is the same.
+    // does with a kind nobody has: it skips it. A pong with no answer before it
+    // means no streams.
     let env = Env::new();
     let mut bridge = Bridge::start(&env);
     bridge.record();
@@ -470,11 +471,6 @@ fn a_bridge_that_does_not_know_a_request_says_nothing_of_it_and_answers_the_ping
     decoder.push(&raw);
     let first = decoder.next_packet().unwrap().unwrap();
     assert!(matches!(first.message, Message::Pong(_)));
-    assert_eq!(
-        engine::judge(&first.message),
-        Verdict::Without(None),
-        "a pong with no answer before it means no streams"
-    );
     assert!(bridge.errors.is_empty());
 }
 

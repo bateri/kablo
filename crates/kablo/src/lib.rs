@@ -9,15 +9,11 @@
 
 pub mod app;
 pub mod bridge;
-pub mod carrier;
 pub mod cli;
 pub mod command;
-pub mod connect;
 pub mod conversation;
 pub mod dial;
 pub mod drive;
-pub mod exec;
-pub mod forward;
 pub mod handshake;
 pub mod inner;
 pub mod journal;

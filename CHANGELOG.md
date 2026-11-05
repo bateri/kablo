@@ -4,26 +4,19 @@ All notable changes to kablo are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 [Semantic Versioning](https://semver.org/).
 
-kablo has two kinds of reader, and this file is for both:
+kablo is the part of bateri that keeps terminals, and is not used anywhere
+else. This file is for the people who run it and for the bateri builds that pin
+a version of it and read this file when they move to the next one. Write what
+they will notice, not how the code changed: the commands, what they print and
+how they exit, what a session does, what the README promises, and the protocol
+(`docs/PROTOCOL.md`), the public API of `kablo-proto`, the keys of `kablo list
+--json` and `kablo version`, the names and targets of the release files and
+where `kablo_proto::install` puts them, and the vte fork in `vendor/vte` (its
+changes are listed in its `FORK.md`). Use **Added**, **Changed**, **Fixed** and
+**Removed**.
 
-- **People who run kablo.** Write what they will notice, not how the code
-  changed: the commands, what they print and how they exit, what a session
-  does, what the README promises. Under **Added**, **Changed**, **Fixed** and
-  **Removed**.
-- **Apps that drive kablo**: a terminal app over `kablo attach`, a program
-  built on the `kablo-proto` crate. They pin a version, install it on servers
-  and read this file when they move to the next one, so every change to what
-  they rely on is also written under **For apps**: the protocol
-  (`docs/PROTOCOL.md`), the public API of `kablo-proto`, the keys of
-  `kablo list --json` and `kablo version`, the exit codes, the names and
-  targets of the release files and where `kablo_proto::install` puts them,
-  and the vte fork in `vendor/vte` (its changes are listed in its `FORK.md`).
-
-What apps rely on only grows. A message, a key, a field or a code that has
-been released keeps its meaning, and a new need is a new one. Something on its
-way out stays for at least one release and is listed under **Going**, with
-what replaces it. A change to the protocol's format is a new protocol version,
-read alongside the one before it (`docs/PROTOCOL.md`, Compatibility).
+A change to the protocol's format is a new protocol version, read alongside the
+one before it (`docs/PROTOCOL.md`, Compatibility).
 
 Write a change under **Unreleased** in the commit that makes it, not on the
 day of the release. At release time rename the section to the new version and
@@ -39,7 +32,7 @@ section is not released.
   verbs that open no terminal work: `send`, `send-key`, `capture` and `wait` (kablo's own, with
   the checks of what a pane is called), `ls`, `notify`, `focus`, `zoom`, `swap`, `rename`,
   `close`, `move` and `resize`, with `--help`. A verb the app answers (`ls`, `focus`, `move` and
-  the like) asks the app connected to this machine, over the conversation of `kablo app`, in the
+  the like) asks the app connected to this machine, in a conversation of its own, in the
   text of the `kablo-bateri` crate, and prints what it says; with none connected it ends with 69,
   except `ls`, which lists what the server has, `rename pane`, which labels the session, and
   `close pane`, which ends it. A target is a terminal number (`p9`), never a bare number or a
@@ -67,26 +60,9 @@ section is not released.
 - **A program that writes a lot, `cat` of a big file for one, reaches the terminal app faster.**
   The session sends a flood of output in larger pieces and does less bookkeeping per read; a
   keystroke's echo or a line of output still goes out at once.
-- **`kablo connect` in a terminal on the session's own machine shows all of a flood.** A program
-  that writes faster than the terminal draws waits for it, as it would in that terminal without a
-  session, where it could have left you with a reset and a picture of the screen in place of what
-  it wrote. With several terminals on that machine the quickest sets the pace. Over `ssh` (`SSH_CONNECTION` or
-  `SSH_TTY` in the environment) the program is not kept waiting for a link that may be slow, and
-  that picture is what you get.
-
-### Fixed
-
-- **A key pressed while a program's output outruns your connection reaches the program.** `^C`
-  during a big `cat` over a slow link could be lost: the session had already let go of a
-  connection that fell too far behind, and the connection did not know yet. The session now reads
-  what you typed until the connection has noticed. The output that was on its way still comes
-  first, so on a slow link the prompt can take seconds to show.
-
-### For apps
-
 - **`kablo-bateri`, the text bateri and its `bateri` command say to each other.** A new crate in
   this workspace, with no I/O and no dependency but `kablo-proto`: the `bateri 2` messages that ride
-  one conversation of `kablo app` (the requests `place`, `ls`, `close`, `notify`, `focus`, `zoom`,
+  one conversation with the app (the requests `place`, `ls`, `close`, `notify`, `focus`, `zoom`,
   `swap`, `move`, `rename`, `resize`, `ssh` and `relay`, and the replies to them), with the writer
   and the strict reader both ends share, and the names they carry (a terminal `p9`, a tab `t3`, a
   side, a shell). It is not part of kablo's frozen wire: it changes with bateri, and an app takes it
@@ -147,6 +123,27 @@ section is not released.
 - **The emulator fork pins `unicode-width` to exactly `0.2.2`**, the table `text_width` was made
   from. An app that takes the fork by `rev` takes that version with it, and a requirement elsewhere
   in the app's tree that rules out `0.2.2` does not resolve.
+
+### Fixed
+
+- **A key pressed while a program's output outruns your connection reaches the program.** `^C`
+  during a big `cat` over a slow link could be lost: the session had already let go of a
+  connection that fell too far behind, and the connection did not know yet. The session now reads
+  what you typed until the connection has noticed. The output that was on its way still comes
+  first, so on a slow link the prompt can take seconds to show.
+
+### Removed
+
+- **The commands for using kablo on its own: `kablo connect`, `kablo exec`, `kablo forward` and
+  `kablo app`.** kablo is used through bateri, which holds the sessions' terminals and reaches a
+  server by its own connection. The server side is as it was: `kablo attach` still carries
+  programs and TCP connections for a client of the protocol, and `/etc/kablo/no-forwarding`
+  still turns the connections off (programs are not connections, and still run). `kablo new
+  --wait` and `kablo upgrade --all` are gone with them; `kablo wait` ends with a program's
+  status as before.
+- **`kablo list --json` no longer has `remote` and `remote_port`.** A session's state no longer
+  names the target of an ssh or mosh in front; the protocol's fields for it stay and are not
+  sent.
 
 ## [0.5.1] - 2026-10-31
 

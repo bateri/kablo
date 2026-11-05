@@ -19,16 +19,14 @@ mod common;
 mod stage;
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{
-    Bridge, Env, Exec, Forward, PATIENCE, client, is_over, read_exactly, rebuilt, same, signal,
-    whole,
-};
+use common::{Bridge, PATIENCE, rebuilt, same, signal, whole};
 use kablo_bateri::message::{Reach, Reply};
-use kablo_proto::v1::{ErrorCode, Message, NewSession, Size, State};
+use kablo_proto::v1::stream::{self, FailCode, MAX_WINDOW};
+use kablo_proto::v1::{ErrorCode, Exit, Message, NewSession, Size, State};
 use stage::Stage;
 
 /// The port of the TCP echo server inside the container (tests/e2e/Dockerfile),
@@ -627,27 +625,6 @@ fn first_next(bridge: &Bridge, id: &str) -> u64 {
     bridge.sessions.get(id).map_or(0, |seen| seen.next)
 }
 
-/// The arguments of `kablo forward` for the echo server, with `ssh host kablo
-/// attach` as the carrier.
-fn forward_args(server: &Server) -> Vec<String> {
-    let carrier = server.ssh("kablo attach");
-    let mut args = vec![
-        "--bind".to_owned(),
-        "127.0.0.1".to_owned(),
-        format!("0:127.0.0.1:{ECHO_PORT}"),
-        "--".to_owned(),
-        carrier.get_program().to_str().unwrap().to_owned(),
-    ];
-    args.extend(carrier.get_args().map(|a| a.to_str().unwrap().to_owned()));
-    args
-}
-
-fn start_forward(env: &Env, server: &Server) -> Forward {
-    let args = forward_args(server);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    Forward::start(env, &args)
-}
-
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
 fn the_server_refuses_forwarding_and_has_an_echo_server_for_the_scenarios_that_use_it() {
@@ -670,7 +647,7 @@ fn the_server_refuses_forwarding_and_has_an_echo_server_for_the_scenarios_that_u
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
-fn kablo_forward_carries_what_sshs_own_forwarding_is_refused() {
+fn the_bridge_carries_what_sshs_own_forwarding_is_refused() {
     let server = server();
 
     // The control: `ssh -L` to the same echo server. The tunnel comes up (it
@@ -718,184 +695,126 @@ fn kablo_forward_carries_what_sshs_own_forwarding_is_refused() {
         "ssh did not say why: {said:?}"
     );
 
-    // The same server, the same echo, by kablo.
-    let env = Env::new();
-    let mut forward = start_forward(&env, &server);
-    let address = forward.announced(1)[0];
-    let mut first = client(address);
-    let mut second = client(address);
-    first.write_all(b"request from the first").unwrap();
-    second.write_all(b"request from the second").unwrap();
-    assert_eq!(
-        read_exactly(&mut second, "request from the second".len()),
-        b"request from the second"
-    );
-    assert_eq!(
-        read_exactly(&mut first, "request from the first".len()),
-        b"request from the first"
-    );
+    // The same server, the same echo, over streams of the bridge.
+    let (mut bridge, _) = server.bridge();
+    let (first, _) = bridge
+        .connect_stream("127.0.0.1", ECHO_PORT, MAX_WINDOW)
+        .unwrap();
+    let (second, _) = bridge
+        .connect_stream("127.0.0.1", ECHO_PORT, MAX_WINDOW)
+        .unwrap();
+    bridge.stream_send(first, b"request from the first", 100);
+    bridge.stream_send(second, b"request from the second", 100);
+    bridge.until("both echoes", |b| {
+        b.flows[&first].data == b"request from the first"
+            && b.flows[&second].data == b"request from the second"
+    });
     // One of them says it is done and still hears the end of the other half.
-    first.shutdown(Shutdown::Write).unwrap();
-    let mut rest = Vec::new();
-    first.read_to_end(&mut rest).unwrap();
-    assert!(rest.is_empty());
-    second.write_all(b" and more").unwrap();
-    assert_eq!(read_exactly(&mut second, 9), b" and more");
+    bridge.stream_eof(first);
+    bridge.until("the end of the first", |b| b.flows[&first].eof);
+    assert!(bridge.flows[&first].data == b"request from the first");
+    bridge.stream_send(second, b" and more", 9);
+    bridge.until("the rest of the second", |b| {
+        b.flows[&second].data == b"request from the second and more"
+    });
+}
+
+// --- commands --------------------------------------------------------------------
+
+fn command(words: &[&str]) -> stream::Command {
+    stream::Command::new(words.iter().map(|w| w.as_bytes().to_vec()).collect())
 }
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
-fn kablo_forward_ends_when_its_ssh_is_killed() {
+fn a_command_runs_where_sshs_own_forwarding_is_off_and_its_output_pipes_on() {
     let server = server();
-    let env = Env::new();
-    let mut forward = start_forward(&env, &server);
-    let address = forward.announced(1)[0];
-    let mut socket = client(address);
-    socket.write_all(b"alive").unwrap();
-    assert_eq!(read_exactly(&mut socket, 5), b"alive");
-
-    // The ssh that carries it is the one child `kablo forward` has.
-    let children = Command::new("pgrep")
-        .args(["-P", &forward.pid().to_string()])
-        .output()
-        .unwrap();
-    let ssh: libc::pid_t = String::from_utf8_lossy(&children.stdout)
-        .lines()
-        .next()
-        .expect("kablo forward has a child")
-        .trim()
-        .parse()
-        .unwrap();
-    // SAFETY: the pid of the ssh this test's `kablo forward` started.
-    unsafe { libc::kill(ssh, libc::SIGKILL) };
-
-    assert_eq!(forward.wait_exit().code(), Some(1));
-    forward.said("ssh was killed by signal 9");
-    assert!(is_over(&mut socket), "the connection outlived its carrier");
-}
-
-// --- kablo exec ------------------------------------------------------------------
-
-/// A `kablo exec` of this test's directory with the server's ssh as the
-/// carrier, and the program the arguments name.
-fn start_exec(env: &Env, server: &Server, options: &[&str], program: &[&str]) -> Exec {
-    let carrier = server.ssh("kablo attach");
-    let mut words = vec![carrier.get_program().to_str().unwrap().to_owned()];
-    words.extend(carrier.get_args().map(|a| a.to_str().unwrap().to_owned()));
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    Exec::start_over(env, options, &words, program)
-}
-
-#[test]
-#[ignore = "needs the sshd container of `make e2e`"]
-fn kablo_exec_runs_a_program_where_sshs_own_forwarding_is_off_and_its_output_pipes_on() {
-    let server = server();
-    let env = Env::new();
+    let (mut bridge, _) = server.bridge();
 
     // The server's directory, as a stream of an archive made there and listed
     // here: the work `ssh host tar -cf - …` does, over the one connection.
-    let mut archive = env.kablo();
-    let carrier = server.ssh("kablo attach");
-    archive
-        .arg("exec")
-        .arg("--")
-        .arg(carrier.get_program())
-        .args(carrier.get_args())
-        .args(["--", "tar", "-cf", "-", "-C", "/etc/ssh", "sshd_config.d"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut archive = archive.spawn().unwrap();
-    let listing = Command::new("tar")
-        .args(["-tf", "-"])
-        .stdin(Stdio::from(archive.stdout.take().unwrap()))
-        .output()
+    let (id, _) = bridge
+        .run_command(
+            command(&["tar", "-cf", "-", "-C", "/etc/ssh", "sshd_config.d"]),
+            MAX_WINDOW,
+        )
         .unwrap();
-    let ended = archive.wait_with_output().unwrap();
-    assert_eq!(ended.status.code(), Some(0), "{ended:?}");
+    bridge.until("the end of the archive", |b| b.flows[&id].closed);
+    let flow = &bridge.flows[&id];
+    assert_eq!(flow.exited, Some(Exit::Code(0)));
+    assert!(
+        flow.stderr.is_empty(),
+        "tar's own words are the only ones that could be here: {:?}",
+        String::from_utf8_lossy(&flow.stderr)
+    );
+    let mut listing = Command::new("tar")
+        .args(["-tf", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    listing.stdin.take().unwrap().write_all(&flow.data).unwrap();
+    let listing = listing.wait_with_output().unwrap();
     let names = String::from_utf8_lossy(&listing.stdout);
     assert!(listing.status.success(), "{listing:?}");
     assert!(
         names.lines().any(|l| l == "sshd_config.d/kablo-e2e.conf"),
         "{names}"
     );
-    assert!(
-        ended.stderr.is_empty(),
-        "tar's own words are the only ones that could be here: {:?}",
-        String::from_utf8_lossy(&ended.stderr)
-    );
 }
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
-fn kablo_exec_over_ssh_keeps_the_streams_apart_and_ends_with_the_programs_status() {
+fn a_command_over_ssh_keeps_the_streams_apart_and_ends_with_the_programs_status() {
     let server = server();
-    let env = Env::new();
+    let (mut bridge, _) = server.bridge();
 
-    let mut running = start_exec(
-        &env,
-        &server,
-        &["--env", "E2E_WORD=over ssh"],
-        &[
-            "/bin/sh",
-            "-c",
-            "echo \"out: $E2E_WORD\"; echo err >&2; cat; exit 7",
-        ],
-    );
-    running.type_in(b"typed\n");
-    running.end_input();
-    let ran = running.finish();
-    assert_eq!(ran.status.code(), Some(7), "{ran:?}");
+    let mut word = command(&[
+        "/bin/sh",
+        "-c",
+        "echo \"out: $E2E_WORD\"; echo err >&2; cat; exit 7",
+    ]);
+    word.env = vec![b"E2E_WORD=over ssh".to_vec()];
+    let (id, _) = bridge.run_command(word, MAX_WINDOW).unwrap();
+    bridge.stream_send(id, b"typed\n", 6);
+    bridge.stream_eof(id);
+    bridge.until("the end", |b| b.flows[&id].closed);
+    let flow = &bridge.flows[&id];
+    assert_eq!(flow.exited, Some(Exit::Code(7)));
     // What the startup file prints is the ssh login's and not the program's: it
     // is noise before the signature.
-    assert_eq!(ran.out(), "out: over ssh\ntyped\n");
-    assert_eq!(ran.err(), "err\n");
+    assert_eq!(flow.data, b"out: over ssh\ntyped\n");
+    assert_eq!(flow.stderr, b"err\n");
 
     // Not a program the server has.
-    let ran = start_exec(&env, &server, &[], &["/no/such/program"]).finish();
-    assert_eq!(ran.status.code(), Some(255));
+    let (_, code, text) = bridge
+        .run_command(command(&["/no/such/program"]), MAX_WINDOW)
+        .unwrap_err();
     assert_eq!(
-        ran.err(),
-        "kablo: cannot run /no/such/program: No such file or directory\n"
+        (code, text.as_str()),
+        (FailCode::START_FAILED, "No such file or directory")
     );
 }
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
-fn kablo_exec_ends_with_its_ssh_and_the_servers_program_goes_with_the_connection() {
+fn the_servers_program_goes_with_the_connection_that_ran_it() {
     let server = server();
-    let env = Env::new();
     // A sleep for a number of seconds of its own, so that it is found by its
     // command line and no other program of the server is taken for it.
     let tag = (1_000_000 + std::process::id()).to_string();
-    let running = start_exec(&env, &server, &[], &["/bin/sleep", &tag]);
+    let (mut bridge, _) = server.bridge();
+    bridge
+        .run_command(command(&["/bin/sleep", &tag]), MAX_WINDOW)
+        .unwrap();
     let start = Instant::now();
     while server.count(&tag) == 0 {
         assert!(start.elapsed() < PATIENCE, "the program never started");
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // The ssh that carries it is the one child `kablo exec` has.
-    let children = Command::new("pgrep")
-        .args(["-P", &running.child.id().to_string()])
-        .output()
-        .unwrap();
-    let ssh: libc::pid_t = String::from_utf8_lossy(&children.stdout)
-        .lines()
-        .next()
-        .expect("kablo exec has a child")
-        .trim()
-        .parse()
-        .unwrap();
-    // SAFETY: the pid of the ssh this test's `kablo exec` started.
-    unsafe { libc::kill(ssh, libc::SIGKILL) };
-    let ran = running.finish();
-    assert_eq!(ran.status.code(), Some(255), "{ran:?}");
-    assert!(
-        ran.err().contains("ssh was killed by signal 9"),
-        "{}",
-        ran.err()
-    );
+    signal(bridge.pid(), libc::SIGKILL);
     // The bridge ends with its connection and takes the program with it.
     let start = Instant::now();
     while server.count(&tag) > 0 {
@@ -907,7 +826,7 @@ fn kablo_exec_ends_with_its_ssh_and_the_servers_program_goes_with_the_connection
     }
 }
 
-// --- kablo app ---------------------------------------------------------------------
+// --- the app ---------------------------------------------------------------------
 
 /// An app as one connects over ssh, saying it takes tickets.
 fn app_over_ssh(server: &Server) -> Bridge {
@@ -916,16 +835,28 @@ fn app_over_ssh(server: &Server) -> Bridge {
     app
 }
 
-/// `ssh host kablo app`, with its input, output and errors piped. sshd gives it
+/// What `kablo bateri ls` asks of the app: the one conversation these
+/// scenarios have with it.
+const ASKED: &[u8] = b"bateri 2\nls\n";
+
+/// `ssh host kablo bateri ls`, with its output and errors piped. sshd gives it
 /// no terminal (`-T`), so it is in none of the server's sessions.
-fn sender(server: &Server, input: Stdio) -> Child {
+fn asker(server: &Server) -> Child {
     server
-        .ssh("kablo app")
-        .stdin(input)
+        .ssh("kablo bateri ls")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+/// The app's reply to the question of `kablo bateri ls`: `text`, which the
+/// command prints, and the end of the conversation.
+fn reply(app: &mut Bridge, stream: u32, text: &str) {
+    let reply = format!("bateri 2\nok text\n{text}");
+    app.stream_send(stream, reply.as_bytes(), reply.len());
+    app.stream_close(stream);
 }
 
 /// Waits for `child` to end, and returns how it did and what it wrote.
@@ -934,7 +865,7 @@ fn ended(mut child: Child) -> Output {
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() > PATIENCE {
             let _ = child.kill();
-            panic!("kablo app never ended");
+            panic!("kablo bateri never ended");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -949,8 +880,8 @@ fn said(bytes: &[u8]) -> String {
 /// that ssh runs there, on its standard output: ssh's, not kablo's.
 const STARTUP_NOISE: &[u8] = b"kablo-e2e: noise from .bashrc before the program starts\n";
 
-/// What `kablo app` itself wrote, of the standard output of a `ssh host kablo
-/// app`: what is left after the startup file's words.
+/// What `kablo bateri` itself wrote, of the standard output of a `ssh host
+/// kablo bateri`: what is left after the startup file's words.
 fn written_by_the_program(stdout: &[u8]) -> &[u8] {
     stdout
         .strip_prefix(STARTUP_NOISE)
@@ -968,31 +899,19 @@ fn a_program_in_a_session_over_ssh_is_from_that_session_with_its_terminal_and_wi
     app.attach(&id, 0);
 
     // From the session's own terminal: the kernel says which it is.
-    app.type_in(
-        &id,
-        "echo from-the-terminal | kablo app; echo \"[terminal=$?]\"\n",
-    );
+    app.type_in(&id, "kablo bateri ls; echo \"[terminal=$?]\"\n");
     let a = app.take_ticket(0, 4096);
     assert_eq!(app.tickets[0].0.as_deref(), Some(id.as_str()));
-    app.until("what the program wrote", |b| {
-        b.flows[&a].data == b"from-the-terminal\n"
-    });
-    app.stream_send(a, b"answer-terminal\n", 16);
-    app.stream_close(a);
+    app.until("what the program asked", |b| b.flows[&a].data == ASKED);
+    reply(&mut app, a, "answer-terminal\n");
     app.wait_for(&id, "answer-terminal\r\n[terminal=0]\r\n");
 
     // Without its terminal (`setsid` drops it): the parents say which.
-    app.type_in(
-        &id,
-        "echo from-the-parents | setsid -w kablo app; echo \"[parents=$?]\"\n",
-    );
+    app.type_in(&id, "setsid -w kablo bateri ls; echo \"[parents=$?]\"\n");
     let b = app.take_ticket(1, 4096);
     assert_eq!(app.tickets[1].0.as_deref(), Some(id.as_str()));
-    app.until("what the program wrote", |b2| {
-        b2.flows[&b].data == b"from-the-parents\n"
-    });
-    app.stream_send(b, b"answer-parents\n", 15);
-    app.stream_close(b);
+    app.until("what the program asked", |b2| b2.flows[&b].data == ASKED);
+    reply(&mut app, b, "answer-parents\n");
     app.wait_for(&id, "answer-parents\r\n[parents=0]\r\n");
 
     assert!(app.errors.is_empty(), "{:?}", app.errors);
@@ -1002,30 +921,21 @@ fn a_program_in_a_session_over_ssh_is_from_that_session_with_its_terminal_and_wi
 
 #[test]
 #[ignore = "needs the sshd container of `make e2e`"]
-fn a_program_that_ssh_starts_is_from_no_session_and_what_the_app_says_comes_out_as_it_is() {
+fn a_program_that_ssh_starts_is_from_no_session_and_what_the_app_says_comes_out() {
     let server = server();
     let mut app = app_over_ssh(&server);
 
-    let mut program = sender(&server, Stdio::piped());
-    let mut input = program.stdin.take().unwrap();
-    input
-        .write_all(b"from outside \x1b[1mevery\x00session")
-        .unwrap();
-    drop(input);
+    let program = asker(&server);
     let a = app.take_ticket(0, 4096);
     assert_eq!(app.tickets[0].0, None, "from no session");
-    app.until("what the program wrote", |b| {
-        b.flows[&a].eof && b.flows[&a].data == b"from outside \x1b[1mevery\x00session"
+    app.until("what the program asked", |b| {
+        b.flows[&a].eof && b.flows[&a].data == ASKED
     });
-    app.stream_send(a, b"answer \x1b[0m\r\n\x00end", 8);
-    app.stream_close(a);
+    reply(&mut app, a, "answer\n");
 
     let ran = ended(program);
     assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
-    assert_eq!(
-        written_by_the_program(&ran.stdout),
-        b"answer \x1b[0m\r\n\x00end"
-    );
+    assert_eq!(written_by_the_program(&ran.stdout), b"answer\n");
     assert_eq!(said(&ran.stderr), "");
 }
 
@@ -1036,18 +946,16 @@ fn an_app_that_goes_away_ends_the_open_conversation_without_a_close_and_the_next
     let server = server();
     let mut app = app_over_ssh(&server);
 
-    let mut program = sender(&server, Stdio::piped());
-    let mut input = program.stdin.take().unwrap();
-    input.write_all(b"half").unwrap();
+    let program = asker(&server);
     let a = app.take_ticket(0, 4096);
-    app.until("what the program wrote", |b| b.flows[&a].data == b"half");
+    app.until("what the program asked", |b| b.flows[&a].data == ASKED);
     drop(app);
 
+    // `ls` has the server's own list for an app that is not there.
     let ran = ended(program);
-    drop(input);
-    assert_eq!(ran.status.code(), Some(1), "{}", said(&ran.stderr));
+    assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
     assert!(
-        said(&ran.stderr).contains("the app went away"),
+        said(&ran.stderr).contains("no Mac is connected"),
         "{}",
         said(&ran.stderr)
     );
@@ -1058,11 +966,10 @@ fn an_app_that_goes_away_ends_the_open_conversation_without_a_close_and_the_next
         assert!(start.elapsed() < PATIENCE, "the bridge outlived its ssh");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let ran = ended(sender(&server, Stdio::null()));
-    assert_eq!(ran.status.code(), Some(69), "{}", said(&ran.stderr));
+    let ran = ended(asker(&server));
+    assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
     let words = said(&ran.stderr);
-    assert!(words.contains("no app is connected"), "{words}");
-    assert_eq!(written_by_the_program(&ran.stdout), b"");
+    assert!(words.contains("no Mac is connected"), "{words}");
 }
 
 #[test]
@@ -1086,28 +993,18 @@ fn an_app_that_connects_again_is_given_the_conversations_not_the_half_dead_conne
     // The app comes back over a new connection and takes the terminal again.
     let mut new = app_over_ssh(&server);
     new.attach(&id, 0);
-    new.type_in(
-        &id,
-        "echo from-the-terminal | kablo app; echo \"[terminal=$?]\"\n",
-    );
+    new.type_in(&id, "kablo bateri ls; echo \"[terminal=$?]\"\n");
     let a = new.take_ticket(0, 4096);
     assert_eq!(new.tickets[0].0.as_deref(), Some(id.as_str()));
-    new.until("what the program wrote", |b| {
-        b.flows[&a].data == b"from-the-terminal\n"
-    });
-    new.stream_send(a, b"answer\n", 7);
-    new.stream_close(a);
+    new.until("what the program asked", |b| b.flows[&a].data == ASKED);
+    reply(&mut new, a, "answer\n");
     new.wait_for(&id, "answer\r\n[terminal=0]\r\n");
 
     // A program outside every session goes to the one used last as well.
-    let mut program = sender(&server, Stdio::piped());
-    let mut input = program.stdin.take().unwrap();
-    input.write_all(b"from outside").unwrap();
-    drop(input);
+    let program = asker(&server);
     let b = new.take_ticket(1, 4096);
     assert_eq!(new.tickets[1].0, None);
-    new.stream_send(b, b"ok", 2);
-    new.stream_close(b);
+    reply(&mut new, b, "ok");
     let ran = ended(program);
     assert_eq!(ran.status.code(), Some(0), "{}", said(&ran.stderr));
     assert_eq!(written_by_the_program(&ran.stdout), b"ok");

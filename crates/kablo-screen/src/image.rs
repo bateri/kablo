@@ -3,7 +3,7 @@
 //! **Bytes, not a grid dump.** The image goes through a parser like any program's
 //! output, so colours, styles, wide characters and clusters come back by the path the
 //! parser already knows, and a terminal that is not ours (a plain emulator behind
-//! `kablo connect`) can take it too. alacritty's types do not reach the format and the
+//! a terminal app) can take it too. alacritty's types do not reach the format and the
 //! format does not follow alacritty's internal layout.
 //!
 //! **Destructive.** alacritty keeps the tab stops, the scrolling region, the active

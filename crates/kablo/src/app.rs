@@ -1,10 +1,10 @@
-//! `kablo app`: a program on the server hands bytes to the app that is
-//! connected to it, and gets bytes back.
+//! A program on the server hands bytes to the app that is connected to it, and
+//! gets bytes back (the `bateri` command does, for each of its requests).
 //!
 //! This is the sender's side of mail (`docs/PROTOCOL.md`, section 5): it joins
-//! this process's standard input and output to one conversation with the app
-//! and does nothing else. It does not look at the bytes, and what they mean is
-//! the app's and the program's. It finds the bridges that carry an app (each
+//! the sender's input and output to one conversation with the app and does
+//! nothing else. It does not look at the bytes, and what they mean is the
+//! app's and the program's. It finds the bridges that carry an app (each
 //! keeps a mailbox in the socket directory, [`crate::mailbox`]), asks each where
 //! its app stands, picks one, and opens a conversation on the mailbox of the
 //! one it picked.
@@ -16,13 +16,12 @@
 //! from the kernel's word on this process, and never this program's.
 //!
 //! The conversation is the stream engine of [`crate::streams`], the same code
-//! the bridge runs, with this process's input and output as its ends. Nothing
+//! the bridge runs, with the sender's input and output as its ends. Nothing
 //! here sets a timer while it goes on: only the two waits for an answer (a
 //! bridge's to a question, the app's to a ticket) have a limit, because the
 //! other end may be a bridge that is stopped or an app that has gone to sleep,
 //! and a sender that waited for either would wait for ever.
 
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
@@ -32,13 +31,18 @@ use kablo_proto::WIRE;
 use kablo_proto::v1::stream::{self as wire, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{Message, Packet, Standing};
 
-use crate::carrier::{READ_CHUNK, clean, signal_in};
 use crate::handshake::{self, ClientStep};
 use crate::outbound::Outbound;
 use crate::peer;
 use crate::sockdir::{self, MailboxFile};
 use crate::streams::{self, Cause, Event, Local, Streams};
-use crate::sys;
+use crate::sys::{self, signal_in};
+
+/// Bytes read from the sender's input at a time.
+const READ_CHUNK: usize = crate::outbound::CHUNK;
+
+/// How many characters of a text from the server are shown.
+const SHOWN: usize = 200;
 
 /// The status when the conversation was had and the app closed it, or when
 /// both had said all they had.
@@ -75,58 +79,20 @@ pub struct Patience {
 }
 
 impl Patience {
-    /// What `kablo app` waits.
+    /// What a conversation waits.
     pub const STANDARD: Patience = Patience {
         ask: ASK_WAIT,
         answer: ANSWER_WAIT,
     };
 }
 
-/// Reads the arguments after `kablo app`: there are none.
-pub fn parse(args: &[OsString]) -> Result<(), String> {
-    match args.first() {
-        None => Ok(()),
-        Some(arg) => Err(format!(
-            "kablo app takes no arguments (not {}): its input is what it hands over",
-            clean(&arg.to_string_lossy())
-        )),
-    }
-}
-
 // --- the run -------------------------------------------------------------------
 
-/// Hands this process's standard input to the app and prints what the app says,
-/// until the conversation is over. Returns the status.
-pub fn run(err: &mut dyn Write) -> u8 {
-    let signals = match sys::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]) {
-        Ok(fd) => fd,
-        Err(e) => {
-            let _ = writeln!(err, "kablo: cannot watch for signals: {e}");
-            return EXIT_TROUBLE;
-        }
-    };
-    let local = match crate::exec::standard() {
-        Ok(local) => local,
-        Err(e) => {
-            let _ = writeln!(err, "kablo: cannot use standard input and output: {e}");
-            return EXIT_TROUBLE;
-        }
-    };
-    let dir = match sockdir::socket_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            let _ = writeln!(err, "kablo: {e}");
-            return EXIT_TROUBLE;
-        }
-    };
-    talk(&dir, local, Some(signals.as_fd()), Patience::STANDARD, err)
-}
-
-/// One conversation for a program that is a part of this process, not a process of its own (the
-/// `bateri` command): hands `message` to the app and returns the status and the bytes the app said.
-/// What `kablo app` would have said on standard error is not said, since the caller has its own
-/// words for each status. A signal ends the conversation as it ends `kablo app`'s, and the
-/// signals are the process's own again once it is over.
+/// One conversation for a program that is a part of this process (the `bateri` command): hands
+/// `message` to the app and returns the status and the bytes the app said. What `talk` would have
+/// said on standard error is not said, since the caller has its own words for each status. A
+/// signal ends the conversation with 128 and its number, and the signals are the process's own
+/// again once it is over.
 pub fn converse(message: &[u8]) -> (u8, Vec<u8>) {
     let signals_pipe = sys::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]).ok();
     let (status, said) = converse_with(message, signals_pipe.as_ref().map(AsFd::as_fd));
@@ -168,7 +134,7 @@ fn converse_with(message: &[u8], signals: Option<BorrowedFd<'_>>) -> (u8, Vec<u8
     })
 }
 
-/// [`run`] for the mailboxes in `dir`, with `local` for the ends of the
+/// One conversation with the app of the mailboxes in `dir`, with `local` for the ends of the
 /// conversation and `signals` (the read end of a pipe of signal numbers, see
 /// [`sys::signal_pipe`]) to end it.
 pub fn talk(
@@ -217,9 +183,27 @@ pub fn talk(
     }
 }
 
-/// The status after a signal ended it: 128 and its number, as `kablo exec`'s.
+/// The status after a signal ended it: 128 and its number.
 fn status_of_signal(signal: i32) -> u8 {
     u8::try_from(128 + signal).unwrap_or(EXIT_TROUBLE)
+}
+
+/// A text from the server as a person may be shown it: no control characters
+/// (it could move the cursor or set the title) and not too long.
+fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !c.is_control() && !changes_direction(c))
+        .take(SHOWN)
+        .collect()
+}
+
+/// Characters that are not control characters and still change how a line
+/// reads: the marks and overrides that reverse the direction of text, and the
+/// zero-width ones.
+fn changes_direction(c: char) -> bool {
+    matches!(c,
+        '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
 }
 
 /// Says there is no app to hand bytes to, and why that may be so, and returns
@@ -644,7 +628,7 @@ impl<'a> Conversing<'a> {
                     });
                 }
                 // A reader that went away ends a writer, quietly, with the status
-                // the system gives one in a pipeline (as `kablo exec` does).
+                // the system gives one in a pipeline.
                 Event::Closed {
                     cause: Cause::Local(io::ErrorKind::BrokenPipe),
                     ..
@@ -744,12 +728,6 @@ mod tests {
 
     fn takes(idle_ms: u64) -> Standing {
         Standing::idle(Duration::from_millis(idle_ms)).with_tickets()
-    }
-
-    #[test]
-    fn nothing_is_asked_for_by_arguments() {
-        assert!(parse(&[]).is_ok());
-        assert!(parse(&[OsString::from("--now")]).is_err());
     }
 
     #[test]

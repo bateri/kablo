@@ -2,7 +2,7 @@
 //! that must not block.
 //!
 //! The relay serves one session on one socket. Whoever wants to talk to it (the
-//! bridge, `kablo connect`, `kablo list`) holds a [`Peer`]: a non-blocking
+//! bridge, `kablo list`) holds a [`Peer`]: a non-blocking
 //! socket with an output buffer, the handshake and a frame decoder. It does
 //! not decide when to read or write; the owner puts [`Peer::fd`] and
 //! [`Peer::interest`] in its `poll` set and calls [`Peer::flush`] and

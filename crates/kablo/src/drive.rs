@@ -1,10 +1,9 @@
 //! Driving a session from the machine it runs on, without attaching to it:
 //! `kablo send`, `send-key`, `capture`, `wait`, `label` and `end`, `kablo here`
-//! (which asks the process table and no relay), and the waiting half of
-//! `kablo new --wait`.
+//! (which asks the process table and no relay).
 //!
 //! These are the programs' commands (an agent, a script) and they are not
-//! clients in the sense of `kablo connect`: they never attach, so the relay
+//! clients in the sense of a terminal app: they never attach, so the relay
 //! goes on answering what the program asks its terminal and the app that shows
 //! the session is not disturbed (`docs/PROTOCOL.md`, section 5, Driving a
 //! session without attaching). Each one starts the same way. It scans the
@@ -30,29 +29,27 @@ use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
 use kablo_proto::v1::{
-    Capture, ErrorCode, Key, MAX_HISTORY, MAX_LABEL, Message, OFFSET_END, Packet, State, Status,
-    Stroke, key,
+    Capture, ErrorCode, Exit, Key, MAX_HISTORY, MAX_LABEL, Message, Packet, State, Status, Stroke,
+    key,
 };
 
 use crate::cli::usage_error;
 use crate::link::Link;
 use crate::listing::printable;
 use crate::origin::{self, Candidate, Origin};
-use crate::{exec, scan, sockdir, sys};
+use crate::{scan, sockdir, sys};
 
 /// The status of a command that could not do what it was asked: the session is
 /// not there or is ambiguous, its relay is old, the connection failed, the
 /// program in it has ended. The words are on standard error.
 pub const EXIT_TROUBLE: u8 = 1;
 
-/// The status of `wait` and `new --wait` when kablo's own part fails: what they
-/// end with is the program's status, and `1` is a status programs have. The same
-/// number `kablo exec` uses.
-pub const EXIT_WAIT_TROUBLE: u8 = exec::EXIT_TROUBLE;
+/// The status of `wait` when kablo's own part fails: what it ends with is the
+/// program's status, and `1` is a status programs have.
+pub const EXIT_WAIT_TROUBLE: u8 = 255;
 
 /// The status of a command whose output was not read to the end because
-/// whatever reads it went away (128 and the number of `SIGPIPE`), as `kablo exec`
-/// and `kablo app` end.
+/// whatever reads it went away (128 and the number of `SIGPIPE`).
 pub const EXIT_PIPE: u8 = 141;
 
 /// The status of `wait --for` when the time ran out first: what GNU `timeout`
@@ -69,10 +66,6 @@ pub const DRIVES_SINCE: [u64; 3] = [0, 2, 0];
 /// is the message's own.
 const MAX_TEXT: usize = kablo_proto::MAX_PAYLOAD - 64;
 
-/// How long `new --wait` waits, once it has seen the program end, for the
-/// session to go; the program's status is the answer either way.
-const DELIVERY_WAIT: Duration = Duration::from_secs(5);
-
 /// How long `kablo end` waits, once it has asked the program to end, for it to
 /// do so: a program that has not by then is not going to for a hang-up, and the
 /// person is told what else there is.
@@ -83,7 +76,7 @@ const END_WAIT: Duration = Duration::from_secs(5);
 enum Family {
     /// Commands that end with `0` or `1`.
     Quick,
-    /// Commands that end with a program's status (`wait`, `new --wait`).
+    /// Commands that end with a program's status (`wait`).
     Waiting,
 }
 
@@ -1006,7 +999,7 @@ pub fn wait(args: &[OsString], err: &mut dyn Write) -> u8 {
         .as_ref()
         .and_then(|(_, time)| Instant::now().checked_add(*time));
     match end_of(&mut talk, until) {
-        Ended::Program(exit) => exec::status_of(exit),
+        Ended::Program(exit) => status_of(exit),
         Ended::Timeout => {
             let within = parsed.within.map(|(text, _)| text).unwrap_or_default();
             let _ = writeln!(
@@ -1021,6 +1014,15 @@ pub fn wait(args: &[OsString], err: &mut dyn Write) -> u8 {
             let _ = writeln!(err, "kablo: {why}");
             EXIT_WAIT_TROUBLE
         }
+    }
+}
+
+/// How a program's end is the status of the command that waited for it: its
+/// code, or 128 and the signal's number (the server's own numbering).
+fn status_of(exit: Exit) -> u8 {
+    match exit {
+        Exit::Code(code) => u8::try_from(code & 0xff).unwrap_or(EXIT_WAIT_TROUBLE),
+        Exit::Signal(signal) => u8::try_from(128 + signal).unwrap_or(EXIT_WAIT_TROUBLE),
     }
 }
 
@@ -1052,52 +1054,6 @@ fn end_of(talk: &mut Talk, until: Option<Instant>) -> Ended {
                     talk.id
                 ));
             }
-        }
-    }
-}
-
-/// The waiting half of `kablo new --wait`: waits for the program in the session
-/// just made to end, then takes the session over (the end is told to an
-/// ordinary client that attaches at the end of the journal, without a picture,
-/// so nothing is played again; when its queue is empty the relay tells the
-/// warden it was heard and the session goes), and returns the program's status.
-/// Seeing the end through a `wait` does not close the session: this is.
-pub fn await_end(dir: &Path, id: &SessionId, err: &mut dyn Write) -> u8 {
-    let mut talk = match Talk::open(dir, id) {
-        Ok(talk) => talk,
-        Err(why) => {
-            let _ = writeln!(err, "kablo: {why}");
-            return EXIT_WAIT_TROUBLE;
-        }
-    };
-    match end_of(&mut talk, None) {
-        Ended::Program(exit) => {
-            take_over(dir, id);
-            exec::status_of(exit)
-        }
-        Ended::Timeout => EXIT_WAIT_TROUBLE,
-        Ended::Trouble(why) => {
-            let _ = writeln!(err, "kablo: {why}");
-            EXIT_WAIT_TROUBLE
-        }
-    }
-}
-
-/// Attaches to a session whose program has ended, at the end of its journal and
-/// with no picture, hears the end, and stays until the session has gone (or
-/// [`DELIVERY_WAIT`] has passed): the session is not kept for a client that has
-/// not heard, and this one has. A session that is already gone has been taken
-/// by somebody else.
-fn take_over(dir: &Path, id: &SessionId) {
-    let Ok(mut talk) = Talk::open(dir, id) else {
-        return;
-    };
-    talk.say(Message::attach(OFFSET_END));
-    let until = Instant::now().checked_add(DELIVERY_WAIT);
-    loop {
-        match talk.hear(until) {
-            Heard::Packet(_) => {}
-            Heard::TimedOut | Heard::Over => return,
         }
     }
 }

@@ -12,7 +12,6 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{Conn, Env, PATIENCE};
@@ -49,12 +48,6 @@ fn programs(conn: &Conn) -> Vec<String> {
 fn wait_for_the_prompt(client: &mut Conn) {
     client.until("a prompt", |c| !c.data.is_empty());
     client.pump(Duration::from_millis(300));
-}
-
-fn text(bytes: &Option<Vec<u8>>) -> Option<String> {
-    bytes
-        .as_ref()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[test]
@@ -180,75 +173,6 @@ fn a_terminal_that_stops_showing_what_is_typed_is_a_secret_until_it_shows_it_aga
     assert!(a.states.iter().filter(|state| state.secret).count() >= 1);
     assert!(!last(&a).secret);
     assert!(!a.status().secret);
-}
-
-/// Whether an ssh client can be run here; the tests that use one say so when
-/// they are skipped.
-fn ssh_here() -> bool {
-    Command::new("ssh")
-        .arg("-V")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// A listener that takes connections and says nothing: an ssh to it stays in
-/// the foreground, waiting for a server that does not speak.
-fn silent_server() -> u16 {
-    common::target(|connection| {
-        std::thread::sleep(Duration::from_secs(600));
-        drop(connection);
-    })
-}
-
-#[test]
-fn an_interactive_ssh_is_told_with_its_target_and_port_and_nothing_else_of_its_line() {
-    if !ssh_here() {
-        eprintln!("skipped: no ssh client here (the parser is tested without one)");
-        return;
-    }
-    let mut env = Env::new();
-    let id = env.start("ssh", &SH);
-    let port = silent_server();
-    let mut a = env.connect(&id);
-    a.attach(0);
-    a.until("a state", |c| !c.states.is_empty());
-    let shell = program(&a).expect("the shell's name");
-    assert_eq!(last(&a).remote, None);
-
-    // A key whose name looks like a secret, and a proxy command with one.
-    a.type_in(&format!(
-        "ssh -F /dev/null -o BatchMode=yes -i /nonexistent/hunter2-key \
-         -o ProxyCommand=none deploy@127.0.0.1 -p {port}\n"
-    ));
-    a.until("the ssh session", |c| last(c).remote.is_some());
-    let state = last(&a);
-    assert_eq!(program(&a).as_deref(), Some("ssh"));
-    assert_eq!(text(&state.remote).as_deref(), Some("deploy@127.0.0.1"));
-    assert_eq!(state.remote_port, Some(port));
-    let status = a.status();
-    assert_eq!(text(&status.remote).as_deref(), Some("deploy@127.0.0.1"));
-    assert_eq!(status.remote_port, Some(port));
-    for told in [format!("{state:?}"), format!("{status:?}")] {
-        assert!(!told.contains("hunter2"), "{told}");
-        assert!(!told.contains("ProxyCommand"), "{told}");
-    }
-
-    // Interrupted, the shell is back and the session is not remote.
-    a.type_in("\x03");
-    a.until("the shell", |c| {
-        program(c).as_deref() == Some(shell.as_str()) && last(c).remote.is_none()
-    });
-    assert_eq!(last(&a).remote_port, None);
-
-    // A command on the other side without `-t` is not an interactive session.
-    a.type_in(&format!(
-        "ssh -F /dev/null -o BatchMode=yes deploy@127.0.0.1 -p {port} uptime\n"
-    ));
-    a.until("ssh", |c| program(c).as_deref() == Some("ssh"));
-    assert_eq!(last(&a).remote, None);
-    assert_eq!(a.status().remote, None);
 }
 
 #[test]

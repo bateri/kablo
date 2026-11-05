@@ -7,13 +7,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{
-    ClientName, MAX_CLIENT_NAME, MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size,
-};
+use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size};
 
 use crate::{
-    app, bridge, command, connect, drive, exec, forward, inner, journal, launch, listing, relay,
-    scan, sockdir, sys, upgrade, warden,
+    bridge, command, drive, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade,
+    warden,
 };
 
 /// The exit status of a command line that does not parse (`EX_USAGE`).
@@ -24,7 +22,6 @@ const USAGE: &str = "usage: kablo <command>
 commands:
   new       start a session that outlives its clients; prints its id
   list      show the sessions on this machine
-  connect   use a session from this terminal (Ctrl-\\ leaves it running)
   send      type text to a session, without attaching to it
   send-key  press keys in a session, without attaching to it
   capture   print what a session's screen shows
@@ -35,22 +32,15 @@ commands:
   here      print the id of the session this runs in
   attach    carry every session over this program's input and output; for
             programs (`ssh host kablo attach`), not for people
-  forward   carry connections to local ports to ports the server reaches, as
-            `ssh -L` does, over a command that runs `kablo attach` there
-  exec      run a program on the server over a command that runs `kablo attach`
-            there, with its input, output and errors here; ends with its status
-  app       hand this program's input to the app connected to this machine and
-            print what the app says back; ends with 69 when there is none
   upgrade   run a session's relay and warden from another kablo binary,
             without ending the session or dropping the clients
   version   print the version and the protocol versions this build speaks
   help      print this text
 
-kablo new [--id ID] [--label TEXT] [--wait] [--cols N] [--rows N] [--cwd DIR]
+kablo new [--id ID] [--label TEXT] [--cols N] [--rows N] [--cwd DIR]
           [--env NAME=VALUE]... [--journal-size BYTES[K|M|G]] [--history ROWS]
           [-- PROGRAM [ARGUMENT]...]
 kablo list [--json]
-kablo connect [--fresh] [--take] [--name NAME] ID
 kablo send [ID] [TEXT | -]
 kablo send-key [ID] KEY...
 kablo capture [ID] [--history ROWS] [--unwrap] [--trim] [--vt]
@@ -59,10 +49,7 @@ kablo label [ID] [TEXT]
 kablo end ID [--force]
 kablo here
 kablo attach
-kablo forward [--bind ADDRESS] (PORT | LOCAL:HOST:PORT)... -- COMMAND [ARGUMENT]...
-kablo exec [--cwd DIR] [--env NAME=VALUE]... -- COMMAND [ARGUMENT]... -- PROGRAM [ARGUMENT]...
-kablo app
-kablo upgrade (--all | ID) PATH
+kablo upgrade ID PATH
 ";
 
 /// The line `kablo version` prints: `key=value` tokens, to which keys may be
@@ -88,7 +75,6 @@ where
         match command.to_str() {
             Some("new") => return command_new(rest, out, err),
             Some("list") => return command_list(rest, out, err),
-            Some("connect") => return command_connect(rest, err),
             Some("send") => return drive::send(rest, err),
             Some("send-key") => return drive::send_key(rest, err),
             Some("capture") => return drive::capture(rest, out, err),
@@ -97,9 +83,6 @@ where
             Some("end") => return drive::end(rest, err),
             Some("here") => return drive::here(rest, out, err),
             Some("attach") => return command_attach(rest, err),
-            Some("forward") => return command_forward(rest, out, err),
-            Some("exec") => return command_exec(rest, err),
-            Some("app") => return command_app(rest, err),
             Some("bateri") => return command::run(rest, out, err),
             Some("upgrade") => return command_upgrade(rest, out, err),
             // The two halves of a session; `kablo new` starts the first and the
@@ -194,8 +177,6 @@ fn internal(args: &[OsString]) -> Result<Internal, &'static str> {
 struct NewArgs {
     id: Option<SessionId>,
     request: NewSession,
-    /// Wait for the program to end and end with its status.
-    wait: bool,
 }
 
 fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
@@ -224,7 +205,6 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
                 }
                 parsed.request.label = Some(text.to_owned());
             }
-            "--wait" => parsed.wait = true,
             "--cols" => cols = Some(number(value()?, "--cols", MAX_COLS)?),
             "--rows" => rows = Some(number(value()?, "--rows", MAX_ROWS)?),
             "--cwd" => {
@@ -352,49 +332,6 @@ fn command_list(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> 
     0
 }
 
-fn command_connect(args: &[OsString], err: &mut dyn Write) -> u8 {
-    let mut options = connect::Options::default();
-    let mut id = None;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match arg.to_str() {
-            Some("--fresh") => options.fresh = true,
-            Some("--take") => options.take = true,
-            Some("--name") => {
-                let Some(name) = args.next().and_then(|name| name.to_str()) else {
-                    return usage_error(err, "--name needs a name");
-                };
-                match ClientName::new(name) {
-                    Some(name) => options.name = Some(name),
-                    None => {
-                        return usage_error(
-                            err,
-                            &format!("a name is from 1 to {MAX_CLIENT_NAME} bytes"),
-                        );
-                    }
-                }
-            }
-            Some(text) if id.is_none() && !text.starts_with('-') => match SessionId::new(text) {
-                Ok(parsed) => id = Some(parsed),
-                Err(_) => return usage_error(err, "that is not a session id"),
-            },
-            _ => {
-                return usage_error(
-                    err,
-                    "connect takes a session id, --fresh, --take and --name NAME",
-                );
-            }
-        }
-    }
-    let Some(id) = id else {
-        return usage_error(err, "connect needs a session id");
-    };
-    let Some(dir) = directory(err) else {
-        return 1;
-    };
-    connect::run(&dir, id, options, err)
-}
-
 fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
     if !args.is_empty() {
         return usage_error(err, "attach takes no arguments");
@@ -404,8 +341,7 @@ fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
     if sys::is_tty(input) {
         let _ = writeln!(
             err,
-            "kablo: attach speaks the protocol on standard input and output, for programs; \
-             to use a session yourself, `kablo connect`"
+            "kablo: attach speaks the protocol on standard input and output, for programs"
         );
         return EXIT_USAGE;
     }
@@ -419,48 +355,19 @@ fn command_attach(args: &[OsString], err: &mut dyn Write) -> u8 {
     bridge::run(dir)
 }
 
-fn command_forward(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    match forward::parse(args) {
-        Ok(options) => forward::run(options, out, err),
-        Err(why) => usage_error(err, &why),
-    }
-}
-
-fn command_exec(args: &[OsString], err: &mut dyn Write) -> u8 {
-    match exec::parse(args) {
-        Ok(options) => exec::run(options, err),
-        Err(why) => usage_error(err, &why),
-    }
-}
-
-fn command_app(args: &[OsString], err: &mut dyn Write) -> u8 {
-    match app::parse(args) {
-        Ok(()) => app::run(err),
-        Err(why) => usage_error(err, &why),
-    }
-}
-
 fn command_upgrade(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    let all = args.iter().any(|arg| arg == "--all");
-    let words: Vec<&OsString> = args.iter().filter(|arg| *arg != "--all").collect();
-    let (target, binary) = match (all, words.as_slice()) {
-        (true, [binary]) => (upgrade::Target::All, *binary),
-        (false, [id, binary]) => {
-            let id = id
-                .to_str()
-                .filter(|text| !text.starts_with('-'))
-                .and_then(|text| SessionId::new(text).ok());
-            match id {
-                Some(id) => (upgrade::Target::One(id), *binary),
-                None => return usage_error(err, "that is not a session id"),
-            }
-        }
-        _ => {
-            return usage_error(
-                err,
-                "upgrade takes --all or a session id, and the path of the new kablo",
-            );
-        }
+    let [id, binary] = args else {
+        return usage_error(
+            err,
+            "upgrade takes a session id and the path of the new kablo",
+        );
+    };
+    let Some(id) = id
+        .to_str()
+        .filter(|text| !text.starts_with('-'))
+        .and_then(|text| SessionId::new(text).ok())
+    else {
+        return usage_error(err, "that is not a session id");
     };
     // The session's keeper is somewhere else: a relative path would mean
     // something else there.
@@ -474,7 +381,7 @@ fn command_upgrade(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) 
     let Some(dir) = directory(err) else {
         return 1;
     };
-    upgrade::run(&dir, target, &binary, out, err)
+    upgrade::run(&dir, &id, &binary, out, err)
 }
 
 fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -482,18 +389,11 @@ fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u
         Ok(parsed) => parsed,
         Err(why) => return usage_error(err, &why),
     };
-    // What the command ends with when kablo itself cannot: 255 when it is to end
-    // with a program's status, which has 1 of its own.
-    let trouble = if parsed.wait {
-        drive::EXIT_WAIT_TROUBLE
-    } else {
-        1
-    };
     let dir = match sockdir::socket_dir() {
         Ok(dir) => dir,
         Err(e) => {
             let _ = writeln!(err, "kablo: {e}");
-            return trouble;
+            return 1;
         }
     };
     let id = match parsed.id {
@@ -502,7 +402,7 @@ fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u
             Ok(id) => id,
             Err(e) => {
                 let _ = writeln!(err, "kablo: cannot make a session id: {e}");
-                return trouble;
+                return 1;
             }
         },
     };
@@ -515,17 +415,11 @@ fn command_new(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u
             {
                 let _ = writeln!(err, "kablo: {note}");
             }
-            if parsed.wait {
-                // The program's status, and the session is taken over once it
-                // has ended: waiting is how an agent runs a program, and one
-                // that ran hundreds would leave hundreds of ended sessions.
-                return drive::await_end(&dir, &id, err);
-            }
             0
         }
         Err(why) => {
             let _ = writeln!(err, "kablo: {why}");
-            trouble
+            1
         }
     }
 }

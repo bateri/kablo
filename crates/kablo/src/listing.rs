@@ -242,17 +242,8 @@ pub fn json(statuses: &[Status]) -> String {
         json_string(&mut out, status.version.as_bytes());
         out.push_str(",\"warden_version\":");
         json_string(&mut out, status.warden_version.as_bytes());
-        // What the terminal is doing: whether it asks for a password, and where
-        // an ssh or mosh in front connects to.
+        // What the terminal is doing: whether it asks for a password.
         let _ = write!(out, ",\"secret\":{}", status.secret);
-        out.push_str(",\"remote\":");
-        json_optional(&mut out, status.remote.as_deref());
-        match status.remote_port {
-            Some(port) => {
-                let _ = write!(out, ",\"remote_port\":{port}");
-            }
-            None => out.push_str(",\"remote_port\":null"),
-        }
         out.push_str(",\"label\":");
         json_optional(&mut out, status.label.as_deref().map(str::as_bytes));
         // When the session's program started, when the one in front did, whether
@@ -480,7 +471,7 @@ mod tests {
         assert!(
             text.contains(
                 "\"version\":\"0.1.0\",\"warden_version\":\"0.1.0\",\
-                 \"secret\":false,\"remote\":null,\"remote_port\":null,\"label\":null,\
+                 \"secret\":false,\"label\":null,\
                  \"started\":null,\"front_started\":null,\"front_is_own\":null,\
                  \"output_at\":null}"
             ),
@@ -490,14 +481,10 @@ mod tests {
         let mut unsaid = status("c");
         unsaid.warden_version.clear();
         assert!(json(&[unsaid]).contains("\"warden_version\":\"\","));
-        // A password asked for, and an ssh in front that connects somewhere.
+        // A password asked for.
         let mut asking = status("d");
         asking.secret = true;
-        asking.remote = Some(b"ada@devbox".to_vec());
-        asking.remote_port = Some(2222);
-        assert!(json(&[asking]).contains(
-            "\"secret\":true,\"remote\":\"ada@devbox\",\"remote_port\":2222,\"label\":null,"
-        ),);
+        assert!(json(&[asking]).contains("\"secret\":true,\"label\":null,"));
         // The label a person gave, escaped like the rest.
         let mut named = status("e");
         named.label = Some("the \"build\"".to_owned());

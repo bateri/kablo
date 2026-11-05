@@ -134,11 +134,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use kablo_proto::v1::Exit;
 use kablo_proto::v1::stream::{
     CONNECT_TIMEOUT, Command, FailCode, MAX_CONNECTING, MAX_DATA, MAX_HOST, MAX_STREAMS,
     MAX_WINDOW, Message, Packet, Side,
 };
-use kablo_proto::v1::{Exit, Features, Message as SessionMessage};
 
 use crate::dial::{self, Refusal, Target};
 use crate::outbound::Frames;
@@ -611,46 +611,6 @@ impl Connector {
     }
 }
 
-/// What a client concludes about a bridge from the first thing it says after
-/// the client asked `features` and, right behind it, `ping`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The bridge takes streams, within these limits.
-    Streams(Features),
-    /// It does not: it is a bridge that predates streams, or its administrator
-    /// has turned them off (and says so in the text).
-    Without(Option<String>),
-}
-
-/// Judges the first message that came back after `features` and `ping` were
-/// sent. A bridge that has streams answers `features` as it reads it, so
-/// before the `pong`; one that does not skips a request it does not know and
-/// answers the `ping` only. Anything but a `features_reply` first means no
-/// streams, an `error` included: the client waits for nothing and never
-/// guesses.
-pub fn judge(first: &SessionMessage) -> Verdict {
-    match first {
-        SessionMessage::FeaturesReply(features) if features.streams => {
-            Verdict::Streams(features.clone())
-        }
-        SessionMessage::FeaturesReply(features) => Verdict::Without(features.reason.clone()),
-        _ => Verdict::Without(None),
-    }
-}
-
-/// Judges, for a client that wants a program run, the first message that came
-/// back after `features` and `ping` were sent: the bridge's features if it runs
-/// commands. A bridge that does not (one from before commands, or one that
-/// answered something else) gives `None`; the client waits for nothing and
-/// never guesses. Commands do not depend on streams: a bridge whose
-/// administrator turned those off still runs them, and says so here.
-pub fn judge_commands(first: &SessionMessage) -> Option<Features> {
-    match first {
-        SessionMessage::FeaturesReply(features) if features.commands => Some(features.clone()),
-        _ => None,
-    }
-}
-
 /// A program whose stream is over and that has been told to end.
 struct Dying {
     program: Program,
@@ -763,12 +723,13 @@ impl Streams {
     }
 
     /// The side this end speaks as: the one to encode the packets it makes with.
+    #[cfg(test)]
     pub fn side(&self) -> Side {
         self.side
     }
 
     /// How many streams there are, the ones still connecting included.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.streams.len() + self.connecting.len()
     }
 
@@ -790,6 +751,7 @@ impl Streams {
     }
 
     /// Whether there are no streams.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -832,6 +794,7 @@ impl Streams {
     /// Client end: opens a stream for `socket`, which is to be carried to
     /// `host:port`. The socket is not read until the server has said `opened`.
     /// Returns the stream's number; the `open` is in `out`.
+    #[cfg(test)]
     pub fn open(
         &mut self,
         socket: TcpStream,
@@ -872,6 +835,7 @@ impl Streams {
     /// descriptors of `local` for its input, output and errors. The input is not
     /// read until the server has said `opened`. Returns the stream's number;
     /// the `open` is in `out`.
+    #[cfg(test)]
     pub fn open_command(
         &mut self,
         local: Local,

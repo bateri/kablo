@@ -2038,8 +2038,6 @@ impl Relay {
             status.program = terminal.program;
             status.cwd = terminal.cwd;
             status.secret = terminal.secret;
-            status.remote = terminal.remote;
-            status.remote_port = terminal.remote_port;
             let own = front == self.child_pid;
             status.front_is_own = Some(own);
             status.front_started = if own {
