@@ -48,13 +48,16 @@ pub struct Anchor {
     machine: Option<String>,
 }
 
+/// The longest a machine's name may be, in bytes.
+const MACHINE_MAX: usize = 253;
+
 /// The machine an address may name: what `bateri ls` prints after the `@` — a host name as the
 /// user typed it to `ssh` without its `user@`, or `local`. Letters, digits and `. _ - :`, starting
 /// with a letter or a digit (so it is never an option), at most 253 bytes.
 pub fn is_machine(name: &str) -> bool {
-    name.len() <= 253
+    name.len() <= MACHINE_MAX
         && name
-            .chars()
+            .bytes()
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric())
         && name
@@ -131,6 +134,14 @@ impl fmt::Display for Anchor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_starts_with_a_letter_or_a_digit_and_is_at_most_253_bytes() {
+        assert!(is_machine("prod") && is_machine("10.0.0.2") && is_machine("local"));
+        assert!(is_machine("host:22") && is_machine(&"a".repeat(253)));
+        assert!(!is_machine("") && !is_machine("-x") && !is_machine("a b") && !is_machine("a@b"));
+        assert!(!is_machine(&"a".repeat(254)) && !is_machine("é"));
+    }
 
     #[test]
     fn a_terminal_is_named_by_its_plain_number() {

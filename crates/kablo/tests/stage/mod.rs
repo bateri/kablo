@@ -149,6 +149,7 @@ impl Stage {
 
     /// Every run has the variable `name`.
     pub fn set_var(&mut self, name: &str, value: &str) {
+        self.vars.retain(|(have, _)| have != name);
         self.vars.push((name.to_owned(), value.to_owned()));
     }
 

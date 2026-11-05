@@ -1,16 +1,16 @@
 //! What the command keeps on this machine, under `~/.local/share/bateri`: the counter that gives
 //! the terminals their numbers, who opened which terminal, and the message that waits for a Mac.
 //!
-//! The state is under `$HOME`, not `XDG_DATA_HOME`: the Mac and a cron job do not have a login
-//! shell's environment, and a counter that two environments place in two directories would give
-//! the same number twice. Everything is written for its owner alone; the terminal the command
-//! starts is another matter and keeps the umask of whoever asked.
+//! The state is under `$HOME` ([`kablo_bateri::paths`]). Everything is written for its owner alone;
+//! the terminal the command starts is another matter and keeps the umask of whoever asked.
 
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use kablo_bateri::paths;
 
 use crate::sys;
 
@@ -40,48 +40,29 @@ impl State {
     }
 
     /// Where the bootstrap writes the command's files: `shell/`, with `bin/bateri` and, on a
-    /// server, `boot.sh`. The call that writes them puts them under `$XDG_DATA_HOME` when the
-    /// server's command had one, so that is looked in first, where it names an absolute path and
-    /// holds the files; otherwise they are beside the counter's state (`~/.local/share`).
+    /// server, `boot.sh`.
     pub fn shell_dir(&self) -> PathBuf {
-        let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-        self.shell_dir_in(xdg.as_deref())
-    }
-
-    /// [`shell_dir`](Self::shell_dir) for the `XDG_DATA_HOME` there is.
-    fn shell_dir_in(&self, xdg: Option<&Path>) -> PathBuf {
-        let there = xdg
-            .filter(|xdg| xdg.is_absolute())
-            .map(|xdg| xdg.join("bateri/shell"));
-        match there {
-            Some(there)
-                if there.join("boot.sh").is_file() || there.join("bin/bateri").is_file() =>
-            {
-                there
-            }
-            _ => self.dir.join("shell"),
-        }
+        self.dir.join(paths::SHELL)
     }
 
     /// The directory the command is found in, which a terminal it starts gets on its `PATH`.
     pub fn bin_dir(&self) -> PathBuf {
-        self.shell_dir().join("bin")
+        self.shell_dir().join(paths::BIN)
     }
 
-    /// The bootstrap of a server's terminal; a machine that has none is not a server (and the Mac
-    /// says which it is, when it is there to say).
+    /// The bootstrap of a server's terminal.
     pub fn boot(&self) -> PathBuf {
-        self.shell_dir().join("boot.sh")
+        self.shell_dir().join(paths::BOOT)
     }
 
     /// `~/.local/share/bateri/terminals/pN`, where who opened a terminal is written.
     pub fn record_of(&self, id: &str) -> PathBuf {
-        self.dir.join("terminals").join(id)
+        self.dir.join(paths::TERMINALS).join(id)
     }
 
     /// `~/.local/share/bateri/placing/pN`, where a message waits for a Mac.
     pub fn note_of(&self, id: &str) -> PathBuf {
-        self.dir.join("placing").join(id)
+        self.dir.join(paths::PLACING).join(id)
     }
 
     /// A directory that only its owner reads, and its parents.
@@ -153,7 +134,7 @@ impl State {
     /// number, which is allowed, and never repeats one.
     pub fn next_number(&self) -> Option<u64> {
         State::make_dir(&self.dir).ok()?;
-        let lock = self.dir.join("next.lock");
+        let lock = self.dir.join(format!("{}.lock", paths::COUNTER));
         let me = std::process::id();
         State::take(&lock)?;
         let held = Held {
@@ -161,7 +142,7 @@ impl State {
             me: format!("{me}\n"),
         };
         fs::write(lock.join("pid"), &held.me).ok();
-        let counter = self.dir.join("next");
+        let counter = self.dir.join(paths::COUNTER);
         let number = match fs::read_to_string(&counter) {
             Ok(text) => {
                 let line = text.lines().next().unwrap_or("");
@@ -257,24 +238,19 @@ mod tests {
     #[test]
     fn the_files_are_where_the_writer_put_them() {
         let root = dir();
-        let state = State::new(root.join("home/.local/share/bateri"));
-        let xdg = root.join("xdg");
-        let beside = state.dir().join("shell");
-        // Nothing anywhere, or an XDG_DATA_HOME that is not an absolute path: beside the state.
-        assert_eq!(state.shell_dir_in(None), beside);
-        assert_eq!(state.shell_dir_in(Some(&xdg)), beside);
-        assert_eq!(state.shell_dir_in(Some(Path::new("relative"))), beside);
-        // The files under it: that is where they are, for the bootstrap and the command alike.
-        fs::create_dir_all(xdg.join("bateri/shell/bin")).unwrap();
-        fs::write(xdg.join("bateri/shell/boot.sh"), "").unwrap();
-        assert_eq!(state.shell_dir_in(Some(&xdg)), xdg.join("bateri/shell"));
+        let state = State::new(root.join("home").join(paths::DIR));
+        let shell = root.join("home/.local/share/bateri/shell");
+        assert_eq!(state.shell_dir(), shell);
+        assert_eq!(state.bin_dir(), shell.join("bin"));
+        assert_eq!(state.boot(), shell.join("boot.sh"));
         assert_eq!(
-            state.shell_dir_in(Some(&xdg)).join("boot.sh"),
-            xdg.join("bateri/shell/boot.sh")
+            state.record_of("p3"),
+            root.join("home/.local/share/bateri/terminals/p3")
         );
-        // A relative one is still ignored, as the writer ignores it.
-        assert_eq!(state.shell_dir_in(Some(Path::new("relative"))), beside);
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            state.note_of("p3"),
+            root.join("home/.local/share/bateri/placing/p3")
+        );
     }
 
     #[test]

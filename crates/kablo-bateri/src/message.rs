@@ -1,10 +1,9 @@
-//! The text an agent's script and the Mac say to each other on kablo's app channel.
+//! The text the `bateri` command and the Mac say to each other on kablo's app channel.
 //!
 //! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `focus`, `zoom`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
 //! line, verbatim. A value has no line break (nor any control character) because the line is
-//! the frame: the script on the server is `sh`, which writes lines and reads none of them
-//! apart. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
+//! the frame. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
 //!
 //! ```text
 //! bateri 2
@@ -50,13 +49,13 @@
 //! **A reply** starts with `bateri 2` too and then says `ok` (`ok placed` and the lines that
 //! tell how and where, `ok text` and the rest of the message as the text to print, `ok start`:
 //! this terminal is not the Mac's to start, start it and ask again) or `error KIND TEXT`
-//! on one line. The script turns the kind into an exit code; the Mac builds the text of an `ls`,
-//! the script prints it.
+//! on one line. The command turns the kind into an exit code; the Mac builds the text of an `ls`,
+//! the command prints it.
 //!
 //! **Reading is strict and never panics**: a wrong greeting, an unknown verb or key, a key twice,
 //! a key without a value, a missing argument, a number that is not written plainly, a message
 //! over [`MAX_BYTES`] — each is an `error usage` that says which, not a guess. A *version* this
-//! build does not read is its own error ([`Kind::Version`]), so a script can try an older one.
+//! build does not read is its own error ([`Kind::Version`]), so the sender can try an older one.
 //!
 //! **One version is read.** Nothing relied on the commands of version 1 when it was dropped
 //! (version 2 replaced it), so keeping its reader would have been dead weight: a request of any other
@@ -83,7 +82,7 @@ pub const MAX_BYTES: usize = 8 * 1024;
 /// another terminal is more than a notification.
 pub const RELAY_MAX_BYTES: usize = 128 * 1024;
 
-/// The commands a window relays to another machine. The script on a server asks for these and
+/// The commands a window relays to another machine. The command on a server asks for these and
 /// nothing else: the terminal it starts there (`split`), what it types and reads (`send`,
 /// `send-key`, `capture`, `wait`), and the end of a terminal whose pane could not be made
 /// (`close`).
@@ -98,7 +97,7 @@ const STDERR_LINES: usize = 20;
 /// The most of one line of stderr a reply carries.
 const STDERR_WIDTH: usize = 400;
 
-/// Why a request was not done. The script maps these to exit codes.
+/// Why a request was not done. The command maps these to exit codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// The message is not one this version reads: a mistake in it (64).
@@ -181,7 +180,7 @@ pub struct Place {
     /// The terminal to show.
     pub terminal: Terminal,
     /// The terminal whose pane it goes beside; none is the sender's own. Its name is kablo's, so
-    /// the sender's own terminal can be named whatever it is called (a script writes it out, since a
+    /// the sender's own terminal can be named whatever it is called (the command writes it out, since a
     /// message that waits on the server is read when nobody names its sender).
     pub anchor: Option<Anchor>,
     /// The side, a tab of its own, or none for the palette's rule.
@@ -201,7 +200,7 @@ pub struct Place {
     pub fresh: Option<String>,
     /// The shell a `fresh` pane is for, by its absolute path, one bateri has an integration for
     /// (`bateri split -- fish`). `None`: the user's own. A terminal is never asked to start
-    /// anything else this way: what is not one of those is a program, which the script starts.
+    /// anything else this way: what is not one of those is a program, which the command starts.
     pub shell: Option<String>,
     /// The terminal runs on this server, not on the machine that asks: the name `ssh` takes for it
     /// (`prod`). The Mac makes the pane that shows it, which connects by its own path (`-S`).
@@ -1560,7 +1559,7 @@ fn id_of(fields: &Fields<'_>, key: &str, kind: IdKind) -> Result<Option<Id>, Fai
 mod tests {
     use super::*;
 
-    // Version 2, frozen: the text a script and the Mac speak. These are never edited; a later
+    // Version 2, frozen: the text the command and the Mac speak. These are never edited; a later
     // version gets its own constants.
     const V2_PLACE: &str =
         "bateri 2\nplace\nterminal p9\nanchor p4\nside below\nratio 30\nkeep-open yes\nfocus yes\n";

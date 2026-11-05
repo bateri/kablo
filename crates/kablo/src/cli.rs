@@ -308,11 +308,15 @@ fn directory(err: &mut dyn Write) -> Option<std::path::PathBuf> {
 }
 
 fn command_list(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    let json = match args {
-        [] => false,
-        [flag] if flag == "--json" => true,
-        _ => return usage_error(err, "list takes only --json"),
-    };
+    match args {
+        [] => list(false, out, err),
+        [flag] if flag == "--json" => list(true, out, err),
+        _ => usage_error(err, "list takes only --json"),
+    }
+}
+
+/// `kablo list`: the sessions on this machine, as a table or, with `json`, as JSON.
+pub fn list(json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let Some(dir) = directory(err) else {
         return 1;
     };

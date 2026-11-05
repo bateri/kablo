@@ -7,22 +7,36 @@
 //! is a program is started right away and its pane asked for; one with no program (`split`, or a
 //! shell named alone) is asked for first, as a pane of the Mac's own (`fresh`): the Mac makes it when
 //! the asker is the Mac itself, and says `ok start` when the asker is a server, which then starts
-//! the terminal with its bootstrap (`boot.sh`) and asks again. When no Mac is there to say, the
-//! bootstrap's file is: a machine that has one is a server's.
+//! the terminal with its bootstrap (`boot.sh`) and asks again. When no Mac is there to say, or it
+//! says nothing that is read, the machine is what says: a Mac has nobody to make the pane and the
+//! command fails, and any other machine is a server's, which starts the terminal with its
+//! bootstrap and leaves the message for a Mac to place.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use kablo_bateri::message::{Home, Placed, Reach, Reply, Request, WindowHome};
-use kablo_bateri::{Anchor, Id, Landed, Side, Terminal};
+use kablo_bateri::{Anchor, Id, Landed, Side, Terminal, is_machine, paths};
 use kablo_proto::SessionId;
 use kablo_proto::v1::NewSession;
 
 use super::state::State;
-use super::words::{check_label, clean, is_machine, is_name, is_terminal};
-use super::{Asked, Ctx, Done, Exit, Io, failure, finish, machine};
+use super::words::{check_label, clean, is_name, is_terminal};
+use super::{Asked, Ctx, Done, Exit, Io, failure, finish, json_name, machine};
 use crate::launch::{self, Failure};
 use crate::{drive, sockdir};
+
+/// Whether this machine is a Mac, which is where the app is. A Mac that does not say what to do
+/// with a terminal that has no program has nobody to make its pane; any other machine is a
+/// server's. (A Mac that is another Mac's server is told to start it, `Reply::Start`, whatever it
+/// is: this is only for when nobody says.) A test says which system this is with
+/// [`crate::ENV_TEST_SYSTEM`].
+fn is_mac() -> bool {
+    match std::env::var(crate::ENV_TEST_SYSTEM).as_deref() {
+        Ok("macos") => true,
+        Ok("linux") => false,
+        _ => cfg!(target_os = "macos"),
+    }
+}
 
 /// What the terminal a command starts does not get from the one that asked: the tab it stands in
 /// (that tab's pane is not the new terminal's), and what only the command reads.
@@ -467,13 +481,13 @@ impl Job<'_> {
         // Whether the Mac can be asked who starts it: there is a pane to go beside, and nothing to
         // wait for (a pane the Mac makes is no terminal to wait on).
         let askable = self.anchor.is_some() && !wants.wait;
-        let boot = self.state.boot().is_file();
+        let bootstraps = !is_mac();
         let mut program = wants.program.clone();
         let mut shell_asked = None;
         if let Some(path) = shell {
             // One that waits or has no pane to go beside is a program like any, where there is no
             // bootstrap to start it with.
-            if askable || boot {
+            if askable || bootstraps {
                 program.clear();
                 shell_asked = Some(path);
             }
@@ -482,7 +496,7 @@ impl Job<'_> {
             if askable {
                 return self.ask_first(io, &cwd, shell_asked.as_deref());
             }
-            if !boot {
+            if !bootstraps {
                 if wants.wait {
                     return Err(Exit::mistake(
                         "--wait needs a program here: name one after --",
@@ -510,7 +524,7 @@ impl Job<'_> {
         // (`kablo new --id t5`): the next is tried.
         let mut tries = 0;
         let id = loop {
-            let id = self.number(io)?;
+            let id = self.number()?;
             match self.start(&id, &cwd, shell_asked.as_deref(), &program) {
                 Started::Ready => break id,
                 Started::Taken if tries + 1 < TRIES => tries += 1,
@@ -535,7 +549,7 @@ impl Job<'_> {
         }
         self.report(io, &landing);
         if self.wants.wait {
-            return finish(drive::wait(&[OsString::from(&id)], io.err));
+            return finish(drive::wait_for(&id, None, io.err));
         }
         Ok(())
     }
@@ -551,7 +565,7 @@ impl Job<'_> {
         let fresh = std::path::absolute(cwd)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| cwd.to_owned());
-        let id = self.number(io)?;
+        let id = self.number()?;
         self.state.record(&id, self.me.as_deref(), self.wants.keep);
         let mut landing = Landing::new(&id);
         let place = self.place(&id, Some(fresh), shell.map(str::to_owned), None);
@@ -568,10 +582,10 @@ impl Job<'_> {
                 self.state.forget(&id);
                 return Err(failure(&failed));
             }
-            // No Mac to say: a machine with a bootstrap is a server's, and starts it; one without
-            // has nobody to make its pane.
+            // No Mac to say: a Mac has nobody to make its pane, and any other machine is a server's
+            // and starts it.
             Asked::NoMac => {
-                if !self.state.boot().is_file() {
+                if is_mac() {
                     self.state.forget(&id);
                     return Err(Exit::new(
                         69,
@@ -587,13 +601,14 @@ impl Job<'_> {
                     Asked::Silent => "the Mac did not answer",
                     _ => "the Mac answered with something this does not read",
                 };
-                // Without a bootstrap there is nobody to start the terminal: nothing is started
-                // and no note is left for a Mac that would find no terminal.
-                if !self.state.boot().is_file() {
+                // On a Mac there is nobody to start the terminal: nothing is started and no note is
+                // left for a Mac that would find no terminal.
+                if is_mac() {
                     self.state.forget(&id);
-                    return Err(Exit::failed(format!(
-                        "{said}, and it is the Mac that makes a pane with no program"
-                    )));
+                    return Err(Exit::new(
+                        69,
+                        format!("{said}, and it is the Mac that makes a pane with no program"),
+                    ));
                 }
                 io.say(&format!(
                     "{said}; its pane will be placed when it next connects"
@@ -651,7 +666,7 @@ impl Job<'_> {
     }
 
     /// The number of the next terminal, as `pN`.
-    fn number(&self, _io: &mut Io<'_>) -> Result<String, Exit> {
+    fn number(&self) -> Result<String, Exit> {
         self.state
             .next_number()
             .map(|number| Terminal(number).to_string())
@@ -664,8 +679,8 @@ impl Job<'_> {
     }
 
     /// Starts terminal `id`, in `cwd`, running `program`. It gets the umask and the environment of
-    /// the caller (this is no subshell: neither was changed) but for the tab the caller stands in,
-    /// the `PATH` with the command on it, and the shell it was asked for.
+    /// the caller, but for the tab the caller stands in, the `PATH` with the command on it, and the
+    /// shell it was asked for.
     fn start(&self, id: &str, cwd: &str, shell: Option<&str>, program: &[String]) -> Started {
         let dir = match sockdir::socket_dir() {
             Ok(dir) => dir,
@@ -707,7 +722,7 @@ impl Job<'_> {
     fn path(&self) -> String {
         let path = std::env::var("PATH").unwrap_or_default();
         let bin = self.state.bin_dir();
-        if !bin.join("bateri").is_file() {
+        if !bin.join(paths::COMMAND).is_file() {
             return path;
         }
         let bin = bin.display().to_string();
@@ -770,10 +785,7 @@ impl Job<'_> {
                 // The Mac refused: nothing is left running for a request that failed. (On a
                 // server it is the server's terminal, which the caller ends.)
                 if !remote {
-                    let _ = drive::end(
-                        &[OsString::from(id), OsString::from("--force")],
-                        &mut std::io::sink(),
-                    );
+                    let _ = drive::end_session(id, true, &mut std::io::sink());
                     self.state.forget(id);
                 }
                 return Err(failure(&failed));
@@ -822,18 +834,13 @@ impl Job<'_> {
     fn report(&self, io: &mut Io<'_>, landing: &Landing) {
         let id = &landing.id;
         if self.wants.json {
-            let named =
-                |id: Option<Id>| id.map_or_else(|| "null".to_owned(), |id| format!("\"{id}\""));
-            let next = landing
-                .next
-                .as_ref()
-                .map_or_else(|| "null".to_owned(), |name| format!("\"{name}\""));
+            let next = json_name(landing.next.as_ref());
             let _ = writeln!(
                 io.out,
                 "{{\"pane\":\"{id}\",\"tab\":{},\"group\":{},\"window\":{},\"landed\":\"{}\",\"next_to\":{next},\"squeezed\":{},\"hidden\":{}}}",
-                named(landing.tab),
-                named(landing.group),
-                named(landing.window),
+                json_name(landing.tab),
+                json_name(landing.group),
+                json_name(landing.window),
                 landing.landed.word(),
                 landing.squeezed,
                 landing.hidden,
@@ -941,7 +948,8 @@ impl Job<'_> {
         if self.anchor.is_some() {
             let place = self.place(number, None, None, Some(server.to_owned()));
             if let Err(exit) = self.place_it(io, &mut landing, &place, number, true) {
-                // In a subshell's silence: the failure the person is told is the Mac's.
+                // The pane could not be made, so the terminal that was started goes with it; the
+                // failure the person is told is the Mac's.
                 self.end_over(io, server, way, number);
                 return Err(exit);
             }

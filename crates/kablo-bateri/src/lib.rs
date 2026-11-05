@@ -13,6 +13,7 @@
 
 pub mod ids;
 pub mod message;
+pub mod paths;
 pub mod place;
 pub mod shell;
 pub mod terminal;

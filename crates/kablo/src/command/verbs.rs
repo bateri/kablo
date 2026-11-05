@@ -7,14 +7,14 @@ use std::ffi::OsString;
 use kablo_bateri::message::{
     Arrange, Format, Home, MAX_STEPS, Placed, Reply, Request, Subject, TabHome, WindowHome,
 };
-use kablo_bateri::{Anchor, Id, IdKind, Side};
+use kablo_bateri::{Anchor, Id, IdKind, Side, paths};
 
 use super::machine;
 use super::words::{
     KINDS, address, check_id, check_label, clean, is_kind, is_terminal, reads_as_id, wrong_kind,
 };
-use super::{Asked, Ctx, Done, Exit, Io, failure, finish, kablo, unread};
-use crate::drive;
+use super::{Asked, Ctx, Done, Exit, Io, failure, finish, json_name, unread};
+use crate::{cli, drive};
 
 /// The mistake of a word that is no pane: it says how to name one and lists the panes there are.
 pub fn not_a_terminal(io: &mut Io<'_>, word: &str, more: &str) -> Exit {
@@ -23,16 +23,11 @@ pub fn not_a_terminal(io: &mut Io<'_>, word: &str, more: &str) -> Exit {
         clean(word)
     ));
     let mut list = Vec::new();
-    kablo_into(&mut list, &["list"]);
+    cli::list(false, &mut list, &mut std::io::sink());
     for line in String::from_utf8_lossy(&list).lines().take(30) {
         let _ = writeln!(io.err, "{line}");
     }
     Exit::status(64)
-}
-
-/// `kablo ARGS`, run in this process, its output given back and its errors dropped.
-fn kablo_into(out: &mut Vec<u8>, args: &[&str]) -> u8 {
-    crate::cli::run(args.iter().map(OsString::from), out, &mut std::io::sink())
 }
 
 impl Io<'_> {
@@ -57,11 +52,6 @@ fn anchor_of(word: &str) -> Option<Anchor> {
 
 fn id_of(word: &str) -> Option<Id> {
     Id::parse(word)
-}
-
-/// `"id"` for an id that is there, `null` for one that is not.
-fn json_id(id: Option<Id>) -> String {
-    id.map_or_else(|| "null".to_owned(), |id| format!("\"{id}\""))
 }
 
 // ─── asking the Mac ──────────────────────────────────────────────────────
@@ -159,7 +149,7 @@ fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         None => ctx.need_here("name the pane to close (close pane p4)")?,
     };
     let remembered = |state: &std::path::Path| {
-        for dir in ["terminals", "placing"] {
+        for dir in [paths::TERMINALS, paths::PLACING] {
             let _ = std::fs::remove_file(state.join(dir).join(&target));
         }
     };
@@ -175,10 +165,7 @@ fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             // is not this machine's terminal to kill, nor to forget.
             if !target.contains('@') {
                 if force {
-                    let _ = drive::end(
-                        &[OsString::from(&target), OsString::from("--force")],
-                        &mut std::io::sink(),
-                    );
+                    let _ = drive::end_session(&target, true, &mut std::io::sink());
                 }
                 remembered(&ctx.state);
             }
@@ -201,11 +188,7 @@ fn close_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
             ),
         ));
     }
-    let mut ending = vec![OsString::from(&target)];
-    if force {
-        ending.push(OsString::from("--force"));
-    }
-    let code = drive::end(&ending, io.err);
+    let code = drive::end_session(&target, force, io.err);
     if code == 0 {
         remembered(&ctx.state);
     }
@@ -242,10 +225,10 @@ pub fn ls(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         "{why}: these are the panes on this server, and none says where it is"
     ));
     if format == Format::Json {
-        return finish(kablo(io, &["list", "--json"]));
+        return finish(cli::list(true, io.out, io.err));
     }
-    let code = kablo(io, &["list"]);
-    let mut names: Vec<String> = std::fs::read_dir(ctx.state.join("placing"))
+    let code = cli::list(false, io.out, io.err);
+    let mut names: Vec<String> = std::fs::read_dir(ctx.state.join(paths::PLACING))
         .map(|dir| {
             dir.filter_map(Result::ok)
                 .filter_map(|entry| entry.file_name().into_string().ok())
@@ -256,7 +239,7 @@ pub fn ls(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
     names.sort();
     let mut header = false;
     for name in names {
-        let Ok(text) = std::fs::read_to_string(ctx.state.join("placing").join(&name)) else {
+        let Ok(text) = std::fs::read_to_string(ctx.state.join(paths::PLACING).join(&name)) else {
             continue;
         };
         let (mut anchor, mut side, mut ratio) = (String::new(), String::new(), String::new());
@@ -694,9 +677,9 @@ fn move_tab(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         let _ = writeln!(
             io.out,
             "{{\"tab\":{},\"group\":{},\"window\":{}}}",
-            json_id(placed.tab),
-            json_id(placed.group),
-            json_id(placed.window)
+            json_name(placed.tab),
+            json_name(placed.group),
+            json_name(placed.window)
         );
     } else if !place.new_group.is_empty() {
         if let Some(group) = placed.group {
@@ -879,9 +862,9 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         let _ = writeln!(
             io.out,
             "{{\"pane\":\"{pane}\",\"tab\":{},\"group\":{},\"window\":{}}}",
-            json_id(placed.tab),
-            json_id(placed.group),
-            json_id(placed.window)
+            json_name(placed.tab),
+            json_name(placed.group),
+            json_name(placed.window)
         );
     } else if new_tab {
         match placed.tab {

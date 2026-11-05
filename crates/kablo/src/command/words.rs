@@ -2,16 +2,13 @@
 //! is a pane, an id, a name, a machine, a label. The window reads exactly these rules where it takes
 //! the words (`kablo-bateri`), so a word that passes here is one it takes.
 
-use super::Exit;
+use kablo_bateri::is_machine;
+use kablo_bateri::message::LABEL_MAX;
 
-/// The longest a label is, in bytes (kablo's own limit for a terminal's).
-pub const LABEL_MAX: usize = 64;
+use super::Exit;
 
 /// The longest an id or a pane's number may be written, letter included.
 const ID_MAX: usize = 19;
-
-/// The longest a machine's name may be.
-const MACHINE_MAX: usize = 253;
 
 /// Whether `word` names an agent's pane: `p` and a number written plainly.
 pub fn is_terminal(word: &str) -> bool {
@@ -39,20 +36,6 @@ pub fn is_name(word: &str) -> bool {
         && word
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// Whether `word` names a machine as `bateri ls` writes it after the `@` of an address: the host
-/// as `ssh` is given it without its user, or `local` for this Mac. It starts with a letter or a
-/// digit, so it is never an option.
-pub fn is_machine(word: &str) -> bool {
-    word.len() <= MACHINE_MAX
-        && word
-            .bytes()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphanumeric())
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
 }
 
 /// A pane written as `p9`, or `p9@prod` for one of another machine: its id and its machine.
@@ -193,8 +176,6 @@ mod tests {
 
     #[test]
     fn a_machine_starts_with_a_letter_or_a_digit_and_an_address_names_one_after_an_at() {
-        assert!(is_machine("prod") && is_machine("10.0.0.2") && is_machine("local"));
-        assert!(!is_machine("") && !is_machine("-x") && !is_machine("a b") && !is_machine("a@b"));
         assert_eq!(address("p9"), Some(("p9", None)));
         assert_eq!(address("p9@prod"), Some(("p9", Some("prod"))));
         assert_eq!(address("p9@"), None);

@@ -11,6 +11,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 
 use kablo_bateri::message::{Reach, Relay, Reply, Request};
+use kablo_bateri::paths;
 
 use super::{Asked, Ctx, Done, Exit, Io, failure, finish, unread};
 
@@ -70,8 +71,15 @@ pub fn unhex_words(words: &[String]) -> Result<Vec<String>, Exit> {
 /// `sh` that looks for the command where the files of that machine are, and says so when it is
 /// nowhere (nothing is installed there: a server bateri never opened is told to be).
 pub fn remote_line(server: &str, words: &[String]) -> String {
+    let command = format!(
+        "{}/{}/{}/{}",
+        paths::DIR,
+        paths::SHELL,
+        paths::BIN,
+        paths::COMMAND
+    );
     let search = format!(
-        "for d in \"${{XDG_DATA_HOME:-$HOME/.local/share}}\" \"$HOME/.local/share\"; do [ -x \"$d/bateri/shell/bin/bateri\" ] && exec env BATERI_QUIET_ORPHAN=1 \"$d/bateri/shell/bin/bateri\" --hex \"$@\"; done; echo \"bateri: bateri is not set up on {server}: open a terminal on it in bateri first\" >&2; exit 127"
+        "[ -x \"$HOME/{command}\" ] && exec env BATERI_QUIET_ORPHAN=1 \"$HOME/{command}\" --hex \"$@\"; echo \"bateri: bateri is not set up on {server}: open a terminal on it in bateri first\" >&2; exit 127"
     );
     let login = format!("exec sh -c {} sh{}", quote(&search), hex_words(words));
     let line = format!(

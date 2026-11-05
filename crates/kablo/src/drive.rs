@@ -984,11 +984,16 @@ fn trimmed(text: &[u8]) -> &[u8] {
 
 /// `kablo wait ID [--for TIME]`.
 pub fn wait(args: &[OsString], err: &mut dyn Write) -> u8 {
-    let parsed = match parse_wait(args) {
-        Ok(parsed) => parsed,
-        Err(why) => return usage_error(err, &why),
-    };
-    let aim = match aim(Some(&parsed.target), "kablo wait ID", Family::Waiting, err) {
+    match parse_wait(args) {
+        Ok(parsed) => wait_for(&parsed.target, parsed.within, err),
+        Err(why) => usage_error(err, &why),
+    }
+}
+
+/// Waits for the program in the session `target` (an id or a label) to end, as long as `within`
+/// says (the text it was written as, for the words of a time that ran out) or for ever.
+pub fn wait_for(target: &str, within: Option<(String, Duration)>, err: &mut dyn Write) -> u8 {
+    let aim = match aim(Some(target), "kablo wait ID", Family::Waiting, err) {
         Ok(aim) => aim,
         Err(status) => return status,
     };
@@ -998,14 +1003,13 @@ pub fn wait(args: &[OsString], err: &mut dyn Write) -> u8 {
     };
     // The one timer here is the person's: a program that never ends is waited
     // for as long as they said, or for ever.
-    let until = parsed
-        .within
+    let until = within
         .as_ref()
         .and_then(|(_, time)| Instant::now().checked_add(*time));
     match end_of(&mut talk, until) {
         Ended::Program(exit) => status_of(exit),
         Ended::Timeout => {
-            let within = parsed.within.map(|(text, _)| text).unwrap_or_default();
+            let within = within.map(|(text, _)| text).unwrap_or_default();
             let _ = writeln!(
                 err,
                 "kablo: the program in session {} had not ended after {}",
@@ -1103,11 +1107,16 @@ pub fn label(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 
 /// delivery, so the session is kept as it is for any program that ends: a
 /// `capture` after this reads its last output.
 pub fn end(args: &[OsString], err: &mut dyn Write) -> u8 {
-    let parsed = match parse_end(args) {
-        Ok(parsed) => parsed,
-        Err(why) => return usage_error(err, &why),
-    };
-    let aim = match aim(Some(&parsed.target), "kablo end ID", Family::Quick, err) {
+    match parse_end(args) {
+        Ok(parsed) => end_session(&parsed.target, parsed.force, err),
+        Err(why) => usage_error(err, &why),
+    }
+}
+
+/// Hangs up on the program of the session `target` (an id or a label), or kills it with `force`,
+/// and waits for it to end.
+pub fn end_session(target: &str, force: bool, err: &mut dyn Write) -> u8 {
+    let aim = match aim(Some(target), "kablo end ID", Family::Quick, err) {
         Ok(aim) => aim,
         Err(status) => return status,
     };
@@ -1121,16 +1130,14 @@ pub fn end(args: &[OsString], err: &mut dyn Write) -> u8 {
     };
     // The request is not answered; a session that cannot take it says so, and
     // the wait that follows hears that as well as the end.
-    talk.say(Message::Terminate {
-        force: parsed.force,
-    });
+    talk.say(Message::Terminate { force });
     let until = Instant::now().checked_add(END_WAIT);
     match end_of(&mut talk, until) {
         Ended::Program(_) => 0,
         Ended::Timeout => {
             let id = &aim.status.id;
             let seconds = END_WAIT.as_secs();
-            let _ = if parsed.force {
+            let _ = if force {
                 writeln!(
                     err,
                     "kablo: the program in session {id} had not ended {seconds} seconds after it \
@@ -1175,20 +1182,23 @@ pub fn here(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     if !args.is_empty() {
         return usage_error(err, "here takes no arguments");
     }
-    let (_, statuses) = match statuses_of(None, Family::Quick, err) {
-        Ok(found) => found,
-        Err(status) => return status,
-    };
-    match here_of(&statuses, own_session) {
+    match here_session(err) {
         Ok(id) => {
             let _ = writeln!(out, "{id}");
             0
         }
-        Err(why) => {
-            let _ = writeln!(err, "kablo: {why}");
-            EXIT_TROUBLE
-        }
+        Err(status) => status,
     }
+}
+
+/// The session this process runs in. On failure the words are written and the status is the
+/// command's to end with.
+pub fn here_session(err: &mut dyn Write) -> Result<SessionId, u8> {
+    let (_, statuses) = statuses_of(None, Family::Quick, err)?;
+    here_of(&statuses, own_session).map_err(|why| {
+        let _ = writeln!(err, "kablo: {why}");
+        EXIT_TROUBLE
+    })
 }
 
 #[cfg(test)]

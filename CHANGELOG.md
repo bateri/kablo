@@ -46,10 +46,12 @@ section is not released.
   the app answers is printed as the pane's number or, with `--json`, where it stands. With no
   program, or a shell named alone, the app is asked first and says who starts the terminal: it
   makes the pane itself, or answers `ok start` and the command starts the terminal with the
-  bootstrap of a server's pane; with no app connected, a machine that has the bootstrap starts it
-  and leaves the message in `~/.local/share/bateri/placing` for the app to read when it connects,
-  and one that has not ends with 69. `--keep-open` follows the program with the login shell on
-  every machine. `-S SERVER` starts the terminal on another machine, and `p9@prod` names one of
+  bootstrap of a server's pane; with no app connected, or one that says nothing that is read, a
+  Mac ends with 69 (the app makes that pane) and any other machine starts it with the bootstrap and
+  leaves the message in `~/.local/share/bateri/placing` for the app to read when it connects.
+  Everything the command keeps is under `~/.local/share/bateri`, and no environment variable moves
+  it. `--keep-open` follows the program with the login shell on every machine. `-S SERVER` starts
+  the terminal on another machine, and `p9@prod` names one of
   its terminals to `send`, `send-key`, `capture` and `wait`: the app says how that machine is
   reached (`ssh` words, or `relay` from a program on a server, or `here` when it is this one).
   `kablo bateri --hex` takes the words of a command written in hex, as the other machine's

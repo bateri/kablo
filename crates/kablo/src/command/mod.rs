@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use kablo_bateri::message::{Failure, Kind, Reply, Request};
 
-use crate::{app, cli, drive};
+use crate::{app, drive};
 
 /// How a command ends when it does not end well, or ends with a status of its own.
 #[derive(Debug)]
@@ -81,8 +81,7 @@ impl Io<'_> {
 pub struct Ctx {
     /// `$HOME`.
     home: PathBuf,
-    /// The state this keeps: `~/.local/share/bateri`, under `$HOME` and not `XDG_DATA_HOME`, since
-    /// the Mac and a cron job do not have a login shell's environment.
+    /// The state this keeps: `~/.local/share/bateri` ([`kablo_bateri::paths`]).
     pub state: PathBuf,
 }
 
@@ -121,7 +120,7 @@ impl Ctx {
             .filter(|home| home.is_absolute())
             .ok_or_else(|| Exit::failed("HOME is not set"))?;
         Ok(Ctx {
-            state: home.join(".local/share/bateri"),
+            state: home.join(kablo_bateri::paths::DIR),
             home,
         })
     }
@@ -154,11 +153,8 @@ impl Ctx {
     /// ones before the numbers (`b-` and 32 digits) and the ones a person made with `kablo new` are
     /// as much a terminal as `p4`.
     pub fn here(&self) -> Option<String> {
-        let mut out = Vec::new();
-        let code = drive::here(&[], &mut out, &mut std::io::sink());
-        let id = String::from_utf8(out).ok()?;
-        let id = id.trim_end_matches('\n');
-        (code == 0 && words::is_name(id)).then(|| id.to_owned())
+        let id = drive::here_session(&mut std::io::sink()).ok()?.to_string();
+        words::is_name(&id).then_some(id)
     }
 
     /// The caller's own terminal, or the mistake that there is none: `what` says what to write.
@@ -327,6 +323,11 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
     }
 }
 
+/// A name as a JSON value: quoted, or `null` where there is none (the Mac has not said).
+pub fn json_name(name: Option<impl std::fmt::Display>) -> String {
+    name.map_or_else(|| "null".to_owned(), |name| format!("\"{name}\""))
+}
+
 /// A command of kablo's own, run in this process, said by its status: `0` is done.
 pub fn finish(code: u8) -> Done {
     if code == 0 {
@@ -334,11 +335,6 @@ pub fn finish(code: u8) -> Done {
     } else {
         Err(Exit::status(code))
     }
-}
-
-/// `kablo list` and the like, run in this process with `args`, printing as it does.
-pub fn kablo(io: &mut Io<'_>, args: &[&str]) -> u8 {
-    cli::run(args.iter().map(OsString::from), io.out, io.err)
 }
 
 #[cfg(test)]

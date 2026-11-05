@@ -85,11 +85,18 @@ fn recorded(out: &Path) -> Recorded {
     }
 }
 
-/// A stage with the command installed, as the bootstrap writes it.
+/// A stage with the command installed, as the bootstrap writes it, on a Mac: the app makes the
+/// pane of a terminal with no program. A test of a server says so with [`on`].
 fn stage() -> Stage {
     let mut stage = Stage::new();
     stage.install_command();
+    on(&mut stage, "macos");
     stage
+}
+
+/// The stage runs on `system` (`macos` or `linux`), whatever it is made for.
+fn on(stage: &mut Stage, system: &str) {
+    stage.set_var(kablo::ENV_TEST_SYSTEM, system);
 }
 
 #[test]
@@ -249,6 +256,7 @@ fn a_program_kept_open_is_followed_by_the_login_shell_in_its_terminal() {
 fn without_a_mac_the_message_waits_on_the_machine_and_the_command_still_answers() {
     // A server: its bootstrap starts what has no program, and the message waits for a Mac.
     let mut stage = stage();
+    on(&mut stage, "linux");
     stage.install_bootstrap();
     stage.set_var("LC_TERMINAL_VERSION", VERSION);
     let program = recorder(&stage).display().to_string();
@@ -308,6 +316,7 @@ fn without_a_mac_the_message_waits_on_the_machine_and_the_command_still_answers(
 #[test]
 fn a_mac_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
     let mut stage = stage();
+    on(&mut stage, "linux");
     stage.install_bootstrap();
     // Version 1 of the text, which nothing here reads.
     stage.mac_says("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n");
@@ -336,24 +345,86 @@ fn a_mac_that_answers_with_something_else_leaves_the_pane_to_be_placed_later() {
 }
 
 #[test]
-fn a_mac_that_is_not_read_and_no_bootstrap_starts_nothing_and_leaves_no_note() {
-    // A machine with no bootstrap has nobody to start a terminal with no program: the Mac made it
-    // or nobody did, so a reply that is not read leaves nothing behind (no terminal, no record, no
-    // note for a Mac that would find no terminal) and the command fails.
+fn on_a_mac_that_does_not_say_nothing_is_started_with_a_bootstrap_there_or_not() {
+    // A Mac has nobody to start a terminal with no program: the app made it or nobody did, so no
+    // Mac, or a reply that is not read, leaves nothing behind (no terminal, no record, no note for
+    // a Mac that would find no terminal, no bootstrap run) and the command ends with 69. A
+    // bootstrap in this home (someone ran `ssh` to it once, or the Mac is another Mac's server)
+    // changes nothing.
+    for bootstrap in [false, true] {
+        for reply in [
+            None,
+            Some("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n"),
+        ] {
+            let mut stage = stage();
+            on(&mut stage, "macos");
+            if bootstrap {
+                stage.install_bootstrap();
+            }
+            if let Some(reply) = reply {
+                stage.mac_says(reply);
+            }
+            let said = stage.run_in("p40", &["split"]);
+            let which = format!("bootstrap {bootstrap}, reply {reply:?}");
+            assert_eq!(said.status, 69, "{which}: {}", said.err);
+            let wanted = if reply.is_some() {
+                "it is the Mac that makes a pane with no program"
+            } else {
+                "no Mac is connected"
+            };
+            assert!(said.err.contains(wanted), "{which}: {}", said.err);
+            assert_eq!(said.out, "", "{which}");
+            assert!(!stage.running().contains(&"p1".to_owned()), "{which}");
+            assert!(!stage.state().join("terminals/p1").exists(), "{which}");
+            assert_eq!(stage.note("p1"), None, "{which}");
+            assert!(stage.bootstrap_saw().is_none(), "{which}");
+        }
+    }
+    // Outside every terminal there is no pane to go beside, with or without a bootstrap.
     let mut stage = stage();
-    stage.mac_says("bateri 1\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n");
-    let said = stage.run_in("p40", &["split"]);
+    on(&mut stage, "macos");
+    stage.install_bootstrap();
+    let said = stage.run(&["split"]);
     assert_eq!(said.status, 1, "{}", said.err);
     assert!(
         said.err
-            .contains("it is the Mac that makes a pane with no program"),
+            .contains("a pane with no program goes beside a pane"),
         "{}",
         said.err
     );
-    assert_eq!(said.out, "");
-    assert!(!stage.running().contains(&"p1".to_owned()));
-    assert!(!stage.state().join("terminals/p1").exists());
-    assert_eq!(stage.note("p1"), None);
+    assert!(stage.bootstrap_saw().is_none());
+}
+
+#[test]
+fn a_mac_that_says_to_start_is_obeyed_on_any_system() {
+    for system in ["macos", "linux"] {
+        let mut stage = stage();
+        on(&mut stage, system);
+        stage.install_bootstrap();
+        stage.set_var("LC_TERMINAL_VERSION", VERSION);
+        stage.connect_mac();
+        let bin = shells(&stage);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        stage.set_var("PATH", &path);
+        let said = stage.go(&Run {
+            here: Some("p40"),
+            args: &["split"],
+            input: None,
+            turns: &[START, PLACED],
+            vars: &[],
+        });
+        assert_eq!(said.status, 0, "{system}: {}", said.err);
+        assert_eq!(said.out, "p1\n", "{system}");
+        assert_eq!(stage.told.len(), 2, "{system}: {:?}", stage.told);
+        let start = Instant::now();
+        while stage.bootstrap_saw().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "{system}: the bootstrap did not run"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]
@@ -1111,6 +1182,7 @@ fn a_shell_bateri_has_an_integration_for_named_alone_is_a_shell_and_any_other_a_
 #[test]
 fn a_server_is_told_to_start_it_and_does_so_with_its_bootstrap_and_asks_again_for_the_pane() {
     let mut stage = stage();
+    on(&mut stage, "linux");
     stage.install_bootstrap();
     stage.set_var("LC_TERMINAL_VERSION", VERSION);
     stage.connect_mac();
@@ -1214,9 +1286,10 @@ fn a_server_is_told_to_start_it_and_does_so_with_its_bootstrap_and_asks_again_fo
 }
 
 #[test]
-fn with_no_mac_the_bootstrap_says_what_this_machine_is_and_with_none_it_is_69() {
+fn with_no_mac_the_system_says_what_this_machine_is_a_server_starts_it_and_a_mac_ends_with_69() {
     // A server: its bootstrap starts it, and the message waits for a Mac without `fresh`.
     let mut stage = stage();
+    on(&mut stage, "linux");
     stage.install_bootstrap();
     let bin = shells(&stage);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
@@ -1232,7 +1305,7 @@ fn with_no_mac_the_bootstrap_says_what_this_machine_is_and_with_none_it_is_69() 
         !note.contains("fresh ") && !note.contains("shell "),
         "{note}"
     );
-    // In no terminal, with no Mac to ask, the file is all there is to go by.
+    // In no terminal, with no Mac to ask, the system is all there is to go by.
     let said = stage.run(&["split", "--", "zsh"]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert!(said.err.contains("ran in no terminal"), "{}", said.err);
@@ -1247,9 +1320,10 @@ fn with_no_mac_the_bootstrap_says_what_this_machine_is_and_with_none_it_is_69() 
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // No bootstrap, no Mac: nobody makes a pane with no program, and the number is spent for
-    // nothing that was left behind.
+    // On a Mac with no Mac connected (the app is not running): nobody makes a pane with no
+    // program, and the number is spent for nothing that was left behind.
     let mut stage = self::stage();
+    on(&mut stage, "macos");
     let said = stage.run_in("p40", &["split"]);
     assert_eq!(said.status, 69, "{}", said.err);
     assert!(said.err.contains("no Mac is connected"), "{}", said.err);

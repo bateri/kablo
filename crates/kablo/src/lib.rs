@@ -44,6 +44,10 @@ mod warden;
 /// run a "newer" build of the same code.
 pub const ENV_TEST_VERSION: &str = "KABLO_TEST_VERSION";
 
+/// The variable that stands in for the system `kablo bateri` runs on (`macos` or `linux`), so that
+/// a test can run the one a build is not made for.
+pub const ENV_TEST_SYSTEM: &str = "KABLO_TEST_SYSTEM";
+
 /// The variable that stands in for the ten minutes an ended session is kept for
 /// a client that asked (in milliseconds), so that a test does not wait that long.
 pub const ENV_TEST_END_KEEP: &str = "KABLO_TEST_END_KEEP_MS";
