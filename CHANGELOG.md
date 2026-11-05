@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-05
+
 ### Fixed
 
 - **A relay that is replaced tells the next one the shell's marks.** A picture ends with the marks
