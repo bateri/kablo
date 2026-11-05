@@ -46,9 +46,12 @@ section is not released.
   the app answers is printed as the pane's number or, with `--json`, where it stands. With no
   program, or a shell named alone, the app is asked first and says who starts the terminal: it
   makes the pane itself, or answers `ok start` and the command starts the terminal with the
-  bootstrap of a server's pane; with no app connected, or one that says nothing that is read, a
-  Mac ends with 69 (the app makes that pane) and any other machine starts it with the bootstrap and
-  leaves the message in `~/.local/share/bateri/placing` for the app to read when it connects.
+  bootstrap of a server's pane; with no app connected, or one that says nothing that is read, the
+  pane that asked decides: one of the app on this machine (`BATERI_TAB_URL` is set) ends with 69
+  (the app makes that pane), one of another machine's app (only `LC_BATERI_TAB_URL` is set, which
+  `ssh` carries) starts it with the bootstrap and leaves the message in
+  `~/.local/share/bateri/placing` for that app to read when it connects, and one of neither (cron,
+  a shell `ssh` opened on its own) ends with 69 and says why.
   Everything the command keeps is under `~/.local/share/bateri`, and no environment variable moves
   it. `--keep-open` follows the program with the login shell on every machine. `-S SERVER` starts
   the terminal on another machine, and `p9@prod` names one of

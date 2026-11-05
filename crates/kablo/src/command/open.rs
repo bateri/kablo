@@ -8,9 +8,10 @@
 //! shell named alone) is asked for first, as a pane of the Mac's own (`fresh`): the Mac makes it when
 //! the asker is the Mac itself, and says `ok start` when the asker is a server, which then starts
 //! the terminal with its bootstrap (`boot.sh`) and asks again. When no Mac is there to say, or it
-//! says nothing that is read, the machine is what says: a Mac has nobody to make the pane and the
-//! command fails, and any other machine is a server's, which starts the terminal with its
-//! bootstrap and leaves the message for a Mac to place.
+//! says nothing that is read, the pane that asked is what says ([`Asker`]): one of the app on this
+//! machine has nobody to make the pane, and one of no app has none to ask, so the command fails;
+//! one of another machine's app is a server's, which starts the terminal with its bootstrap and
+//! leaves the message for that app to place.
 
 use std::path::{Path, PathBuf};
 
@@ -25,27 +26,56 @@ use super::{Asked, Ctx, Done, Exit, Io, failure, finish, json_name, machine};
 use crate::launch::{self, Failure};
 use crate::{drive, sockdir};
 
-/// Whether this machine is a Mac, which is where the app is. A Mac that does not say what to do
-/// with a terminal that has no program has nobody to make its pane; any other machine is a
-/// server's. (A Mac that is another Mac's server is told to start it, `Reply::Start`, whatever it
-/// is: this is only for when nobody says.) A test says which system this is with
-/// [`crate::ENV_TEST_SYSTEM`].
-fn is_mac() -> bool {
-    match std::env::var(crate::ENV_TEST_SYSTEM).as_deref() {
-        Ok("macos") => true,
-        Ok("linux") => false,
-        _ => cfg!(target_os = "macos"),
-    }
-}
+/// The variable the app puts in the shells it holds on its own machine, with the pane's address.
+const PANE_HERE: &str = "BATERI_TAB_URL";
+
+/// The variable `ssh` carries to a server, with the address of the pane of the app that opened
+/// the connection.
+const PANE_CARRIED: &str = "LC_BATERI_TAB_URL";
 
 /// What the terminal a command starts does not get from the one that asked: the tab it stands in
 /// (that tab's pane is not the new terminal's), and what only the command reads.
 const NOT_PASSED_ON: [&str; 4] = [
-    "LC_BATERI_TAB_URL",
-    "BATERI_TAB_URL",
+    PANE_CARRIED,
+    PANE_HERE,
     "TERM_SESSION_ID",
     "BATERI_QUIET_ORPHAN",
 ];
+
+/// Whose app a terminal that asks belongs to, which is what says who starts a terminal with no
+/// program when the app does not answer. The terminal's own environment says it, not the system
+/// it runs on: the app holds panes on whatever machine it runs, and a machine can be the server
+/// of another machine's app while it has an app of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asker {
+    /// A pane of the app on this machine: the app makes the pane of a terminal with no program,
+    /// or nobody does.
+    LocalApp,
+    /// A pane of the app on another machine, which reached this one as its server: the terminal
+    /// is this machine's to start, with the bootstrap its files hold, and the pane waits for
+    /// that app.
+    RemoteApp,
+    /// Nothing says (cron, a shell `ssh` opened on its own): no app is the one to ask.
+    Nobody,
+}
+
+impl Asker {
+    /// The asker the environment of this process says.
+    fn of_env() -> Asker {
+        Asker::of(|name| std::env::var_os(name))
+    }
+
+    fn of(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Asker {
+        let set = |name| var(name).is_some_and(|value| !value.is_empty());
+        if set(PANE_HERE) {
+            Asker::LocalApp
+        } else if set(PANE_CARRIED) {
+            Asker::RemoteApp
+        } else {
+            Asker::Nobody
+        }
+    }
+}
 
 /// How many numbers are tried when a terminal made by hand holds the one that comes next.
 const TRIES: u32 = 5;
@@ -350,6 +380,7 @@ pub fn open(ctx: &Ctx, io: &mut Io<'_>, mode: Mode, args: &[String]) -> Done {
         wants,
         me,
         anchor,
+        asker: Asker::of_env(),
         state: ctx.state(),
     };
     job.run(io)
@@ -363,6 +394,7 @@ struct Job<'a> {
     me: Option<String>,
     /// The terminal the pane goes beside; none is a terminal no pane shows.
     anchor: Option<String>,
+    asker: Asker,
     state: State,
 }
 
@@ -481,7 +513,9 @@ impl Job<'_> {
         // Whether the Mac can be asked who starts it: there is a pane to go beside, and nothing to
         // wait for (a pane the Mac makes is no terminal to wait on).
         let askable = self.anchor.is_some() && !wants.wait;
-        let bootstraps = !is_mac();
+        // Only the pane of another machine's app starts what has no program here, with the
+        // bootstrap of this machine; its files hold that bootstrap, and the command does not look.
+        let bootstraps = self.asker == Asker::RemoteApp;
         let mut program = wants.program.clone();
         let mut shell_asked = None;
         if let Some(path) = shell {
@@ -582,40 +616,50 @@ impl Job<'_> {
                 self.state.forget(&id);
                 return Err(failure(&failed));
             }
-            // No Mac to say: a Mac has nobody to make its pane, and any other machine is a server's
-            // and starts it.
-            Asked::NoMac => {
-                if is_mac() {
-                    self.state.forget(&id);
-                    return Err(Exit::new(
-                        69,
-                        "no Mac is connected: it is the Mac that makes a pane with no program",
-                    ));
-                }
-                self.start_or_forget(&id, cwd, shell)?;
-                let place = self.place(&id, None, None, None);
-                self.wait_note(io, &mut landing, &place);
-            }
-            other => {
-                let said = match other {
-                    Asked::Silent => "the Mac did not answer",
-                    _ => "the Mac answered with something this does not read",
+            // The app does not say who starts it, and the pane that asked says whose app it is.
+            unanswered => {
+                let said = match unanswered {
+                    Asked::Silent => Some("the Mac did not answer"),
+                    Asked::NoMac => None,
+                    _ => Some("the Mac answered with something this does not read"),
                 };
-                // On a Mac there is nobody to start the terminal: nothing is started and no note is
-                // left for a Mac that would find no terminal.
-                if is_mac() {
-                    self.state.forget(&id);
-                    return Err(Exit::new(
-                        69,
-                        format!("{said}, and it is the Mac that makes a pane with no program"),
-                    ));
+                match self.asker {
+                    // The app of another machine: the terminal is started here, with the
+                    // bootstrap, and its pane is placed when that app connects.
+                    Asker::RemoteApp => {
+                        if let Some(said) = said {
+                            io.say(&format!(
+                                "{said}; its pane will be placed when it next connects"
+                            ));
+                        }
+                        self.start_or_forget(&id, cwd, shell)?;
+                        let place = self.place(&id, None, None, None);
+                        self.wait_note(io, &mut landing, &place);
+                    }
+                    // Nobody is left to start the terminal: nothing is started and no note is
+                    // left for an app that would find no terminal.
+                    Asker::LocalApp => {
+                        self.state.forget(&id);
+                        return Err(Exit::new(
+                            69,
+                            match said {
+                                None => "no Mac is connected: it is the Mac that makes a pane with no program".to_owned(),
+                                Some(said) => format!(
+                                    "{said}, and it is the Mac that makes a pane with no program"
+                                ),
+                            },
+                        ));
+                    }
+                    Asker::Nobody => {
+                        self.state.forget(&id);
+                        return Err(Exit::new(
+                            69,
+                            format!(
+                                "the bateri app makes the pane of a terminal with no program, and nothing says which bateri app this terminal belongs to ({PANE_HERE} and {PANE_CARRIED} are not set): run it in a bateri terminal, or name a program after --"
+                            ),
+                        ));
+                    }
                 }
-                io.say(&format!(
-                    "{said}; its pane will be placed when it next connects"
-                ));
-                self.start_or_forget(&id, cwd, shell)?;
-                let place = self.place(&id, None, None, None);
-                self.wait_note(io, &mut landing, &place);
             }
         }
         self.report(io, &landing);
@@ -1022,4 +1066,39 @@ fn find_program(name: &str) -> Option<String> {
         .map(|dir| Path::new(dir).join(name))
         .find(|candidate| runs(candidate))
         .map(|found| found.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::{Asker, PANE_CARRIED, PANE_HERE};
+
+    fn asker(set: &[(&str, &str)]) -> Asker {
+        Asker::of(|name| {
+            set.iter()
+                .find(|(have, _)| *have == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn the_environment_of_the_pane_says_whose_app_it_belongs_to() {
+        let url = "bateri://tab/5A1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+        // The app puts both in the shells it holds; the first is enough.
+        assert_eq!(asker(&[(PANE_HERE, url)]), Asker::LocalApp);
+        assert_eq!(
+            asker(&[(PANE_HERE, url), (PANE_CARRIED, url)]),
+            Asker::LocalApp
+        );
+        // `ssh` carries only the second.
+        assert_eq!(asker(&[(PANE_CARRIED, url)]), Asker::RemoteApp);
+        assert_eq!(asker(&[]), Asker::Nobody);
+        // A variable with nothing in it says nothing.
+        assert_eq!(
+            asker(&[(PANE_HERE, ""), (PANE_CARRIED, url)]),
+            Asker::RemoteApp
+        );
+        assert_eq!(asker(&[(PANE_HERE, ""), (PANE_CARRIED, "")]), Asker::Nobody);
+    }
 }

@@ -32,6 +32,23 @@ pub struct Said {
 /// How long a run may take before the test gives up on it.
 const LIMIT: Duration = Duration::from_secs(60);
 
+/// What the app puts in the shells it holds on its own machine: the address of the pane.
+pub const PANE_HERE: &str = "BATERI_TAB_URL";
+
+/// What `ssh` carries to a server: the address of the pane of the app that opened the connection.
+pub const PANE_CARRIED: &str = "LC_BATERI_TAB_URL";
+
+/// Whose app a run is in the pane of, which a run says by its environment.
+#[derive(Clone, Copy, Debug)]
+pub enum Pane {
+    /// A pane of the app on this machine: both variables, as the app sets them.
+    Local,
+    /// A pane of the app on another machine, reached through `ssh`: the carried variable only.
+    Carried,
+    /// A shell of no app (cron, a plain `ssh`): neither variable.
+    Bare,
+}
+
 /// One run: where it is, and what to do about the conversations it has.
 pub struct Run<'a> {
     pub here: Option<&'a str>,
@@ -151,6 +168,24 @@ impl Stage {
     pub fn set_var(&mut self, name: &str, value: &str) {
         self.vars.retain(|(have, _)| have != name);
         self.vars.push((name.to_owned(), value.to_owned()));
+    }
+
+    /// Every run is in `pane`.
+    pub fn in_pane(&mut self, pane: Pane) {
+        let url = "bateri://tab/5A1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+        self.unset_var(PANE_HERE);
+        self.unset_var(PANE_CARRIED);
+        if matches!(pane, Pane::Local) {
+            self.set_var(PANE_HERE, url);
+        }
+        if matches!(pane, Pane::Local | Pane::Carried) {
+            self.set_var(PANE_CARRIED, url);
+        }
+    }
+
+    /// No run has the variable `name`, whatever the test's own environment has.
+    pub fn unset_var(&mut self, name: &str) {
+        self.vars.retain(|(have, _)| have != name);
     }
 
     /// The runs in a terminal have this umask.
@@ -365,6 +400,8 @@ impl Stage {
                     .args(run.args)
                     .env("KABLO_DIR", &self.env.dir)
                     .env("HOME", &self.home)
+                    .env_remove(PANE_HERE)
+                    .env_remove(PANE_CARRIED)
                     .envs(self.vars.iter().map(|(n, v)| (n, v)))
                     .envs(run.vars.iter().copied())
                     .stdin(Stdio::from(File::open(&input).unwrap()))
@@ -394,6 +431,9 @@ impl Stage {
                     code.display(),
                     code.display()
                 ));
+                // The test says whose pane the run is in; the pane of whoever runs the tests is
+                // not it.
+                job = format!("unset {PANE_HERE} {PANE_CARRIED}\n{job}");
                 if let Some(mask) = mask {
                     job = format!("umask {mask}\n{job}");
                 }
