@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-05
+
 ### Added
 
 - **`kablo bateri VERB`, the `bateri` command of a terminal app, is a command of kablo.** The
