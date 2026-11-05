@@ -541,7 +541,7 @@ impl Job<'_> {
                 // this machine to go beside: what is to run is for that program to name.
                 if self.ctx.words() == Words::OfAppHere {
                     return Err(Exit::failed(
-                        "a terminal on this computer needs a program: name the one to run after --",
+                        "a terminal on the computer of the bateri app (@local) needs a program: name the one to run after --",
                     ));
                 }
                 return Err(Exit::failed(

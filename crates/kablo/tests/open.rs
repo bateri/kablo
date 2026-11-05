@@ -901,7 +901,9 @@ fn words_the_app_of_this_machine_relayed_with_no_program_start_nothing_and_say_w
             assert_eq!(said.status, 1, "{which}: {}", said.err);
             assert_eq!(said.out, "", "{which}");
             assert!(
-                said.err.contains("needs a program") && said.err.contains("after --"),
+                said.err
+                    .contains("on the computer of the bateri app (@local) needs a program")
+                    && said.err.contains("after --"),
                 "{which}: {}",
                 said.err
             );
