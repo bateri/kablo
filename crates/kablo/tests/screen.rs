@@ -150,6 +150,73 @@ fn a_picture_tells_the_shells_marks_the_ring_no_longer_holds() {
     assert!(marks[0] > at(b"mark-two"), "after the screen");
 }
 
+/// A program that has printed more than the ring holds, whose command's marks only the relay still
+/// knows: the relay that replaces it is told them. Without them a picture says no command runs,
+/// and a terminal app takes the program for a shell at its prompt. What the person was typing is
+/// not told: it would have to be written down on its way.
+#[test]
+fn the_shells_marks_outlive_a_relay_that_is_replaced_after_the_ring_lost_them() {
+    let mut env = Env::new();
+    let id = env.start("swap-marks", &SMALL_RING);
+    let newer = env.newer_kablo("marks");
+    let mut witness = env.connect(&id);
+    witness.attach(0);
+    witness.type_in(
+        "printf '\\033]133;A;bt_block=1\\007\\033]7;file:///first\\007\\033]8133;u;typed\\007\\033]8133;b;main\\007\\033]133;C\\007mark-%s\\n' one\n",
+    );
+    witness.wait_for("mark-one\r\n", 0);
+    print_lines(&mut witness, 300);
+    let mut control = env.connect(&id);
+    settle(&mut control, &mut witness);
+    let first = find(&witness.data, b"\x1b]133;A;bt_block=1\x07").unwrap();
+    assert!(
+        (first as u64) < control.status().retained_from,
+        "the ring no longer holds the first mark"
+    );
+
+    let said = env
+        .kablo()
+        .arg("upgrade")
+        .arg(&id)
+        .arg(&newer)
+        .output()
+        .unwrap();
+    assert!(
+        said.status.success(),
+        "{}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+
+    let mut late = env.connect(&id);
+    let (_, truncated) = late.attach(0);
+    assert!(truncated, "what it asked for is gone");
+    late.until("the picture", |c| {
+        c.pictures.last().is_some_and(|p| p.complete)
+    });
+    let picture = &late.picture().bytes;
+    let at = |mark: &[u8]| {
+        find(picture, mark).unwrap_or_else(|| {
+            panic!(
+                "{:?} in {:?}",
+                String::from_utf8_lossy(mark),
+                String::from_utf8_lossy(picture)
+            )
+        })
+    };
+    let marks = [
+        at(b"\x1b]133;A;bt_block=1\x07"),
+        at(b"\x1b]7;file:///first\x07"),
+        at(b"\x1b]8133;b;main\x07"),
+        at(b"\x1b]133;C\x07"),
+    ];
+    assert!(marks.is_sorted(), "{marks:?}");
+    assert_eq!(find(picture, b"\x1b]8133;u;typed"), None, "the typed line");
+    assert!(
+        !env.dir.join(format!("{id}.marks")).exists(),
+        "what was left for the next relay does not stay"
+    );
+}
+
 #[test]
 fn a_picture_is_made_for_the_size_the_client_says() {
     let mut env = Env::new();

@@ -1492,3 +1492,83 @@ fn a_reset_and_a_forget_leave_the_marks_where_they_are() {
         lossy(&image)
     );
 }
+
+/// Where each of `marks` is in `image`, each once.
+fn told_once(image: &[u8], marks: &[&[u8]]) -> Vec<usize> {
+    marks
+        .iter()
+        .map(|mark| {
+            let at: Vec<usize> = image
+                .windows(mark.len())
+                .enumerate()
+                .filter(|(_, window)| window == mark)
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(
+                at.len(),
+                1,
+                "{:?} in {:?}",
+                String::from_utf8_lossy(mark),
+                String::from_utf8_lossy(image)
+            );
+            at[0]
+        })
+        .collect()
+}
+
+#[test]
+fn a_screen_takes_the_marks_the_one_before_it_left_and_tells_them_once() {
+    let mut before = Screen::new(80, 24, 100);
+    before.feed(
+        b"\x1b]133;A;bt_block=1\x07\x1b]7;file:///first\x07\x1b]8133;u;typed\x07\
+          \x1b]8133;b;main\x07\x1b]133;C\x07output\r\n",
+    );
+    let left = before.marks_left();
+    assert!(
+        !left.windows(5).any(|window| window == b"typed"),
+        "the typed line is not written down"
+    );
+
+    // The next screen has read the part of the stream the ring still holds, which holds the
+    // last of those marks; the stream after them says the command ended.
+    let mut next = Screen::new(80, 24, 100);
+    next.feed(b"\x1b]133;C\x07output\r\n");
+    next.take_marks(&left, b"more\r\n\x1b]133;D;0;bt_block=1\x07");
+    let image = next.image();
+    let at = told_once(
+        &image,
+        &[
+            b"\x1b]133;A;bt_block=1\x07",
+            b"\x1b]7;file:///first\x07",
+            b"\x1b]8133;b;main\x07",
+            b"\x1b]133;C\x07",
+            b"\x1b]133;D;0;bt_block=1\x07",
+        ],
+    );
+    assert!(at.is_sorted(), "{at:?}");
+}
+
+#[test]
+fn a_screen_keeps_the_line_being_typed_only_when_it_is_the_newest_it_read() {
+    let left = b"\x1b]133;A;bt_block=2\x07\x1b]133;B\x07";
+    let mut typing = Screen::new(80, 24, 100);
+    typing.feed(b"\x1b]133;B\x07\x1b]8133;u;live\x07");
+    typing.take_marks(left, b"");
+    let image = typing.image();
+    let at = told_once(
+        &image,
+        &[
+            b"\x1b]133;A;bt_block=2\x07",
+            b"\x1b]133;B\x07",
+            b"\x1b]8133;u;live\x07",
+        ],
+    );
+    assert!(at.is_sorted(), "{at:?}");
+
+    // A prompt came after it: that line is over, and telling it last would bring it back.
+    let mut over = Screen::new(80, 24, 100);
+    over.feed(b"\x1b]8133;u;gone\x07\x1b]133;A;bt_block=2\x07");
+    over.take_marks(left, b"");
+    let image = over.image();
+    assert!(!image.windows(4).any(|window| window == b"gone"));
+}

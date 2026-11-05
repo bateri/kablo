@@ -26,6 +26,18 @@ section is not released.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A relay that is replaced tells the next one the shell's marks.** A picture ends with the marks
+  of the commands, the directories and the dock, and the relay that took over could only find the
+  ones its ring still held. A program that had printed more than the ring holds came back with no
+  sign that a command was running, and a terminal app took it for a shell at its prompt. The relay
+  now leaves them in `<id>.marks` in the socket directory when it lets go, and the next one takes
+  the file away when it goes on. The line being typed (OSC 8133 `u`) is not written to it: the next
+  relay finds that in the ring. A relay that crashed leaves nothing, and the marks come back at the
+  shell's next prompt. This starts with the relay that is replaced: one from before this version
+  leaves nothing.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added

@@ -203,6 +203,23 @@ impl Screen {
         }
     }
 
+    /// The shell's marks for the screen that comes after this one when the relay is replaced, all
+    /// but the line the person is typing ([`Screen::take_marks`]).
+    pub fn marks_left(&self) -> Vec<u8> {
+        let mut left = Vec::new();
+        self.tail.marks().write_lasting(&mut left);
+        left
+    }
+
+    /// The shell's marks from the screen this one comes after: `left` is its
+    /// [`Screen::marks_left`], `since` the stream from where it stood to where this screen stands.
+    /// They take the place of the ones this screen read, which came from a part of that same
+    /// stream, except for the line the person is typing when that is the newest it read.
+    pub fn take_marks(&mut self, left: &[u8], since: &[u8]) {
+        let typing = self.tail.marks().typing().map(<[u8]>::to_vec);
+        self.tail.take_marks(left, since, typing.as_deref());
+    }
+
     /// Forgets the scrollback: the rows that scrolled off the top of the screen. What is
     /// shown stays, and so does everything the screen keeps besides its rows; rows that
     /// scroll off later are kept as before.

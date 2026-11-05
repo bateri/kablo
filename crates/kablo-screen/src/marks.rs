@@ -27,6 +27,11 @@
 //!   with `bt_remote=`), so the last of a kind is kept for each such name apart from the
 //!   others; the value is not part of the name.
 //!
+//! **A relay that is replaced leaves its marks to the next** ([`Marks::write_lasting`]): the next
+//! one builds its screen from what the ring holds, and the ring of a program that has printed a
+//! lot no longer holds the marks of the command it runs. What is left is written down on its way
+//! to the next relay, so `u`, the line the person is typing, is not part of it.
+//!
 //! A mark longer than its limit ([`MARK_LIMIT`], [`DOCK_LIMIT`]) is not one a terminal takes
 //! and is not kept; one of a kind where only the last counts takes the kind's last away, so
 //! that an older one is not told again as if it were the newest.
@@ -73,6 +78,9 @@ pub(crate) const DIRECTORY_HOSTS: usize = 8;
 
 /// The OSC 8133 kinds that say what is so; the others say what happened once.
 const DOCK_KINDS: &[u8] = b"ueobwg";
+
+/// The OSC 8133 kind that holds the line the person is typing.
+const TYPED: u8 = b'u';
 
 /// One mark: when it came and its payload (the bytes between `ESC ]` and the end, the C0
 /// controls left out, as the parser has them).
@@ -197,23 +205,56 @@ impl Marks {
 
     /// The payloads kept, in the order they came.
     pub(crate) fn in_order(&self) -> Vec<&[u8]> {
+        self.ordered(|_| true)
+    }
+
+    /// The payloads kept whose kind `keep` takes (OSC 133's has none, and is kept), in the order
+    /// they came.
+    fn ordered(&self, keep: impl Fn(&Kind) -> bool) -> Vec<&[u8]> {
         let mut marks: Vec<&Mark> = self
             .prompts
             .iter()
-            .chain(self.last.iter().map(|(_, mark)| mark))
+            .chain(
+                self.last
+                    .iter()
+                    .filter(|(kind, _)| keep(kind))
+                    .map(|(_, mark)| mark),
+            )
             .collect();
         marks.sort_by_key(|mark| mark.at);
         marks.into_iter().map(|mark| &*mark.payload).collect()
     }
 
+    /// The line the person is typing, when it is the newest thing the shell said: the state of a
+    /// prompt, which an older mark of the kind is not.
+    pub(crate) fn typing(&self) -> Option<&[u8]> {
+        let newest = self.next.checked_sub(1)?;
+        self.last.iter().find_map(|(kind, mark)| {
+            (mark.at == newest && matches!(kind, Kind::Dock(_, TYPED))).then_some(&*mark.payload)
+        })
+    }
+
     /// The marks as the sequences that tell them, in the order they came; nothing when there
     /// are none.
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
-        for payload in self.in_order() {
-            out.extend_from_slice(b"\x1b]");
-            out.extend_from_slice(payload);
-            out.push(0x07);
-        }
+        tell(self.in_order(), out);
+    }
+
+    /// [`Marks::write`] for what is left to the next relay: all but the line the person is typing.
+    pub(crate) fn write_lasting(&self, out: &mut Vec<u8>) {
+        tell(
+            self.ordered(|kind| !matches!(kind, Kind::Dock(_, TYPED))),
+            out,
+        );
+    }
+}
+
+/// `payloads` as the sequences that tell them.
+fn tell(payloads: Vec<&[u8]>, out: &mut Vec<u8>) {
+    for payload in payloads {
+        out.extend_from_slice(b"\x1b]");
+        out.extend_from_slice(payload);
+        out.push(0x07);
     }
 }
 

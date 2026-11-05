@@ -146,8 +146,6 @@ pub fn read_label(dir: &Path, id: &SessionId) -> Option<String> {
 /// that a relay that reads it at any moment finds a whole label, the old or the
 /// new.
 pub fn write_label(dir: &Path, id: &SessionId, label: &str) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if label.is_empty() {
         return remove_label(dir, id);
     }
@@ -157,16 +155,29 @@ pub fn write_label(dir: &Path, id: &SessionId, label: &str) -> io::Result<()> {
             format!("a label is at most {MAX_LABEL} bytes"),
         ));
     }
-    let path = label_path(dir, id);
-    let scratch = dir.join(format!(".{id}.label.{}", std::process::id()));
+    write_whole(dir, &label_path(dir, id), "label", id, label.as_bytes())
+}
+
+/// `bytes` as the file `path`: written under another name in `dir` and renamed, so that whoever
+/// reads it finds it whole, and readable by this user alone.
+fn write_whole(
+    dir: &Path,
+    path: &Path,
+    kind: &str,
+    id: &SessionId,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let scratch = dir.join(format!(".{id}.{kind}.{}", std::process::id()));
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(&scratch)
-        .and_then(|mut file| file.write_all(label.as_bytes()))
-        .and_then(|()| std::fs::rename(&scratch, &path));
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&scratch, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&scratch);
     }
@@ -180,6 +191,40 @@ pub fn remove_label(dir: &Path, id: &SessionId) -> io::Result<()> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
+}
+
+/// The most a file of marks is read of: more than a relay's marks can be, whatever the file holds.
+const MARKS_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// The file a relay that is replaced leaves the shell's marks in, for the relay that takes over
+/// (`kablo_screen::Screen::marks_left`). It holds where in the stream the marks reach, a line in
+/// decimal, then the marks. It stands from the moment the first relay lets go until the next is
+/// told to go on; its name does not end in `.sock`, so [`session_ids`] does not take it for a
+/// session.
+pub fn marks_path(dir: &Path, id: &SessionId) -> PathBuf {
+    dir.join(format!("{id}.marks"))
+}
+
+/// Leaves `marks`, which reach `offset` of the stream, for the relay that takes over session `id`.
+pub fn write_marks(dir: &Path, id: &SessionId, offset: u64, marks: &[u8]) -> io::Result<()> {
+    let mut bytes = format!("{offset}\n").into_bytes();
+    bytes.extend_from_slice(marks);
+    write_whole(dir, &marks_path(dir, id), "marks", id, &bytes)
+}
+
+/// Takes what a relay left for this one: where the marks reach and the marks. The file goes
+/// whatever it holds; one that is not what [`write_marks`] writes says nothing.
+pub fn take_marks(dir: &Path, id: &SessionId) -> Option<(u64, Vec<u8>)> {
+    use std::io::Read;
+    let path = marks_path(dir, id);
+    let file = std::fs::File::open(&path).ok()?;
+    let mut bytes = Vec::new();
+    let read = file.take(MARKS_LIMIT).read_to_end(&mut bytes);
+    let _ = std::fs::remove_file(&path);
+    read.ok()?;
+    let end = bytes.iter().position(|&byte| byte == b'\n')?;
+    let offset = std::str::from_utf8(bytes.get(..end)?).ok()?.parse().ok()?;
+    Some((offset, bytes.get(end + 1..)?.to_vec()))
 }
 
 /// The name every mailbox starts with. The rest is the pid of the bridge that
@@ -279,6 +324,29 @@ mod tests {
         let dir = PathBuf::from(format!("/tmp/kt-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn marks_left_for_the_next_relay_are_taken_once_and_a_file_that_is_not_theirs_says_nothing() {
+        let dir = scratch("marks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = SessionId::new("marked").unwrap();
+        assert_eq!(take_marks(&dir, &id), None, "none left");
+        write_marks(&dir, &id, 42, b"\x1b]133;C\x07\nmore").unwrap();
+        let mode = std::fs::metadata(marks_path(&dir, &id))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            take_marks(&dir, &id),
+            Some((42, b"\x1b]133;C\x07\nmore".to_vec()))
+        );
+        assert_eq!(take_marks(&dir, &id), None, "taken");
+        std::fs::write(marks_path(&dir, &id), "not a number\nmarks").unwrap();
+        assert_eq!(take_marks(&dir, &id), None);
+        assert!(!marks_path(&dir, &id).exists(), "it goes all the same");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

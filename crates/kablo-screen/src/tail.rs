@@ -160,6 +160,19 @@ impl Tail {
         &self.marks
     }
 
+    /// The marks told by `left`, sequences as [`Marks::write`] writes them, and by `since`, the
+    /// stream after them, in place of the ones this tail followed; `also` is one more, the
+    /// newest. What this tail is in the middle of stays.
+    pub(crate) fn take_marks(&mut self, left: &[u8], since: &[u8], also: Option<&[u8]>) {
+        let mut told = Tail::default();
+        told.feed(left);
+        told.feed(since);
+        if let Some(payload) = also {
+            told.marks.osc(payload);
+        }
+        self.marks = told.marks;
+    }
+
     /// The OSC open in [`Tail::bytes`] ends here and the parser dispatches it: its payload is
     /// what follows `ESC ]`.
     fn dispatch_osc(&mut self) {

@@ -34,7 +34,9 @@
 //! client is told how far the questions were answered (`answered`) and keeps
 //! its own answers back. A relay that starts (a replacement, or a restart after
 //! a crash) has no screen to carry over and builds it again from what the
-//! journal holds.
+//! journal holds; what the journal may no longer hold is the shell's marks, and
+//! a relay that is replaced leaves those to the next in a file. After a crash
+//! they are lost, and the shell tells them again at its next prompt.
 //!
 //! **The terminal's state is told, not polled.** What only the server can see
 //! of the terminal (the program in the foreground, whether a password is being
@@ -72,7 +74,8 @@
 //! (forwarded to the warden, which owns the shell) or when the shell exits.
 //!
 //! The relay can be replaced while the shell lives: it keeps no state that a
-//! successor cannot rebuild from the journal's header and the descriptors.
+//! successor cannot rebuild from the journal's header, the descriptors and the
+//! marks it left ([`sockdir::marks_path`]).
 //! A client's `upgrade` is passed to the warden, which starts the other binary
 //! as a second relay; when that one is set up this one is told to quit
 //! (`Quit`): it stops reading the terminal, drops its clients by leaving, and
@@ -794,10 +797,14 @@ impl Relay {
                 self.flush_input();
                 if self.leaving_for_good() {
                     self.forget_label();
+                    self.forget_marks();
+                } else {
+                    self.leave_marks();
                 }
                 // The screen goes with this process and a successor builds its own from
                 // the journal, every byte of which that a client was shown is at or below
-                // `answered` already: parsing what is left would only delay the release.
+                // `answered` already: parsing what is left would only delay the release. The
+                // marks say how far they reach, and the successor reads the rest.
                 let offset = self.journal.total();
                 self.send_warden(&ToWarden::Released { offset });
                 return 0;
@@ -852,6 +859,7 @@ impl Relay {
         match message {
             ToRelay::Go => {
                 self.feed_screen(Feed::Held);
+                self.take_marks();
                 self.live = true;
                 self.reading = true;
                 if self.exit.is_some() {
@@ -1981,12 +1989,8 @@ impl Relay {
     }
 
     /// The session's label: what its file says (see [`sockdir::label_path`]).
-    /// The directory is the listening socket's, so that this does not depend on
-    /// where the relay was started from.
     fn label(&self) -> Option<String> {
-        let address = self.listener.local_addr().ok()?;
-        let dir = address.as_pathname()?.parent()?;
-        sockdir::read_label(dir, &self.id)
+        sockdir::read_label(&self.directory()?, &self.id)
     }
 
     /// Whether this relay going is the end of the session, and not its being
@@ -2002,13 +2006,59 @@ impl Relay {
         self.is_orphaned() || (self.exit.is_some() && !self.replacing)
     }
 
+    /// The socket directory: the listening socket's, so that this does not depend on where the
+    /// relay was started from.
+    fn directory(&self) -> Option<std::path::PathBuf> {
+        let address = self.listener.local_addr().ok()?;
+        Some(address.as_pathname()?.parent()?.to_path_buf())
+    }
+
     /// Takes the label file away: the session is gone.
     fn forget_label(&self) {
-        if let Some(address) = self.listener.local_addr().ok()
-            && let Some(dir) = address.as_pathname().and_then(std::path::Path::parent)
-        {
-            let _ = sockdir::remove_label(dir, &self.id);
+        if let Some(dir) = self.directory() {
+            let _ = sockdir::remove_label(&dir, &self.id);
         }
+    }
+
+    /// Leaves the shell's marks to the relay that takes over, as far as the screen has read:
+    /// the ring may no longer hold them.
+    fn leave_marks(&self) {
+        let Some(dir) = self.directory() else {
+            return;
+        };
+        let state = self.core.lock();
+        let left = state.screen.marks_left();
+        let _ = sockdir::write_marks(&dir, &self.id, state.at, &left);
+    }
+
+    /// Takes what a relay left for a session that is over: nobody comes for it.
+    fn forget_marks(&self) {
+        if let Some(dir) = self.directory() {
+            let _ = sockdir::take_marks(&dir, &self.id);
+        }
+    }
+
+    /// The marks the relay before this one left, once the screen has read what the ring holds:
+    /// they take the place of the ones it found there, with what came after them. Marks that
+    /// reach past what this screen has read are not of this stream.
+    fn take_marks(&mut self) {
+        let Some((reach, left)) = self
+            .directory()
+            .and_then(|dir| sockdir::take_marks(&dir, &self.id))
+        else {
+            return;
+        };
+        let journal = Arc::clone(&self.journal);
+        let mut state = self.core.lock();
+        if reach > state.at {
+            return;
+        }
+        // What the ring has dropped of the stream after them is lost with its marks.
+        let from = reach.max(journal.total().saturating_sub(journal.capacity()));
+        let mut since = vec![0; usize::try_from(state.at.saturating_sub(from)).unwrap_or(0)];
+        let got = journal.copy_out(from, &mut since).unwrap_or(0);
+        since.truncate(got);
+        state.screen.take_marks(&left, &since);
     }
 
     fn status(&mut self) -> Status {
@@ -2454,6 +2504,11 @@ mod tests {
         relay.forget_label();
         assert_eq!(relay.label(), None);
         assert!(!label.exists());
+        // What it may have left in a swap that did not end goes with the session.
+        let marks = sockdir::marks_path(&dir, &id);
+        sockdir::write_marks(&dir, &id, 0, b"").unwrap();
+        relay.forget_marks();
+        assert!(!marks.exists());
     }
 
     #[test]
