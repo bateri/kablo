@@ -2038,6 +2038,17 @@ impl Packet {
         }
     }
 
+    /// An error, about `session` or about the connection.
+    pub fn error(session: Option<SessionId>, code: ErrorCode, text: &str) -> Packet {
+        Packet {
+            session,
+            message: Message::Error {
+                code,
+                text: text.to_owned(),
+            },
+        }
+    }
+
     /// The frame this packet is.
     pub fn to_frame(&self) -> Result<RawFrame> {
         Ok(RawFrame {

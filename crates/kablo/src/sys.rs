@@ -1,10 +1,13 @@
-//! The libc calls the warden and the relay share, each behind a small safe
-//! function.
+//! The libc calls the processes of kablo share (the warden, the relay, the
+//! bridge and the commands), each behind a small safe function.
 //!
-//! Everything `unsafe` in the process code is here or in `journal`, `pty` and
-//! `procinfo`, so the loops that use them read as plain Rust. The functions
+//! Most of the `unsafe` in the process code is here or in `journal`, `pty` and
+//! `procinfo`, so the loops that use them read as plain Rust. The rest sits
+//! beside the code that needs it: taking over the descriptors a process was
+//! started with, and the setting up of the warden's own process. The functions
 //! keep to what a loop needs: descriptor flags, `poll`, passing descriptors
-//! over a Unix socket, the terminal's size, signals.
+//! over a Unix socket and who is at the other end of one, the terminal's size,
+//! signals, a process's lineage and start time.
 
 use std::ffi::{CString, OsString};
 use std::io;

@@ -278,7 +278,9 @@ impl Journal {
         }
     }
 
-    /// Appends `data` (the single writer).
+    /// Appends `data` (the single writer), as a test puts what a program printed
+    /// in the ring; the relay fills it from the terminal ([`Journal::fill_from`]).
+    #[cfg(test)]
     pub fn append(&self, data: &[u8]) {
         let mut total = self.total_cell().load(Ordering::Relaxed);
         let mut rest = data;
@@ -372,6 +374,7 @@ impl Journal {
     /// start inside a line (an escape sequence is rarely longer than one).
     /// With no newline in the ring, the ring's start. (The ring's, not the
     /// floor's: what a screen is built from is whatever is still written.)
+    #[cfg(test)]
     pub fn line_start(&self) -> u64 {
         self.line_start_from(0)
     }

@@ -8,7 +8,8 @@
 //!
 //! Beside the wire, [`install`] holds the rules a client shares for putting a
 //! kablo binary on a server: which target a server is, what the binary of a
-//! release is called and where it goes.
+//! release is called and where it goes. [`tune`] holds the rule both ends of a
+//! stream share for how large its window is.
 //!
 //! A connection is a [`hello`] handshake, then [`frame`]s. A frame is a header
 //! (kind, channel, session id, payload length) and a payload; the payload of
@@ -39,6 +40,7 @@ pub mod hello;
 pub mod install;
 pub mod session;
 pub mod tlv;
+pub mod tune;
 pub mod v1;
 
 pub use error::{Error, Result};

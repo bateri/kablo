@@ -7,17 +7,19 @@
 //! the session id each frame carries. (Opening a connection per session would
 //! meet the server's limit on sessions per connection, ten by default.)
 //!
-//! It is a router and nothing else. A request for a session goes to that
-//! session's relay over the relay's own socket; what the relay sends comes back
-//! to the client as it is. The program's bytes are not looked at, and the bridge
-//! keeps no copy of them: a client that comes back asks for its offset again.
-//! Four things it answers itself, because they are about the connection and
+//! For the sessions it is a router and nothing else. A request for a session
+//! goes to that session's relay over the relay's own socket; what the relay
+//! sends comes back to the client as it is. The program's bytes are not looked
+//! at, and the bridge keeps no copy of them: a client that comes back asks for
+//! its offset again. What it answers itself is what is about the connection and
 //! not a session: `ping`, unless it names a session the client has written or
 //! typed to and not yet had a `pong` for (the relay answers that one, once the
 //! program's terminal has taken what was sent before it: it is how a client
-//! learns that keys were typed); `list`, by asking every relay for its status;
-//! `new`, by starting the session as `kablo new` does and answering with the
-//! new session's status; and `label`, by writing the session's label file.
+//! learns that keys were typed); `features`, by saying what this bridge takes
+//! and noting what the client does; `list`, by asking every relay for its
+//! status; `new`, by starting the session as `kablo new` does and answering
+//! with the new session's status; and `label`, by writing the session's label
+//! file. The streams and the mailbox, below, are the bridge's own as well.
 //!
 //! A relay that dies or is replaced while a client is attached does not show:
 //! see [`crate::link`]. A client that goes away (the standard input ends) ends
@@ -65,7 +67,7 @@ use kablo_proto::v1::{
 };
 use kablo_proto::{SessionId, WIRE};
 
-use crate::handshake::{self, Step};
+use crate::handshake::{Opening, Served};
 use crate::launch::{self, Failure};
 use crate::link::Link;
 use crate::mailbox::{self, Mailbox};
@@ -126,9 +128,7 @@ struct Bridge {
     dir: PathBuf,
     input: BorrowedFd<'static>,
     output: BorrowedFd<'static>,
-    /// Bytes received before the handshake is complete.
-    hello: Vec<u8>,
-    open: bool,
+    opening: Opening,
     decoder: IncomingDecoder,
     out: Outbound,
     streams: Streams,
@@ -164,8 +164,7 @@ impl Bridge {
             dir,
             input,
             output,
-            hello: Vec::new(),
-            open: false,
+            opening: Opening::default(),
             decoder: IncomingDecoder::new(),
             out: Outbound::new(chunk),
             streams: Streams::new(wire::Side::Server, streams::Config::default()),
@@ -356,31 +355,21 @@ impl Bridge {
 
     /// Bytes arrived from the client: the handshake first, then packets.
     fn feed(&mut self, bytes: &[u8], now: Instant, outgoing: &mut Vec<Packet>) {
-        if self.open {
-            self.decoder.push(bytes);
-        } else {
-            self.hello.extend_from_slice(bytes);
-            match handshake::serve(&WIRE, &self.hello) {
-                Ok(Step::Need) => return,
-                Ok(Step::Done {
-                    reply, consumed, ..
-                }) => {
-                    self.out.push(&reply);
-                    let rest = self.hello.get(consumed..).unwrap_or_default().to_vec();
-                    self.decoder.push(&rest);
-                    self.hello = Vec::new();
-                    self.open = true;
-                }
-                Ok(Step::Refused { reply }) => {
-                    self.out.push(&reply);
-                    let _ = self.flush();
-                    self.stop = Some(1);
-                    return;
-                }
-                Err(_) => {
-                    self.stop = Some(1);
-                    return;
-                }
+        match self
+            .opening
+            .serve(&WIRE, bytes, |stream| self.decoder.push(stream))
+        {
+            Ok(Served::Waiting) => return,
+            Ok(Served::Open(reply)) => self.out.push(&reply),
+            Ok(Served::Refused(reply)) => {
+                self.out.push(&reply);
+                let _ = self.flush();
+                self.stop = Some(1);
+                return;
+            }
+            Err(_) => {
+                self.stop = Some(1);
+                return;
             }
         }
         loop {
@@ -392,10 +381,11 @@ impl Bridge {
                 Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(e) if e.is_recoverable() => {
-                    outgoing.push(Packet::connection(Message::Error {
-                        code: ErrorCode::BAD_REQUEST,
-                        text: "malformed message".to_owned(),
-                    }));
+                    outgoing.push(Packet::error(
+                        None,
+                        ErrorCode::BAD_REQUEST,
+                        "malformed message",
+                    ));
                 }
                 // The framing itself is broken: there is no telling where the
                 // next frame starts.
@@ -436,11 +426,13 @@ impl Bridge {
             }
             (_, Message::List) => match Scan::start(&self.dir, scan::WAIT) {
                 Ok(scan) => self.scans.push(scan),
-                Err(e) => outgoing.push(failure(None, ErrorCode::UNAVAILABLE, &e.to_string())),
+                Err(e) => {
+                    outgoing.push(Packet::error(None, ErrorCode::UNAVAILABLE, &e.to_string()))
+                }
             },
             (session, Message::New(request)) => self.create(session, &request, outgoing),
             (Some(id), Message::Label(label)) => self.label(id, &label, outgoing),
-            (None, Message::Label(_)) => outgoing.push(failure(
+            (None, Message::Label(_)) => outgoing.push(Packet::error(
                 None,
                 ErrorCode::BAD_REQUEST,
                 "this request needs a session id",
@@ -448,14 +440,16 @@ impl Bridge {
             (Some(id), message) if is_request(&message) => {
                 self.route(id, message, now, outgoing);
             }
-            (None, message) if is_request(&message) => outgoing.push(failure(
+            (None, message) if is_request(&message) => outgoing.push(Packet::error(
                 None,
                 ErrorCode::BAD_REQUEST,
                 "this request needs a session id",
             )),
-            (session, _) => {
-                outgoing.push(failure(session, ErrorCode::BAD_REQUEST, "not a request"))
-            }
+            (session, _) => outgoing.push(Packet::error(
+                session,
+                ErrorCode::BAD_REQUEST,
+                "not a request",
+            )),
         }
     }
 
@@ -472,7 +466,7 @@ impl Bridge {
             {
                 return;
             }
-            match mailbox.from_app(packet, self.streams.len()) {
+            match mailbox.app_says(packet, self.streams.len()) {
                 None => return,
                 Some(not_mail) => packet = not_mail,
             }
@@ -507,7 +501,7 @@ impl Bridge {
                     | Message::Resize(_)
                     | Message::Forget
                     | Message::DropInput => {
-                        return outgoing.push(failure(
+                        return outgoing.push(Packet::error(
                             Some(id),
                             ErrorCode::NOT_ATTACHED,
                             "attach first",
@@ -554,7 +548,7 @@ impl Bridge {
             return outgoing.push(Link::refusal(&id, &e));
         }
         if let Err(e) = sockdir::write_label(&self.dir, &id, label) {
-            outgoing.push(failure(
+            outgoing.push(Packet::error(
                 Some(id),
                 ErrorCode::UNAVAILABLE,
                 &format!("the label cannot be written: {e}"),
@@ -576,7 +570,7 @@ impl Bridge {
             .journal_size
             .is_some_and(|size| !(journal::MIN_CAPACITY..=journal::MAX_CAPACITY).contains(&size))
         {
-            return outgoing.push(failure(
+            return outgoing.push(Packet::error(
                 wanted,
                 ErrorCode::BAD_REQUEST,
                 &format!(
@@ -587,14 +581,14 @@ impl Bridge {
             ));
         }
         if request.size.is_some_and(|size| !size.fits()) {
-            return outgoing.push(failure(
+            return outgoing.push(Packet::error(
                 wanted,
                 ErrorCode::BAD_REQUEST,
                 &format!("a terminal has at most {MAX_COLS} columns and {MAX_ROWS} rows"),
             ));
         }
         if request.history.is_some_and(|rows| rows > MAX_HISTORY) {
-            return outgoing.push(failure(
+            return outgoing.push(Packet::error(
                 wanted,
                 ErrorCode::BAD_REQUEST,
                 &format!("the screen keeps 0 to {MAX_HISTORY} rows of scrollback"),
@@ -607,7 +601,7 @@ impl Bridge {
             let id = match wanted.clone().map(Ok).unwrap_or_else(launch::fresh_id) {
                 Ok(id) => id,
                 Err(e) => {
-                    return outgoing.push(failure(
+                    return outgoing.push(Packet::error(
                         None,
                         ErrorCode::UNAVAILABLE,
                         &format!("cannot make a session id: {e}"),
@@ -618,7 +612,7 @@ impl Bridge {
                 Ok(()) => return outgoing.push(created(&self.dir, id)),
                 Err(Failure::Exists(taken)) => {
                     if wanted.is_some() {
-                        return outgoing.push(failure(
+                        return outgoing.push(Packet::error(
                             Some(taken.clone()),
                             ErrorCode::SESSION_EXISTS,
                             &Failure::Exists(taken).to_string(),
@@ -626,11 +620,15 @@ impl Bridge {
                     }
                 }
                 Err(Failure::Other(why)) => {
-                    return outgoing.push(failure(wanted.clone(), ErrorCode::UNAVAILABLE, &why));
+                    return outgoing.push(Packet::error(
+                        wanted.clone(),
+                        ErrorCode::UNAVAILABLE,
+                        &why,
+                    ));
                 }
             }
         }
-        outgoing.push(failure(
+        outgoing.push(Packet::error(
             None,
             ErrorCode::UNAVAILABLE,
             "no unused session id could be made",
@@ -686,7 +684,7 @@ fn created(dir: &std::path::Path, id: SessionId) -> Packet {
     let found = Scan::of(dir, vec![id.clone()], scan::WAIT).run();
     match found.into_iter().next() {
         Some(status) => Packet::about(id, Message::Created(status)),
-        None => failure(
+        None => Packet::error(
             Some(id),
             ErrorCode::UNAVAILABLE,
             "the session started but does not answer",
@@ -746,16 +744,6 @@ fn is_request(message: &Message) -> bool {
             | Message::Forget
             | Message::DropInput
     )
-}
-
-fn failure(session: Option<SessionId>, code: ErrorCode, text: &str) -> Packet {
-    Packet {
-        session,
-        message: Message::Error {
-            code,
-            text: text.to_owned(),
-        },
-    }
 }
 
 /// Makes sure the socket directory is safe to use if it is there.

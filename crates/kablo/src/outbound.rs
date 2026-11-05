@@ -58,6 +58,16 @@ impl Frames for std::collections::VecDeque<Vec<u8>> {
     }
 }
 
+/// How a run of writes ended.
+enum Wrote {
+    /// Everything queued was written.
+    Empty,
+    /// The pipe takes no more for now.
+    Blocked,
+    /// The pipe is gone.
+    Failed,
+}
+
 /// The bytes waiting to be written to the connection.
 #[derive(Debug)]
 pub struct Outbound {
@@ -132,6 +142,18 @@ impl Outbound {
         self.admit(frames, force);
     }
 
+    /// Every byte ever written, for an owner that tells where in the queue a
+    /// frame it made ends.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Writes with `write` until it takes no more. `false` when `write` failed
+    /// for good. For an end that has no stream frames to move in.
+    pub fn drain(&mut self, write: &mut impl FnMut(&[u8]) -> io::Result<usize>) -> bool {
+        !matches!(self.write_out(write), Wrote::Failed)
+    }
+
     /// Writes with `write` until it takes no more, moving stream frames in as
     /// the queue empties. `false` when `write` failed for good.
     pub fn flush(
@@ -140,32 +162,41 @@ impl Outbound {
         write: &mut impl FnMut(&[u8]) -> io::Result<usize>,
     ) -> bool {
         loop {
-            while self.pending() > 0 {
-                let end = (self.sent + self.chunk).min(self.buf.len());
-                let waiting = self.buf.get(self.sent..end).unwrap_or_default();
-                match write(waiting) {
-                    Ok(0) => {
-                        self.compact();
-                        return true;
-                    }
-                    Ok(n) => {
-                        self.sent += n;
-                        self.written = self.written.saturating_add(n as u64);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        self.compact();
-                        return true;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => return false,
-                }
+            match self.write_out(write) {
+                Wrote::Failed => return false,
+                Wrote::Blocked => return true,
+                Wrote::Empty => {}
             }
-            self.compact();
             if frames.next_len().is_none() {
                 return true;
             }
             self.admit(frames, false);
         }
+    }
+
+    fn write_out(&mut self, write: &mut impl FnMut(&[u8]) -> io::Result<usize>) -> Wrote {
+        while self.pending() > 0 {
+            let end = (self.sent + self.chunk).min(self.buf.len());
+            let waiting = self.buf.get(self.sent..end).unwrap_or_default();
+            match write(waiting) {
+                Ok(0) => {
+                    self.compact();
+                    return Wrote::Blocked;
+                }
+                Ok(n) => {
+                    self.sent += n;
+                    self.written = self.written.saturating_add(n as u64);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.compact();
+                    return Wrote::Blocked;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Wrote::Failed,
+            }
+        }
+        self.compact();
+        Wrote::Empty
     }
 
     fn compact(&mut self) {
@@ -388,5 +419,25 @@ mod tests {
         }));
         assert_eq!(sizes, [16, 16, 8]);
         assert_eq!(out.pending(), 0);
+    }
+
+    #[test]
+    fn an_end_without_streams_drains_what_the_pipe_takes_and_counts_it() {
+        let mut out = Outbound::new(16);
+        out.push(&frame(b'a', 40));
+        let mut pipe = Pipe {
+            room: 25,
+            taken: Vec::new(),
+        };
+        assert!(out.drain(&mut |b| pipe.write(b)));
+        assert_eq!(out.pending(), 15);
+        assert_eq!(out.written(), 25);
+        pipe.room = 100;
+        assert!(out.drain(&mut |b| pipe.write(b)));
+        assert_eq!(out.pending(), 0);
+        assert_eq!(out.written(), 40);
+        assert_eq!(pipe.taken, frame(b'a', 40));
+        out.push(&frame(b'b', 1));
+        assert!(!out.drain(&mut |_| Err(io::ErrorKind::BrokenPipe.into())));
     }
 }

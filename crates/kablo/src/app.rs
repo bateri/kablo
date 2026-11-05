@@ -31,8 +31,8 @@ use kablo_proto::WIRE;
 use kablo_proto::v1::stream::{self as wire, FailCode, Incoming, IncomingDecoder};
 use kablo_proto::v1::{Message, Packet, Standing};
 
-use crate::handshake::{self, ClientStep};
-use crate::outbound::Outbound;
+use crate::handshake::{Answered, Opening};
+use crate::outbound::{self, Outbound};
 use crate::peer;
 use crate::sockdir::{self, MailboxFile};
 use crate::streams::{self, Cause, Event, Local, Streams};
@@ -263,11 +263,8 @@ struct Bridge {
 struct Question {
     sock: OwnedFd,
     /// The handshake and the question, as far as they are written.
-    out: Vec<u8>,
-    sent: usize,
-    /// What has come before the handshake's reply is whole.
-    hello: Vec<u8>,
-    open: bool,
+    out: Outbound,
+    opening: Opening,
     decoder: IncomingDecoder,
     standing: Option<Standing>,
     /// It will answer nothing: the connection ended or the bridge did not
@@ -281,17 +278,15 @@ impl Question {
     /// in the bridge's queue until it is accepted.
     fn to(mailbox: &MailboxFile) -> io::Result<Question> {
         let sock = peer::connect_ours(&mailbox.path)?;
-        let mut out = Vec::new();
-        WIRE.write_hello(&mut out).map_err(io::Error::other)?;
+        let mut out = Outbound::new(outbound::CHUNK);
+        WIRE.write_hello(out.buffer()).map_err(io::Error::other)?;
         Packet::connection(Message::Ask)
-            .encode(&mut out)
+            .encode(out.buffer())
             .map_err(io::Error::other)?;
         Ok(Question {
             sock,
             out,
-            sent: 0,
-            hello: Vec::new(),
-            open: false,
+            opening: Opening::default(),
             decoder: IncomingDecoder::new(),
             standing: None,
             over: false,
@@ -304,18 +299,9 @@ impl Question {
 
     /// Writes what the socket takes.
     fn write(&mut self) {
-        while self.sent < self.out.len() {
-            let rest = self.out.get(self.sent..).unwrap_or_default();
-            match sys::write_fd(self.sock.as_fd(), rest) {
-                Ok(0) => break,
-                Ok(n) => self.sent += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    self.over = true;
-                    break;
-                }
-            }
+        let sock = self.sock.as_fd();
+        if !self.out.drain(&mut |bytes| sys::write_fd(sock, bytes)) {
+            self.over = true;
         }
     }
 
@@ -344,22 +330,15 @@ impl Question {
     }
 
     fn take(&mut self, bytes: &[u8]) {
-        if self.open {
-            self.decoder.push(bytes);
-        } else {
-            self.hello.extend_from_slice(bytes);
-            match handshake::reply(&WIRE, &self.hello) {
-                Ok(ClientStep::Need) => return,
-                Ok(ClientStep::Done { consumed, .. }) => {
-                    let rest = self.hello.get(consumed..).unwrap_or_default().to_vec();
-                    self.decoder.push(&rest);
-                    self.hello = Vec::new();
-                    self.open = true;
-                }
-                Ok(ClientStep::Refused) | Err(_) => {
-                    self.over = true;
-                    return;
-                }
+        match self
+            .opening
+            .answer(&WIRE, bytes, |stream| self.decoder.push(stream))
+        {
+            Ok(Answered::Waiting) => return,
+            Ok(Answered::Open) => {}
+            Ok(Answered::Refused) | Err(_) => {
+                self.over = true;
+                return;
             }
         }
         // Whatever comes after the answer is for the conversation.
@@ -419,7 +398,7 @@ fn ask_all(
         for (at, question) in questions.iter().enumerate() {
             if question.waiting() {
                 let mut events = libc::POLLIN;
-                if question.sent < question.out.len() {
+                if question.out.pending() > 0 {
                     events |= libc::POLLOUT;
                 }
                 set.push(sys::want(question.sock.as_raw_fd(), events));

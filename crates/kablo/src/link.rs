@@ -591,13 +591,7 @@ impl Link {
     fn fail(&mut self, code: ErrorCode, text: &str, out: &mut Vec<Packet>) {
         self.gone = true;
         self.peer = None;
-        out.push(Packet::about(
-            self.id.clone(),
-            Message::Error {
-                code,
-                text: text.to_owned(),
-            },
-        ));
+        out.push(Packet::error(Some(self.id.clone()), code, text));
     }
 }
 
@@ -605,12 +599,10 @@ impl Link {
 fn refusal(id: &SessionId, error: &io::Error) -> Packet {
     match error.kind() {
         // Nothing listens: the file is stale or the session is over.
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Packet::about(
-            id.clone(),
-            Message::Error {
-                code: ErrorCode::UNKNOWN_SESSION,
-                text: "no such session".to_owned(),
-            },
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Packet::error(
+            Some(id.clone()),
+            ErrorCode::UNKNOWN_SESSION,
+            "no such session",
         ),
         _ => unavailable(id, &error.to_string()),
     }
@@ -640,13 +632,7 @@ fn parked_size(packet: &Packet) -> usize {
 }
 
 fn unavailable(id: &SessionId, text: &str) -> Packet {
-    Packet::about(
-        id.clone(),
-        Message::Error {
-            code: ErrorCode::UNAVAILABLE,
-            text: text.to_owned(),
-        },
-    )
+    Packet::error(Some(id.clone()), ErrorCode::UNAVAILABLE, text)
 }
 
 #[cfg(test)]

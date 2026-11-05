@@ -6,6 +6,10 @@
 //! caller keeps them and asks again each time more come: a hello that is not
 //! all there yet reads as an unexpected end, which here means "wait". Nothing
 //! past the hello is consumed.
+//!
+//! [`Opening`] is that keeping, for a connection that goes on to speak packets:
+//! it holds the bytes of the hello and hands what follows it to the
+//! connection's decoder.
 
 use std::io::ErrorKind;
 
@@ -82,6 +86,102 @@ pub fn reply(protocol: &Protocol, bytes: &[u8]) -> Result<ClientStep> {
         Ok(_) => Err(Error::BadHello),
         Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => Ok(ClientStep::Need),
         Err(e) => Err(e),
+    }
+}
+
+/// The start of one connection: the bytes that arrive are the hello until it
+/// is whole, and the stream after that.
+#[derive(Debug, Default)]
+pub struct Opening {
+    /// Bytes received before the handshake is complete.
+    hello: Vec<u8>,
+    open: bool,
+}
+
+/// How the server end of an [`Opening`] stands.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Served {
+    /// The hello is not all here yet.
+    Waiting,
+    /// The handshake is over: send `reply` (empty after the first time), and
+    /// the stream is in the decoder.
+    Open(Vec<u8>),
+    /// The peer speaks no version we do: send `reply` (it says so) and close.
+    Refused(Vec<u8>),
+}
+
+/// How the client end of an [`Opening`] stands.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The server's reply is not all here yet.
+    Waiting,
+    /// The handshake is over, and the stream is in the decoder.
+    Open,
+    /// The server speaks no version we do.
+    Refused,
+}
+
+impl Opening {
+    /// Whether the handshake is over.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Bytes arrived at the end that was connected to. While the hello is not
+    /// whole they are kept; the bytes behind it, and every byte after, go to
+    /// `stream`, whole or in part, as they come. An error is a hello that no
+    /// version of the protocol starts with.
+    pub fn serve(
+        &mut self,
+        protocol: &Protocol,
+        bytes: &[u8],
+        stream: impl FnOnce(&[u8]),
+    ) -> Result<Served> {
+        if self.open {
+            stream(bytes);
+            return Ok(Served::Open(Vec::new()));
+        }
+        self.hello.extend_from_slice(bytes);
+        Ok(match serve(protocol, &self.hello)? {
+            Step::Need => Served::Waiting,
+            Step::Done {
+                reply, consumed, ..
+            } => {
+                self.finish(consumed, stream);
+                Served::Open(reply)
+            }
+            Step::Refused { reply } => Served::Refused(reply),
+        })
+    }
+
+    /// Bytes arrived at the end that connected, as [`Opening::serve`] takes
+    /// them at the end that was connected to.
+    pub fn answer(
+        &mut self,
+        protocol: &Protocol,
+        bytes: &[u8],
+        stream: impl FnOnce(&[u8]),
+    ) -> Result<Answered> {
+        if self.open {
+            stream(bytes);
+            return Ok(Answered::Open);
+        }
+        self.hello.extend_from_slice(bytes);
+        Ok(match reply(protocol, &self.hello)? {
+            ClientStep::Need => Answered::Waiting,
+            ClientStep::Done { consumed, .. } => {
+                self.finish(consumed, stream);
+                Answered::Open
+            }
+            ClientStep::Refused => Answered::Refused,
+        })
+    }
+
+    /// The hello was the first `consumed` bytes: what follows is the stream.
+    fn finish(&mut self, consumed: usize, stream: impl FnOnce(&[u8])) {
+        stream(self.hello.get(consumed..).unwrap_or_default());
+        self.hello = Vec::new();
+        self.open = true;
     }
 }
 
@@ -162,5 +262,85 @@ mod tests {
         let mut bytes = Vec::new();
         WIRE.write_reply(&mut bytes, 0).unwrap();
         assert_eq!(reply(&WIRE, &bytes).unwrap(), ClientStep::Refused);
+    }
+
+    #[test]
+    fn a_server_opening_keeps_the_hello_and_hands_the_stream_on() {
+        let bytes = hello();
+        let mut opening = Opening::default();
+        let mut stream = Vec::new();
+        for byte in bytes.get(..bytes.len() - 1).unwrap() {
+            let served = opening.serve(&WIRE, &[*byte], |b| stream.extend_from_slice(b));
+            assert_eq!(served.unwrap(), Served::Waiting);
+        }
+        assert!(!opening.is_open());
+        let last = [bytes.last().copied().unwrap(), 1, 2];
+        let Served::Open(reply) = opening
+            .serve(&WIRE, &last, |b| stream.extend_from_slice(b))
+            .unwrap()
+        else {
+            panic!("expected the handshake to be over");
+        };
+        assert!(!reply.is_empty());
+        assert!(opening.is_open());
+        assert_eq!(stream, [1, 2], "what follows the hello, and not the hello");
+        let served = opening.serve(&WIRE, &[3], |b| stream.extend_from_slice(b));
+        assert_eq!(
+            served.unwrap(),
+            Served::Open(Vec::new()),
+            "the reply goes out once"
+        );
+        assert_eq!(stream, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_server_opening_refuses_a_peer_with_no_common_version_and_a_peer_that_is_noise() {
+        let mut bytes = WIRE.signature.to_vec();
+        bytes.extend_from_slice(&[7, 9]);
+        let mut opening = Opening::default();
+        let served = opening.serve(&WIRE, &bytes, |_| panic!("no stream"));
+        let Served::Refused(reply) = served.unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(reply.starts_with(WIRE.signature));
+        assert!(!opening.is_open());
+
+        let noise = vec![b'x'; kablo_proto::NOISE_LIMIT + 8];
+        let mut opening = Opening::default();
+        assert!(
+            opening
+                .serve(&WIRE, &noise, |_| panic!("no stream"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_client_opening_skips_the_banner_and_hands_the_stream_on() {
+        let mut bytes = b"motd\n".to_vec();
+        WIRE.write_reply(&mut bytes, 1).unwrap();
+        let whole = bytes.len();
+        bytes.extend_from_slice(&[7, 7]);
+        let mut opening = Opening::default();
+        let mut stream = Vec::new();
+        let answered = opening.answer(&WIRE, &bytes[..whole - 1], |b| stream.extend_from_slice(b));
+        assert_eq!(answered.unwrap(), Answered::Waiting);
+        assert!(!opening.is_open());
+        let answered = opening.answer(&WIRE, &bytes[whole - 1..], |b| stream.extend_from_slice(b));
+        assert_eq!(answered.unwrap(), Answered::Open);
+        assert!(opening.is_open());
+        assert_eq!(stream, [7, 7]);
+        let answered = opening.answer(&WIRE, &[8], |b| stream.extend_from_slice(b));
+        assert_eq!(answered.unwrap(), Answered::Open);
+        assert_eq!(stream, [7, 7, 8]);
+    }
+
+    #[test]
+    fn a_client_opening_is_refused_by_a_server_with_nothing_in_common() {
+        let mut bytes = Vec::new();
+        WIRE.write_reply(&mut bytes, 0).unwrap();
+        let mut opening = Opening::default();
+        let answered = opening.answer(&WIRE, &bytes, |_| panic!("no stream"));
+        assert_eq!(answered.unwrap(), Answered::Refused);
+        assert!(!opening.is_open());
     }
 }

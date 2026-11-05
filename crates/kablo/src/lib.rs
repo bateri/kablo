@@ -4,39 +4,41 @@
 //! is the shell's parent and stays the same process while the shell lives
 //! (it replaces its own program in place when the session is upgraded), and a
 //! *relay* that serves clients and can be replaced without touching the shell.
-//! The wire clients speak is the `kablo-proto` crate; the pieces here are the
-//! ones that are not for clients.
+//! The bridge (`kablo attach`) carries every session on the machine to a
+//! client over one connection. The wire a client speaks is the `kablo-proto`
+//! crate; the client is bateri, which speaks it itself, and the commands that
+//! drive a session from the machine it runs on (`send`, `capture`, ...), which
+//! are in the pieces here.
 
 pub mod app;
 pub mod bridge;
 pub mod cli;
-pub mod command;
-pub mod conversation;
-pub mod dial;
-pub mod drive;
-pub mod handshake;
+mod command;
+mod conversation;
+mod dial;
+mod drive;
+mod handshake;
 pub mod inner;
-pub mod journal;
-pub mod launch;
+mod journal;
+mod launch;
 pub mod link;
-pub mod listing;
-pub mod mailbox;
+mod listing;
+mod mailbox;
 mod mirror;
 pub mod origin;
-pub mod outbound;
-pub mod peer;
-pub mod process;
-pub mod procinfo;
+mod outbound;
+mod peer;
+mod process;
+mod procinfo;
 pub mod pty;
-pub mod relay;
-pub mod scan;
+mod relay;
+mod scan;
 pub mod sockdir;
 pub mod streams;
 pub mod sys;
-pub mod tune;
-pub mod typing;
-pub mod upgrade;
-pub mod warden;
+mod typing;
+mod upgrade;
+mod warden;
 
 /// The variable that stands in for this build's release, so that a test can
 /// run a "newer" build of the same code.

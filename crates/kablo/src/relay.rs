@@ -96,7 +96,7 @@ use kablo_proto::v1::{
 use kablo_proto::{SessionId, WIRE};
 use kablo_screen::Screen;
 
-use crate::handshake::{self, Step};
+use crate::handshake::{Opening, Served};
 use crate::inner::{self, ADOPT_DESCRIPTORS, Decoder, INNER, ToRelay, ToWarden};
 use crate::journal::Journal;
 use crate::mirror::{
@@ -142,11 +142,12 @@ const STATE_SETTLE: Duration = Duration::from_millis(200);
 /// The one look at the terminal that follows output or input by
 /// [`STATE_SETTLE`].
 ///
-/// This is the only timer the relay has, and it has a stop condition: it is
-/// armed by output the relay read or input a client typed, it fires **once**,
-/// and then it is not armed again until there is more of either. A session
-/// nobody is attached to never has it armed, and neither does one that has
-/// ended, so an idle session is a `poll` with no timeout.
+/// This is the timer that output and input arm (the others are [`EndKeep`]'s,
+/// the pause's, and the one for a client that was dropped behind), and it has a
+/// stop condition: it is armed by output the relay read or input a client
+/// typed, it fires **once**, and then it is not armed again until there is more
+/// of either. A session nobody is attached to never has it armed, and neither
+/// does one that has ended, so an idle session is a `poll` with no timeout.
 #[derive(Default)]
 struct Settle {
     due: Option<Instant>,
@@ -352,9 +353,7 @@ pub fn run(id: SessionId) -> u8 {
 
 struct Client {
     sock: UnixStream,
-    open: bool,
-    /// Bytes received before the handshake is complete.
-    hello: Vec<u8>,
+    opening: Opening,
     decoder: PacketDecoder,
     /// Encoded bytes for the client; `out[sent..]` is not yet written.
     out: Vec<u8>,
@@ -1368,8 +1367,7 @@ impl Relay {
         }
         self.clients.push(Client {
             sock,
-            open: false,
-            hello: Vec::new(),
+            opening: Opening::default(),
             decoder: PacketDecoder::new(),
             out: Vec::new(),
             sent: 0,
@@ -1423,30 +1421,20 @@ impl Relay {
         let Some(client) = self.clients.get_mut(i) else {
             return;
         };
-        if client.open {
-            client.decoder.push(bytes);
-        } else {
-            client.hello.extend_from_slice(bytes);
-            match handshake::serve(&WIRE, &client.hello) {
-                Ok(Step::Need) => return,
-                Ok(Step::Done {
-                    reply, consumed, ..
-                }) => {
-                    client.out.extend_from_slice(&reply);
-                    let rest = client.hello.get(consumed..).unwrap_or_default().to_vec();
-                    client.decoder.push(&rest);
-                    client.hello.clear();
-                    client.open = true;
-                }
-                Ok(Step::Refused { reply }) => {
-                    client.out.extend_from_slice(&reply);
-                    client.closing = true;
-                    return;
-                }
-                Err(_) => {
-                    client.dead = true;
-                    return;
-                }
+        match client
+            .opening
+            .serve(&WIRE, bytes, |stream| client.decoder.push(stream))
+        {
+            Ok(Served::Waiting) => return,
+            Ok(Served::Open(reply)) => client.out.extend_from_slice(&reply),
+            Ok(Served::Refused(reply)) => {
+                client.out.extend_from_slice(&reply);
+                client.closing = true;
+                return;
+            }
+            Err(_) => {
+                client.dead = true;
+                return;
             }
         }
         self.take_packets(i);
@@ -3697,6 +3685,15 @@ mod tests {
         assert_eq!(keep.timeout(start), Some(window));
     }
 
+    /// The start of a connection whose handshake is over.
+    fn opened() -> Opening {
+        let mut hello = Vec::new();
+        WIRE.write_hello(&mut hello).unwrap();
+        let mut opening = Opening::default();
+        opening.serve(&WIRE, &hello, |_| {}).unwrap();
+        opening
+    }
+
     /// A client over a socket whose far end is returned (it must outlive the
     /// test, or the relay's writes find it closed), attached as one that asks
     /// for the session to be kept or as one that does not, and not yet told.
@@ -3705,8 +3702,7 @@ mod tests {
         sock.set_nonblocking(true).unwrap();
         let client = Client {
             sock,
-            open: true,
-            hello: Vec::new(),
+            opening: opened(),
             decoder: PacketDecoder::new(),
             out: Vec::new(),
             sent: 0,

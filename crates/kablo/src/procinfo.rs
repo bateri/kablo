@@ -32,13 +32,6 @@ const MAX_LAUNCH_NAME: usize = 255;
 #[cfg(target_os = "linux")]
 const ARG0_LIMIT: usize = 1024;
 
-/// What the terminal looks like now, looked at from outside: the same answer
-/// for every question that is put to it. See [`Watch`] for the one that asks
-/// again and again.
-pub fn look(master: BorrowedFd<'_>, shell_pid: u32) -> TerminalState {
-    Watch::default().look(master, shell_pid)
-}
-
 /// A look at the terminal that remembers the name it worked out, so that a
 /// program that stays in the foreground while it streams output has its
 /// command line read once, not on every look.
@@ -329,7 +322,7 @@ mod tests {
         request.argv = vec![b"/bin/sleep".to_vec(), b"5".to_vec()];
         request.cwd = Some(b"/".to_vec());
         let mut child = crate::pty::spawn(&pty.slave, &request).unwrap();
-        let state = look(pty.master.as_fd(), child.id());
+        let state = Watch::default().look(pty.master.as_fd(), child.id());
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(state.program.as_deref(), Some(&b"sleep"[..]));

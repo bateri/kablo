@@ -54,6 +54,11 @@ section is not released.
   reached (`ssh` words, or `relay` from a program on a server, or `here` when it is this one).
   `kablo bateri --hex` takes the words of a command written in hex, as the other machine's
   command line does.
+- **`kablo-proto` gains `tune` and `v1::Packet::error`.** `tune` is the rule for how large a
+  stream's window is (`Rtt`, `Tuner`, `START`, `LEAST`, `GAIN`, `RATES`), which both ends of a
+  stream apply: it was inside `kablo`, and a client that opens streams of its own takes it from
+  here, so its windows are the server's. It changes no byte of the wire. `Packet::error(session,
+  code, text)` makes an `error` packet, about a session or, with `None`, about the connection.
 
 ### Changed
 

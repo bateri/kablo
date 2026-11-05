@@ -121,12 +121,8 @@ impl Conversations {
         Conversations::default()
     }
 
-    /// How many conversations there are, in whatever state.
-    pub fn len(&self) -> usize {
-        self.list.len()
-    }
-
     /// Whether there are none.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
@@ -302,7 +298,7 @@ impl Conversations {
 
     /// A stream message from the sender about its stream. One that is not
     /// `close` is not valid before the conversation is joined.
-    pub fn from_sender(
+    pub fn sender_says(
         &mut self,
         sender: u64,
         stream: u32,
@@ -328,7 +324,7 @@ impl Conversations {
 
     /// A stream message from the app about its stream `stream`, which is one
     /// of a conversation.
-    pub fn from_app(&mut self, stream: u32, message: wire::Message, said: &mut Said) {
+    pub fn app_says(&mut self, stream: u32, message: wire::Message, said: &mut Said) {
         if let Some(i) = self.joined_by_app(stream) {
             self.pass(i, End::App, message, said);
         }
@@ -554,14 +550,14 @@ mod tests {
         // The sender gave 100 (the app may send it that many), the app 50.
         let mut table = joined(100, 50);
         let mut said = Said::default();
-        table.from_sender(SENDER, 1, data(50), &mut said);
-        table.from_app(5, data(100), &mut said);
+        table.sender_says(SENDER, 1, data(50), &mut said);
+        table.app_says(5, data(100), &mut said);
         assert_eq!(said.to_app, [wire::Packet::new(5, data(50))]);
         assert_eq!(said.to_senders, [(SENDER, wire::Packet::new(1, data(100)))]);
         // Out of window: a credit makes room.
         said = Said::default();
-        table.from_app(5, wire::Message::Credit(10), &mut said);
-        table.from_sender(SENDER, 1, data(10), &mut said);
+        table.app_says(5, wire::Message::Credit(10), &mut said);
+        table.sender_says(SENDER, 1, data(10), &mut said);
         assert_eq!(
             (said.to_app.len(), said.to_senders.len()),
             (1, 1),
@@ -574,7 +570,7 @@ mod tests {
     fn an_end_that_sends_more_than_it_was_given_loses_the_conversation() {
         let mut table = joined(100, 50);
         let mut said = Said::default();
-        table.from_sender(SENDER, 1, data(51), &mut said);
+        table.sender_says(SENDER, 1, data(51), &mut said);
         assert_eq!(said.to_app, [wire::Packet::new(5, wire::Message::Close)]);
         assert_eq!(
             said.to_senders,
@@ -596,13 +592,13 @@ mod tests {
             let mut said = Said::default();
             if matches!(message, wire::Message::Eof) {
                 // A second `eof`, and a `data` after the first.
-                table.from_sender(SENDER, 1, wire::Message::Eof, &mut said);
+                table.sender_says(SENDER, 1, wire::Message::Eof, &mut said);
                 said = Said::default();
-                table.from_sender(SENDER, 1, data(1), &mut said);
+                table.sender_says(SENDER, 1, data(1), &mut said);
             } else {
                 match from {
-                    End::Sender => table.from_sender(SENDER, 1, message, &mut said),
-                    End::App => table.from_app(5, message, &mut said),
+                    End::Sender => table.sender_says(SENDER, 1, message, &mut said),
+                    End::App => table.app_says(5, message, &mut said),
                 }
             }
             assert!(table.is_empty(), "{said:?}");
@@ -615,19 +611,19 @@ mod tests {
     fn a_conversation_ends_with_a_close_or_with_both_eofs() {
         let mut table = joined(100, 100);
         let mut said = Said::default();
-        table.from_sender(SENDER, 1, wire::Message::Eof, &mut said);
+        table.sender_says(SENDER, 1, wire::Message::Eof, &mut said);
         assert_eq!(table.joined(), 1);
-        table.from_app(5, data(3), &mut said);
-        table.from_app(5, wire::Message::Eof, &mut said);
+        table.app_says(5, data(3), &mut said);
+        table.app_says(5, wire::Message::Eof, &mut said);
         assert!(table.is_empty(), "both ends said they send no more");
         // Frames of a conversation that is over are ignored.
         said = Said::default();
-        table.from_app(5, wire::Message::Close, &mut said);
-        table.from_sender(SENDER, 1, wire::Message::Close, &mut said);
+        table.app_says(5, wire::Message::Close, &mut said);
+        table.sender_says(SENDER, 1, wire::Message::Close, &mut said);
         assert!(said.to_app.is_empty() && said.to_senders.is_empty());
 
         let mut table = joined(100, 100);
-        table.from_app(5, wire::Message::Close, &mut said);
+        table.app_says(5, wire::Message::Close, &mut said);
         assert_eq!(
             said.to_senders,
             [(SENDER, wire::Packet::new(1, wire::Message::Close))]
@@ -641,7 +637,7 @@ mod tests {
         let mut said = Said::default();
         table.begin(SENDER, 1, 10).unwrap();
         table.located(SENDER, 1, None, &mut said);
-        table.from_sender(SENDER, 1, wire::Message::Close, &mut said);
+        table.sender_says(SENDER, 1, wire::Message::Close, &mut said);
         assert!(table.is_empty() && said.to_senders.is_empty());
         // The app's late answer is a failed open.
         table.answer(5, 10, 1, 0, &mut said);
@@ -662,7 +658,7 @@ mod tests {
         let mut table = Conversations::new();
         let mut said = Said::default();
         table.begin(SENDER, 1, 10).unwrap();
-        table.from_sender(SENDER, 1, data(1), &mut said);
+        table.sender_says(SENDER, 1, data(1), &mut said);
         assert!(table.is_empty());
         assert_eq!(
             said.to_senders,

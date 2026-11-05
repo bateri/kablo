@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE, pattern};
 use kablo::streams::WINDOW;
-use kablo::tune;
 use kablo_proto::tlv;
+use kablo_proto::tune;
 use kablo_proto::v1::Exit;
 use kablo_proto::v1::stream::{self, FailCode, MAX_WINDOW};
 use kablo_proto::v1::{Message, Offers};

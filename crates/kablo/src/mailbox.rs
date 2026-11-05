@@ -51,8 +51,9 @@ use kablo_proto::v1::{ErrorCode, Message, Packet, Standing};
 use kablo_proto::{SessionId, WIRE};
 
 use crate::conversation::{Conversations, Said};
-use crate::handshake::{self, Step};
+use crate::handshake::{Opening, Served};
 use crate::origin::{self, Candidate, Origin};
+use crate::outbound::{self, Outbound};
 use crate::scan::{self, Scan};
 use crate::{sockdir, sys};
 
@@ -105,17 +106,11 @@ struct Sender {
     /// The process at the other end when it connected; `None` when the kernel
     /// would not say.
     pid: Option<u32>,
-    /// Bytes received before the handshake is complete.
-    hello: Vec<u8>,
-    open: bool,
+    opening: Opening,
     decoder: IncomingDecoder,
-    out: Vec<u8>,
-    sent: usize,
-    /// Bytes written to the socket since the connection began, for telling
-    /// where in `out` the frames of `bulk` are.
-    written: u64,
+    out: Outbound,
     /// The frames of a conversation's `data` waiting in `out`: where each ends
-    /// (in the bytes of `written`) and how large it is. They are kept in check
+    /// (in the bytes `out` has written) and how large it is. They are kept in check
     /// by the window the connection gave for them and not by [`MAX_OUT`],
     /// which is for what a connection asks for and does not read.
     bulk: VecDeque<(u64, usize)>,
@@ -129,22 +124,22 @@ struct Sender {
 
 impl Sender {
     fn pending(&self) -> usize {
-        self.out.len().saturating_sub(self.sent)
+        self.out.pending()
     }
 
     /// Queues a packet of the session channel.
     fn send(&mut self, packet: &Packet) {
-        let _ = packet.encode(&mut self.out);
+        let _ = packet.encode(self.out.buffer());
         self.limit();
     }
 
     /// Queues a packet of the stream channel.
     fn send_stream(&mut self, packet: &wire::Packet) {
-        let before = self.out.len();
-        let _ = packet.encode(wire::Side::Server, &mut self.out);
+        let before = self.pending();
+        let _ = packet.encode(wire::Side::Server, self.out.buffer());
         if matches!(packet.message, wire::Message::Data(_)) {
-            let size = self.out.len().saturating_sub(before);
-            let end = self.written + self.pending() as u64;
+            let size = self.pending().saturating_sub(before);
+            let end = self.out.written() + self.pending() as u64;
             self.bulk.push_back((end, size));
             self.bulk_bytes += size;
         }
@@ -169,31 +164,16 @@ impl Sender {
 
     /// Writes what the socket takes.
     fn flush(&mut self) {
-        while self.pending() > 0 {
-            let waiting = self.out.get(self.sent..).unwrap_or_default();
-            match sys::write_fd(self.sock.as_fd(), waiting) {
-                Ok(0) => break,
-                Ok(n) => {
-                    self.sent += n;
-                    self.written += n as u64;
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    self.dead = true;
-                    break;
-                }
-            }
+        let sock = self.sock.as_fd();
+        if !self.out.drain(&mut |bytes| sys::write_fd(sock, bytes)) {
+            self.dead = true;
         }
         while let Some(&(end, size)) = self.bulk.front() {
-            if end > self.written {
+            if end > self.out.written() {
                 break;
             }
             self.bulk_bytes = self.bulk_bytes.saturating_sub(size);
             self.bulk.pop_front();
-        }
-        if self.pending() == 0 {
-            self.out.clear();
-            self.sent = 0;
         }
     }
 
@@ -218,31 +198,21 @@ impl Sender {
     /// not act on is answered here.
     fn take(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut events = Vec::new();
-        if self.open {
-            self.decoder.push(bytes);
-        } else {
-            self.hello.extend_from_slice(bytes);
-            match handshake::serve(&WIRE, &self.hello) {
-                Ok(Step::Need) => return events,
-                Ok(Step::Done {
-                    reply, consumed, ..
-                }) => {
-                    self.out.extend_from_slice(&reply);
-                    let rest = self.hello.get(consumed..).unwrap_or_default().to_vec();
-                    self.decoder.push(&rest);
-                    self.hello = Vec::new();
-                    self.open = true;
-                }
-                Ok(Step::Refused { reply }) => {
-                    self.out.extend_from_slice(&reply);
-                    self.flush();
-                    self.dead = true;
-                    return events;
-                }
-                Err(_) => {
-                    self.dead = true;
-                    return events;
-                }
+        match self
+            .opening
+            .serve(&WIRE, bytes, |stream| self.decoder.push(stream))
+        {
+            Ok(Served::Waiting) => return events,
+            Ok(Served::Open(reply)) => self.out.push(&reply),
+            Ok(Served::Refused(reply)) => {
+                self.out.push(&reply);
+                self.flush();
+                self.dead = true;
+                return events;
+            }
+            Err(_) => {
+                self.dead = true;
+                return events;
             }
         }
         while !self.dead {
@@ -253,7 +223,7 @@ impl Sender {
                         message: Message::Pong(bytes),
                     }),
                     Message::Ask => events.push(Event::Ask(packet.session)),
-                    _ => self.send(&failure(
+                    _ => self.send(&Packet::error(
                         packet.session,
                         ErrorCode::BAD_REQUEST,
                         "a mailbox takes ask and open",
@@ -269,9 +239,11 @@ impl Sender {
                 // skips a frame it cannot read.
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(e) if e.is_recoverable() => {
-                    self.send(&failure(None, ErrorCode::BAD_REQUEST, "malformed message"))
-                }
+                Err(e) if e.is_recoverable() => self.send(&Packet::error(
+                    None,
+                    ErrorCode::BAD_REQUEST,
+                    "malformed message",
+                )),
                 // The framing itself is broken: there is no telling where the
                 // next frame starts.
                 Err(_) => self.dead = true,
@@ -485,7 +457,7 @@ impl Mailbox {
     /// ticket, or is about one a conversation has, is taken here (`held` is how
     /// many other streams the app has, for the limit on them); any other is
     /// given back for the streams the bridge keeps itself.
-    pub fn from_app(&mut self, packet: wire::Packet, held: usize) -> Option<wire::Packet> {
+    pub fn app_says(&mut self, packet: wire::Packet, held: usize) -> Option<wire::Packet> {
         let wire::Packet { stream, message } = packet;
         let mut said = Said::default();
         match message {
@@ -497,7 +469,7 @@ impl Mailbox {
                 if !self.conversations.owns(stream) {
                     return Some(wire::Packet { stream, message });
                 }
-                self.conversations.from_app(stream, message, &mut said);
+                self.conversations.app_says(stream, message, &mut said);
             }
         }
         self.say(said);
@@ -559,12 +531,9 @@ impl Mailbox {
             id: self.next_sender,
             sock,
             pid,
-            hello: Vec::new(),
-            open: false,
+            opening: Opening::default(),
             decoder: IncomingDecoder::new(),
-            out: Vec::new(),
-            sent: 0,
-            written: 0,
+            out: Outbound::new(outbound::CHUNK),
             bulk: VecDeque::new(),
             bulk_bytes: 0,
             highest: 0,
@@ -604,7 +573,7 @@ impl Mailbox {
             }
         };
         if let (Some(why), Some(sender)) = (refused, self.senders.get_mut(i)) {
-            sender.send(&failure(None, ErrorCode::UNAVAILABLE, &why));
+            sender.send(&Packet::error(None, ErrorCode::UNAVAILABLE, &why));
         }
     }
 
@@ -658,7 +627,7 @@ impl Mailbox {
             | wire::Message::Eof
             | wire::Message::Close) => {
                 self.conversations
-                    .from_sender(id, stream, message, &mut said);
+                    .sender_says(id, stream, message, &mut said);
             }
             _ => {}
         }
@@ -724,16 +693,6 @@ impl Mailbox {
 impl Drop for Mailbox {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn failure(session: Option<SessionId>, code: ErrorCode, text: &str) -> Packet {
-    Packet {
-        session,
-        message: Message::Error {
-            code,
-            text: text.to_owned(),
-        },
     }
 }
 

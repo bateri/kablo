@@ -1,24 +1,28 @@
 //! Driving a session from the machine it runs on, without attaching to it:
-//! `kablo send`, `send-key`, `capture`, `wait`, `label` and `end`, `kablo here`
-//! (which asks the process table and no relay).
+//! `kablo send`, `send-key`, `capture`, `wait`, `label` and `end`, and `kablo
+//! here`.
 //!
 //! These are the programs' commands (an agent, a script) and they are not
 //! clients in the sense of a terminal app: they never attach, so the relay
 //! goes on answering what the program asks its terminal and the app that shows
 //! the session is not disturbed (`docs/PROTOCOL.md`, section 5, Driving a
-//! session without attaching). Each one starts the same way. It scans the
-//! socket directory, which tells it every session's id, label and relay
-//! version in one pass, finds the one it was told to work on, and stops when
-//! that session's relay is from before these messages: an older relay skips a
-//! kind it does not know, so a `wait` would be waited out for ever and a `send`
-//! would be dropped without a word.
+//! session without attaching). Each one starts the same way. It looks in the
+//! socket directory's files for the sessions the name it was told may be about
+//! (with no name, every running session), asks their relays how they stand,
+//! and finds the one it was told to work on, or, with no name, the one the
+//! process table says this process runs in. Then it stops if that session's
+//! relay is from before these messages: an older relay skips a kind it does not
+//! know, so a `wait` would be waited out for ever and a `send` would be dropped
+//! without a word. (`here` asks no more than that, and so answers for an older
+//! relay too.)
 //!
-//! The conversation itself is a [`Link`], the same one the bridge keeps for an
-//! app: when a relay is replaced (`kablo upgrade`) a `read` and a `wait` are
+//! The conversation itself is a [`Link`], the same one the bridge keeps for a
+//! client: when a relay is replaced (`kablo upgrade`) a `read` and a `wait` are
 //! asked again of the new one, and a `write` never is, because the keys would be
-//! pressed twice. Nothing here sets a timer while it goes on: the only limit is
-//! the one `wait --for` was given, which is the poll's timeout, and the link's
-//! own for a session that does not answer.
+//! pressed twice. Nothing here sets a timer while it goes on: the limits are the
+//! one `wait --for` was given, the five seconds `end` allows the program, and
+//! the link's own for a session that does not answer; each is the poll's
+//! timeout.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};

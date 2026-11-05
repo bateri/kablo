@@ -30,7 +30,7 @@
 //! window larger than that only fills the carrier's queues, which typing on
 //! the same connection then waits behind. So a stream's window is what the
 //! link needs, measured by this end from its own credit: how long it takes to
-//! come back as bytes, and the rate they come at ([`crate::tune`]; a new
+//! come back as bytes, and the rate they come at ([`kablo_proto::tune`]; a new
 //! stream starts at what the last one learned, or [`Config::start`]). That is
 //! within a part of [`Config::budget`],
 //! which the streams of a connection share equally, at most [`Config::window`]
@@ -134,6 +134,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use kablo_proto::tune::{self, Rtt, Tuner};
 use kablo_proto::v1::Exit;
 use kablo_proto::v1::stream::{
     CONNECT_TIMEOUT, Command, FailCode, MAX_CONNECTING, MAX_DATA, MAX_HOST, MAX_STREAMS,
@@ -144,7 +145,6 @@ use crate::dial::{self, Refusal, Target};
 use crate::outbound::Frames;
 use crate::process::{self, COMMAND_KILL_WAIT, Pipes, Program};
 use crate::sys;
-use crate::tune::{self, Rtt, Tuner};
 
 /// Bytes of `data` frames that may wait for the wire before sockets are not
 /// read.

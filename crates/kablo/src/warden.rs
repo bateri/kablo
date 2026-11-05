@@ -10,14 +10,16 @@
 //! **Its code reaches a running session only by renewal.** Nothing starts a
 //! new warden for a session that has a shell: a new release's relay is
 //! started by the old release's warden, and an update never touches the
-//! shell's parent. So this file is std and `libc` only (through `sys`), panics
-//! nowhere (`unwrap`, `expect` and indexing are denied in the workspace),
-//! speaks only the inner wire, and holds no logic that could be wrong in a way
-//! a relay could not work around. Behaviour belongs in the relay. What cannot
-//! change is the way out: a warden of any release must be able to renew into
-//! a later one and a later one must be able to take over from it (see
-//! *Renewing*), because a build that lost either would leave every warden
-//! started from the builds before it where it is.
+//! shell's parent. So this file keeps to std, `libc` (through `sys`) and the
+//! few parts of this crate a warden cannot do without (`journal`, `pty`,
+//! `sockdir`, `inner`, `handshake`), panics nowhere (`unwrap`, `expect` and
+//! indexing are denied in the workspace), speaks the inner wire to its relays
+//! (and reads, once, the `new` it was started with), and holds no logic that
+//! could be wrong in a way a relay could not work around. Behaviour belongs in
+//! the relay. What cannot change is the way out: a warden of any release must
+//! be able to renew into a later one and a later one must be able to take over
+//! from it (see *Renewing*), because a build that lost either would leave every
+//! warden started from the builds before it where it is.
 //!
 //! **Replacing the relay.** A relay that was asked to (`upgrade`) hands the
 //! request on; the warden checks the binary named, starts it as a *second*
