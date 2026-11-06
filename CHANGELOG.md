@@ -26,6 +26,23 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`bateri split --float` opens a pane that floats over its tab, and `bateri move pane` lifts, moves,
+  resizes and sets one back.** `split [PANE | --tab TAB] --float [--at X,Y] [--size W,H]` opens the
+  pane over the tab of PANE (the caller's own with none named) or the tab `--tab` names; it goes
+  with no `--left`, `--right`, `--above`, `--below` and no `--ratio`, and `--at` and `--size` go with
+  `--float`. `move pane [PANE] --float [--at X,Y] [--size W,H]` lifts a pane of the flat area,
+  `move pane [PANE] --at X,Y` and `--size W,H` (one of them at least, both allowed) move and resize
+  a floating one, and `move pane [PANE] --dock` sets it back in the flat area. Each stands alone: with
+  `--beside`, `--tab`, `--new-tab` or a side it is 64, as is `--float` with `--dock`, and `--dock`
+  with `--at` or `--size`. `X,Y` is the corner and `W,H` the size, whole percents of the tab from 0
+  to 100, written with no sign, space or leading zero (`--at 10,20`). Whether a pane is floating
+  already, or can be, is the app's to say, as 64. `tab` and `window` take none of these flags. In
+  the app channel (`kablo-bateri`, still version 2) a `place` takes the new keys `float`, `at` and
+  `size`, and a `move` takes `float`, `dock`, `at` and `size`; the frozen `V2_*` texts are read as they
+  were, and an app from before this change answers the new keys with "takes no `float`" (64).
+
 ## [0.6.1] - 2026-11-05
 
 ### Fixed

@@ -5,7 +5,8 @@
 use std::ffi::OsString;
 
 use kablo_bateri::message::{
-    Arrange, Format, Home, MAX_STEPS, Placed, Reply, Request, Subject, TabHome, WindowHome,
+    Arrange, Extent, Format, Frame, Home, MAX_STEPS, Placed, Reply, Request, Spot, Subject,
+    TabHome, WindowHome,
 };
 use kablo_bateri::{Anchor, Id, IdKind, Side, paths};
 
@@ -717,6 +718,10 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
     let mut new_tab = false;
     let mut label = String::new();
     let mut place = Where::default();
+    let mut float = false;
+    let mut dock = false;
+    let mut corner: Option<Spot> = None;
+    let mut size: Option<Extent> = None;
     let mut at = 0;
     while let Some(rest) = args.get(at..).filter(|rest| !rest.is_empty()) {
         if let Some(used) = place.take(rest)? {
@@ -728,6 +733,23 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         at += 1;
         match arg {
             "--left" | "--right" | "--above" | "--below" => take_side(&mut side, arg)?,
+            "--float" => float = true,
+            "--dock" => dock = true,
+            "--at" | "--size" => {
+                let value = next.ok_or_else(|| {
+                    Exit::mistake(if arg == "--at" {
+                        "--at takes X,Y"
+                    } else {
+                        "--size takes W,H"
+                    })
+                })?;
+                at += 1;
+                take_frame(&mut corner, &mut size, arg, value)?;
+            }
+            _ if arg.starts_with("--at=") || arg.starts_with("--size=") => {
+                let (name, value) = arg.split_once('=').unwrap_or_default();
+                take_frame(&mut corner, &mut size, name, value)?;
+            }
             "--beside" => {
                 let value =
                     next.ok_or_else(|| Exit::mistake("--beside takes the pane to go beside"))?;
@@ -797,17 +819,39 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
         .iter()
         .filter(|asked| **asked)
         .count();
-    match asked {
-        0 => {
+    let framed = corner.is_some() || size.is_some();
+    // Floating a pane, taking it back, and moving or resizing a floating one are not a place the
+    // pane goes to: each stands alone.
+    let floating = float || dock || framed;
+    if floating {
+        if float && dock {
             return Err(Exit::mistake(
-                "move needs a place: --beside PANE and a side, --tab TAB or --new-tab",
+                "a pane floats (--float) or docks (--dock), not both",
             ));
         }
-        1 => {}
-        _ => {
+        if dock && framed {
             return Err(Exit::mistake(
-                "a pane goes beside another (--beside), into a tab (--tab) or into a new tab (--new-tab): one of them",
+                "--dock puts a pane back in the flat area: it goes with no --at and no --size",
             ));
+        }
+        if asked > 0 || side.is_some() {
+            return Err(Exit::mistake(
+                "--float, --dock, --at and --size go with no --beside, --tab, --new-tab and no side: a pane moves in one step, and floats in another",
+            ));
+        }
+    } else {
+        match asked {
+            0 => {
+                return Err(Exit::mistake(
+                    "move needs a place: --beside PANE and a side, --tab TAB, --new-tab, or --float, --dock, --at and --size for a floating pane",
+                ));
+            }
+            1 => {}
+            _ => {
+                return Err(Exit::mistake(
+                    "a pane goes beside another (--beside), into a tab (--tab) or into a new tab (--new-tab): one of them",
+                ));
+            }
         }
     }
     if pane.is_empty() {
@@ -819,7 +863,16 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
     let Some(moved) = anchor_of(&pane) else {
         return Err(unread());
     };
-    let arrange = if new_tab {
+    let arrange = if floating {
+        let frame = Frame { at: corner, size };
+        if float {
+            Arrange::Float { pane: moved, frame }
+        } else if dock {
+            Arrange::Dock(moved)
+        } else {
+            Arrange::Reframe { pane: moved, frame }
+        }
+    } else if new_tab {
         if side.is_some() {
             return Err(Exit::mistake("a new tab has no side"));
         }
@@ -881,6 +934,34 @@ fn move_pane(ctx: &Ctx, io: &mut Io<'_>, args: &[String]) -> Done {
                 let _ = writeln!(io.out);
             }
         }
+    }
+    Ok(())
+}
+
+/// The corner (`--at X,Y`) or the size (`--size W,H`) of a pane that floats: each once, in whole
+/// percents of the tab.
+fn take_frame(
+    corner: &mut Option<Spot>,
+    size: &mut Option<Extent>,
+    name: &str,
+    value: &str,
+) -> Done {
+    if name == "--at" {
+        if corner.is_some() {
+            return Err(Exit::mistake("name one --at"));
+        }
+        *corner = Some(Spot::parse(value).ok_or_else(|| {
+            Exit::mistake("--at is X,Y: two whole percents of the tab from 0 to 100 (--at 10,20)")
+        })?);
+    } else {
+        if size.is_some() {
+            return Err(Exit::mistake("name one --size"));
+        }
+        *size = Some(Extent::parse(value).ok_or_else(|| {
+            Exit::mistake(
+                "--size is W,H: two whole percents of the tab from 0 to 100 (--size 50,40)",
+            )
+        })?);
     }
     Ok(())
 }

@@ -210,6 +210,8 @@ pub fn unread() -> Exit {
 const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--above|--below] [--ratio PERCENT]
                     [--label TEXT] [--cwd DIR] [--keep-open] [--wait] [--focus] [--json]
                     [-S SERVER] [-- PROGRAM [ARG]...]
+       bateri split [PANE | --tab TAB] --float [--at X,Y] [--size W,H] [--label TEXT] [--cwd DIR]
+                    [--keep-open] [--wait] [--focus] [--json] [-S SERVER] [-- PROGRAM [ARG]...]
        bateri tab [PANE] [--group GROUP | --window WINDOW] [--new-group NAME] [--label TEXT]
                   [--cwd DIR] [--keep-open] [--wait] [--focus] [--json] [-S SERVER]
                   [-- PROGRAM [ARG]...]
@@ -231,9 +233,16 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri move pane [PANE] --tab TAB [--left|--right|--above|--below] [--json]
        bateri move pane [PANE] --new-tab [NAME] [--group GROUP | --window WINDOW] [--new-group NAME]
                                [--json]
+       bateri move pane [PANE] --float [--at X,Y] [--size W,H] [--json]
+       bateri move pane [PANE] --at X,Y [--size W,H] [--json]
+       bateri move pane [PANE] --size W,H [--json]
+       bateri move pane [PANE] --dock [--json]
        bateri move tab [TAB] --group GROUP | --window WINDOW | --new-group NAME [--window WINDOW] [--json]
        bateri resize [PANE] --left|--right|--above|--below [--by N]
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
+A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
+sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
+tab, 0 to 100, from its top left corner.
 A pane is p and its number (p7); with none named it is the one this runs in. One of another
 machine is written with the machine after an @ (p9@prod), as bateri ls writes it; -S starts a
 terminal on a server, or on this computer from a server (-S @local) (full level only).

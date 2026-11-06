@@ -40,6 +40,7 @@ fn place(terminal: u64, anchor: u64) -> Place {
         ratio: None,
         keep_open: false,
         focus: false,
+        float: None,
         home: Home::default(),
         fresh: None,
         shell: None,

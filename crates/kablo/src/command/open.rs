@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kablo_bateri::message::{Home, Placed, Reach, Reply, Request, WindowHome};
+use kablo_bateri::message::{Extent, Frame, Home, Placed, Reach, Reply, Request, Spot, WindowHome};
 use kablo_bateri::{Anchor, Id, Landed, Side, Terminal, is_machine, paths};
 use kablo_proto::SessionId;
 use kablo_proto::v1::NewSession;
@@ -104,6 +104,10 @@ struct Wants {
     anchor: Option<String>,
     side: Option<Side>,
     ratio: Option<u8>,
+    /// `--float`, and where (`--at`) and how big (`--size`): the pane floats over its tab.
+    float: bool,
+    at: Option<Spot>,
+    size: Option<Extent>,
     cwd: Option<String>,
     keep: bool,
     wait: bool,
@@ -162,6 +166,9 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
         anchor: None,
         side: None,
         ratio: None,
+        float: false,
+        at: None,
+        size: None,
         cwd: None,
         keep: false,
         wait: false,
@@ -225,6 +232,40 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
                     }
                     _ => return Err(Exit::mistake("--ratio is a percent from 1 to 99")),
                 };
+            }
+            "--float" => {
+                if mode != Mode::Split {
+                    return Err(Exit::mistake(format!(
+                        "{word} takes no --float: a pane floats (split --float)"
+                    )));
+                }
+                wants.float = true;
+            }
+            _ if name == "--at" || name == "--size" => {
+                if mode != Mode::Split {
+                    return Err(Exit::mistake(format!("{word} takes no {name}")));
+                }
+                let given = if name == "--at" {
+                    wants.at.is_some()
+                } else {
+                    wants.size.is_some()
+                };
+                if given {
+                    return Err(Exit::mistake(format!("name one {name}")));
+                }
+                if name == "--at" {
+                    let text = value(args, &mut at, "--at", "--at takes X,Y")?;
+                    wants.at = Some(Spot::parse(&text).ok_or_else(|| {
+                        Exit::mistake(
+                            "--at is X,Y: two whole percents of the tab from 0 to 100 (--at 10,20)",
+                        )
+                    })?);
+                } else {
+                    let text = value(args, &mut at, "--size", "--size takes W,H")?;
+                    wants.size = Some(Extent::parse(&text).ok_or_else(|| {
+                        Exit::mistake("--size is W,H: two whole percents of the tab from 0 to 100 (--size 50,40)")
+                    })?);
+                }
             }
             _ if name == "--cwd" => {
                 let text = value(args, &mut at, "--cwd", "--cwd takes a directory")?;
@@ -326,6 +367,17 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
             }
         }
         at += 1;
+    }
+    if wants.float {
+        if wants.side.is_some() || wants.ratio.is_some() {
+            return Err(Exit::mistake(
+                "--float is no split: it goes with no --left, --right, --above, --below and no --ratio",
+            ));
+        }
+    } else if wants.at.is_some() || wants.size.is_some() {
+        return Err(Exit::mistake(
+            "--at and --size go with --float (split --float --at 10,20 --size 50,40)",
+        ));
     }
     if mode != Mode::Split {
         wants.side = Some(Side::Tab);
@@ -806,6 +858,10 @@ impl Job<'_> {
             ratio: wants.ratio,
             keep_open: wants.keep,
             focus: wants.focus,
+            float: wants.float.then_some(Frame {
+                at: wants.at,
+                size: wants.size,
+            }),
             home: Home {
                 tab: wants.tab,
                 group: wants.group,

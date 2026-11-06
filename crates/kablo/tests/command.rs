@@ -13,7 +13,9 @@
 mod common;
 mod stage;
 
-use kablo_bateri::message::{Arrange, Home, Request, Subject, TabHome, WindowHome};
+use kablo_bateri::message::{
+    Arrange, Extent, Frame, Home, Request, Spot, Subject, TabHome, WindowHome,
+};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
 use stage::{Stage, parse_told};
 
@@ -382,6 +384,51 @@ fn the_layout_verbs_are_the_apps_alone_and_say_what_they_asked() {
             },
         ),
         (
+            vec!["move", "pane", "p9", "--float"],
+            Arrange::Float {
+                pane: pane(9),
+                frame: Frame::default(),
+            },
+        ),
+        (
+            vec!["move", "pane", "--float", "--at", "10,20", "--size=50,40"],
+            Arrange::Float {
+                pane: pane(4),
+                frame: Frame {
+                    at: Some(Spot { x: 10, y: 20 }),
+                    size: Some(Extent {
+                        width: 50,
+                        height: 40,
+                    }),
+                },
+            },
+        ),
+        (vec!["move", "pane", "p9", "--dock"], Arrange::Dock(pane(9))),
+        (vec!["move", "pane", "--dock"], Arrange::Dock(pane(4))),
+        (
+            vec!["move", "pane", "p9", "--at=0,100"],
+            Arrange::Reframe {
+                pane: pane(9),
+                frame: Frame {
+                    at: Some(Spot { x: 0, y: 100 }),
+                    size: None,
+                },
+            },
+        ),
+        (
+            vec!["move", "pane", "p9", "--size", "30,100", "--at", "5,5"],
+            Arrange::Reframe {
+                pane: pane(9),
+                frame: Frame {
+                    at: Some(Spot { x: 5, y: 5 }),
+                    size: Some(Extent {
+                        width: 30,
+                        height: 100,
+                    }),
+                },
+            },
+        ),
+        (
             vec!["resize", "p9", "--left", "--by", "3"],
             Arrange::Resize {
                 pane: Some(pane(9)),
@@ -474,6 +521,31 @@ fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
         &["move", "pane", "p9", "--beside", "p9", "--right"],
         &["move", "pane", "p9", "--beside", "p3", "--right", "--left"],
         &["move", "pane", "p9", "p8", "--beside", "p3", "--right"],
+        &["move", "pane", "p9", "--float", "--dock"],
+        &["move", "pane", "p9", "--dock", "--at", "1,1"],
+        &["move", "pane", "p9", "--dock", "--size", "1,1"],
+        &["move", "pane", "p9", "--float", "--beside", "p3", "--right"],
+        &["move", "pane", "p9", "--float", "--tab", "t3"],
+        &["move", "pane", "p9", "--float", "--new-tab"],
+        &["move", "pane", "p9", "--float", "--new-tab", "web"],
+        &["move", "pane", "p9", "--float", "--right"],
+        &["move", "pane", "p9", "--float", "--group", "g1"],
+        &["move", "pane", "p9", "--at", "1,1", "--tab", "t3"],
+        &["move", "pane", "p9", "--dock", "--new-tab"],
+        &["move", "pane", "p9", "--at", "101,1"],
+        &["move", "pane", "p9", "--at", "1"],
+        &["move", "pane", "p9", "--at", "01,1"],
+        &["move", "pane", "p9", "--at", "1, 1"],
+        &["move", "pane", "p9", "--at"],
+        &["move", "pane", "p9", "--size"],
+        &["move", "pane", "p9", "--size", "a,b"],
+        &["move", "pane", "p9", "--size=50"],
+        &["move", "pane", "p9", "--at", "1,1", "--at", "2,2"],
+        &["move", "pane", "p9", "--size", "1,1", "--size=2,2"],
+        &["move", "pane", "p9", "--float", "p8"],
+        &["move", "pane", "p9", "--float=yes"],
+        &["move", "tab", "t3", "--float"],
+        &["move", "tab", "t3", "--group", "g1", "--at", "1,1"],
         &["resize", "p9"],
         &["resize", "p9", "--left", "--right"],
         &["resize", "p9", "--left", "--by", "0"],
@@ -490,6 +562,47 @@ fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
         "nothing reached the bateri app: {:?}",
         stage.told
     );
+}
+
+#[test]
+fn a_move_that_floats_says_nothing_of_a_place_and_its_json_says_where_the_pane_is() {
+    let mut stage = Stage::with_app(MOVED);
+    let said = stage.run_in(
+        "p4",
+        &["move", "pane", "p9", "--float", "--at", "10,20", "--json"],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(said.out.starts_with("{\"pane\":\"p9\""), "{}", said.out);
+    let said = stage.run_in("p4", &["move", "pane", "p9", "--dock"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "", "a move that is no new tab prints nothing");
+    assert_eq!(stage.told.len(), 2);
+    // What the bateri app says of a pane that is in the wrong layer is the mistake it is: 64, and its
+    // words, as `swap`'s is when two panes are in no one tab.
+    for (reply, args) in [
+        (
+            "bateri 2\nerror usage p9 is not floating\n",
+            &["move", "pane", "p9", "--dock"][..],
+        ),
+        (
+            "bateri 2\nerror usage p9 floats already\n",
+            &["move", "pane", "p9", "--float"],
+        ),
+    ] {
+        stage.app_says(reply);
+        let said = stage.run_in("p4", args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+        assert!(
+            said.err.starts_with("bateri: p9 "),
+            "{args:?}: {}",
+            said.err
+        );
+    }
+    // An old bateri app does not know the lines: it says so, and that is 64 as well.
+    stage.app_says("bateri 2\nerror usage `move` takes no `float`\n");
+    let said = stage.run_in("p4", &["move", "pane", "p9", "--float"]);
+    assert_eq!(said.status, 64, "{}", said.err);
+    assert_eq!(said.err, "bateri: `move` takes no `float`\n");
 }
 
 #[test]

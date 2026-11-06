@@ -33,6 +33,14 @@
 //! new tab's lines name. A `move` of a tab with no `id` is the caller's. Every `move` is answered
 //! `ok placed`: where the tab stands now, which it may have made or carried to another window.
 //!
+//! A pane may float over its tab instead of standing in it. A `place` with `float yes` opens its pane so,
+//! in the anchor's tab or the one `tab` names, and goes with no `side` and no `ratio`. A `move` of a
+//! pane with `float yes` floats one that stands in the tab; with `dock yes` it takes a floating one back
+//! to the flat area; with neither, `at` and `size` alone move or resize a floating pane. Each of these
+//! stands alone, with no `beside`, `side`, `tab` or line of a new tab. `at X,Y` is the corner and
+//! `size W,H` the size, in whole percents of the tab from 0 to 100 (`at 10,20`, `size 50,40`); what a
+//! `float` leaves out is the bateri app's to choose, and a card that would not fit is held inside the tab.
+//!
 //! A pane for a terminal that runs on another machine than the caller's is a `place` with the
 //! `server` line (`server prod`: the name `ssh` takes), and the `ssh` verb asks how to reach that
 //! server (`ssh`, then `server prod`); its reply is the one word `relay` ([`Reach`]), or `here`
@@ -173,6 +181,127 @@ impl Format {
     }
 }
 
+/// The most a corner or a size of a floating pane is: the whole of the tab, in percent.
+pub const MOST_PERCENT: u8 = 100;
+
+/// A pair of whole percents of the tab, `10,20`: no sign, no space, no leading zero.
+fn percents(value: &str) -> Option<(u8, u8)> {
+    let (first, second) = value.split_once(',')?;
+    let one = |text: &str| {
+        text.parse::<u8>()
+            .ok()
+            .filter(|percent| *percent <= MOST_PERCENT && percent.to_string() == text)
+    };
+    Some((one(first)?, one(second)?))
+}
+
+/// Where the top left corner of a floating pane is, in percent of its tab from the tab's top left:
+/// `--at 10,20` is `x` 10, `y` 20. A card that would reach beyond the tab is held inside it by the
+/// bateri app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spot {
+    pub x: u8,
+    pub y: u8,
+}
+
+impl Spot {
+    /// `X,Y`, each from 0 to 100.
+    pub fn parse(value: &str) -> Option<Spot> {
+        percents(value).map(|(x, y)| Spot { x, y })
+    }
+}
+
+impl std::fmt::Display for Spot {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{},{}", self.x, self.y)
+    }
+}
+
+/// How big a floating pane is, in percent of its tab: `--size 50,40` is `width` 50, `height` 40.
+/// The bateri app never goes under the least a pane can be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub width: u8,
+    pub height: u8,
+}
+
+impl Extent {
+    /// `W,H`, each from 0 to 100.
+    pub fn parse(value: &str) -> Option<Extent> {
+        percents(value).map(|(width, height)| Extent { width, height })
+    }
+}
+
+impl std::fmt::Display for Extent {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{},{}", self.width, self.height)
+    }
+}
+
+/// What a floating pane is asked for: a corner and a size, each or neither. What is not asked is
+/// the bateri app's to choose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Frame {
+    pub at: Option<Spot>,
+    pub size: Option<Extent>,
+}
+
+impl Frame {
+    /// Whether neither a corner nor a size is asked for.
+    pub fn is_empty(&self) -> bool {
+        self.at.is_none() && self.size.is_none()
+    }
+
+    /// What a request this writes must hold so that it reads back: no percent over 100.
+    fn check(&self) -> Result<(), Failure> {
+        let over = self.at.is_some_and(|at| at.x.max(at.y) > MOST_PERCENT)
+            || self
+                .size
+                .is_some_and(|size| size.width.max(size.height) > MOST_PERCENT);
+        if over {
+            return Err(Failure::usage("a corner and a size are 0 to 100 percent"));
+        }
+        Ok(())
+    }
+
+    /// The `at` and `size` lines, in the order they are read.
+    fn push(&self, out: &mut String) -> Result<(), Failure> {
+        self.check()?;
+        if let Some(at) = self.at {
+            push(out, "at", &at.to_string())?;
+        }
+        if let Some(size) = self.size {
+            push(out, "size", &size.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// The `at` and `size` lines of `fields`.
+    fn of(fields: &Fields<'_>) -> Result<Frame, Failure> {
+        let at = fields
+            .get("at")
+            .map(|value| {
+                Spot::parse(value).ok_or_else(|| {
+                    Failure::usage(format!(
+                        "`at` is X,Y, two whole percents of the tab from 0 to 100 (`10,20`), not `{value}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        let size = fields
+            .get("size")
+            .map(|value| {
+                Extent::parse(value).ok_or_else(|| {
+                    Failure::usage(format!(
+                        "`size` is W,H, two whole percents of the tab from 0 to 100 (`50,40`), not `{value}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(Frame { at, size })
+    }
+}
+
 /// A pane for a terminal the server has started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
@@ -190,6 +319,9 @@ pub struct Place {
     pub keep_open: bool,
     /// The pane takes the keyboard.
     pub focus: bool,
+    /// The pane floats over the tab it opens in (the anchor's, or the one `home.tab` names), where
+    /// and as big as this says. It is no split: it goes with no `side` and no `ratio`.
+    pub float: Option<Frame>,
     /// Where else than beside the anchor, and the label.
     pub home: Home,
     /// The terminal is not started: the bateri app opens an ordinary pane of this computer, its shell started
@@ -460,6 +592,12 @@ pub enum Arrange {
         side: Side,
         steps: u8,
     },
+    /// A flat pane floats over its own tab, where and as big as `frame` says.
+    Float { pane: Anchor, frame: Frame },
+    /// A floating pane goes back to the flat area of its tab, where the bateri app puts it.
+    Dock(Anchor),
+    /// A floating pane moves or changes its size: `frame` holds one of them at least.
+    Reframe { pane: Anchor, frame: Frame },
 }
 
 /// How a pane landed, as the reply to a [`Place`] says it.
@@ -580,6 +718,15 @@ impl Request {
                 }
                 if place.focus {
                     push(&mut out, "focus", "yes")?;
+                }
+                if let Some(frame) = &place.float {
+                    if place.side.is_some() || place.ratio.is_some() {
+                        return Err(Failure::usage(
+                            "`float` is no split: it goes with no `side` and no `ratio`",
+                        ));
+                    }
+                    push(&mut out, "float", "yes")?;
+                    frame.push(&mut out)?;
                 }
                 if let Some(directory) = &place.fresh {
                     if !directory.starts_with('/') {
@@ -769,6 +916,27 @@ fn encode_arrange(out: &mut String, arrange: &Arrange) -> Result<(), Failure> {
             }
             push(out, "side", pane_side(*side)?.word())?;
             push(out, "steps", &steps.to_string())?;
+        }
+        Arrange::Float { pane, frame } => {
+            out.push_str("move\n");
+            push(out, "terminal", &pane.to_string())?;
+            push(out, "float", "yes")?;
+            frame.push(out)?;
+        }
+        Arrange::Dock(pane) => {
+            out.push_str("move\n");
+            push(out, "terminal", &pane.to_string())?;
+            push(out, "dock", "yes")?;
+        }
+        Arrange::Reframe { pane, frame } => {
+            if frame.is_empty() {
+                return Err(Failure::usage(
+                    "a floating pane moves or resizes: `at` or `size`",
+                ));
+            }
+            out.push_str("move\n");
+            push(out, "terminal", &pane.to_string())?;
+            frame.push(out)?;
         }
     }
     Ok(())
@@ -1007,6 +1175,9 @@ fn read_request<'a>(
                     "ratio",
                     "keep-open",
                     "focus",
+                    "float",
+                    "at",
+                    "size",
                     "fresh",
                     "shell",
                     "server",
@@ -1057,6 +1228,18 @@ fn read_request<'a>(
                     "`server` and `fresh` do not go together: a terminal on a server is started",
                 ));
             }
+            let float = if fields.flag("float")? {
+                if side.is_some() || ratio.is_some() {
+                    return Err(Failure::usage(
+                        "`float` is no split: it goes with no `side` and no `ratio`",
+                    ));
+                }
+                Some(Frame::of(&fields)?)
+            } else if fields.get("at").is_some() || fields.get("size").is_some() {
+                return Err(Failure::usage("`at` and `size` go with `float`"));
+            } else {
+                None
+            };
             Ok(Request::Place(Place {
                 terminal: fields.terminal("terminal")?,
                 anchor: fields
@@ -1067,6 +1250,7 @@ fn read_request<'a>(
                 ratio,
                 keep_open: fields.flag("keep-open")?,
                 focus: fields.flag("focus")?,
+                float,
                 home,
                 fresh: fields
                     .get("fresh")
@@ -1267,8 +1451,15 @@ fn read_arrange<'a>(
                     "new-group",
                     "window",
                     "label",
+                    "float",
+                    "dock",
+                    "at",
+                    "size",
                 ],
             )?;
+            let float = fields.flag("float")?;
+            let dock = fields.flag("dock")?;
+            let framed = fields.get("at").is_some() || fields.get("size").is_some();
             let into_tab = id_field(&fields, "tab", IdKind::Tab)?;
             let group = id_field(&fields, "group", IdKind::Group)?;
             let window = id_field(&fields, "window", IdKind::Window)?;
@@ -1278,6 +1469,11 @@ fn read_arrange<'a>(
                 let Subject::Tab(tab) = subject_of(&fields)? else {
                     return Err(Failure::usage("`move` moves a pane or a tab"));
                 };
+                if float || dock || framed {
+                    return Err(Failure::usage(
+                        "`float`, `dock`, `at` and `size` are for a pane, not a tab",
+                    ));
+                }
                 if label.is_some() || into_tab.is_some() {
                     return Err(Failure::usage(
                         "a tab goes to a `group`, a `window` or a `new-group`, and its label is a `rename`'s",
@@ -1300,6 +1496,39 @@ fn read_arrange<'a>(
                     }
                 };
                 return Ok(Arrange::MoveTab { tab, to });
+            }
+            if float || dock || framed {
+                if float && dock {
+                    return Err(Failure::usage(
+                        "a pane floats or docks, not both: `float` and `dock` do not go together",
+                    ));
+                }
+                if dock && framed {
+                    return Err(Failure::usage(
+                        "`dock` puts a pane back in the flat area: it goes with no `at` and no `size`",
+                    ));
+                }
+                if fields.get("beside").is_some()
+                    || fields.get("side").is_some()
+                    || into_tab.is_some()
+                    || group.is_some()
+                    || new_group.is_some()
+                    || window.is_some()
+                    || label.is_some()
+                {
+                    return Err(Failure::usage(
+                        "`float`, `dock`, `at` and `size` go with the pane and nothing that says where it goes beside, into a tab or as a tab",
+                    ));
+                }
+                let pane = address_of("terminal", fields.need("terminal")?)?;
+                let frame = Frame::of(&fields)?;
+                return Ok(if float {
+                    Arrange::Float { pane, frame }
+                } else if dock {
+                    Arrange::Dock(pane)
+                } else {
+                    Arrange::Reframe { pane, frame }
+                });
             }
             if let Some(tab) = into_tab {
                 if fields.get("beside").is_some()
@@ -1577,6 +1806,7 @@ mod tests {
             ratio: Some(30),
             keep_open: true,
             focus: true,
+            float: None,
             fresh: None,
             shell: None,
             server: None,
@@ -1629,6 +1859,7 @@ mod tests {
             ratio: None,
             keep_open: false,
             focus: false,
+            float: None,
             fresh: None,
             shell: None,
             server: None,
@@ -1819,6 +2050,7 @@ mod tests {
                 ratio: None,
                 keep_open: false,
                 focus: false,
+                float: None,
                 fresh: None,
                 shell: None,
                 server: None,
@@ -2060,6 +2292,7 @@ mod tests {
             ratio: None,
             keep_open: false,
             focus: false,
+            float: None,
             fresh: None,
             shell: None,
             server: None,
@@ -2447,6 +2680,9 @@ mod tests {
             V2_REPLY_PLACED,
             V2_REPLY_TEXT,
             V2_REPLY_ERROR,
+            FLOAT_PLACE_AT,
+            FLOAT_MOVE_FRAMED,
+            FLOAT_DOCK,
             "bateri 2\nnotify\ntext héllo wörld ✓\n",
         ];
         for seed in seeds {
@@ -2910,5 +3146,274 @@ mod tests {
             ..place()
         };
         assert!(Request::Place(there).encode().is_err());
+    }
+
+    // The keys that float a pane came after the fixtures above, in the same version; they are
+    // frozen the same way and never edited.
+    const FLOAT_PLACE: &str = "bateri 2\nplace\nterminal p9\nanchor p4\nfloat yes\n";
+    const FLOAT_PLACE_AT: &str = "bateri 2\nplace\nterminal p9\nanchor p4\nfocus yes\nfloat yes\nat 10,20\nsize 50,40\ntab t3\n";
+    const FLOAT_MOVE: &str = "bateri 2\nmove\nterminal p9\nfloat yes\n";
+    const FLOAT_MOVE_FRAMED: &str =
+        "bateri 2\nmove\nterminal p9\nfloat yes\nat 0,100\nsize 30,100\n";
+    const FLOAT_DOCK: &str = "bateri 2\nmove\nterminal p9\ndock yes\n";
+    const FLOAT_REFRAME_AT: &str = "bateri 2\nmove\nterminal p9@prod\nat 5,5\n";
+    const FLOAT_REFRAME_SIZE: &str = "bateri 2\nmove\nterminal p9\nsize 60,70\n";
+
+    fn floating(at: Option<(u8, u8)>, size: Option<(u8, u8)>) -> Frame {
+        Frame {
+            at: at.map(|(x, y)| Spot { x, y }),
+            size: size.map(|(width, height)| Extent { width, height }),
+        }
+    }
+
+    #[test]
+    fn a_pane_that_floats_is_read_and_written_byte_for_byte() {
+        let cases = [
+            (
+                FLOAT_PLACE,
+                Request::Place(Place {
+                    float: Some(Frame::default()),
+                    ..bare_with_anchor()
+                }),
+            ),
+            (
+                FLOAT_PLACE_AT,
+                Request::Place(Place {
+                    focus: true,
+                    float: Some(floating(Some((10, 20)), Some((50, 40)))),
+                    home: Home {
+                        tab: Id::parse("t3"),
+                        ..Home::default()
+                    },
+                    ..bare_with_anchor()
+                }),
+            ),
+            (
+                FLOAT_MOVE,
+                Request::Arrange(Arrange::Float {
+                    pane: pane(9),
+                    frame: Frame::default(),
+                }),
+            ),
+            (
+                FLOAT_MOVE_FRAMED,
+                Request::Arrange(Arrange::Float {
+                    pane: pane(9),
+                    frame: floating(Some((0, 100)), Some((30, 100))),
+                }),
+            ),
+            (FLOAT_DOCK, Request::Arrange(Arrange::Dock(pane(9)))),
+            (
+                FLOAT_REFRAME_AT,
+                Request::Arrange(Arrange::Reframe {
+                    pane: Anchor::address("p9@prod").expect("an address"),
+                    frame: floating(Some((5, 5)), None),
+                }),
+            ),
+            (
+                FLOAT_REFRAME_SIZE,
+                Request::Arrange(Arrange::Reframe {
+                    pane: pane(9),
+                    frame: floating(None, Some((60, 70))),
+                }),
+            ),
+        ];
+        for (text, request) in cases {
+            assert_eq!(Request::parse(text).as_ref(), Ok(&request), "{text}");
+            assert_eq!(request.encode().as_deref(), Ok(text), "{text}");
+        }
+        // `no` is the same as no line, as it is for the flags there already are.
+        assert_eq!(
+            Request::parse("bateri 2\nplace\nterminal p9\nanchor p4\nfloat no\n"),
+            Ok(Request::Place(bare_with_anchor()))
+        );
+        assert_eq!(
+            Request::parse("bateri 2\nmove\nterminal p9\ndock no\nfloat yes\n"),
+            Request::parse(FLOAT_MOVE)
+        );
+    }
+
+    #[test]
+    fn a_corner_and_a_size_are_whole_percents_written_plainly() {
+        assert_eq!(Spot::parse("0,100"), Some(Spot { x: 0, y: 100 }));
+        assert_eq!(
+            Extent::parse("55,60"),
+            Some(Extent {
+                width: 55,
+                height: 60
+            })
+        );
+        assert_eq!(Spot { x: 7, y: 80 }.to_string(), "7,80");
+        for bad in [
+            "", "5", "5,", ",5", "5,5,5", "101,0", "0,101", "256,1", "-1,2", "+1,2", "01,2",
+            "1,02", "1, 2", " 1,2", "1,2 ", "1.5,2", "a,b", "1;2", "1x2",
+        ] {
+            assert_eq!(Spot::parse(bad), None, "{bad:?}");
+            assert_eq!(Extent::parse(bad), None, "{bad:?}");
+        }
+        for bad in ["101,0", "10", "01,2", "1, 2", "-1,2"] {
+            for key in ["at", "size"] {
+                let text = format!("bateri 2\nmove\nterminal p9\nfloat yes\n{key} {bad}\n");
+                let failure = usage(&text);
+                assert_eq!(failure.kind, Kind::Usage, "{text:?}");
+                assert!(
+                    failure.text.contains(&format!("`{key}` is")),
+                    "{text:?}: {}",
+                    failure.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn what_floats_goes_with_no_split_and_no_other_place() {
+        let place = "bateri 2\nplace\nterminal p9\nanchor p4\n";
+        let moving = "bateri 2\nmove\nterminal p9\n";
+        for (base, extra, word) in [
+            (place, "at 10,20\n", "go with `float`"),
+            (place, "size 50,40\n", "go with `float`"),
+            (place, "float no\nat 10,20\n", "go with `float`"),
+            (place, "float yes\nside left\n", "no split"),
+            (place, "float yes\nside tab\n", "no split"),
+            (place, "float yes\nratio 30\n", "no split"),
+            (place, "float yes\ngroup g1\n", "the side is `tab`"),
+            (place, "float yes\nnew-group api\n", "the side is `tab`"),
+            (place, "float yes\nwindow w1\n", "the side is `tab`"),
+            (place, "float yes\nlabel web\n", "label of a tab"),
+            (place, "float maybe\n", "yes or no"),
+            (place, "float yes\nat 10,20\nat 1,1\n", "given twice"),
+            (moving, "float yes\ndock yes\n", "do not go together"),
+            (moving, "dock yes\nat 1,1\n", "no `at` and no `size`"),
+            (moving, "dock yes\nsize 1,1\n", "no `at` and no `size`"),
+            (
+                moving,
+                "float yes\nbeside p3\nside right\n",
+                "nothing that says",
+            ),
+            (moving, "float yes\nside right\n", "nothing that says"),
+            (moving, "float yes\ntab t3\n", "nothing that says"),
+            (moving, "dock yes\ntab t3\n", "nothing that says"),
+            (
+                moving,
+                "float yes\nside tab\nnew-group api\n",
+                "nothing that says",
+            ),
+            (
+                moving,
+                "at 1,1\nbeside p3\nside left\n",
+                "nothing that says",
+            ),
+            (
+                moving,
+                "size 1,1\nside tab\nlabel web\n",
+                "nothing that says",
+            ),
+            (
+                "bateri 2\nmove\nsubject tab\nid t3\ngroup g1\n",
+                "float yes\n",
+                "for a pane, not a tab",
+            ),
+            (
+                "bateri 2\nmove\nsubject tab\nid t3\ngroup g1\n",
+                "at 1,1\n",
+                "for a pane, not a tab",
+            ),
+            ("bateri 2\nzoom\n", "float yes\n", "takes no `float`"),
+            ("bateri 2\nresize\nside left\n", "at 1,1\n", "takes no `at`"),
+            (
+                "bateri 2\nclose\nterminal p9\n",
+                "dock yes\n",
+                "takes no `dock`",
+            ),
+        ] {
+            let failure = usage(&format!("{base}{extra}"));
+            assert_eq!(failure.kind, Kind::Usage, "{extra:?}");
+            assert!(failure.text.contains(word), "{extra:?}: {}", failure.text);
+        }
+        // A move with no pane to move is no move.
+        assert!(
+            usage("bateri 2\nmove\nfloat yes\n")
+                .text
+                .contains("needs a `terminal`")
+        );
+        assert!(
+            usage("bateri 2\nmove\ndock yes\n")
+                .text
+                .contains("needs a `terminal`")
+        );
+        // A move with neither a place nor a float asks for a place, as it did.
+        assert!(
+            usage("bateri 2\nmove\nterminal p9\nfloat no\n")
+                .text
+                .contains("needs a `beside`")
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_read_back_is_not_written() {
+        let split_and_float = Place {
+            side: Some(Side::Right),
+            float: Some(Frame::default()),
+            ..bare_with_anchor()
+        };
+        assert!(Request::Place(split_and_float).encode().is_err());
+        let sized_and_ratioed = Place {
+            ratio: Some(30),
+            float: Some(Frame::default()),
+            ..bare_with_anchor()
+        };
+        assert!(Request::Place(sized_and_ratioed).encode().is_err());
+        let in_a_group = Place {
+            float: Some(Frame::default()),
+            home: Home {
+                group: Id::parse("g1"),
+                ..Home::default()
+            },
+            ..bare_with_anchor()
+        };
+        assert!(Request::Place(in_a_group).encode().is_err());
+        for frame in [
+            floating(Some((101, 0)), None),
+            floating(Some((0, 101)), None),
+            floating(None, Some((101, 5))),
+            floating(None, Some((5, 255))),
+        ] {
+            assert!(
+                Request::Place(Place {
+                    float: Some(frame),
+                    ..bare_with_anchor()
+                })
+                .encode()
+                .is_err(),
+                "{frame:?}"
+            );
+            assert!(
+                Request::Arrange(Arrange::Float {
+                    pane: pane(9),
+                    frame
+                })
+                .encode()
+                .is_err(),
+                "{frame:?}"
+            );
+            assert!(
+                Request::Arrange(Arrange::Reframe {
+                    pane: pane(9),
+                    frame
+                })
+                .encode()
+                .is_err(),
+                "{frame:?}"
+            );
+        }
+        // A pane that is moved or resized in place is moved or resized by something.
+        assert!(
+            Request::Arrange(Arrange::Reframe {
+                pane: pane(9),
+                frame: Frame::default()
+            })
+            .encode()
+            .is_err()
+        );
     }
 }

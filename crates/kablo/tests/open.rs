@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kablo_bateri::message::{Home, Place, Request, WindowHome, hex_word};
+use kablo_bateri::message::{Extent, Frame, Home, Place, Request, Spot, WindowHome, hex_word};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
 use stage::{Pane, Run, Stage, parse_told};
 
@@ -32,6 +32,7 @@ fn place(terminal: u64, anchor: u64) -> Place {
         ratio: None,
         keep_open: false,
         focus: false,
+        float: None,
         home: Home::default(),
         fresh: None,
         shell: None,
@@ -141,6 +142,95 @@ fn a_split_starts_the_terminal_and_tells_the_app_where_the_pane_goes() {
             .permissions(),
     );
     assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn a_split_that_floats_asks_for_a_pane_over_the_tab_and_no_split() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let program = recorder(&stage).display().to_string();
+    let out = stage.env.dir.join("float");
+    let said = stage.run_in(
+        "p40",
+        &[
+            "split",
+            "--float",
+            "--at",
+            "10,20",
+            "--size=50,40",
+            "--tab",
+            "t3",
+            "--",
+            &program,
+            &out.display().to_string(),
+        ],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p1\n");
+    let wanted = Place {
+        float: Some(Frame {
+            at: Some(Spot { x: 10, y: 20 }),
+            size: Some(Extent {
+                width: 50,
+                height: 40,
+            }),
+        }),
+        home: Home {
+            tab: Id::parse("t3"),
+            ..Home::default()
+        },
+        ..place(1, 40)
+    };
+    assert_eq!(stage.told, [encoded(wanted.clone())]);
+    assert_eq!(parse_told(&stage.told[0]), Request::Place(wanted));
+    // With nothing else said the card is the bateri app's to place, and a pane that is named goes in
+    // its tab; a shell with no program is a pane of the bateri app's own, and floats too.
+    stage.forget_told();
+    stage.app_says(PLACED);
+    let said = stage.run_in("p40", &["split", "p7", "--float"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    let wanted = Place {
+        float: Some(Frame::default()),
+        fresh: Some(stage.home.display().to_string()),
+        ..place(2, 7)
+    };
+    assert_eq!(stage.told, [encoded(wanted)]);
+}
+
+#[test]
+fn a_float_that_goes_with_a_split_or_is_no_float_is_64_before_anything_starts() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    for args in [
+        &["split", "--float", "--left"][..],
+        &["split", "--float", "--below"],
+        &["split", "--float", "--ratio", "30"],
+        &["split", "--at", "10,20"],
+        &["split", "--size", "50,40"],
+        &["split", "--float", "--at", "101,0"],
+        &["split", "--float", "--at", "10"],
+        &["split", "--float", "--at", "10,"],
+        &["split", "--float", "--at", "010,20"],
+        &["split", "--float", "--at"],
+        &["split", "--float", "--size", "5,x"],
+        &["split", "--float", "--size"],
+        &["split", "--float", "--at", "1,1", "--at", "2,2"],
+        &["split", "--float", "--size", "1,1", "--size=2,2"],
+        &["split", "--float=yes"],
+        &["tab", "--float"],
+        &["tab", "--at", "1,1"],
+        &["window", "--float"],
+        &["window", "--size", "1,1"],
+    ] {
+        let said = stage.run_in("p40", args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+    }
+    assert!(stage.told.is_empty(), "{:?}", stage.told);
+    assert!(
+        stage.running().iter().all(|id| id == "p40"),
+        "nothing was started: {:?}",
+        stage.running()
+    );
 }
 
 #[test]
