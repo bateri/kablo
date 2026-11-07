@@ -42,6 +42,11 @@ section is not released.
   the app channel (`kablo-bateri`, still version 2) a `place` takes the new keys `float`, `at` and
   `size`, and a `move` takes `float`, `dock`, `at` and `size`; the frozen `V2_*` texts are read as they
   were, and an app from before this change answers the new keys with "takes no `float`" (64).
+- **`bateri minimize [PANE]` shrinks a floating pane to a capsule, or opens it again.** It works like
+  `zoom`: the pane named, or the one it runs in; whether the pane floats, so that it has a card to
+  minimize, is the app's to say, as 64. In the app channel (`kablo-bateri`, still version 2) the new
+  verb `minimize` takes the key `terminal`, written as `zoom`'s is; an app from before this change
+  answers it with "`minimize` is no verb" (64).
 
 ## [0.6.1] - 2026-11-05
 

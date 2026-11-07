@@ -1,6 +1,6 @@
 //! The text the `bateri` command and the bateri app say to each other on kablo's app channel.
 //!
-//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `focus`, `zoom`, `swap`, `move`, `resize`), then one
+//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
 //! line, verbatim. A value has no line break (nor any control character) because the line is
 //! the frame. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
@@ -24,11 +24,11 @@
 //! `terminal` of a `close` is named the same way, because a `close` that names none closes the
 //! caller's own.
 //!
-//! The verbs that move the keyboard or change the layout (`focus`, `zoom`, `swap`, `move`,
+//! The verbs that move the keyboard or change the layout (`focus`, `zoom`, `minimize`, `swap`, `move`,
 //! `resize`) name panes the same way and a tab, a group or a window by its id (`t3`, `g1`, `w1`);
 //! a `focus` that names no id means the one the caller stands in. A pane of another machine is
 //! named with the machine after an `@` (`p9@prod`, this computer `p9@local`: [`Anchor::address`]),
-//! in `close`, `focus`, `zoom`, `swap`, `move` and `resize`. A `move` of a pane with `tab` joins
+//! in `close`, `focus`, `zoom`, `minimize`, `swap`, `move` and `resize`. A `move` of a pane with `tab` joins
 //! that tab; with `side tab` and no `beside` it makes the pane a tab of its own, in the place a
 //! new tab's lines name. A `move` of a tab with no `id` is the caller's. Every `move` is answered
 //! `ok placed`: where the tab stands now, which it may have made or carried to another window.
@@ -559,6 +559,10 @@ pub enum Arrange {
     Focus(Subject),
     /// Fill the tab with a pane, or give the tab back: the pane named, or the caller's own.
     Zoom(Option<Anchor>),
+    /// A floating pane's card becomes a capsule, or opens again: the pane named, or the
+    /// caller's own. A pane of the flat area has no card to minimize: that is the app's to
+    /// refuse.
+    Minimize(Option<Anchor>),
     /// Two panes of one tab trade places.
     Swap { pane: Anchor, other: Anchor },
     /// Close a tab, a group or a window, without a question: the panes in it end.
@@ -869,6 +873,12 @@ fn encode_arrange(out: &mut String, arrange: &Arrange) -> Result<(), Failure> {
         }
         Arrange::Zoom(pane) => {
             out.push_str("zoom\n");
+            if let Some(pane) = pane {
+                push(out, "terminal", &pane.to_string())?;
+            }
+        }
+        Arrange::Minimize(pane) => {
+            out.push_str("minimize\n");
             if let Some(pane) = pane {
                 push(out, "terminal", &pane.to_string())?;
             }
@@ -1332,11 +1342,11 @@ fn read_request<'a>(
             let fields = Fields::read(verb, lines, &["text"])?;
             Ok(Request::Notify(fields.need("text")?.to_owned()))
         }
-        "focus" | "zoom" | "swap" | "move" | "resize" | "rename" => {
+        "focus" | "zoom" | "minimize" | "swap" | "move" | "resize" | "rename" => {
             read_arrange(verb, lines).map(Request::Arrange)
         }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, ssh, relay, focus, zoom, swap, move, resize or rename"
+            "`{other}` is no verb: place, ls, close, notify, ssh, relay, focus, zoom, minimize, swap, move, resize or rename"
         ))),
     }
 }
@@ -1428,6 +1438,10 @@ fn read_arrange<'a>(
         "zoom" => {
             let fields = Fields::read(verb, lines, &["terminal"])?;
             Ok(Arrange::Zoom(pane(&fields, "terminal")?))
+        }
+        "minimize" => {
+            let fields = Fields::read(verb, lines, &["terminal"])?;
+            Ok(Arrange::Minimize(pane(&fields, "terminal")?))
         }
         "swap" => {
             let fields = Fields::read(verb, lines, &["terminal", "other"])?;
@@ -1877,6 +1891,9 @@ mod tests {
     const V2_FOCUS_PANE: &str = "bateri 2\nfocus\nsubject pane\nid p9\n";
     const V2_ZOOM: &str = "bateri 2\nzoom\nterminal p9\n";
     const V2_ZOOM_OWN: &str = "bateri 2\nzoom\n";
+    // A verb added to version 2 after it was frozen: the keys are the same kind as `zoom`'s.
+    const V2_MINIMIZE: &str = "bateri 2\nminimize\nterminal p9\n";
+    const V2_MINIMIZE_OWN: &str = "bateri 2\nminimize\n";
     const V2_SWAP: &str = "bateri 2\nswap\nterminal p9\nother p3\n";
     const V2_MOVE: &str = "bateri 2\nmove\nterminal p9\nbeside p3\nside right\n";
     const V2_RESIZE: &str = "bateri 2\nresize\nterminal p9\nside left\nsteps 3\n";
@@ -1897,6 +1914,8 @@ mod tests {
             (V2_FOCUS_PANE, Arrange::Focus(Subject::Pane(Some(pane(9))))),
             (V2_ZOOM, Arrange::Zoom(Some(pane(9)))),
             (V2_ZOOM_OWN, Arrange::Zoom(None)),
+            (V2_MINIMIZE, Arrange::Minimize(Some(pane(9)))),
+            (V2_MINIMIZE_OWN, Arrange::Minimize(None)),
             (
                 V2_SWAP,
                 Arrange::Swap {
@@ -2331,6 +2350,7 @@ mod tests {
             ("bateri 2\nresize\nside left\nsteps 51\n", "from 1 to 50"),
             ("bateri 2\nresize\nside left\nsteps 03\n", "from 1 to 50"),
             ("bateri 2\nzoom\nside left\n", "takes no `side`"),
+            ("bateri 2\nminimize\nside left\n", "takes no `side`"),
         ] {
             let failure = usage(text);
             assert_eq!(failure.kind, Kind::Usage, "{text:?}");
@@ -3123,6 +3143,7 @@ mod tests {
             "bateri 2\nclose\nterminal p9@prod\n",
             "bateri 2\nfocus\nsubject pane\nid p9@prod\n",
             "bateri 2\nzoom\nterminal p9@prod\n",
+            "bateri 2\nminimize\nterminal p9@prod\n",
             "bateri 2\nswap\nterminal p9@prod\nother p3\n",
             "bateri 2\nmove\nterminal p9@prod\nbeside p3@local\nside right\n",
             "bateri 2\nresize\nterminal p9@prod\nside left\nsteps 2\n",
@@ -3319,6 +3340,7 @@ mod tests {
                 "for a pane, not a tab",
             ),
             ("bateri 2\nzoom\n", "float yes\n", "takes no `float`"),
+            ("bateri 2\nminimize\n", "float yes\n", "takes no `float`"),
             ("bateri 2\nresize\nside left\n", "at 1,1\n", "takes no `at`"),
             (
                 "bateri 2\nclose\nterminal p9\n",

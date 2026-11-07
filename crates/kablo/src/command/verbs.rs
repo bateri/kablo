@@ -305,7 +305,7 @@ pub fn notify(ctx: &Ctx, words: &[String]) -> Done {
     }
 }
 
-// ─── focus, zoom, swap, rename, resize ───────────────────────────────────
+// ─── focus, zoom, minimize, swap, rename, resize ─────────────────────────
 
 pub fn focus(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     let Some((kind, rest)) = words.split_first() else {
@@ -364,6 +364,23 @@ pub fn zoom(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         }
     };
     app_does(ctx, &Request::Arrange(Arrange::Zoom(pane)))
+}
+
+pub fn minimize(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
+    if words.len() > 1 {
+        return Err(Exit::mistake("minimize names one pane"));
+    }
+    let pane = match words.first() {
+        Some(pane) => {
+            io.check_id("minimize", "pane", pane)?;
+            anchor_of(pane)
+        }
+        None => {
+            ctx.need_here("name the pane to minimize (minimize p4)")?;
+            None
+        }
+    };
+    app_does(ctx, &Request::Arrange(Arrange::Minimize(pane)))
 }
 
 pub fn swap(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {

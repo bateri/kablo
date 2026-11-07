@@ -335,6 +335,7 @@ fn the_layout_verbs_are_the_apps_alone_and_say_what_they_asked() {
     for args in [
         &["focus", "tab", "t3"][..],
         &["zoom", "p9"],
+        &["minimize", "p9"],
         &["swap", "p9", "p3"],
         &["move", "pane", "p9", "--beside", "p3", "--right"],
         &["resize", "p9", "--left"],
@@ -368,6 +369,8 @@ fn the_layout_verbs_are_the_apps_alone_and_say_what_they_asked() {
         ),
         (vec!["zoom", "p9"], Arrange::Zoom(Some(pane(9)))),
         (vec!["zoom"], Arrange::Zoom(None)),
+        (vec!["minimize", "p9"], Arrange::Minimize(Some(pane(9)))),
+        (vec!["minimize"], Arrange::Minimize(None)),
         (
             vec!["swap", "p9", "p3"],
             Arrange::Swap {
@@ -503,6 +506,12 @@ fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
         said.err,
         "bateri: t3 is a tab, not a pane: zoom takes a pane\n"
     );
+    let said = stage.run_in("p4", &["minimize", "t3"]);
+    assert_eq!(said.status, 64, "{}", said.err);
+    assert_eq!(
+        said.err,
+        "bateri: t3 is a tab, not a pane: minimize takes a pane\n"
+    );
     for args in [
         &["focus"][..],
         &["focus", "frame", "t3"],
@@ -511,6 +520,7 @@ fn a_word_and_an_id_of_another_kind_is_64_and_says_what_to_write() {
         &["focus", "tab", "web"],
         &["focus", "tab", "--json"],
         &["zoom", "p4", "p5"],
+        &["minimize", "p4", "p5"],
         &["swap", "p4"],
         &["swap", "p4", "p4"],
         &["swap", "p4", "t3"],

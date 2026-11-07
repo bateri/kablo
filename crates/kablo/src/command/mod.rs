@@ -4,7 +4,7 @@
 //! **Who does what.** The terminal is the machine's: `kablo new` starts it here, it gets a number
 //! (`p9`), and `send`, `send-key`, `capture` and `wait` are kablo's own, with no bateri app anywhere. The
 //! bateri app only decides where a pane that shows the terminal goes, and every verb that needs its
-//! windows (`focus`, `zoom`, `swap`, `move`, `resize`, `rename tab`, `close tab`) is asked of it as
+//! windows (`focus`, `zoom`, `minimize`, `swap`, `move`, `resize`, `rename tab`, `close tab`) is asked of it as
 //! one `bateri 2` message on kablo's app channel ([`crate::app::converse`], the text is
 //! `kablo-bateri`'s). The words of every verb, and the exit codes, are the ones the command has
 //! always had: 0, 1, 64 (a mistake in the command), 69 (what needs the bateri app, with none connected),
@@ -227,6 +227,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri wait PANE [--for TIME]
        bateri focus pane|tab|group|window [ID]
        bateri zoom [PANE]
+       bateri minimize [PANE]
        bateri swap PANE PANE
        bateri rename pane|tab|group ID LABEL
        bateri move pane [PANE] --beside PANE --left|--right|--above|--below [--json]
@@ -242,7 +243,8 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
 sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
-tab, 0 to 100, from its top left corner.
+tab, 0 to 100, from its top left corner. minimize shrinks a floating pane to a capsule, or opens
+it again.
 A pane is p and its number (p7); with none named it is the one this runs in. One of another
 machine is written with the machine after an @ (p9@prod), as bateri ls writes it; -S starts a
 terminal on a server, or on this computer from a server (-S @local) (full level only).
@@ -339,6 +341,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "close" => verbs::close(ctx, io, &words),
         "focus" => verbs::focus(ctx, io, &words),
         "zoom" => verbs::zoom(ctx, io, &words),
+        "minimize" => verbs::minimize(ctx, io, &words),
         "swap" => verbs::swap(ctx, io, &words),
         "rename" => verbs::rename(ctx, io, &words),
         "move" => verbs::moving(ctx, io, &words),
