@@ -9,7 +9,7 @@ resolver = "3"
 exclude = ["vendor/vte", "vendor/alacritty_terminal"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"

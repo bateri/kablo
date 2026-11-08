@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
 ### Added
 
 - **`bateri split --float` opens a pane that floats over its tab, and `bateri move pane` lifts, moves,
