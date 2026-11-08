@@ -513,12 +513,12 @@ impl Job<'_> {
     fn run(self, io: &mut Io<'_>) -> Done {
         // On a server (`-S`) the directory is the server's to say, and the server says if it is none.
         if let Some(server) = self.wants.server.clone() {
-            if let Some(cwd) = &self.wants.cwd {
-                if clean(cwd) != *cwd {
-                    return Err(Exit::mistake(
-                        "the directory has a control character in its name",
-                    ));
-                }
+            if let Some(cwd) = &self.wants.cwd
+                && clean(cwd) != *cwd
+            {
+                return Err(Exit::mistake(
+                    "the directory has a control character in its name",
+                ));
             }
             match machine::reach(self.ctx, &server)? {
                 // This machine is the one named: the plain terminal, and the plain pane.

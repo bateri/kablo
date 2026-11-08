@@ -30,7 +30,7 @@ Choices:
   musl it ships statically). musl's own COPYRIGHT file is given whole,
   `tools/licenses/musl-COPYRIGHT`, because it also lists the authors and the
   few third-party parts with other licenses; it is the file of the musl
-  release the toolchain builds its libc from (musl 1.2.3 for Rust 1.88:
+  release the toolchain builds its libc from (musl 1.2.5 for Rust 1.99:
   `src/ci/docker/scripts/musl.sh` in the Rust repository) — replace it when a
   toolchain moves to another release.
 - The workspace's own crates are not third-party and are left out by
@@ -51,7 +51,7 @@ TARGETS = [
 # The Rust version of the Linux build image whose musl `licenses/musl-COPYRIGHT`
 # is (a test holds it to the image's FROM line, so that moving the toolchain
 # forces the file to be looked at).
-MUSL_FOR_RUST = "1.88"
+MUSL_FOR_RUST = "1.99"
 ROOT = "kablo"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Licenses without an MIT option that are accepted, each a recorded decision

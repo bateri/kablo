@@ -1513,10 +1513,10 @@ fn a_server_is_told_to_start_it_and_does_so_with_its_bootstrap_and_asks_again_fo
     );
     let start = Instant::now();
     let shell = loop {
-        if let Ok(shell) = std::fs::read_to_string(stage.home.join("boot.shell")) {
-            if !shell.is_empty() {
-                break shell;
-            }
+        if let Ok(shell) = std::fs::read_to_string(stage.home.join("boot.shell"))
+            && !shell.is_empty()
+        {
+            break shell;
         }
         assert!(
             start.elapsed() < Duration::from_secs(20),

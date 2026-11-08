@@ -215,15 +215,15 @@ pub const INHERITED_SIGNALS: [libc::c_int; 10] = [
 fn login_shell(request_env: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let named =
         |value: &[u8]| (!value.is_empty() && value.first() == Some(&b'/')).then(|| value.to_vec());
-    if let Some((_, value)) = request_env.iter().rev().find(|(name, _)| name == b"SHELL") {
-        if let Some(shell) = named(value) {
-            return shell;
-        }
+    if let Some((_, value)) = request_env.iter().rev().find(|(name, _)| name == b"SHELL")
+        && let Some(shell) = named(value)
+    {
+        return shell;
     }
-    if let Some(value) = std::env::var_os("SHELL") {
-        if let Some(shell) = named(value.as_bytes()) {
-            return shell;
-        }
+    if let Some(value) = std::env::var_os("SHELL")
+        && let Some(shell) = named(value.as_bytes())
+    {
+        return shell;
     }
     passwd_shell()
         .and_then(|shell| named(&shell))

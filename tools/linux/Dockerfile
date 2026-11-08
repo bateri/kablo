@@ -6,7 +6,7 @@
 # are two different gates (Homebrew's rustc is not pinned; after `brew
 # upgrade` this line is updated too). The Makefile reads the tag from here;
 # the version lives only on this line.
-FROM rust:1.88-bookworm
+FROM rust:1.99-bookworm
 
 # `file` reports whether the release binary is statically linked; `ps` is
 # what the session tests use to find the processes of their own sessions.

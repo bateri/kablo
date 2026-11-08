@@ -311,11 +311,11 @@ impl Drop for Env {
         // and lets the warden clean up. A session that cannot be reached is
         // ended by pid below.
         for id in self.sessions.iter().chain(&self.named_alike) {
-            if self.socket(id).exists() {
-                if let Ok(mut conn) = Conn::try_open(self.socket(id), id, Duration::from_secs(2)) {
-                    conn.send(Message::Terminate { force: true });
-                    conn.pump(Duration::from_millis(300));
-                }
+            if self.socket(id).exists()
+                && let Ok(mut conn) = Conn::try_open(self.socket(id), id, Duration::from_secs(2))
+            {
+                conn.send(Message::Terminate { force: true });
+                conn.pump(Duration::from_millis(300));
             }
         }
         let deadline = Instant::now() + Duration::from_secs(3);

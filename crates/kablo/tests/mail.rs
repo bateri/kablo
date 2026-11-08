@@ -269,7 +269,7 @@ fn a_bridge_keeps_a_mailbox_that_is_no_session_and_takes_it_away_when_it_goes() 
         .collect();
     assert_eq!(
         listed,
-        [id.clone()],
+        std::slice::from_ref(&id),
         "the mailbox is not listed as a session"
     );
     let out = env.kablo().arg("list").output().unwrap();

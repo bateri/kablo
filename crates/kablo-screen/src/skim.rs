@@ -17,7 +17,7 @@ const BLOCK: usize = 16;
 #[inline]
 pub(crate) fn until(bytes: &[u8], stop: impl Fn(u8) -> bool) -> usize {
     let mut at = 0;
-    for block in bytes.chunks_exact(BLOCK) {
+    for block in bytes.as_chunks::<BLOCK>().0 {
         if block.iter().fold(false, |any, &byte| any | stop(byte)) {
             break;
         }

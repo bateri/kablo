@@ -96,10 +96,10 @@ pub fn session_ids(dir: &Path) -> io::Result<Vec<SessionId>> {
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
-        if let Some(id) = name.strip_suffix(".sock") {
-            if let Ok(id) = SessionId::new(id) {
-                ids.push(id);
-            }
+        if let Some(id) = name.strip_suffix(".sock")
+            && let Ok(id) = SessionId::new(id)
+        {
+            ids.push(id);
         }
     }
     ids.sort();

@@ -200,10 +200,11 @@ impl Stage {
         };
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".sock") {
-                if self.adopted.insert(id.to_owned()) && !self.runners.iter().any(|r| r == id) {
-                    self.env.track_named_alike(id);
-                }
+            if let Some(id) = name.strip_suffix(".sock")
+                && self.adopted.insert(id.to_owned())
+                && !self.runners.iter().any(|r| r == id)
+            {
+                self.env.track_named_alike(id);
             }
         }
     }

@@ -612,15 +612,15 @@ impl Mailbox {
             // is for.
             wire::Message::Open { .. }
             | wire::Message::OpenCommand { .. }
-            | wire::Message::OpenTicket { .. } => {
-                if sender.number(stream) {
-                    said.failed(
-                        id,
-                        stream,
-                        FailCode::BAD_REQUEST,
-                        "a mailbox takes mail and nothing to connect to or run",
-                    );
-                }
+            | wire::Message::OpenTicket { .. }
+                if sender.number(stream) =>
+            {
+                said.failed(
+                    id,
+                    stream,
+                    FailCode::BAD_REQUEST,
+                    "a mailbox takes mail and nothing to connect to or run",
+                );
             }
             message @ (wire::Message::Data(_)
             | wire::Message::Credit(_)
