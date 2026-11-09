@@ -222,7 +222,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri close tab|group|window [ID]
        bateri ls [--json]
        bateri notify TEXT...
-       bateri message TEXT... | --json-field FIELD
+       bateri message [--] TEXT... | --json-field FIELD
        bateri send [PANE] [TEXT | -]
        bateri send-key [PANE] KEY...
        bateri capture [PANE] [--history ROWS] [--unwrap] [--trim] [--vt]
@@ -337,6 +337,16 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
                 _ => {}
             }
         }
+    }
+    // The words of `message` are text, but what stands first may be asking how it is used.
+    if verb == "message"
+        && matches!(
+            rest.first().and_then(|word| word.to_str()),
+            Some("-h" | "--help")
+        )
+    {
+        let _ = write!(io.out, "{USAGE}");
+        return Ok(());
     }
     let words: Vec<String> = rest
         .iter()

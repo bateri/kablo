@@ -414,6 +414,47 @@ fn message_needs_an_app_and_sends_one_line() {
 }
 
 #[test]
+fn message_reads_its_options_and_takes_the_rest_as_words() {
+    let mut stage = Stage::with_app(OK);
+    let payload = stop_payload(r#""Done.\u0085 Next\u009b.""#);
+    let said = message_with(
+        &mut stage,
+        &["message", "--json-field=last_assistant_message"],
+        payload.as_bytes(),
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(
+        message_of(&stage, 0),
+        "Done. Next.",
+        "the C1 controls go with the others"
+    );
+    for (at, (args, shown)) in [
+        (&["message", "--", "--help"][..], "--help"),
+        (&["message", "- fixed", "-5"][..], "- fixed -5"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let said = message_with(&mut stage, args, b"");
+        assert_eq!(said.status, 0, "{args:?}: {}", said.err);
+        assert_eq!(message_of(&stage, at + 1), shown);
+    }
+    let said = message_with(&mut stage, &["message", "--help"], b"");
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(said.out.contains("bateri message"), "{}", said.out);
+    for args in [
+        &["message", "--nope"][..],
+        &["message", "-x"][..],
+        &["message", "--json-field="][..],
+        &["message", "--json-field=a", "b"][..],
+        &["message", "--json-field"][..],
+    ] {
+        assert_eq!(message_with(&mut stage, args, b"").status, 64, "{args:?}");
+    }
+    assert_eq!(stage.told.len(), 3, "nothing else reached the bateri app");
+}
+
+#[test]
 fn message_takes_the_last_answer_out_of_a_hooks_json() {
     let mut stage = Stage::with_app(OK);
     let field = ["message", "--json-field", "last_assistant_message"];

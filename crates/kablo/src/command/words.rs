@@ -67,7 +67,7 @@ pub fn reads_as_id(word: &str) -> bool {
 /// the tab.
 pub fn clean(text: &str) -> String {
     text.chars()
-        .filter(|c| !matches!(u32::from(*c), 0..=8 | 11..=31 | 127))
+        .filter(|c| !matches!(u32::from(*c), 0..=8 | 11..=31 | 127..=159))
         .collect()
 }
 

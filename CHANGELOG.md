@@ -29,7 +29,8 @@ section is not released.
 ### Added
 
 - **`bateri message` hands the last thing an agent said to the app.** `message TEXT...` sends the
-  words, and `message --json-field FIELD` reads the string member FIELD of the JSON on standard
+  words (after `--` when the first starts with a dash), and `message --json-field FIELD` or
+  `--json-field=FIELD` reads the string member FIELD of the JSON on standard
   input, which is what an agent's hook is given (Claude Code's `Stop` hook, with
   `last_assistant_message`); the verb knows no agent, the hook names the field. The text is made one
   line like `notify`'s and cut to 1000 bytes at a character, not refused. A hook must not get in the

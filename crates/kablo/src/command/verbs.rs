@@ -323,18 +323,8 @@ const JSON_BYTES: u64 = 1024 * 1024;
 /// nothing and ends with 0; only a command that is written wrong is 64, and no bateri app is 69,
 /// as it is for `notify`.
 pub fn message(ctx: &Ctx, words: &[String]) -> Done {
-    let text = match words.split_first() {
-        None => {
-            return Err(Exit::mistake(
-                "message takes the words to show, or --json-field and the name of the field",
-            ));
-        }
-        Some((flag, rest)) if flag == "--json-field" => {
-            let [field] = rest else {
-                return Err(Exit::mistake(
-                    "message --json-field takes the name of one field, read from the JSON on standard input",
-                ));
-            };
+    let text = match json_field(words)? {
+        Some(field) => {
             let mut input = Vec::new();
             let read = std::io::stdin()
                 .lock()
@@ -352,8 +342,17 @@ pub fn message(ctx: &Ctx, words: &[String]) -> Done {
             }
             text
         }
-        Some(_) => {
-            let text = one_line(&words.join(" "));
+        None => {
+            let shown = match words.split_first() {
+                Some((first, rest)) if first == "--" => rest,
+                Some((first, _)) if reads_as_option(first) => {
+                    return Err(Exit::mistake(format!(
+                        "message has no option {first}: put -- before words that start with a dash"
+                    )));
+                }
+                _ => words,
+            };
+            let text = one_line(&shown.join(" "));
             if text.is_empty() {
                 return Err(Exit::mistake("message takes the words to show"));
             }
@@ -368,6 +367,39 @@ pub fn message(ctx: &Ctx, words: &[String]) -> Done {
             Err(Exit::new(69, "the bateri app is not connected to show it"))
         }
     }
+}
+
+/// The field `words` name when they are `--json-field FIELD` or `--json-field=FIELD`; none when
+/// they are the words to show.
+fn json_field(words: &[String]) -> Result<Option<&str>, Exit> {
+    let Some((first, rest)) = words.split_first() else {
+        return Err(Exit::mistake(
+            "message takes the words to show, or --json-field and the name of the field",
+        ));
+    };
+    let field = match (first.strip_prefix("--json-field="), rest) {
+        (Some(field), []) => field,
+        (None, [field]) if first == "--json-field" => field.as_str(),
+        (Some(_), _) => "",
+        (None, _) if first == "--json-field" => "",
+        (None, _) => return Ok(None),
+    };
+    if field.is_empty() {
+        return Err(Exit::mistake(
+            "message --json-field takes the name of one field, read from the JSON on standard input",
+        ));
+    }
+    Ok(Some(field))
+}
+
+/// Whether the first word of `message` is an option, written as one: a dash or two and a letter,
+/// with no space in the word. `- fixed` and `-5` are text.
+fn reads_as_option(word: &str) -> bool {
+    !word.contains(char::is_whitespace)
+        && word
+            .strip_prefix('-')
+            .map(|rest| rest.strip_prefix('-').unwrap_or(rest))
+            .is_some_and(|name| name.starts_with(char::is_alphabetic))
 }
 
 /// `text` as one line the app takes: the line breaks and tabs are spaces, the other control
