@@ -12,7 +12,7 @@ kablo-bateri = { path = "../kablo-bateri" }
 # the rules bateri's terminal and this crate both read, written once in pencere. The whole
 # crate comes with it (`apps` cannot be taken alone); only this crate uses it, and the keeper
 # and the bridge never call it. Apache-2.0.
-pencere-host = { git = "https://github.com/bateri/pencere", rev = "a529ade0f42f0a14a11a24e414a61f904f173d96" }
+pencere-host = { git = "https://github.com/bateri/pencere", rev = "02b59c336724a6010b042518d49400a077381708" }
 
 [lints]
 workspace = true
