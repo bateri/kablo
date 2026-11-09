@@ -642,6 +642,25 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_line_that_is_only_a_word_it_does_not_know_is_passed_over_too() {
+        let more = V2_OFFERED_PRODUCTION.to_owned() + "newer\n";
+        let Reply::Package(Answer::Offered(offered)) = Reply::parse(&more).unwrap() else {
+            panic!("an offer");
+        };
+        assert!(offered.production);
+        // One it knows, with no value, is a mistake; and so is an empty line.
+        let bare = V2_OFFERED.to_owned() + "production\n";
+        assert!(
+            Reply::parse(&bare)
+                .unwrap_err()
+                .text
+                .contains("has no value")
+        );
+        let empty = V2_OFFERED.to_owned() + "\n";
+        assert!(Reply::parse(&empty).is_err());
+    }
+
+    #[test]
     fn a_request_that_is_not_right_is_a_usage_error_that_says_which() {
         let cases = [
             ("bateri 2\npackage state\n", "needs a `target`"),

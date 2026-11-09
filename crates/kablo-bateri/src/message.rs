@@ -858,13 +858,14 @@ impl<'a> Fields<'a> {
     ) -> Result<Fields<'a>, Failure> {
         let mut taken: Vec<(&'a str, &'a str)> = Vec::new();
         for line in lines {
-            let (key, value) = line.split_once(' ').ok_or_else(|| {
-                if line.is_empty() {
-                    Failure::usage("a line is empty")
-                } else {
-                    Failure::usage(format!("`{line}` has no value"))
-                }
-            })?;
+            let (key, value) = match line.split_once(' ') {
+                Some(pair) => pair,
+                // A line that is only a word the reader does not know is passed over like any
+                // other it does not know; a known one with no value is a mistake.
+                None if ignore_unknown && !line.is_empty() && !allowed.contains(&line) => continue,
+                None if line.is_empty() => return Err(Failure::usage("a line is empty")),
+                None => return Err(Failure::usage(format!("`{line}` has no value"))),
+            };
             if !allowed.contains(&key) {
                 if ignore_unknown {
                     continue;
