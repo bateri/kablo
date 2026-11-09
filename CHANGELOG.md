@@ -40,6 +40,23 @@ section is not released.
   as for `notify`. In the app channel (`kablo-bateri`, still version 2) the new verb `message` takes
   the key `text`, as `notify` does, and is not one of the commands a window relays to another
   machine; an app from before this change answers it with "`message` is no verb" (64).
+- **`bateri package list`, `remove`, `auto` and `not-here`: the programs a machine has.** kablo
+  keeps them in `~/.local/share/bateri/apps` and is the only one that writes it, on a computer and
+  on a server alike: `apps/<name>/<version>/` holds the program, its `app.json` and the signature,
+  `apps/bin/<name>` is a link to the newest, and small notes sit beside (`source`, `key`,
+  `stopped`, `auto-off`, `not-here`). The folder is the record, and `list` reads it. These verbs
+  need no bateri app. A release goes in only when the signature of its `app.json` holds, its key
+  is the one approved for the program (or one kablo ships with, bateri's), it is newer than what
+  is there, and the file is the one the `app.json` signs by its sum. The link only goes forward;
+  the machine keeps the version linked, the one before it and any younger than thirty days. The
+  names of the folder are `kablo_bateri::paths` (`APPS` and the rest) and the keys kablo trusts
+  without being asked are `kablo_bateri::keys`; the new crate `kablo-package` does the work.
+
+### Changed
+
+- **The binaries carry pencere's check of an `app.json`** (`pencere-host`, with `ed25519-dalek`
+  for the signature and `serde`), as `THIRD-PARTY-LICENSES.txt` lists. Only `kablo bateri package`
+  uses it; the keeper and the bridge do not.
 
 ## [0.7.0] - 2026-11-09
 

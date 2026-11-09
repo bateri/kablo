@@ -2170,7 +2170,7 @@ fn credit_brings_a_stream_to_its_part_as_other_streams_come_and_go() {
     // 400 bytes taken: the other end may still send 600, more than the part,
     // so nothing is given back.
     p.send(1, Message::Data(vec![b'x'; 400]));
-    assert_eq!(credits(&p, 1), []);
+    assert_eq!(credits(&p, 1), Vec::<u32>::new());
     // 400 more: 200 left, and 300 of credit makes it the part.
     p.send(1, Message::Data(vec![b'x'; 400]));
     assert_eq!(credits(&p, 1), [300]);
