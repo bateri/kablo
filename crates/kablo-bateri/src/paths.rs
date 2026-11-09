@@ -31,6 +31,36 @@ pub const COMMAND: &str = "bateri";
 /// The bootstrap of a server's terminal, in [`SHELL`].
 pub const BOOT: &str = "boot.sh";
 
+/// The programs the machine has (`apps/<name>/<version>/<name>`), in [`DIR`]: kablo is the only
+/// one that writes it, on a computer and on a server alike.
+pub const APPS: &str = "apps";
+
+/// The links to the newest version of each program, in [`APPS`]: `bin/<name>` is
+/// `../<name>/<version>/<name>`.
+pub const APPS_BIN: &str = "bin";
+
+/// What a version of a program is signed in, in its directory.
+pub const APP_MANIFEST: &str = "app.json";
+
+/// The signature of [`APP_MANIFEST`], in the same directory.
+pub const APP_SIGNATURE: &str = "app.json.sig";
+
+/// Where the program came from (an address or `user/repo`), in the program's directory.
+pub const APP_SOURCE: &str = "source";
+
+/// The key the machine's person approved for the program, in the program's directory.
+pub const APP_KEY: &str = "key";
+
+/// Present when a newer release came signed with another key than [`APP_KEY`]: the key it came
+/// with. The program stays at the version it was, in the program's directory.
+pub const APP_STOPPED: &str = "stopped";
+
+/// Present when programs are not updated on their own, in [`APPS`].
+pub const AUTO_OFF: &str = "auto-off";
+
+/// The programs the person said not to bring here, one name a line, in [`APPS`].
+pub const NOT_HERE: &str = "not-here";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +75,21 @@ mod tests {
         assert_eq!(
             [COUNTER, TERMINALS, PLACING],
             ["next", "terminals", "placing"]
+        );
+    }
+
+    // The folder of the programs is written by kablo and read by every kablo of every version
+    // that has been on the machine, and bateri's older build wrote the first two levels.
+    #[test]
+    fn the_folder_of_the_programs_is_the_one_bateri_started() {
+        let bin = format!("{DIR}/{APPS}/{APPS_BIN}");
+        let manifest = format!("{DIR}/{APPS}/textpen/1.0.0/{APP_MANIFEST}");
+        assert_eq!(bin, ".local/share/bateri/apps/bin");
+        assert_eq!(manifest, ".local/share/bateri/apps/textpen/1.0.0/app.json");
+        assert_eq!(APP_SIGNATURE, "app.json.sig");
+        assert_eq!(
+            [APP_SOURCE, APP_KEY, APP_STOPPED, AUTO_OFF, NOT_HERE],
+            ["source", "key", "stopped", "auto-off", "not-here"]
         );
     }
 }

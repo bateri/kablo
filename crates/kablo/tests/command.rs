@@ -1165,3 +1165,34 @@ fn the_words_of_a_command_are_held_to_the_same_rules_in_every_verb() {
     assert!(said.err.starts_with("usage: bateri split"), "{}", said.err);
     assert!(stage.told.is_empty());
 }
+
+#[test]
+fn the_package_verbs_work_with_no_bateri_app_and_tell_it_nothing() {
+    let mut stage = Stage::new();
+    let said = stage.run(&["package", "list"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "no programs here\nupdates on their own: on\n");
+
+    let apps = stage.home.join(".local/share/bateri/apps");
+    let said = stage.run(&["package", "auto", "off"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(apps.join("auto-off").is_file());
+    let said = stage.run(&["package", "not-here", "textpen"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(
+        std::fs::read_to_string(apps.join("not-here")).unwrap(),
+        "textpen\n"
+    );
+    let said = stage.run(&["package", "list"]);
+    assert_eq!(
+        said.out,
+        "no programs here\nupdates on their own: off\nnot brought here: textpen\n"
+    );
+
+    let said = stage.run(&["package", "remove", "textpen"]);
+    assert_eq!(said.status, 1);
+    assert!(said.err.contains("textpen is not here"), "{}", said.err);
+    let said = stage.run(&["package", "remove", "../x"]);
+    assert_eq!(said.status, 64, "{}", said.err);
+    assert!(stage.told.is_empty(), "{:?}", stage.told);
+}

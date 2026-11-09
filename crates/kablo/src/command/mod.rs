@@ -13,6 +13,7 @@
 
 mod machine;
 mod open;
+mod package;
 mod state;
 mod verbs;
 mod words;
@@ -233,12 +234,19 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
                                [--json]
        bateri move tab [TAB] --group GROUP | --window WINDOW | --new-group NAME [--window WINDOW] [--json]
        bateri resize [PANE] --left|--right|--above|--below [--by N]
+       bateri package list
+       bateri package remove NAME
+       bateri package auto [on|off]
+       bateri package not-here [NAME]...
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane is p and its number (p7); with none named it is the one this runs in. One of another
 machine is written with the machine after an @ (p9@prod), as bateri ls writes it; -S starts a
 terminal on a server, or on this computer from a server (-S @local) (full level only).
 Without a program, split, tab and window open a shell. A shell named alone (-- zsh, -- fish) is
 the same, with its dock where bateri has an integration for it. bateri ls lists what is open.
+bateri package is about the programs this machine keeps (~/.local/share/bateri/apps): list shows
+them, remove takes one away, auto says whether they are updated on their own, not-here names what
+is not to be brought here. It needs no bateri app.
 ";
 
 /// `kablo bateri VERB ARGS...`: returns the status.
@@ -340,6 +348,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "send-key" => verbs::send_key(ctx, io, rest, &words),
         "capture" => verbs::capture(ctx, io, rest, &words),
         "wait" => verbs::wait(ctx, io, rest, &words),
+        "package" => package::package(ctx, io, &words),
         "help" | "-h" | "--help" => {
             let _ = write!(io.out, "{USAGE}");
             Ok(())

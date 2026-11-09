@@ -11,13 +11,16 @@ when the file in the repository differs from what it prints.
 Why it exists: MIT and Apache-2.0 require the notice to travel with copies, and
 the `kablo` binaries are distributed. A hand-kept list silently goes stale
 whenever a dependency is added, so the yardstick is `cargo tree`: `kablo`'s
-**product** graph (normal + build edges; dev-dependencies are not in a binary),
-the union over the four targets `make dist` builds.
+**product** graph (normal + build edges; dev-dependencies are not in a binary,
+and neither are procedural macros: they run in the compiler, so `serde_derive`
+and the crates only it needs are left out), the union over the four targets
+`make dist` builds.
 
 Choices:
 - A crate with no MIT option whose license is on the allow list
   (`OWN_LICENSES`) is given with its own text: the full Apache-2.0 text (+ NOTICE
-  if any). Any other license without an MIT option stops the script: that is a
+  if any), or the crate's BSD-3-Clause file, which carries its copyright holder
+  and the three conditions. Any other license without an MIT option stops the script: that is a
   dependency decision and is never added to the list silently (GPL-2.0-only
   least of all — kablo is GPL-3.0-or-later).
 - Every remaining crate offers MIT as one of its options ("MIT OR Apache-2.0",
@@ -55,9 +58,10 @@ MUSL_FOR_RUST = "1.88"
 ROOT = "kablo"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Licenses without an MIT option that are accepted, each a recorded decision
-# (all GPL-3 compatible): Apache-2.0 for alacritty_terminal. Anything else
-# without an MIT option stops the script.
-OWN_LICENSES = {"Apache-2.0"}
+# (all GPL-3 compatible): Apache-2.0 for alacritty_terminal; BSD-3-Clause for
+# the signature check of `pencere-host` (`ed25519-dalek`, `curve25519-dalek`,
+# `subtle`). Anything else without an MIT option stops the script.
+OWN_LICENSES = {"Apache-2.0", "BSD-3-Clause"}
 # For crates whose license file carries no copyright line, the project's own
 # attribution instead of the author list.
 COPYRIGHT = {"alacritty_terminal": ["Copyright 2020 The Alacritty Project"]}
@@ -97,7 +101,7 @@ def run(*args):
 
 def graph_crates(target):
     """The (name, version) pairs in `kablo`'s product graph for one target."""
-    out = run("cargo", "tree", "-p", ROOT, "-e", "normal,build", "--locked",
+    out = run("cargo", "tree", "-p", ROOT, "-e", "normal,build,no-proc-macro", "--locked",
               "--target", target, "--prefix", "none", "-f", "{p}")
     crates = set()
     for line in out.splitlines():
@@ -195,6 +199,14 @@ def main():
         if license is None:
             continue
         root = os.path.dirname(pkg["manifest_path"])
+        if license == "BSD-3-Clause":
+            text = read_first(root, ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE-BSD"))
+            if text is None or "Redistribution and use" not in text:
+                sys.exit(f"{name} {version}: BSD-3-Clause text not found")
+            out += [RULE, name, pkg.get("repository") or "",
+                    "Licensed under the BSD 3-Clause License; full text below.",
+                    RULE, "", text, "", ""]
+            continue
         text = read_first(root, ("LICENSE-APACHE", "LICENSE-APACHE.md", "LICENSE-APACHE.txt",
                                  "LICENSE", "LICENSE.md", "LICENSE.txt"))
         if text is None or "Apache License" not in text:

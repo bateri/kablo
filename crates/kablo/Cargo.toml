@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 kablo-bateri = { path = "../kablo-bateri" }
+kablo-package = { path = "../kablo-package" }
 kablo-proto = { path = "../kablo-proto" }
 kablo-screen = { path = "../kablo-screen" }
 libc = "0.2"

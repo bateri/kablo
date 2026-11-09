@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ids;
+pub mod keys;
 pub mod message;
 pub mod paths;
 pub mod place;
