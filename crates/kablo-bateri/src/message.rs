@@ -836,6 +836,26 @@ impl<'a> Fields<'a> {
         lines: impl Iterator<Item = &'a str>,
         allowed: &[&str],
     ) -> Result<Fields<'a>, Failure> {
+        Self::read_with(verb, lines, allowed, false)
+    }
+
+    /// As [`Fields::read`], but a line whose key is not one of `allowed` is passed over: the way
+    /// a reply is read, so that a newer sender may say more than this reader knows. A request is
+    /// read with [`Fields::read`], strictly.
+    pub(crate) fn read_ignoring_unknown(
+        verb: &'a str,
+        lines: impl Iterator<Item = &'a str>,
+        allowed: &[&str],
+    ) -> Result<Fields<'a>, Failure> {
+        Self::read_with(verb, lines, allowed, true)
+    }
+
+    fn read_with(
+        verb: &'a str,
+        lines: impl Iterator<Item = &'a str>,
+        allowed: &[&str],
+        ignore_unknown: bool,
+    ) -> Result<Fields<'a>, Failure> {
         let mut taken: Vec<(&'a str, &'a str)> = Vec::new();
         for line in lines {
             let (key, value) = line.split_once(' ').ok_or_else(|| {
@@ -846,6 +866,9 @@ impl<'a> Fields<'a> {
                 }
             })?;
             if !allowed.contains(&key) {
+                if ignore_unknown {
+                    continue;
+                }
                 return Err(Failure::usage(format!("`{verb}` takes no `{key}`")));
             }
             if taken.iter().any(|(seen, _)| *seen == key) {
@@ -873,7 +896,7 @@ impl<'a> Fields<'a> {
         terminal_of(key, self.need(key)?)
     }
 
-    fn flag(&self, key: &str) -> Result<bool, Failure> {
+    pub(crate) fn flag(&self, key: &str) -> Result<bool, Failure> {
         match self.get(key) {
             None | Some("no") => Ok(false),
             Some("yes") => Ok(true),

@@ -244,7 +244,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri resize [PANE] --left|--right|--above|--below [--by N]
        bateri package list
        bateri package install SOURCE [--trust KEY]
-       bateri package update [NAME]
+       bateri package update [NAME [--trust KEY]]
        bateri package watch
        bateri package remove NAME
        bateri package auto [on|off]
@@ -257,7 +257,8 @@ Without a program, split, tab and window open a shell. A shell named alone (-- z
 the same, with its dock where bateri has an integration for it. bateri ls lists what is open.
 bateri package is about the programs this machine keeps (~/.local/share/bateri/apps): list shows
 them, install brings one (a name the bateri app follows, user/repo or an address) and asks at a
-terminal about a key it does not know, update looks for newer releases, watch does that once a day
+terminal about a key it does not know (--trust KEY, on install and on update NAME, names the key to
+approve where there is none), update looks for newer releases, watch does that once a day
 while the app that started it is connected, remove takes one away, auto says whether they are
 updated on their own, not-here names what is not to be brought here. Only install, update and watch
 need a bateri app.

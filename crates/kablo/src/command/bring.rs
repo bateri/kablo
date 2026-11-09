@@ -12,6 +12,11 @@
 //! ask at, it is refused. A program whose newer release came with another key stops where it is, once
 //! told to the person, until `update NAME` is answered at a terminal.
 //!
+//! **A Production server starts with updating off.** When the app says the machine it answers for
+//! is a Production server (`production` in the offer) and the first program is installed on a
+//! machine that has none, `auto-off` is written, so that nothing there changes on its own until a
+//! person says so (`bateri package auto on`, which stays). A later install does not touch it.
+//!
 //! Nothing here sleeps but [`Machine::watch`]: once a day, while the bridge that started it is
 //! there (a process the bridge starts ends with it).
 
@@ -253,22 +258,59 @@ impl Machine<'_> {
         let Way::Go(approved) = self.way(&release, trust, true)? else {
             return Err(unread());
         };
+        // The first program of a Production server: read from the folder before it is put in.
+        let first_on_production = offered.production
+            && self
+                .store
+                .names()
+                .map_err(|error| Exit::failed(clean(&error.to_string())))?
+                .is_empty();
         self.bring(&offered, &release, approved.as_deref())?;
         let _ = writeln!(io.out, "{} {} installed", release.name, release.version);
+        if first_on_production {
+            self.store
+                .set_auto(false)
+                .map_err(|error| Exit::failed(clean(&error.to_string())))?;
+            let _ = writeln!(
+                io.out,
+                "programs are not updated on their own on this server, which bateri keeps as Production; `bateri package auto on` turns it on"
+            );
+        }
         Ok(())
     }
 
-    /// `update [NAME]`.
+    /// `update [NAME [--trust KEY]]`.
     pub fn update(&mut self, io: &mut Io<'_>, args: &[String]) -> Done {
-        let named = match args {
-            [] => None,
-            [name] if !name.starts_with('-') => Some(name.as_str()),
-            _ => {
-                return Err(Exit::mistake(
-                    "package update takes the name of one program",
-                ));
+        let mut named = None;
+        let mut trust = None;
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            match word.as_str() {
+                "--trust" => {
+                    let key = words
+                        .next()
+                        .ok_or_else(|| Exit::mistake("--trust takes the key to approve"))?;
+                    trust = Some(key.as_str());
+                }
+                other if other.starts_with('-') => {
+                    return Err(Exit::mistake(format!(
+                        "package update takes no '{}'",
+                        clean(other)
+                    )));
+                }
+                other if named.is_none() => named = Some(other),
+                _ => {
+                    return Err(Exit::mistake(
+                        "package update takes the name of one program",
+                    ));
+                }
             }
-        };
+        }
+        if trust.is_some() && named.is_none() {
+            return Err(Exit::mistake(
+                "package update --trust names the program whose key it approves: update NAME --trust KEY",
+            ));
+        }
         self.allowed()?;
         let names = match named {
             Some(name) => vec![name.to_owned()],
@@ -282,7 +324,7 @@ impl Machine<'_> {
         }
         let mut trouble = false;
         for name in names {
-            match self.look(&name, named.is_some()) {
+            match self.look(&name, named.is_some(), trust) {
                 Ok(Looked::Current(version)) => {
                     let _ = writeln!(io.out, "{name} {version} is the newest");
                 }
@@ -292,7 +334,7 @@ impl Machine<'_> {
                 Ok(Looked::Held { key }) => {
                     let _ = writeln!(
                         io.out,
-                        "{name} stays as it is: its newer release is signed with {key}, not with the approved key; `bateri package update {name}` asks about it"
+                        "{name} stays as it is: its newer release is signed with {key}, not with the approved key; `bateri package update {name}` asks about it (at a terminal), or `bateri package update {name} --trust {key}` approves that key"
                     );
                 }
                 Ok(Looked::Skipped(why)) => {
@@ -316,8 +358,8 @@ impl Machine<'_> {
     }
 
     /// Looks for a newer release of one program and puts it in. `may_ask` is whether a person
-    /// may be asked about a key.
-    fn look(&mut self, name: &str, may_ask: bool) -> Result<Looked, Exit> {
+    /// may be asked about a key; `trust` is the key a person named to be approved.
+    fn look(&mut self, name: &str, may_ask: bool, trust: Option<&str>) -> Result<Looked, Exit> {
         let trouble = |error: kablo_package::Error| Exit::failed(clean(&error.to_string()));
         let Some(current) = self.store.current(name).map_err(trouble)? else {
             return Err(Exit::failed(format!("{} is not here", clean(name))));
@@ -341,7 +383,7 @@ impl Machine<'_> {
         if release.version <= current {
             return Ok(Looked::Current(current));
         }
-        match self.way(&release, None, may_ask)? {
+        match self.way(&release, trust, may_ask)? {
             Way::Hold => {
                 if self.store.stop(name, &release.key).map_err(trouble)? {
                     // Once: nothing is said again for the same key.
@@ -404,7 +446,7 @@ impl Machine<'_> {
             .names()
             .map_err(|error| Exit::failed(clean(&error.to_string())))?;
         for name in names {
-            match self.look(&name, false) {
+            match self.look(&name, false, None) {
                 Err(exit) if exit.code == 69 || exit.code > 128 => return Err(exit),
                 _ => {}
             }
@@ -477,6 +519,8 @@ mod tests {
         lies_about_the_name: Cell<bool>,
         /// It offers what it has, whatever version the machine said it had.
         ignores_have: Cell<bool>,
+        /// It keeps the machine as a Production server, and says so in every offer.
+        production: Cell<bool>,
     }
 
     impl Fake {
@@ -524,6 +568,7 @@ mod tests {
                                 source: "bateri/textpen".into(),
                                 manifest,
                                 signature,
+                                production: self.production.get(),
                             }))
                         }
                     }
@@ -597,6 +642,7 @@ mod tests {
                     wrong_file: Cell::new(false),
                     lies_about_the_name: Cell::new(false),
                     ignores_have: Cell::new(false),
+                    production: Cell::new(false),
                 },
                 person: Scripted {
                     terminal: false,
@@ -916,6 +962,131 @@ mod tests {
     }
 
     #[test]
+    fn the_first_program_of_a_production_server_leaves_updating_off_and_says_so() {
+        let mut rig = Rig::trusting_a("production", &["textpen-1.0.0"]);
+        rig.fake.production.set(true);
+        assert!(
+            rig.store.auto(),
+            "updating is on until something turns it off"
+        );
+        let (done, out, _) = rig.install(&["textpen"]);
+        assert_eq!(code(&done), 0, "{}", text(&done));
+        assert!(!rig.store.auto());
+        assert!(out.starts_with("textpen 1.0.0 installed\n"), "{out}");
+        assert!(out.contains("bateri package auto on"), "{out}");
+    }
+
+    #[test]
+    fn a_machine_that_is_not_a_production_server_keeps_updating_on() {
+        let mut rig = Rig::trusting_a("not-production", &["textpen-1.0.0"]);
+        let (done, out, _) = rig.install(&["textpen"]);
+        assert_eq!(code(&done), 0, "{}", text(&done));
+        assert!(rig.store.auto());
+        assert_eq!(out, "textpen 1.0.0 installed\n");
+    }
+
+    #[test]
+    fn a_later_install_on_a_production_server_leaves_what_the_person_chose() {
+        let mut rig = Rig::trusting_a("production-later", &["textpen-1.0.0"]);
+        rig.fake.production.set(true);
+        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
+        assert!(!rig.store.auto());
+        // The person turns updating on; the next install, of the same program or another, is not
+        // the first and does not take that back.
+        rig.store.set_auto(true).unwrap();
+        rig.fake.catalog.borrow_mut().push("textpen-1.1.0");
+        let (done, out, _) = rig.install(&["textpen"]);
+        assert_eq!(code(&done), 0, "{}", text(&done));
+        assert_eq!(out, "textpen 1.1.0 installed\n");
+        assert!(rig.store.auto());
+        *rig.fake.catalog.borrow_mut() = vec!["other-1.0.0"];
+        let (done, _, _) = rig.install(&["other"]);
+        assert_eq!(code(&done), 0, "{}", text(&done));
+        assert!(rig.store.auto());
+        // And a person who turned it off on purpose keeps it off, of course.
+        rig.store.set_auto(false).unwrap();
+        *rig.fake.catalog.borrow_mut() = vec!["textpen-1.2.0"];
+        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
+        assert!(!rig.store.auto());
+    }
+
+    #[test]
+    fn an_install_that_fails_on_a_production_server_leaves_it_as_it_was() {
+        let mut rig = Rig::trusting_a("production-fails", &["textpen-1.0.0"]);
+        rig.fake.production.set(true);
+        rig.fake.wrong_file.set(true);
+        let (done, _, _) = rig.install(&["textpen"]);
+        assert_ne!(code(&done), 0);
+        assert_eq!(rig.current("textpen"), None);
+        assert!(
+            rig.store.auto(),
+            "nothing was installed, nothing is switched"
+        );
+        // The machine is still empty, so the install that works is its first.
+        rig.fake.wrong_file.set(false);
+        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
+        assert!(!rig.store.auto());
+    }
+
+    #[test]
+    fn update_trust_approves_exactly_the_key_it_names_where_nobody_can_be_asked() {
+        let mut rig = Rig::trusting_a("update-trust", &["textpen-1.0.0"]);
+        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
+        rig.fake
+            .catalog
+            .borrow_mut()
+            .push("textpen-1.3.0-other-key");
+
+        // The key of the release is B: A is not it.
+        let (done, _, _) = rig.update(&["textpen", "--trust", &key_a()]);
+        assert_eq!(code(&done), 77);
+        assert!(
+            text(&done).contains(&key_b()) && text(&done).contains(&key_a()),
+            "{}",
+            text(&done)
+        );
+        assert_eq!(rig.current("textpen"), Some(v("1.0.0")));
+
+        // B is: the program goes forward, with the key kept and nobody asked.
+        let (done, out, _) = rig.update(&["--trust", &key_b(), "textpen"]);
+        assert_eq!(code(&done), 0, "{}", text(&done));
+        assert_eq!(out, "textpen 1.0.0 -> 1.3.0\n");
+        assert_eq!(rig.store.key("textpen").unwrap(), Some(key_b()));
+        assert_eq!(rig.store.stopped("textpen").unwrap(), None);
+        assert!(rig.person.asked.is_empty());
+    }
+
+    #[test]
+    fn update_trust_names_one_program_and_one_key() {
+        let mut rig = Rig::trusting_a("update-trust-words", &["textpen-1.0.0"]);
+        let (done, _, _) = rig.update(&["--trust", &key_b()]);
+        assert_ne!(code(&done), 0);
+        assert!(
+            text(&done).contains("update NAME --trust KEY"),
+            "{}",
+            text(&done)
+        );
+        let (done, _, _) = rig.update(&["textpen", "--trust"]);
+        assert!(
+            text(&done).contains("takes the key to approve"),
+            "{}",
+            text(&done)
+        );
+        let (done, _, _) = rig.update(&["textpen", "other"]);
+        assert!(text(&done).contains("one program"), "{}", text(&done));
+        let (done, _, _) = rig.update(&["--force"]);
+        assert!(
+            text(&done).contains("takes no '--force'"),
+            "{}",
+            text(&done)
+        );
+        assert!(
+            rig.fake.told().is_empty(),
+            "a mistake in the words asks nobody"
+        );
+    }
+
+    #[test]
     fn a_new_key_stops_the_program_tells_the_app_once_and_waits_for_a_person() {
         let mut rig = Rig::trusting_a("stop", &["textpen-1.0.0"]);
         assert_eq!(code(&rig.install(&["textpen"]).0), 0);
@@ -1065,6 +1236,9 @@ mod tests {
         let (done, ..) = rig.run(|machine, _| {
             machine.watch(&mut || {
                 rounds += 1;
+                // The round after this one meets the app's absence and ends the watch; a machine
+                // that does not look (updating off) would rest for ever, so this ends it first.
+                assert!(rounds < 100, "the watch never met the app's absence");
                 *refuses.borrow_mut() = Some(Asked::NoApp);
                 true
             })
