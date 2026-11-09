@@ -48,12 +48,10 @@ section is not released.
   and `not-here [NAME]...` need no bateri app. `install SOURCE [--trust KEY]` asks the app of the
   bridge for the release, judges it itself, has the file brought and puts it in; `update [NAME
   [--trust KEY]]` does that for what is here; `watch` tells the app what the machine has (`package state`) and then
-  looks for newer releases once a day, for as long as the bridge that started it is there, unless
-  `auto off`. A release goes in only when the signature of its `app.json` holds, its key is the one
+  looks for newer releases once a day, for as long as the bridge that started it is there, unless `auto off` (then it only tells the state again each day); it ends, with status 69, when the app is gone, whether it had anything to look at or not. A release goes in only when the signature of its `app.json` holds, its key is the one
   approved for the program (or one kablo ships with, bateri's), it is newer than what is there, and
   the file is the one the `app.json` signs by its sum. Any other key is asked about at a terminal
-  (`Trust it? [y/N]`) and refused where there is none, unless `--trust` names that very key (`install
-  SOURCE --trust KEY` and `update NAME --trust KEY` alike; a wrong key is 77). A newer
+  (`Trust it? [y/N]`) and refused where there is none, unless `--trust` names that very key (`install SOURCE --trust KEY` and `update NAME --trust KEY` alike; any other key is 77, even where the release's own key needs no approval, and `update` tells the app the key it was given, not the old one). What a held program prints as the way on says the key must be known to be right. A newer
   release signed with another key stops the program where it is, tells the app once, and waits for
   `update NAME` to be answered. The link only goes forward; the machine keeps the version linked, the
   one before it and any younger than thirty days. With no bateri app connected these ask for, the
@@ -68,9 +66,8 @@ section is not released.
 - **A Production server starts with updating off.** The app's `ok offered` may carry a line
   `production yes` when it keeps the machine as a Production server. When it does and the program
   `install` puts in is the first on the machine (`names` of the folder is empty, read before it
-  goes in), kablo writes `auto-off` and says so; any later install leaves the note as the person
-  left it, so `bateri package auto on` stays on. A reply is read leaving out a line it does not
-  know, so that the app may say more later; the line is left out when it is not for a Production
+  goes in), kablo writes `auto-off` before the program goes in, takes it back if the install fails (unless the person had it off already), and says so; any later install leaves the note as the person
+  left it, so `bateri package auto on` stays on. A reply is read leaving out a line it does not know (a bare word too), so that the app may say more later; the line is left out when it is not for a Production
   machine, which makes the answer the text it always was. A kablo of the first build of these verbs
   (before this line) refuses an `ok offered` with it ("`offered` takes no `production`"), which only a
   Production machine is sent.
