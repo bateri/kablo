@@ -1,6 +1,6 @@
 //! The text the `bateri` command and the bateri app say to each other on kablo's app channel.
 //!
-//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
+//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `message`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
 //! line, verbatim. A value has no line break (nor any control character) because the line is
 //! the frame. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
@@ -358,6 +358,10 @@ pub enum Request {
     Close(Anchor),
     /// Tell the user something.
     Notify(String),
+    /// Say what an agent last answered, for the app to show beside the terminal it runs in. The
+    /// text is one line like `notify`'s; what the verb is told is the agent's own business, the
+    /// app only keeps it for the terminal that sent it.
+    Message(String),
     /// Move the keyboard or the layout.
     Arrange(Arrange),
     /// How to reach the server a terminal is to be started on: the `ssh` arguments (`-S`); to a
@@ -784,6 +788,10 @@ impl Request {
             }
             Request::Notify(text) => {
                 out.push_str("notify\n");
+                push(&mut out, "text", text)?;
+            }
+            Request::Message(text) => {
+                out.push_str("message\n");
                 push(&mut out, "text", text)?;
             }
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
@@ -1342,11 +1350,15 @@ fn read_request<'a>(
             let fields = Fields::read(verb, lines, &["text"])?;
             Ok(Request::Notify(fields.need("text")?.to_owned()))
         }
+        "message" => {
+            let fields = Fields::read(verb, lines, &["text"])?;
+            Ok(Request::Message(fields.need("text")?.to_owned()))
+        }
         "focus" | "zoom" | "minimize" | "swap" | "move" | "resize" | "rename" => {
             read_arrange(verb, lines).map(Request::Arrange)
         }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, ssh, relay, focus, zoom, minimize, swap, move, resize or rename"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize or rename"
         ))),
     }
 }
@@ -1898,6 +1910,8 @@ mod tests {
     const V2_MOVE: &str = "bateri 2\nmove\nterminal p9\nbeside p3\nside right\n";
     const V2_RESIZE: &str = "bateri 2\nresize\nterminal p9\nside left\nsteps 3\n";
     const V2_RESIZE_OWN: &str = "bateri 2\nresize\nside below\nsteps 1\n";
+    // Another verb added to version 2 after it was frozen: one `text` line, as `notify`'s.
+    const V2_MESSAGE: &str = "bateri 2\nmessage\ntext Done: 3 tests failed, the fix is in\n";
 
     fn pane(number: u64) -> Anchor {
         Anchor::of(Terminal(number))
@@ -1962,6 +1976,31 @@ mod tests {
                 steps: 1
             }))
         );
+    }
+
+    #[test]
+    fn message_is_read_and_written_byte_for_byte() {
+        let request = Request::Message("Done: 3 tests failed, the fix is in".to_owned());
+        assert_eq!(Request::parse(V2_MESSAGE).as_ref(), Ok(&request));
+        assert_eq!(request.encode().as_deref(), Ok(V2_MESSAGE));
+        // It is its own verb: `notify` does not read it, and it names a `text` or it is refused.
+        assert_ne!(
+            Request::parse(V2_MESSAGE),
+            Ok(Request::Notify(
+                "Done: 3 tests failed, the fix is in".to_owned()
+            ))
+        );
+        assert!(
+            usage("bateri 2\nmessage\n").text.contains("needs a `text`"),
+            "a message says what it carries"
+        );
+        assert!(
+            usage("bateri 2\nmessage\ntext a\nlevel 3\n")
+                .text
+                .contains("takes no `level`")
+        );
+        // A message is not a thing another machine is asked to run: the app of the terminal gets it.
+        assert!(!RELAYED.contains(&"message"));
     }
 
     const V2_CLOSE_TAB: &str = "bateri 2\nclose\nsubject tab\nid t3\n";
@@ -2476,6 +2515,7 @@ mod tests {
             Request::Close(Anchor::of(Terminal(120))),
             Request::Close(Anchor::parse("b-0123456789abcdef0123456789abcdef").expect("a name")),
             Request::Notify("two  spaces, and a trailing one ".to_owned()),
+            Request::Message("two  spaces, and a trailing one ".to_owned()),
         ];
         for request in requests {
             let text = request.encode().expect("a request that can be written");
@@ -2504,6 +2544,12 @@ mod tests {
     fn a_value_with_a_line_break_is_refused_both_ways() {
         let wrote = Request::Notify("two\nlines".to_owned()).encode();
         assert_eq!(wrote.expect_err("no line break").kind, Kind::Usage);
+        let wrote = Request::Message("two\nlines".to_owned()).encode();
+        assert_eq!(wrote.expect_err("no line break").kind, Kind::Usage);
+        assert_eq!(
+            usage("bateri 2\nmessage\ntext a\u{1b}[31mb\n").kind,
+            Kind::Usage
+        );
         // Written by hand, the second line is a key of its own.
         let failure = usage("bateri 2\nnotify\ntext two\nlines\n");
         assert_eq!(failure.kind, Kind::Usage);
@@ -2597,6 +2643,8 @@ mod tests {
         assert!(usage(&long).text.contains("bytes"));
         let long = Request::Notify("x".repeat(MAX_BYTES));
         assert_eq!(long.encode().expect_err("too long").kind, Kind::Usage);
+        let long = Request::Message("x".repeat(MAX_BYTES));
+        assert_eq!(long.encode().expect_err("too long").kind, Kind::Usage);
         assert_eq!(
             Request::Place(Place {
                 ratio: Some(100),
@@ -2689,6 +2737,7 @@ mod tests {
             V2_LS,
             V2_CLOSE,
             V2_NOTIFY,
+            V2_MESSAGE,
             V2_FOCUS_TAB,
             V2_MOVE,
             V2_RESIZE,

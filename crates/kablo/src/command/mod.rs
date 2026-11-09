@@ -11,6 +11,7 @@
 //! 77 (refused), 128+n, and for `wait` the program's own, 124 when the time ran out, 255 for
 //! kablo's trouble.
 
+mod json;
 mod machine;
 mod open;
 mod state;
@@ -221,6 +222,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri close tab|group|window [ID]
        bateri ls [--json]
        bateri notify TEXT...
+       bateri message TEXT... | --json-field FIELD
        bateri send [PANE] [TEXT | -]
        bateri send-key [PANE] KEY...
        bateri capture [PANE] [--history ROWS] [--unwrap] [--trim] [--vt]
@@ -245,6 +247,9 @@ A pane that floats lies over its tab: --float opens one (split) or lifts one (mo
 sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
 tab, 0 to 100, from its top left corner. minimize shrinks a floating pane to a capsule, or opens
 it again.
+message hands the last thing an agent said to the app, which shows it beside the terminal this
+runs in: TEXT, or with --json-field the string member FIELD of the JSON on standard input, as an
+agent's hook is given it (nothing is sent, and the status is 0, when the input has no such text).
 A pane is p and its number (p7); with none named it is the one this runs in. One of another
 machine is written with the machine after an @ (p9@prod), as bateri ls writes it; -S starts a
 terminal on a server, or on this computer from a server (-S @local) (full level only).
@@ -318,7 +323,10 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
     let verb = verb.to_string_lossy().into_owned();
     // `--help` anywhere a command's own words are options; what comes after `--`, and the text of
     // the verbs that take any text, is not ours to read.
-    if !matches!(verb.as_str(), "send" | "send-key" | "notify" | "rename") {
+    if !matches!(
+        verb.as_str(),
+        "send" | "send-key" | "notify" | "message" | "rename"
+    ) {
         for word in rest {
             match word.to_str() {
                 Some("--") => break,
@@ -348,6 +356,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "resize" => verbs::resize(ctx, io, &words),
         "ls" => verbs::ls(ctx, io, &words),
         "notify" => verbs::notify(ctx, &words),
+        "message" => verbs::message(ctx, &words),
         "send" => verbs::send(ctx, io, rest, &words),
         "send-key" => verbs::send_key(ctx, io, rest, &words),
         "capture" => verbs::capture(ctx, io, rest, &words),

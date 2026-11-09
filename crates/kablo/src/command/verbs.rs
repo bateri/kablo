@@ -3,6 +3,7 @@
 //! the bateri app's windows is asked of the bateri app.
 
 use std::ffi::OsString;
+use std::io::Read;
 
 use kablo_bateri::message::{
     Arrange, Extent, Format, Frame, Home, MAX_STEPS, Placed, Reply, Request, Spot, Subject,
@@ -10,6 +11,7 @@ use kablo_bateri::message::{
 };
 use kablo_bateri::{Anchor, Id, IdKind, Side, paths};
 
+use super::json;
 use super::machine;
 use super::words::{
     KINDS, address, check_id, check_label, clean, is_kind, is_terminal, reads_as_id, wrong_kind,
@@ -81,7 +83,7 @@ fn app_moves(ctx: &Ctx, arrange: Arrange) -> Result<Placed, Exit> {
     }
 }
 
-// ─── close, ls, notify ───────────────────────────────────────────────────
+// ─── close, ls, notify, message ──────────────────────────────────────────
 
 /// `close pane|tab|group|window [ID]`: the kind is written, never guessed (`close p9` and a bare
 /// `close` are mistakes that say what to write).
@@ -303,6 +305,92 @@ pub fn notify(ctx: &Ctx, words: &[String]) -> Done {
             Err(Exit::new(69, "the bateri app is not connected to show it"))
         }
     }
+}
+
+/// The most bytes of text a `message` sends. A longer one is cut, not refused: it comes from an
+/// agent's hook, which cannot be told to say less and must not fail.
+const MESSAGE_BYTES: usize = 1000;
+
+/// The most of its input `message --json-field` reads. A hook's payload is the agent's last
+/// answer and a few names; what is longer is no payload.
+const JSON_BYTES: u64 = 1024 * 1024;
+
+/// `message TEXT...` and `message --json-field FIELD`: the last thing an agent said, handed to the
+/// bateri app for the terminal this runs in. The text of the second is the string member FIELD of
+/// the JSON on standard input, which is what an agent's hook is given. The verb knows no agent:
+/// FIELD is the hook's to name. Run by a hook, it must not get in the agent's way, so an input that
+/// has no such text (no JSON, no member, a member that is no string, one that says nothing) sends
+/// nothing and ends with 0; only a command that is written wrong is 64, and no bateri app is 69,
+/// as it is for `notify`.
+pub fn message(ctx: &Ctx, words: &[String]) -> Done {
+    let text = match words.split_first() {
+        None => {
+            return Err(Exit::mistake(
+                "message takes the words to show, or --json-field and the name of the field",
+            ));
+        }
+        Some((flag, rest)) if flag == "--json-field" => {
+            let [field] = rest else {
+                return Err(Exit::mistake(
+                    "message --json-field takes the name of one field, read from the JSON on standard input",
+                ));
+            };
+            let mut input = Vec::new();
+            let read = std::io::stdin()
+                .lock()
+                .take(JSON_BYTES + 1)
+                .read_to_end(&mut input);
+            if read.is_err() || input.len() as u64 > JSON_BYTES {
+                return Ok(());
+            }
+            let Some(text) = json::string_field(&input, field) else {
+                return Ok(());
+            };
+            let text = one_line(&text);
+            if text.is_empty() {
+                return Ok(());
+            }
+            text
+        }
+        Some(_) => {
+            let text = one_line(&words.join(" "));
+            if text.is_empty() {
+                return Err(Exit::mistake("message takes the words to show"));
+            }
+            text
+        }
+    };
+    match ctx.ask(&Request::Message(text))? {
+        Asked::Reply(Reply::Done) => Ok(()),
+        Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
+        Asked::Reply(_) | Asked::Unreadable => Err(unread()),
+        Asked::NoApp | Asked::Silent => {
+            Err(Exit::new(69, "the bateri app is not connected to show it"))
+        }
+    }
+}
+
+/// `text` as one line the app takes: the line breaks and tabs are spaces, the other control
+/// characters go, the ends are trimmed and what is longer than [`MESSAGE_BYTES`] is cut at a
+/// character.
+fn one_line(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\t' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let flat = clean(&flat);
+    let flat = flat.trim();
+    let mut end = flat.len().min(MESSAGE_BYTES);
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    flat.get(..end).unwrap_or_default().trim_end().to_owned()
 }
 
 // ─── focus, zoom, minimize, swap, rename, resize ─────────────────────────

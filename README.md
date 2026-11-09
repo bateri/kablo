@@ -376,7 +376,7 @@ memory of where its relay comes from (see *Limits*).
 - **`kablo bateri VERB`** is the command a terminal app puts on the `PATH` of the
   terminals it opens, for the programs (a coding agent, a build script) that run in
   them: `split`, `tab` and `window` start a terminal and ask the app where its pane
-  goes, and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `focus`, `zoom`,
+  goes, and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `focus`, `zoom`,
   `swap`, `rename`, `close`, `move` and `resize` drive the others (`kablo bateri
   --help`). What needs the app's windows is one text message of the `kablo-bateri`
   crate, which the app reads with the same code, over the mailbox above; the

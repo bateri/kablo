@@ -17,7 +17,7 @@ use kablo_bateri::message::{
     Arrange, Extent, Frame, Home, Request, Spot, Subject, TabHome, WindowHome,
 };
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
-use stage::{Stage, parse_told};
+use stage::{Run, Stage, parse_told};
 
 const OK: &str = "bateri 2\nok\n";
 const MOVED: &str =
@@ -326,6 +326,155 @@ fn notify_needs_an_app_and_sends_one_line() {
     assert_eq!(stage.run_in("p4", &["notify", &long]).status, 64);
     assert_eq!(stage.run_in("p4", &["notify"]).status, 64);
     assert_eq!(stage.told.len(), 1, "nothing else reached the bateri app");
+}
+
+/// `bateri message ARGS` in the terminal p4, with `input` on its standard input.
+fn message_with(stage: &mut Stage, args: &[&str], input: &[u8]) -> stage::Said {
+    stage.go(&Run {
+        here: Some("p4"),
+        args,
+        input: Some(input),
+        turns: &[],
+        vars: &[],
+    })
+}
+
+/// What Claude Code's `Stop` hook is given on standard input, with the last answer `answer` (a JSON
+/// string, quotes and escapes written out).
+fn stop_payload(answer: &str) -> String {
+    format!(
+        r#"{{"session_id":"4f1c","transcript_path":"/home/a/.claude/projects/x/4f1c.jsonl","cwd":"/work","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":{answer}}}"#
+    )
+}
+
+fn message_of(stage: &Stage, at: usize) -> String {
+    match parse_told(&stage.told[at]) {
+        Request::Message(text) => text,
+        other => panic!("a message was told, not {other:?}"),
+    }
+}
+
+#[test]
+fn message_needs_an_app_and_sends_one_line() {
+    let mut stage = Stage::new();
+    let said = stage.run_in("p4", &["message", "the fix is in"]);
+    assert_eq!(said.status, 69);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected to show it\n"
+    );
+    // A hook with something to say has no one to say it to; one with nothing to say need not ask.
+    let payload = stop_payload(r#""Done.""#);
+    assert_eq!(
+        message_with(
+            &mut stage,
+            &["message", "--json-field", "last_assistant_message"],
+            payload.as_bytes()
+        )
+        .status,
+        69
+    );
+    assert_eq!(
+        message_with(
+            &mut stage,
+            &["message", "--json-field", "nothing"],
+            payload.as_bytes()
+        )
+        .status,
+        0
+    );
+    stage.app_says(OK);
+    let said = stage.run_in("p4", &["message", "3 tests\nfailed:", "\u{1b}[31mx\ty"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(message_of(&stage, 0), "3 tests failed: [31mx y");
+    // The text is cut to 1000 bytes, not refused, and never in the middle of a character.
+    let said = stage.run_in("p4", &["message", &"x".repeat(1500)]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(message_of(&stage, 1), "x".repeat(1000));
+    let said = stage.run_in("p4", &["message", &"€".repeat(400)]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(message_of(&stage, 2), "€".repeat(333));
+    // A mistake in the command is 64 and tells the app nothing.
+    for args in [
+        &["message"][..],
+        &["message", "--json-field"],
+        &["message", "--json-field", "a", "b"],
+        &["message", "\n\t\u{1b}"],
+        &["message", " "],
+    ] {
+        let said = stage.run_in("p4", args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+    }
+    assert_eq!(stage.told.len(), 3, "nothing else reached the bateri app");
+    // An app from before the verb says it is none, and that is the status the hook swallows.
+    stage.app_says("bateri 2\nerror usage `message` is no verb: place, ls, close, notify\n");
+    let said = stage.run_in("p4", &["message", "hello"]);
+    assert_eq!(said.status, 64);
+    assert!(said.err.contains("is no verb"), "{}", said.err);
+}
+
+#[test]
+fn message_takes_the_last_answer_out_of_a_hooks_json() {
+    let mut stage = Stage::with_app(OK);
+    let field = ["message", "--json-field", "last_assistant_message"];
+    let payload = stop_payload(
+        r#""Done.\r\n\r\nThree tests failed:\n- \"a\"\t\u001b[1mbold\u001b[0m\n- café 😀""#,
+    );
+    let said = message_with(&mut stage, &field, payload.as_bytes());
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "");
+    assert_eq!(
+        message_of(&stage, 0),
+        "Done.    Three tests failed: - \"a\" [1mbold[0m - café 😀"
+    );
+    // Another member is another name; the verb knows no agent.
+    let said = message_with(
+        &mut stage,
+        &["message", "--json-field", "hook_event_name"],
+        payload.as_bytes(),
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(message_of(&stage, 1), "Stop");
+    // A long answer is cut to 1000 bytes; a long document (a payload of 900 KiB) is read whole.
+    let big = "word ".repeat(180_000);
+    let said = message_with(
+        &mut stage,
+        &field,
+        stop_payload(&format!("\"{big}\"")).as_bytes(),
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(message_of(&stage, 2), big[..1000].trim_end());
+    assert_eq!(stage.told.len(), 3);
+    // No text to send: nothing goes, and the hook is told it went well.
+    let past = "x".repeat(2 * 1024 * 1024);
+    let nothing: [(&str, String); 11] = [
+        (
+            "no such member",
+            stop_payload("1").replace("last_assistant_message", "other"),
+        ),
+        ("not a string", stop_payload("5")),
+        ("null", stop_payload("null")),
+        ("an object", stop_payload(r#"{"text":"x"}"#)),
+        ("empty", stop_payload(r#""""#)),
+        ("only blanks", stop_payload(r#"" \n\t\u001b ""#)),
+        (
+            "in a member inside",
+            r#"{"a":{"last_assistant_message":"x"}}"#.to_owned(),
+        ),
+        ("cut short", stop_payload(r#""x""#)[..60].to_owned()),
+        ("not JSON", "Done. All of it.".to_owned()),
+        ("no input", String::new()),
+        (
+            "more than a hook gives",
+            format!(r#"{{"last_assistant_message":"{past}"}}"#),
+        ),
+    ];
+    for (what, input) in nothing {
+        let said = message_with(&mut stage, &field, input.as_bytes());
+        assert_eq!(said.status, 0, "{what}: {}", said.err);
+        assert_eq!(said.err, "", "{what}");
+    }
+    assert_eq!(stage.told.len(), 3, "nothing else reached the bateri app");
 }
 
 #[test]

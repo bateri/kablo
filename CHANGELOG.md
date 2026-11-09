@@ -26,6 +26,20 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`bateri message` hands the last thing an agent said to the app.** `message TEXT...` sends the
+  words, and `message --json-field FIELD` reads the string member FIELD of the JSON on standard
+  input, which is what an agent's hook is given (Claude Code's `Stop` hook, with
+  `last_assistant_message`); the verb knows no agent, the hook names the field. The text is made one
+  line like `notify`'s and cut to 1000 bytes at a character, not refused. A hook must not get in the
+  agent's way, so an input with no such text (no JSON, a document that is cut short or followed by
+  anything, no such member at the top level, a member that is no string, one that says nothing, more
+  than 1 MiB) sends nothing and ends with 0; a command written wrong is 64, and no bateri app is 69,
+  as for `notify`. In the app channel (`kablo-bateri`, still version 2) the new verb `message` takes
+  the key `text`, as `notify` does, and is not one of the commands a window relays to another
+  machine; an app from before this change answers it with "`message` is no verb" (64).
+
 ## [0.7.0] - 2026-11-09
 
 ### Added
