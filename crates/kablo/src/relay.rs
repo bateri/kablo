@@ -2997,7 +2997,9 @@ mod tests {
             relay.drive(0);
         }
         writer.join().unwrap();
-        assert_eq!(typed_to_the_program(&slave), b"k".repeat(20));
+        // One key a turn, and a program that keeps the terminal full ends the stream in fewer
+        // than twenty of them.
+        assert_eq!(typed_to_the_program(&slave), b"k".repeat(typed));
         // A turn waits for more to gather, but only as many times as the budget has: what
         // is typed is not kept from the program for long.
         assert!(worst < Duration::from_millis(250), "a turn took {worst:?}");
@@ -3202,19 +3204,28 @@ mod tests {
                     "{kib}K: {got} of {}",
                     stream.len()
                 );
-                // One turn of the relay's loop, and then the client reads what it was sent.
+                // One turn of the relay's loop, and then the client reads all that turn read, as
+                // one that reads flat out does: the socket holds less than a turn when this
+                // thread comes late to a terminal the program has filled.
                 if relay.paused(Instant::now()).is_none() {
                     let mut set = [sys::want(relay.master.as_raw_fd(), libc::POLLIN)];
                     if sys::poll(&mut set, Some(Duration::from_millis(1))).unwrap() > 0 {
                         relay.read_terminal();
                     }
                 }
-                relay.drive(0);
-                assert!(
-                    relay.clients[0].attach.is_some(),
-                    "{kib}K: dropped behind after {got} bytes"
-                );
-                got += received(&far, &mut decoder);
+                while (got as u64) < relay.journal.total() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(60),
+                        "{kib}K: {got} of {}",
+                        stream.len()
+                    );
+                    relay.drive(0);
+                    assert!(
+                        relay.clients[0].attach.is_some(),
+                        "{kib}K: dropped behind after {got} bytes"
+                    );
+                    got += received(&far, &mut decoder);
+                }
             }
             writer.join().unwrap();
             assert_eq!(got, stream.len(), "{kib}K");
