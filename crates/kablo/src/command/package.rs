@@ -2,12 +2,23 @@
 //! words a person types and the lines they read. What needs no bateri app to be connected is here:
 //! the list, taking a program away, and the two notes that decide what is brought.
 
-use kablo_package::{Error, Store};
+use std::io::{BufRead, Write};
+use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use kablo_bateri::message::Request;
+use kablo_package::{Error, Store, this_target};
+
+use super::bring::{Bateri, CHECK_EVERY, Machine, Person};
 use super::words::clean;
-use super::{Ctx, Done, Exit, Io};
+use super::{Asked, Ctx, Done, Exit, Io};
+use crate::{app, bridge, sys};
 
 const USAGE: &str = "usage: bateri package list
+       bateri package install SOURCE [--trust KEY]
+       bateri package update [NAME]
+       bateri package watch
        bateri package remove NAME
        bateri package auto [on|off]
        bateri package not-here [NAME]...
@@ -15,7 +26,95 @@ const USAGE: &str = "usage: bateri package list
 
 /// `bateri package VERB ARGS...`.
 pub fn package(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
-    run(&Store::in_home(&ctx.home()), io, words)
+    let store = Store::in_home(&ctx.home());
+    if let Some((verb, rest)) = words.split_first()
+        && matches!(verb.as_str(), "install" | "update" | "watch")
+    {
+        return bring(ctx, &store, io, verb, rest);
+    }
+    run(&store, io, words)
+}
+
+/// The app of the bridge that started this program, when one did; else whichever one answers.
+struct Asking<'a> {
+    ctx: &'a Ctx,
+    bridge: Option<u32>,
+}
+
+impl Bateri for Asking<'_> {
+    fn ask(&self, request: &Request) -> Result<Asked, Exit> {
+        self.ctx.ask_at(request, self.bridge)
+    }
+}
+
+/// The person at the terminal this runs in: asked on standard error, answering on standard input.
+struct AtTerminal;
+
+impl Person for AtTerminal {
+    fn at_terminal(&self) -> bool {
+        sys::is_tty(std::io::stdin().as_fd()) && sys::is_tty(std::io::stderr().as_fd())
+    }
+
+    fn agrees(&mut self, question: &str) -> bool {
+        let mut err = std::io::stderr();
+        let _ = write!(err, "{question}");
+        let _ = err.flush();
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        read.is_ok() && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    }
+}
+
+/// A name for the directory a file is brought to, new at every call.
+fn fresh_part() -> String {
+    static SERIAL: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or_default();
+    format!(
+        "{:x}-{nanos:x}-{:x}",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn bring(ctx: &Ctx, store: &Store, io: &mut Io<'_>, verb: &str, args: &[String]) -> Done {
+    let Some(target) = this_target() else {
+        return Err(Exit::failed(
+            "no program is released for this kind of machine",
+        ));
+    };
+    let asking = Asking {
+        ctx,
+        bridge: app::started_by_bridge(),
+    };
+    let parts = fresh_part;
+    let mut person = AtTerminal;
+    let mut machine = Machine {
+        store,
+        bateri: &asking,
+        person: &mut person,
+        target,
+        switched_off: bridge::forwarding_off(std::path::Path::new(bridge::NO_FORWARDING)),
+        parts: &parts,
+    };
+    match verb {
+        "install" => machine.install(io, args),
+        "update" => machine.update(io, args),
+        _ => {
+            if let Some(arg) = args.first() {
+                return Err(Exit::mistake(format!(
+                    "package watch takes no '{}'",
+                    clean(arg)
+                )));
+            }
+            machine.watch(&mut || {
+                std::thread::sleep(CHECK_EVERY);
+                true
+            })
+        }
+    }
 }
 
 fn run(store: &Store, io: &mut Io<'_>, words: &[String]) -> Done {

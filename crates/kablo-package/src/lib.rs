@@ -39,7 +39,7 @@ use pencere_host::apps::is_name;
 pub use error::Error;
 pub use list::{Listing, Program};
 pub use pencere_host::apps::Version;
-pub use put::{Outcome, Put, Trust};
+pub use put::{Outcome, Put, Release, Standing, Trust, inspect};
 
 /// Names that would be a file or a folder of the machine's own, or the command of a person's:
 /// no program can have them.

@@ -341,6 +341,46 @@ fn with_two_apps_the_one_at_the_terminal_wins_and_away_from_a_terminal_the_one_u
 }
 
 #[test]
+fn a_conversation_pinned_to_a_bridge_asks_that_bridge_even_when_another_was_used_later() {
+    let mut env = Env::new();
+    let first = env.start("app-pin-a", &SH);
+    let second = env.start("app-pin-b", &SH);
+    let mut at_first = app_that_takes_mail(&env);
+    let mut at_second = app_that_takes_mail(&env);
+    at_first.attach(&first, 0);
+    std::thread::sleep(Duration::from_millis(400));
+    at_second.attach(&second, 0);
+    let pinned = at_first.pid();
+
+    // Left to itself, a conversation from no terminal goes to the app used last: the second.
+    // Pinned, it goes to the first, and the second is not asked for anything.
+    let dir = env.dir.clone();
+    let talking = std::thread::spawn(move || {
+        let mut words = Vec::new();
+        let patience = Patience {
+            ask: Duration::from_secs(5),
+            answer: Duration::from_secs(20),
+        };
+        let status = app::talk_with(&dir, null_local(), None, patience, Some(pinned), &mut words);
+        (status, words)
+    });
+    let a = at_first.take_ticket(0, 4096);
+    at_first.stream_close(a);
+    let (status, words) = talking.join().unwrap();
+    assert_eq!(status, 0, "{}", said(&words));
+    assert!(at_second.tickets.is_empty(), "the other app was asked");
+
+    // A pin on a bridge that is none is no app at all.
+    let mut words = Vec::new();
+    let patience = Patience {
+        ask: Duration::from_millis(500),
+        answer: Duration::from_secs(5),
+    };
+    let status = app::talk_with(&env.dir, null_local(), None, patience, Some(1), &mut words);
+    assert_eq!(status, 69, "{}", said(&words));
+}
+
+#[test]
 fn an_app_that_comes_back_through_a_new_bridge_gets_it_before_the_half_dead_one_it_left() {
     let mut env = Env::new();
     let id = env.start("app-back", &SH);

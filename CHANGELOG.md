@@ -40,17 +40,32 @@ section is not released.
   as for `notify`. In the app channel (`kablo-bateri`, still version 2) the new verb `message` takes
   the key `text`, as `notify` does, and is not one of the commands a window relays to another
   machine; an app from before this change answers it with "`message` is no verb" (64).
-- **`bateri package list`, `remove`, `auto` and `not-here`: the programs a machine has.** kablo
+- **`bateri package`: the programs a machine has, and asking the bateri app for them.** kablo
   keeps them in `~/.local/share/bateri/apps` and is the only one that writes it, on a computer and
   on a server alike: `apps/<name>/<version>/` holds the program, its `app.json` and the signature,
   `apps/bin/<name>` is a link to the newest, and small notes sit beside (`source`, `key`,
-  `stopped`, `auto-off`, `not-here`). The folder is the record, and `list` reads it. These verbs
-  need no bateri app. A release goes in only when the signature of its `app.json` holds, its key
-  is the one approved for the program (or one kablo ships with, bateri's), it is newer than what
-  is there, and the file is the one the `app.json` signs by its sum. The link only goes forward;
-  the machine keeps the version linked, the one before it and any younger than thirty days. The
-  names of the folder are `kablo_bateri::paths` (`APPS` and the rest) and the keys kablo trusts
-  without being asked are `kablo_bateri::keys`; the new crate `kablo-package` does the work.
+  `stopped`, `auto-off`, `not-here`). The folder is the record. `list`, `remove`, `auto [on|off]`
+  and `not-here [NAME]...` need no bateri app. `install SOURCE [--trust KEY]` asks the app of the
+  bridge for the release, judges it itself, has the file brought and puts it in; `update [NAME]`
+  does that for what is here; `watch` tells the app what the machine has (`package state`) and then
+  looks for newer releases once a day, for as long as the bridge that started it is there, unless
+  `auto off`. A release goes in only when the signature of its `app.json` holds, its key is the one
+  approved for the program (or one kablo ships with, bateri's), it is newer than what is there, and
+  the file is the one the `app.json` signs by its sum. Any other key is asked about at a terminal
+  (`Trust it? [y/N]`) and refused where there is none, unless `--trust` names that very key. A newer
+  release signed with another key stops the program where it is, tells the app once, and waits for
+  `update NAME` to be answered. The link only goes forward; the machine keeps the version linked, the
+  one before it and any younger than thirty days. With no bateri app connected these ask for, the
+  status is 69 ("no bateri is connected to bring it"); where `/etc/kablo/no-forwarding` is, they are
+  refused (77).
+- **The messages for it** are in `kablo_bateri::package`, version 2 like the rest: `package state`,
+  `package offer` (answered `ok current` or `ok offered`, the `app.json` and its signature as hex),
+  `package fetch` (answered `ok brought`) and `package key-changed`; a bateri that does not know
+  them answers "is no verb" and `kablo_bateri::package::is_old` says so. The names of the folder are
+  `kablo_bateri::paths` (`APPS` and the rest) and the keys kablo trusts without being asked are
+  `kablo_bateri::keys`; the new crate `kablo-package` does the work on the folder.
+- **`app::converse_at` and `app::talk_with`** ask the app of one bridge (by its pid) instead of the
+  one that was used last; a program a bridge started (`watch`) asks the one that started it.
 
 ### Changed
 

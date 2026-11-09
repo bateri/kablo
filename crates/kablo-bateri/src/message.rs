@@ -72,6 +72,7 @@
 //! no names for a window, a group or a tab, and went with `bateri new`.)
 
 use crate::ids::{Id, Kind as IdKind};
+use crate::package::{Answer, Package};
 use crate::place::{Landed, Side};
 use crate::shell::ShellKind;
 use crate::terminal::{Anchor, LOCAL_SERVER, Terminal};
@@ -159,7 +160,7 @@ impl Failure {
         }
     }
 
-    fn usage(text: impl Into<String>) -> Failure {
+    pub(crate) fn usage(text: impl Into<String>) -> Failure {
         Failure::new(Kind::Usage, text)
     }
 }
@@ -369,6 +370,8 @@ pub enum Request {
     Ssh(String),
     /// A command for another machine than the sender's, run there by the window (a `full` server).
     Relay(Relay),
+    /// Something about the programs a machine has ([`crate::package`]).
+    Package(Package),
 }
 
 /// A `bateri` command the window runs on another machine for a program on a server.
@@ -640,6 +643,8 @@ pub enum Reply {
     Text(String),
     /// A relayed command ran: how it ended and what it said.
     Relayed(Relayed),
+    /// The answer to a `package offer` or a `package fetch`.
+    Package(Answer),
     Failed(Failure),
 }
 
@@ -795,6 +800,7 @@ impl Request {
                 push(&mut out, "text", text)?;
             }
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
+            Request::Package(package) => package.encode_into(&mut out)?,
         }
         let limit = if matches!(self, Request::Relay(_)) {
             RELAY_MAX_BYTES
@@ -995,7 +1001,7 @@ fn check_value(key: &str, value: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn push(out: &mut String, key: &str, value: &str) -> Result<(), Failure> {
+pub(crate) fn push(out: &mut String, key: &str, value: &str) -> Result<(), Failure> {
     check_value(key, value)?;
     out.push_str(key);
     out.push(' ');
@@ -1005,13 +1011,13 @@ fn push(out: &mut String, key: &str, value: &str) -> Result<(), Failure> {
 }
 
 /// The `key value` lines of one request, each key at most once and only the ones the verb takes.
-struct Fields<'a> {
+pub(crate) struct Fields<'a> {
     verb: &'a str,
     taken: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> Fields<'a> {
-    fn read(
+    pub(crate) fn read(
         verb: &'a str,
         lines: impl Iterator<Item = &'a str>,
         allowed: &[&str],
@@ -1037,14 +1043,14 @@ impl<'a> Fields<'a> {
         Ok(Fields { verb, taken })
     }
 
-    fn get(&self, key: &str) -> Option<&'a str> {
+    pub(crate) fn get(&self, key: &str) -> Option<&'a str> {
         self.taken
             .iter()
             .find(|(seen, _)| *seen == key)
             .map(|(_, value)| *value)
     }
 
-    fn need(&self, key: &str) -> Result<&'a str, Failure> {
+    pub(crate) fn need(&self, key: &str) -> Result<&'a str, Failure> {
         self.get(key)
             .ok_or_else(|| Failure::usage(format!("`{}` needs a `{key}`", self.verb)))
     }
@@ -1357,8 +1363,11 @@ fn read_request<'a>(
         "focus" | "zoom" | "minimize" | "swap" | "move" | "resize" | "rename" => {
             read_arrange(verb, lines).map(Request::Arrange)
         }
+        "package state" | "package offer" | "package fetch" | "package key-changed" => {
+            crate::package::read(verb, lines).map(Request::Package)
+        }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize or rename"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch or package key-changed"
         ))),
     }
 }
@@ -1667,6 +1676,7 @@ impl Reply {
                 }
                 out.push_str(&relayed.stdout);
             }
+            Reply::Package(answer) => answer.encode_into(&mut out),
             Reply::Failed(failure) => {
                 // One line, whatever the words held.
                 let text: String = failure
@@ -1701,6 +1711,9 @@ impl Reply {
             "ok text" => Ok(Reply::Text(body.to_owned())),
             "ok relayed" => read_relayed(body),
             "ok placed" => read_placed(body),
+            "ok current" | "ok offered" | "ok brought" => {
+                Answer::read(status, body).map(Reply::Package)
+            }
             other => Err(Failure::usage(format!("`{other}` is no status"))),
         }
     }

@@ -45,6 +45,40 @@ pub enum Trust<'a> {
     Approved(&'a str),
 }
 
+/// Where a key stands for a program on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// It is the key approved for the program.
+    Approved,
+    /// The program has no approved key yet, and this is one kablo ships with.
+    Shipped,
+    /// The program has no approved key yet, and this is nobody's the machine knows.
+    Unknown,
+    /// The program has another approved key.
+    Changed { recorded: String },
+}
+
+/// Who a release says it is, once its signature holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    pub name: String,
+    pub version: Version,
+    /// The key it is signed with.
+    pub key: String,
+}
+
+/// Reads an `app.json` and checks the signature it came with against the key it names: whose
+/// release it is, at which version, signed by whom. Nothing about the machine is looked at, and
+/// nothing is written.
+pub fn inspect(manifest: &[u8], signature: &[u8]) -> Result<Release, Error> {
+    let manifest = apps::verify(manifest, signature).map_err(Error::Manifest)?;
+    Ok(Release {
+        name: manifest.name,
+        version: manifest.version,
+        key: manifest.key,
+    })
+}
+
 /// What [`Store::put`] came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -159,19 +193,29 @@ impl Store {
         Ok(Outcome::Installed { version, before })
     }
 
+    /// Where a key stands for a program on this machine.
+    pub fn standing(&self, name: &str, key: &str) -> Result<Standing, Error> {
+        Ok(match self.key(name)? {
+            Some(recorded) if recorded == key => Standing::Approved,
+            Some(recorded) => Standing::Changed { recorded },
+            None if self.embedded.iter().any(|known| known == key) => Standing::Shipped,
+            None => Standing::Unknown,
+        })
+    }
+
     /// Whether the key signing a release is good enough, and whether it is to be written down.
     fn trust(&self, name: &str, key: &str, trust: Trust<'_>) -> Result<bool, Error> {
         let approved = matches!(trust, Trust::Approved(approved) if approved == key);
-        match self.key(name)? {
-            Some(recorded) if recorded == key => Ok(false),
-            Some(_) if approved => Ok(true),
-            Some(recorded) => Err(Error::KeyChanged {
+        match self.standing(name, key)? {
+            Standing::Approved => Ok(false),
+            Standing::Shipped => Ok(true),
+            Standing::Unknown | Standing::Changed { .. } if approved => Ok(true),
+            Standing::Unknown => Err(Error::Unapproved {
+                key: key.to_string(),
+            }),
+            Standing::Changed { recorded } => Err(Error::KeyChanged {
                 recorded,
                 offered: key.to_string(),
-            }),
-            None if approved || self.embedded.iter().any(|known| known == key) => Ok(true),
-            None => Err(Error::Unapproved {
-                key: key.to_string(),
             }),
         }
     }

@@ -14,6 +14,7 @@
 pub mod ids;
 pub mod keys;
 pub mod message;
+pub mod package;
 pub mod paths;
 pub mod place;
 pub mod shell;
