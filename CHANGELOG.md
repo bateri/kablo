@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-09
+
 ### Added
 
 - **`bateri message` hands the last thing an agent said to the app.** `message TEXT...` sends the
