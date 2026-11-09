@@ -1196,3 +1196,59 @@ fn the_package_verbs_work_with_no_bateri_app_and_tell_it_nothing() {
     assert_eq!(said.status, 64, "{}", said.err);
     assert!(stage.told.is_empty(), "{:?}", stage.told);
 }
+
+#[test]
+fn install_with_no_bateri_app_is_69_and_says_what_it_wanted_one_for() {
+    let mut stage = Stage::new();
+    let said = stage.run(&["package", "install", "textpen"]);
+    assert_eq!(said.status, 69, "{}", said.err);
+    assert!(
+        said.err.contains("no bateri is connected to bring it"),
+        "{}",
+        said.err
+    );
+}
+
+#[test]
+fn a_bateri_that_does_not_know_the_package_verbs_is_told_to_be_updated() {
+    // What the bateri before these verbs answers: the reader's own words for a verb it lacks.
+    const OLD: &str = "bateri 2\nerror usage `package offer` is no verb: place, ls, close\n";
+    let mut stage = Stage::with_app(OLD);
+    let said = stage.run(&["package", "install", "textpen"]);
+    assert_eq!(said.status, 1, "{}", said.err);
+    assert!(said.err.contains("update bateri"), "{}", said.err);
+    // The question went out as the format freezes it: the source as written, this kind of machine.
+    let target = kablo_package::this_target().unwrap();
+    assert_eq!(
+        told_one(&stage),
+        format!("bateri 2\npackage offer\nsource textpen\ntarget {target}\n")
+    );
+}
+
+#[test]
+fn install_asks_nobody_at_a_pipe_and_refuses_what_it_cannot_ask_about() {
+    // Not a terminal: a key nobody approved is refused with the way out, and nothing is put in.
+    let (manifest, signature) = {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kablo-package/tests/fixture");
+        (
+            std::fs::read_to_string(dir.join("textpen-1.0.0.app.json")).unwrap(),
+            std::fs::read_to_string(dir.join("textpen-1.0.0.app.json.sig")).unwrap(),
+        )
+    };
+    let hex = |text: &str| kablo_bateri::message::hex_word(text);
+    let offered = format!(
+        "bateri 2\nok offered\nsource bateri/textpen\nmanifest {}\nsignature {}\n",
+        hex(&manifest),
+        hex(&signature)
+    );
+    let mut stage = Stage::with_app(&offered);
+    let said = stage.run(&["package", "install", "textpen"]);
+    assert_eq!(said.status, 77, "{}", said.err);
+    assert!(said.err.contains("--trust ed25519:"), "{}", said.err);
+    assert_eq!(stage.told.len(), 1, "{:?}", stage.told);
+    assert!(
+        !stage.home.join(".local/share/bateri/apps/textpen").exists(),
+        "nothing is put in"
+    );
+}

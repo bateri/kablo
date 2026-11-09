@@ -94,13 +94,35 @@ impl Patience {
 /// signal ends the conversation with 128 and its number, and the signals are the process's own
 /// again once it is over.
 pub fn converse(message: &[u8]) -> (u8, Vec<u8>) {
+    converse_at(message, None)
+}
+
+/// [`converse`], with the app of one bridge: the one whose process has this pid. A program a bridge
+/// started for the app it carries (`bateri package watch`) talks to that app and to no other one
+/// that is connected to the same server.
+pub fn converse_at(message: &[u8], bridge: Option<u32>) -> (u8, Vec<u8>) {
     let signals_pipe = sys::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]).ok();
-    let (status, said) = converse_with(message, signals_pipe.as_ref().map(AsFd::as_fd));
+    let (status, said) = converse_with(message, bridge, signals_pipe.as_ref().map(AsFd::as_fd));
     sys::release_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
     (status, said)
 }
 
-fn converse_with(message: &[u8], signals: Option<BorrowedFd<'_>>) -> (u8, Vec<u8>) {
+/// The pid of the bridge that started this process, when this process was started by a bridge on
+/// the server's behalf: its parent, if that parent keeps a mailbox here. None when a person runs
+/// the command, so that it asks whichever app [`converse`] would.
+pub fn started_by_bridge() -> Option<u32> {
+    let dir = sockdir::socket_dir().ok()?;
+    let parent = std::os::unix::process::parent_id();
+    sockdir::mailbox_path(&dir, parent)
+        .exists()
+        .then_some(parent)
+}
+
+fn converse_with(
+    message: &[u8],
+    bridge: Option<u32>,
+    signals: Option<BorrowedFd<'_>>,
+) -> (u8, Vec<u8>) {
     let mut unsaid = Vec::new();
     let Ok(dir) = sockdir::socket_dir() else {
         return (EXIT_TROUBLE, Vec::new());
@@ -129,7 +151,14 @@ fn converse_with(message: &[u8], signals: Option<BorrowedFd<'_>>) -> (u8, Vec<u8
         scope.spawn(move || {
             let _ = io::copy(&mut std::fs::File::from(errors_read), &mut io::sink());
         });
-        let status = talk(&dir, local, signals, Patience::STANDARD, &mut unsaid);
+        let status = talk_with(
+            &dir,
+            local,
+            signals,
+            Patience::STANDARD,
+            bridge,
+            &mut unsaid,
+        );
         (status, reading.join().unwrap_or_default())
     })
 }
@@ -144,8 +173,24 @@ pub fn talk(
     patience: Patience,
     err: &mut dyn Write,
 ) -> u8 {
+    talk_with(dir, local, signals, patience, None, err)
+}
+
+/// [`talk`] with the app of the bridge `only` (its pid), if one is named: of the mailboxes in
+/// `dir`, no other is asked.
+pub fn talk_with(
+    dir: &Path,
+    local: Local,
+    signals: Option<BorrowedFd<'_>>,
+    patience: Patience,
+    only: Option<u32>,
+    err: &mut dyn Write,
+) -> u8 {
     let boxes = match mailboxes(dir) {
-        Ok(boxes) => boxes,
+        Ok(boxes) => boxes
+            .into_iter()
+            .filter(|mailbox| only.is_none_or(|pid| mailbox.pid == pid))
+            .collect::<Vec<_>>(),
         Err(e) => {
             let _ = writeln!(err, "kablo: {e}");
             return EXIT_TROUBLE;

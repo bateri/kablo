@@ -11,6 +11,7 @@
 //! 77 (refused), 128+n, and for `wait` the program's own, 124 when the time ran out, 255 for
 //! kablo's trouble.
 
+mod bring;
 mod machine;
 mod open;
 mod package;
@@ -171,6 +172,13 @@ impl Ctx {
         self.ask_text(&text)
     }
 
+    /// One conversation with the app of one bridge ([`app::converse_at`]), for a request.
+    pub fn ask_at(&self, request: &Request, bridge: Option<u32>) -> Result<Asked, Exit> {
+        let text = encode(request)?;
+        let (status, reply) = app::converse_at(text.as_bytes(), bridge);
+        asked_of(status, &reply)
+    }
+
     /// The terminal this runs in, under whatever name it has (none outside every terminal): the
     /// ones before the numbers (`b-` and 32 digits) and the ones a person made with `kablo new` are
     /// as much a terminal as `p4`.
@@ -235,6 +243,9 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri move tab [TAB] --group GROUP | --window WINDOW | --new-group NAME [--window WINDOW] [--json]
        bateri resize [PANE] --left|--right|--above|--below [--by N]
        bateri package list
+       bateri package install SOURCE [--trust KEY]
+       bateri package update [NAME]
+       bateri package watch
        bateri package remove NAME
        bateri package auto [on|off]
        bateri package not-here [NAME]...
@@ -245,8 +256,11 @@ terminal on a server, or on this computer from a server (-S @local) (full level 
 Without a program, split, tab and window open a shell. A shell named alone (-- zsh, -- fish) is
 the same, with its dock where bateri has an integration for it. bateri ls lists what is open.
 bateri package is about the programs this machine keeps (~/.local/share/bateri/apps): list shows
-them, remove takes one away, auto says whether they are updated on their own, not-here names what
-is not to be brought here. It needs no bateri app.
+them, install brings one (a name the bateri app follows, user/repo or an address) and asks at a
+terminal about a key it does not know, update looks for newer releases, watch does that once a day
+while the app that started it is connected, remove takes one away, auto says whether they are
+updated on their own, not-here names what is not to be brought here. Only install, update and watch
+need a bateri app.
 ";
 
 /// `kablo bateri VERB ARGS...`: returns the status.
