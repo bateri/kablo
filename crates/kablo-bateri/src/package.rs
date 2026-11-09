@@ -16,6 +16,17 @@
 //!                                have 1.0.0
 //! ```
 //!
+//! and, as an answer to the `offer`, `ok offered` with its lines:
+//!
+//! ```text
+//! bateri 2
+//! ok offered
+//! source bateri/textpen
+//! manifest x7b22…
+//! signature x6564…
+//! production yes
+//! ```
+//!
 //! * `package state` tells the app what the machine has (`installed`, the names), what the person
 //!   said not to bring here (`not-here`) and which kind of machine it is (`target`, as an `app.json`
 //!   names it in `files`). The answer is a plain `ok`.
@@ -24,8 +35,11 @@
 //!   `have`. `key` is the key approved on the machine for the program, if any, so that the app can
 //!   leave out a release it knows the machine would turn away; kablo checks it again. The answer is
 //!   `ok current` (nothing newer) or `ok offered`: the `source` as the app resolved it, the
-//!   `app.json` and its signature, each as `x` and the hex of its bytes ([`crate::message::hex_word`]).
-//!   The file is not in it.
+//!   `app.json` and its signature, each as `x` and the hex of its bytes ([`crate::message::hex_word`]),
+//!   and `production yes` when the app keeps this machine as a Production server (the line is left
+//!   out otherwise, so an answer that is not for a Production machine is the same text it always
+//!   was). The file is not in it. A reply is read leaving out a line it does not know, so that the
+//!   app may say more later; a request is read strictly.
 //! * `package fetch` asks the app to bring the file of the release (`name`, `version`, `target`,
 //!   `source`) to the machine, into the directory `.<version>.part-<part>` of the program's folder.
 //!   The answer is `ok brought` when it is there, and the machine checks it before it goes in.
@@ -127,6 +141,9 @@ pub struct Offered {
     pub manifest: String,
     /// Its signature, as it is in `app.json.sig`.
     pub signature: String,
+    /// The app keeps this machine as a Production server: a machine that has no program yet leaves
+    /// updating on its own off when this is the first it installs.
+    pub production: bool,
 }
 
 /// Whether a failure is a bateri that does not know the `package` verbs.
@@ -274,6 +291,9 @@ impl Answer {
                 out.push_str(&format!("source {}\n", one_line(&offered.source)));
                 out.push_str(&format!("manifest {}\n", hex_word(&offered.manifest)));
                 out.push_str(&format!("signature {}\n", hex_word(&offered.signature)));
+                if offered.production {
+                    out.push_str("production yes\n");
+                }
             }
         }
     }
@@ -289,7 +309,11 @@ impl Answer {
             "ok brought" => Ok(Answer::Brought),
             "ok offered" => {
                 let lines = body.strip_suffix('\n').unwrap_or(body).split('\n');
-                let fields = Fields::read("offered", lines, &["source", "manifest", "signature"])?;
+                let fields = Fields::read_ignoring_unknown(
+                    "offered",
+                    lines,
+                    &["source", "manifest", "signature", "production"],
+                )?;
                 let source = fields.need("source")?;
                 check_source(source)?;
                 let manifest = bounded_hex("manifest", fields.need("manifest")?, MANIFEST_MAX)?;
@@ -298,6 +322,7 @@ impl Answer {
                     source: source.to_owned(),
                     manifest,
                     signature,
+                    production: fields.flag("production")?,
                 }))
             }
             other => Err(Failure::usage(format!("`{other}` is no status"))),
@@ -465,6 +490,7 @@ mod tests {
     const V2_BROUGHT: &str = "bateri 2\nok brought\n";
     // `{"a":1}` and `ed25519:xx\n`.
     const V2_OFFERED: &str = "bateri 2\nok offered\nsource bateri/textpen\nmanifest x7b2261223a317d\nsignature x656432353531393a78780a\n";
+    const V2_OFFERED_PRODUCTION: &str = "bateri 2\nok offered\nsource bateri/textpen\nmanifest x7b2261223a317d\nsignature x656432353531393a78780a\nproduction yes\n";
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| (*name).to_owned()).collect()
@@ -536,15 +562,19 @@ mod tests {
 
     #[test]
     fn the_answers_are_written_and_read_byte_for_byte() {
-        let offered = Reply::Package(Answer::Offered(Offered {
-            source: "bateri/textpen".into(),
-            manifest: "{\"a\":1}".into(),
-            signature: "ed25519:xx\n".into(),
-        }));
+        let offered = |production| {
+            Reply::Package(Answer::Offered(Offered {
+                source: "bateri/textpen".into(),
+                manifest: "{\"a\":1}".into(),
+                signature: "ed25519:xx\n".into(),
+                production,
+            }))
+        };
         for (reply, text) in [
             (Reply::Package(Answer::Current), V2_CURRENT),
             (Reply::Package(Answer::Brought), V2_BROUGHT),
-            (offered, V2_OFFERED),
+            (offered(false), V2_OFFERED),
+            (offered(true), V2_OFFERED_PRODUCTION),
         ] {
             assert_eq!(reply.encode(), text, "{reply:?}");
             assert_eq!(Reply::parse(text).unwrap(), reply, "{text}");
@@ -559,10 +589,56 @@ mod tests {
             source: "bateri/textpen".into(),
             manifest: manifest.into(),
             signature: "ed25519:abc\n".into(),
+            production: false,
         }));
         let text = reply.encode();
         assert_eq!(text.lines().count(), 5, "{text}");
         assert_eq!(Reply::parse(&text).unwrap(), reply);
+    }
+
+    #[test]
+    fn an_offer_without_the_production_line_is_not_for_a_production_machine() {
+        // What a bateri from before the line says: the machine is no Production one.
+        let Reply::Package(Answer::Offered(offered)) = Reply::parse(V2_OFFERED).unwrap() else {
+            panic!("an offer");
+        };
+        assert!(!offered.production);
+        let Reply::Package(Answer::Offered(offered)) = Reply::parse(V2_OFFERED_PRODUCTION).unwrap()
+        else {
+            panic!("an offer");
+        };
+        assert!(offered.production);
+    }
+
+    #[test]
+    fn a_reply_may_say_more_than_this_reader_knows_and_a_request_may_not() {
+        // A newer app's line is passed over, wherever it stands; the lines this reader knows are
+        // still read, and one it knows twice is still refused.
+        let more = V2_OFFERED_PRODUCTION.replace(
+            "source bateri/textpen\n",
+            "source bateri/textpen\nsomething-new a b c\n",
+        ) + "and-another yes\n";
+        let Reply::Package(Answer::Offered(offered)) = Reply::parse(&more).unwrap() else {
+            panic!("an offer");
+        };
+        assert!(offered.production);
+        assert_eq!(offered.source, "bateri/textpen");
+        let twice = V2_OFFERED.to_owned() + "source again\n";
+        assert!(
+            Reply::parse(&twice)
+                .unwrap_err()
+                .text
+                .contains("given twice")
+        );
+        let odd = V2_OFFERED.to_owned() + "production maybe\n";
+        assert!(Reply::parse(&odd).unwrap_err().text.contains("yes or no"));
+        // A request is not read like this: an unknown line is a mistake.
+        assert!(
+            Request::parse("bateri 2\npackage offer\nsource x\ntarget a\nproduction yes\n")
+                .unwrap_err()
+                .text
+                .contains("takes no `production`")
+        );
     }
 
     #[test]

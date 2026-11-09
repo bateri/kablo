@@ -17,7 +17,7 @@ use crate::{app, bridge, sys};
 
 const USAGE: &str = "usage: bateri package list
        bateri package install SOURCE [--trust KEY]
-       bateri package update [NAME]
+       bateri package update [NAME [--trust KEY]]
        bateri package watch
        bateri package remove NAME
        bateri package auto [on|off]
