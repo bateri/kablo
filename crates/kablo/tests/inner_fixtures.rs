@@ -54,6 +54,7 @@ fn to_relay() -> Vec<(&'static str, ToRelay)> {
                 child_pid: 4242,
                 exit: None,
                 warden_version: None,
+                wait_for_client: None,
             }),
         ),
         (
@@ -63,6 +64,7 @@ fn to_relay() -> Vec<(&'static str, ToRelay)> {
                 child_pid: 4242,
                 exit: Some(Exit::Signal(15)),
                 warden_version: None,
+                wait_for_client: None,
             }),
         ),
         (
@@ -72,6 +74,17 @@ fn to_relay() -> Vec<(&'static str, ToRelay)> {
                 child_pid: 4242,
                 exit: None,
                 warden_version: Some("0.1.0".into()),
+                wait_for_client: None,
+            }),
+        ),
+        (
+            "adopt_waiting",
+            ToRelay::Adopt(Adopt {
+                id: work(),
+                child_pid: 4242,
+                exit: None,
+                warden_version: None,
+                wait_for_client: Some(1500),
             }),
         ),
         ("go", ToRelay::Go),
@@ -259,6 +272,7 @@ fn what_a_later_version_adds_is_ignored() {
             child_pid: 4242,
             exit: None,
             warden_version: None,
+            wait_for_client: None,
         }))
     );
 }

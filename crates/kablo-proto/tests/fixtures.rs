@@ -534,6 +534,16 @@ fn messages() -> Vec<(&'static str, Packet)> {
             ),
         ),
         (
+            "new_wait",
+            Packet::about(
+                id("build-1"),
+                Message::New(with(NewSession::default(), |n| {
+                    n.argv = vec![b"/bin/sh".to_vec()];
+                    n.wait_for_client = Some(1500);
+                })),
+            ),
+        ),
+        (
             "status_reply_label",
             work(Message::StatusReply(with(Status::new(id("work")), |s| {
                 s.pid = 4242;
@@ -3303,6 +3313,45 @@ fn a_status_and_a_new_are_read_with_a_label_or_without_one() {
     let mut wire = Vec::new();
     write_packet(&mut wire, &list).unwrap();
     assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(list));
+}
+
+/// A session keeps the terminal's questions for its first client no longer than it may: a
+/// sender cannot write a longer wait, a receiver reads none as none, and a `new` written
+/// before the wait was is one that waits for nobody.
+#[test]
+fn a_new_waits_for_its_client_no_longer_than_a_session_may() {
+    let waiting = |wait: u32| {
+        Packet::about(
+            id("build-1"),
+            Message::New(with(NewSession::default(), |n| {
+                n.wait_for_client = Some(wait);
+            })),
+        )
+    };
+    let longest = waiting(v1::MAX_WAIT_FOR_CLIENT);
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &longest).unwrap();
+    assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(longest));
+    assert!(write_packet(&mut Vec::new(), &waiting(v1::MAX_WAIT_FOR_CLIENT + 1)).is_err());
+    // No wait at all is not written, and reads as none.
+    let mut wire = Vec::new();
+    write_packet(&mut wire, &waiting(0)).unwrap();
+    let Some(Message::New(read)) = read_packet(&mut wire.as_slice())
+        .unwrap()
+        .map(|packet| packet.message)
+    else {
+        panic!("not a new");
+    };
+    assert_eq!(read.wait_for_client, None);
+    for name in ["new_empty", "new_full", "new_history", "new_label"] {
+        let Some(Message::New(new)) = read_packet(&mut fixture(name).as_slice())
+            .unwrap()
+            .map(|packet| packet.message)
+        else {
+            panic!("{name} is not a new");
+        };
+        assert_eq!(new.wait_for_client, None, "{name}");
+    }
 }
 
 #[test]

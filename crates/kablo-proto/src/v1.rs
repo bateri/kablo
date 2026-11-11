@@ -177,6 +177,11 @@ pub const DEFAULT_HISTORY: u32 = 2_000;
 /// The longest binary path an `upgrade` can name.
 pub const MAX_PATH: usize = 4096;
 
+/// The longest a session may keep the terminal's questions for its first client
+/// ([`NewSession::wait_for_client`]), in milliseconds: a program nobody comes for is answered
+/// by the session after no longer than this.
+pub const MAX_WAIT_FOR_CLIENT: u32 = 10_000;
+
 /// A terminal's size: cells and, for programs that ask, pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Size {
@@ -773,6 +778,15 @@ pub struct NewSession {
     pub history: Option<u32>,
     /// The session's label, at most [`MAX_LABEL`] bytes; an empty one is none.
     pub label: Option<String>,
+    /// How long, in milliseconds, the session keeps the terminal's questions (device
+    /// attributes, the cursor position) for the client that asks for it, at most
+    /// [`MAX_WAIT_FOR_CLIENT`]. A session answers those itself while no client is attached,
+    /// so that a program nobody watches is not left waiting; but a program that is started
+    /// with its session asks before the one who started it can have attached, and is then
+    /// answered by the session, not by the terminal it was started for. With this, what is
+    /// asked before the first client attaches is that client's to answer, and the session
+    /// answers it only when no client has come in this long. `None`: answered at once.
+    pub wait_for_client: Option<u32>,
 }
 
 mod new_key {
@@ -783,6 +797,7 @@ mod new_key {
     pub const JOURNAL_SIZE: u16 = 5;
     pub const HISTORY: u16 = 6;
     pub const LABEL: u16 = 7;
+    pub const WAIT_FOR_CLIENT: u16 = 8;
 }
 
 impl NewSession {
@@ -807,6 +822,12 @@ impl NewSession {
         }
         if let Some(label) = &self.label {
             check_label(label)?;
+        }
+        if self
+            .wait_for_client
+            .is_some_and(|wait| wait > MAX_WAIT_FOR_CLIENT)
+        {
+            return Err(Error::Malformed("wait for client"));
         }
         Ok(())
     }
@@ -840,6 +861,9 @@ impl NewSession {
         if let Some(label) = self.label.as_ref().filter(|label| !label.is_empty()) {
             w.put(new_key::LABEL, label.as_bytes());
         }
+        if let Some(wait) = self.wait_for_client.filter(|wait| *wait > 0) {
+            w.put_u32(new_key::WAIT_FOR_CLIENT, wait);
+        }
         Ok(w.finish())
     }
 
@@ -861,6 +885,10 @@ impl NewSession {
                 new_key::HISTORY => new.history = Some(tlv::read_u32(value, "history")?),
                 new_key::LABEL => {
                     new.label = Some(tlv::read_text(value, "label")?).filter(|l| !l.is_empty())
+                }
+                new_key::WAIT_FOR_CLIENT => {
+                    new.wait_for_client =
+                        Some(tlv::read_u32(value, "wait for client")?).filter(|wait| *wait > 0)
                 }
                 _ => {}
             }

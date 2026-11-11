@@ -239,7 +239,11 @@ memory of where its relay comes from (see *Limits*).
   attached**: device attributes, the cursor position, mode and size reports, and
   whether the kitty keyboard protocol is there (answered as a terminal that has
   it would, as the client's own terminal does).
-  With a client attached its own terminal answers. A client that comes back
+  With a client attached its own terminal answers. A session that was started to
+  wait for its first client (`kablo new --wait-for-client`, at most ten seconds)
+  answers nothing until that client has attached or the wait has passed: a
+  program that asks the moment it starts is then answered by the terminal it was
+  started for. A client that comes back
   is not left to answer them again: an app that cannot hold its answers back gets a picture of the screen
   in place of bytes that hold a question the session answered, and an app that
   has a terminal of its own is told how far the questions were answered (see

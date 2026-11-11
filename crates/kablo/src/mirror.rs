@@ -45,7 +45,8 @@ pub(crate) enum Feed {
     /// before this relay or between two), and their questions are answered now;
     /// the others were answered by whoever read them.
     Held,
-    /// Bytes nobody is to answer (the last output of a program that has ended).
+    /// Bytes this relay is not to answer, now or later: the last output of a program that
+    /// has ended, and what was kept for the client that is being attached, which answers it.
     Spent,
     /// Bytes an attached client was shown: those below the offset answered, and
     /// no further. The worker's.

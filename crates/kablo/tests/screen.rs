@@ -316,6 +316,92 @@ fn a_program_that_asks_while_nobody_is_attached_is_answered() {
     late.wait_for("got:1b5b313b3152:\r\n", 0);
 }
 
+/// A session that is started for a client keeps the terminal's questions for it: a program
+/// that asks at once, before the one who started it can have attached, is not answered by
+/// the session's own screen (it would then hear that answer first, and take the terminal for
+/// one that the client is not). The client that comes is told that nothing was answered, is
+/// shown the question, and its answer is the one the program hears.
+#[test]
+fn a_program_started_with_its_session_is_answered_by_the_client_it_was_started_for() {
+    let mut env = Env::new();
+    let id = env.start(
+        "for-a-client",
+        &[
+            "--wait-for-client",
+            "8000",
+            "--",
+            "/bin/sh",
+            "-c",
+            ASK_FOR_THE_CURSOR,
+        ],
+    );
+    // The question is in the journal, and the session has had the time to answer it, had
+    // it meant to: whoever read it, the warden before the relay or the relay.
+    wait_for_output(&env, &id, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    // It comes as a terminal does: with its size, and as one that answers what it is shown.
+    // It is given the bytes, and no picture in their place.
+    let mut client = env.connect(&id);
+    assert_eq!(client.attach_if_answered(0, 80, 24), (0, false));
+    assert_eq!(client.answered, 0, "nothing was answered for it");
+    client.wait_for("\x1b[6n", 0);
+    client.type_in("\x1b[9;9R");
+    // Exactly the client's answer, and not the screen's before or after it.
+    client.wait_for("got:1b5b393b3952:\r\n", 0);
+}
+
+/// Nobody came in the time the session was to wait: the program is answered by the session
+/// then, as one that nobody watches is, and a client that comes later is told that it was.
+#[test]
+fn a_session_whose_client_did_not_come_in_time_answers_the_program_itself() {
+    let mut env = Env::new();
+    let id = env.start(
+        "nobody-came",
+        &[
+            "--wait-for-client",
+            "400",
+            "--",
+            "/bin/sh",
+            "-c",
+            ASK_FOR_THE_CURSOR,
+        ],
+    );
+    wait_for_output(&env, &id, 4);
+    // The answer comes with nobody attached, once the wait is over.
+    let start = Instant::now();
+    let mut control = env.connect(&id);
+    while control.status().offset < ASKED_AND_ANSWERED {
+        assert!(start.elapsed() < PATIENCE, "the session never answered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut late = env.connect(&id);
+    late.attach(0);
+    assert!(late.answered >= 4, "the question was the session's by then");
+    late.wait_for("got:1b5b313b3152:\r\n", 0);
+}
+
+/// A client that comes for a picture, or for the end of the stream, is not shown the
+/// question that was kept: the session answers it first, as it does when nobody comes.
+#[test]
+fn a_question_kept_for_a_client_that_wants_no_bytes_is_answered_by_the_session() {
+    let mut env = Env::new();
+    let id = env.start(
+        "for-a-picture",
+        &[
+            "--wait-for-client",
+            "8000",
+            "--",
+            "/bin/sh",
+            "-c",
+            ASK_FOR_THE_CURSOR,
+        ],
+    );
+    wait_for_output(&env, &id, 4);
+    let mut client = env.connect(&id);
+    client.attach_with_picture(0, 80, 24);
+    client.wait_for("got:1b5b313b3152:\r\n", 0);
+}
+
 #[test]
 fn a_client_that_is_attached_is_the_one_that_answers() {
     let mut env = Env::new();

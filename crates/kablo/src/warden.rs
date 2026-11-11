@@ -311,6 +311,10 @@ struct Warden {
     /// The channel to `kablo new` until the first relay is ready.
     control: Option<UnixStream>,
     chunk: usize,
+    /// Until when the terminal's questions are kept for the session's first client
+    /// (`NewSession::wait_for_client`): a relay is told what is left of it. Not carried
+    /// through a renewal: the wait is a session's first seconds.
+    wait_for_client: Option<Instant>,
 }
 
 impl Warden {
@@ -383,6 +387,9 @@ impl Warden {
             renew_pending: false,
             control: Some(control),
             chunk,
+            wait_for_client: request
+                .wait_for_client
+                .map(|wait| Instant::now() + Duration::from_millis(u64::from(wait))),
         })
     }
 
@@ -482,6 +489,7 @@ impl Warden {
             renew_pending: false,
             control: None,
             chunk: usize::try_from(chunk).unwrap_or(4096),
+            wait_for_client: None,
         };
         warden.send(relay_serial, &ToRelay::Renewed(crate::release()));
         if ended {
@@ -827,6 +835,13 @@ impl Warden {
             child_pid: self.child.id(),
             exit: self.exit,
             warden_version: Some(crate::release()),
+            // What is left of it: a relay that comes later (a restart, a replacement) keeps
+            // the questions no longer than the first would have.
+            wait_for_client: self.wait_for_client.and_then(|until| {
+                u32::try_from(until.saturating_duration_since(Instant::now()).as_millis())
+                    .ok()
+                    .filter(|left| *left > 0)
+            }),
         });
         let fds = [
             self.master.as_raw_fd(),

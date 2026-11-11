@@ -28,7 +28,11 @@
 //! questions (device attributes, the cursor position) are answered by that
 //! screen only while no client is attached, so a program that asks while nobody
 //! looks is not left waiting and one that is watched hears one answer, the
-//! client's. A client whose terminal answers what it is shown and cannot hold
+//! client's. A session that was started to wait for its first client
+//! (`NewSession::wait_for_client`) answers nothing until that client has attached
+//! or the wait has passed: a program started with its session asks before anybody
+//! can have attached, and is to hear the answer of the terminal it was started
+//! for, not the screen's. A client whose terminal answers what it is shown and cannot hold
 //! its answers back says so in its view, and is sent a picture rather than
 //! bytes that hold a question already answered (`last_reply`); any other
 //! client is told how far the questions were answered (`answered`) and keeps
@@ -497,6 +501,12 @@ struct Relay {
     /// The version of the warden that keeps the session; empty if it did not
     /// say.
     warden_version: String,
+    /// Until when the terminal's questions are kept for the session's first client
+    /// (`NewSession::wait_for_client`): while it stands and no client has attached, the
+    /// screen is given nothing, so it answers no question and counts none as answered, and
+    /// the client that comes for the bytes is told so and answers them itself. `None` for a
+    /// session that keeps none, and from the first attach or the end of the time on.
+    wait_for_client: Option<Instant>,
     /// This relay is the one that serves (it was told `Go`): it accepts
     /// clients. Until then the listening socket is left to its other holders.
     live: bool,
@@ -661,6 +671,9 @@ impl Relay {
             output_at: None,
             exit: adopt.exit,
             warden_version: adopt.warden_version.unwrap_or_default(),
+            wait_for_client: adopt
+                .wait_for_client
+                .map(|left| Instant::now() + Duration::from_millis(u64::from(left))),
             live: false,
             reading: false,
             master_done: false,
@@ -788,6 +801,7 @@ impl Relay {
                 self.accept_paused = false;
             }
             self.deliver_if_due(Instant::now());
+            self.stop_waiting_for_a_client(Instant::now());
             if self.is_orphaned() {
                 self.quit = true;
             }
@@ -1199,6 +1213,12 @@ impl Relay {
     /// terminal's answers to the questions in them that are its to hear (`mode`
     /// says which), in stream order: whoever else is feeding the screen is waited for.
     fn feed_screen(&mut self, mode: Feed) {
+        // The questions are the first client's while it is waited for: the screen is given
+        // nothing of what this relay or the warden read, so it answers none of it and none
+        // of it counts as answered. (What nobody is to answer is given as ever.)
+        if matches!(mode, Feed::Live | Feed::Held) && self.keeps_questions(Instant::now()) {
+            return;
+        }
         let core = Arc::clone(&self.core);
         let journal = Arc::clone(&self.journal);
         let mut state = core.lock();
@@ -1227,6 +1247,22 @@ impl Relay {
                     core.parsed_to(state.at);
                     break;
                 }
+            }
+        }
+    }
+
+    /// Whether the terminal's questions are being kept for the session's first client.
+    fn keeps_questions(&self, now: Instant) -> bool {
+        self.wait_for_client.is_some_and(|until| now < until)
+    }
+
+    /// The first client did not come in time: the screen is given what was kept for it and
+    /// answers it, as it does for a program nobody watches.
+    fn stop_waiting_for_a_client(&mut self, now: Instant) {
+        if self.wait_for_client.is_some_and(|until| now >= until) {
+            self.wait_for_client = None;
+            if self.live {
+                self.catch_up();
             }
         }
     }
@@ -1633,9 +1669,29 @@ impl Relay {
         if view.is_some_and(|view| !view.size.fits()) {
             return self.too_big(i);
         }
+        // A client that comes for the bytes while the terminal's questions are kept for it is
+        // the one that answers them, and is told how far the session answered, which is where
+        // the keeping began. The screen is given what was kept before anything else of this
+        // attach reads it (the client's size does), as bytes that are not its to answer: it
+        // answers none of them, and they do not count as answered already, which would have a
+        // terminal that answers what it is shown sent a picture in their place. A client that
+        // comes for the end, for a picture or for bytes the ring no longer holds is not shown
+        // the questions: for it the screen answers them first, as it does when nobody comes.
+        let kept = (self.keeps_questions(Instant::now())
+            && offset != OFFSET_END
+            && offset >= self.journal.retained_from()
+            && !view.is_some_and(|view| view.picture))
+        .then(|| self.journal.answered())
+        .flatten()
+        .filter(|answered| offset <= *answered);
+        self.wait_for_client = None;
         // The screen has all that was read, and `last_reply` says what was answered of it,
         // before a client is added: it is told by them.
-        self.catch_up();
+        if kept.is_some() {
+            self.feed_screen(Feed::Spent);
+        } else {
+            self.catch_up();
+        }
         let total = self.journal.total();
         if offset != OFFSET_END && offset > total {
             return self.error(
@@ -1696,8 +1752,9 @@ impl Relay {
                 offset: start,
                 truncated,
                 // A journal that keeps no track of answers counts as all
-                // answered, as it does for the relay (`replayed_mark`).
-                answered: self.journal.answered().unwrap_or(total),
+                // answered, as it does for the relay (`replayed_mark`). What was kept
+                // for this client is its to answer: it is told where the keeping began.
+                answered: kept.or(self.journal.answered()).unwrap_or(total),
             },
         );
         // Then what the terminal is doing: before the picture and the
@@ -2273,10 +2330,20 @@ impl Relay {
             .filter_map(|client| client.dropped_behind_at)
             .map(|at| (at + DROPPED_BEHIND_LIMIT).saturating_duration_since(now))
             .min();
-        [self.settle.timeout(now), keep, pause, dropped_behind]
-            .into_iter()
-            .flatten()
-            .min()
+        // The end of the wait for a first client: what was kept for it is answered then.
+        let first_client = self
+            .wait_for_client
+            .map(|until| until.saturating_duration_since(now));
+        [
+            self.settle.timeout(now),
+            keep,
+            pause,
+            dropped_behind,
+            first_client,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Tells the warden the session may be removed, once, when it is time.
@@ -2421,6 +2488,7 @@ mod tests {
             output_at: None,
             exit: None,
             warden_version: String::new(),
+            wait_for_client: None,
             live: false,
             reading: false,
             master_done: false,

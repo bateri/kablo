@@ -7,7 +7,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use kablo_proto::SessionId;
-use kablo_proto::v1::{MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, NewSession, Size};
+use kablo_proto::v1::{
+    MAX_COLS, MAX_HISTORY, MAX_LABEL, MAX_ROWS, MAX_WAIT_FOR_CLIENT, NewSession, Size,
+};
 
 use crate::{
     bridge, command, drive, inner, journal, launch, listing, relay, scan, sockdir, sys, upgrade,
@@ -39,7 +41,7 @@ commands:
 
 kablo new [--id ID] [--label TEXT] [--cols N] [--rows N] [--cwd DIR]
           [--env NAME=VALUE]... [--journal-size BYTES[K|M|G]] [--history ROWS]
-          [-- PROGRAM [ARGUMENT]...]
+          [--wait-for-client MILLISECONDS] [-- PROGRAM [ARGUMENT]...]
 kablo list [--json]
 kablo send [ID] [TEXT | -]
 kablo send-key [ID] KEY...
@@ -233,6 +235,16 @@ fn parse_new(args: &[OsString]) -> Result<NewArgs, String> {
             }
             "--history" => {
                 parsed.request.history = Some(history(value()?)?);
+            }
+            "--wait-for-client" => {
+                parsed.request.wait_for_client = Some(
+                    number(
+                        value()?,
+                        "--wait-for-client",
+                        u16::try_from(MAX_WAIT_FOR_CLIENT).unwrap_or(u16::MAX),
+                    )
+                    .map(u32::from)?,
+                );
             }
             other => return Err(format!("unknown option {other}")),
         }
@@ -525,6 +537,20 @@ mod tests {
 
     fn os(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn new_takes_how_long_the_questions_wait_for_a_client() {
+        let parsed = parse_new(&os(&["--wait-for-client", "1500", "--", "/bin/sh"])).unwrap();
+        assert_eq!(parsed.request.wait_for_client, Some(1500));
+        let plain = parse_new(&os(&["--", "/bin/sh"])).unwrap();
+        assert_eq!(plain.request.wait_for_client, None);
+        for bad in ["0", "10001", "soon", "-1"] {
+            assert!(
+                parse_new(&os(&["--wait-for-client", bad])).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

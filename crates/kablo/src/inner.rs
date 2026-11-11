@@ -168,6 +168,10 @@ pub struct Adopt {
     /// The version of the build the warden is; `None` from a warden that did
     /// not say.
     pub warden_version: Option<String>,
+    /// How much is left, in milliseconds, of the time the session keeps the terminal's
+    /// questions for its first client (`NewSession::wait_for_client`); `None` when it
+    /// keeps none, and from a warden that did not say.
+    pub wait_for_client: Option<u32>,
 }
 
 /// Warden to relay.
@@ -249,6 +253,7 @@ mod key {
     pub const ADOPT_CHILD_PID: u16 = 2;
     pub const ADOPT_EXIT: u16 = 3;
     pub const ADOPT_WARDEN_VERSION: u16 = 4;
+    pub const ADOPT_WAIT_FOR_CLIENT: u16 = 5;
     pub const EXIT: u16 = 1;
     pub const TEXT: u16 = 1;
     pub const OFFSET: u16 = 1;
@@ -319,6 +324,9 @@ impl Wire for ToRelay {
                 if let Some(version) = &adopt.warden_version {
                     w.put(key::ADOPT_WARDEN_VERSION, version.as_bytes());
                 }
+                if let Some(wait) = adopt.wait_for_client.filter(|wait| *wait > 0) {
+                    w.put_u32(key::ADOPT_WAIT_FOR_CLIENT, wait);
+                }
                 frame(to_relay::ADOPT, w.finish())
             }
             ToRelay::Go => frame(to_relay::GO, Vec::new()),
@@ -346,6 +354,7 @@ impl Wire for ToRelay {
                 let mut child_pid = 0;
                 let mut exit = None;
                 let mut warden_version = None;
+                let mut wait_for_client = None;
                 for entry in tlv::entries(p) {
                     let (k, value) = entry?;
                     match k {
@@ -357,6 +366,10 @@ impl Wire for ToRelay {
                         key::ADOPT_WARDEN_VERSION => {
                             warden_version = Some(tlv::read_text(value, "adopt warden version")?)
                         }
+                        key::ADOPT_WAIT_FOR_CLIENT => {
+                            wait_for_client = Some(tlv::read_u32(value, "adopt wait for client")?)
+                                .filter(|wait| *wait > 0)
+                        }
                         _ => {}
                     }
                 }
@@ -366,6 +379,7 @@ impl Wire for ToRelay {
                     child_pid,
                     exit,
                     warden_version,
+                    wait_for_client,
                 })
             }
             to_relay::GO => ToRelay::Go,

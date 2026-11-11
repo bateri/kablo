@@ -159,11 +159,12 @@ at the server's default size.
 | 5 | u64 | `journal`: the journal's capacity in bytes, from 16 KiB to 1 GiB; the default is 8 MiB |
 | 6 | u32 | `history`: how many rows of scrollback the session's screen keeps, from 0 to 100000; the default is 2000 |
 | 7 | text | `label`: the session's label, at most 64 bytes (below); empty is none |
+| 8 | u32 | `wait`: how many milliseconds the session keeps the terminal's questions for its first client, at most 10000 (Questions nobody answers, below); none or 0 means they are answered at once |
 
 The command is an argument vector, **never a shell string**, and a server never
 builds a command line out of it. No argument, name, value or directory may
 contain a NUL; a name is not empty and has no `=`; a directory is not empty.
-A `new` that breaks this, or has a `label` over 64 bytes or that is not UTF-8, is malformed. A `journal` or a `history` outside its range is
+A `new` that breaks this, or has a `label` over 64 bytes or that is not UTF-8, or a `wait` over 10000, is malformed. A `journal` or a `history` outside its range is
 answered with `error` (`BAD_REQUEST`) and starts nothing.
 
 The session id in the header is the name asked for; a header with no id lets
@@ -700,6 +701,18 @@ questions were answered, so what it reads while it serves, and what the keeper
 read while no server did (a program that asks at once, before the relay is up;
 the moment between one relay and the next), is answered once, by whichever relay
 comes to it first, and what an earlier relay answered is not answered again.
+A program that is started with its session asks before the one who started the
+session can have attached, and would so be answered by the server and not by
+the terminal it was started for (a program that tells terminals apart by the
+answer takes that terminal for another). A `new` with a `wait` says that a client
+is coming: until one has attached, or the wait has passed, the server answers
+nothing; the client that then attaches for the bytes is told that nothing was
+answered (`attached`'s `answered`) and answers what it is shown. A client that
+attaches for the end of the stream or for a picture is not shown the questions,
+so for it the server answers them first, as it does when the wait passes with
+nobody there. The wait is the session's first moments and no more: what is left
+of it is told to a relay that starts within it, and a keeper that is renewed
+forgets it.
 Colour, clipboard and pixel-size questions are never answered by the server;
 the client's terminal answers those when it sees them, as it always does. The
 kitty keyboard question is answered as a terminal that has the protocol would,
