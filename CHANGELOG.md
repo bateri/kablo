@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-12
+
 ### Added
 
 - **A session can keep the terminal's questions for the client it is started for.** A program that is started with its session asks its terminal the moment it starts, before the one who started the session can have attached, and was answered by the session itself: a program that tells terminals apart by the answer then took the client's terminal for another (an editor that shows its page in bateri opened as a plain editor when bateri started it on a server). A `new` can now say how long the session waits for its first client (`wait`, key 8 of `new`, at most 10000 ms; `NewSession::wait_for_client`, `MAX_WAIT_FOR_CLIENT`; `kablo new --wait-for-client MILLISECONDS`): until a client has attached, or the wait has passed, the session answers nothing, and the client that attaches for the bytes is told that nothing was answered and answers itself. A client that attaches for a picture or for the end of the stream is not shown the questions: for it the session answers them first, as it does when the wait passes. Without it a session answers at once, as before. A server from before this skips the key and answers at once.
