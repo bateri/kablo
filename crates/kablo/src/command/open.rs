@@ -81,6 +81,15 @@ impl Asker {
 /// How many numbers are tried when a terminal made by hand holds the one that comes next.
 const TRIES: u32 = 5;
 
+/// How long, in milliseconds, the terminal of a program keeps the terminal's questions for the
+/// pane that is asked for (`NewSession::wait_for_client`). The program is started before the
+/// bateri app is asked for its pane and asks its terminal the moment it starts; a terminal
+/// nobody is attached to answers for itself, as a plain terminal, and a program that shows a
+/// view in its pane then took the pane for one that shows none. Shorter than the two seconds
+/// such a program waits for its answer: a pane that takes longer than this to come is answered
+/// for, as a terminal with no pane is.
+const PANE_WAIT_MS: u32 = 1500;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Split,
@@ -579,6 +588,14 @@ impl Job<'_> {
                 shell_asked = Some(path);
             }
         }
+        // A program of the caller's that a pane is asked for: its first questions are that pane's
+        // to answer. The pane is asked for by this command, beside the one it has to go beside, or
+        // by the command of another machine that had an app carry these words here (`-S`), once
+        // it is told the number. A terminal with neither has nobody to wait for, and the shell the
+        // bootstrap starts is answered as it was.
+        let pane_wait = (!program.is_empty()
+            && (self.anchor.is_some() || self.ctx.words() != Words::Own))
+            .then_some(PANE_WAIT_MS);
         if program.is_empty() {
             if askable {
                 return self.ask_first(io, &cwd, shell_asked.as_deref());
@@ -619,7 +636,7 @@ impl Job<'_> {
         let mut tries = 0;
         let id = loop {
             let id = self.number()?;
-            match self.start(&id, &cwd, shell_asked.as_deref(), &program) {
+            match self.start(&id, &cwd, shell_asked.as_deref(), &program, pane_wait) {
                 Started::Ready => break id,
                 Started::Taken if tries + 1 < TRIES => tries += 1,
                 Started::Taken => {
@@ -757,7 +774,7 @@ impl Job<'_> {
     }
 
     fn start_bootstrap(&self, id: &str, cwd: &str, shell: Option<&str>) -> Result<(), Exit> {
-        match self.start(id, cwd, shell, &self.bootstrap()) {
+        match self.start(id, cwd, shell, &self.bootstrap(), None) {
             Started::Ready => Ok(()),
             Started::Taken => Err(Exit::failed(format!(
                 "kablo could not start {id}: a session called {id} exists already"
@@ -784,8 +801,16 @@ impl Job<'_> {
 
     /// Starts terminal `id`, in `cwd`, running `program`. It gets the umask and the environment of
     /// the caller, but for the tab the caller stands in, the `PATH` with the command on it, and the
-    /// shell it was asked for.
-    fn start(&self, id: &str, cwd: &str, shell: Option<&str>, program: &[String]) -> Started {
+    /// shell it was asked for. `pane_wait` is how long it keeps the terminal's questions for the
+    /// pane that is asked for next ([`PANE_WAIT_MS`]).
+    fn start(
+        &self,
+        id: &str,
+        cwd: &str,
+        shell: Option<&str>,
+        program: &[String],
+        pane_wait: Option<u32>,
+    ) -> Started {
         let dir = match sockdir::socket_dir() {
             Ok(dir) => dir,
             Err(error) => return Started::Failed(error.to_string()),
@@ -799,6 +824,7 @@ impl Job<'_> {
             .map(|word| word.as_bytes().to_vec())
             .collect();
         request.label = self.wants.pane_label().map(str::to_owned);
+        request.wait_for_client = pane_wait;
         let absolute = std::path::absolute(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
         request.cwd = Some(absolute.as_os_str().as_encoded_bytes().to_vec());
         request

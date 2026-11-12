@@ -243,7 +243,8 @@ memory of where its relay comes from (see *Limits*).
   wait for its first client (`kablo new --wait-for-client`, at most ten seconds)
   answers nothing until that client has attached or the wait has passed: a
   program that asks the moment it starts is then answered by the terminal it was
-  started for. A client that comes back
+  started for, whether that client comes for the bytes or for a picture of the
+  screen and what follows it. A client that comes back
   is not left to answer them again: an app that cannot hold its answers back gets a picture of the screen
   in place of bytes that hold a question the session answered, and an app that
   has a terminal of its own is told how far the questions were answered (see
@@ -380,7 +381,8 @@ memory of where its relay comes from (see *Limits*).
 - **`kablo bateri VERB`** is the command a terminal app puts on the `PATH` of the
   terminals it opens, for the programs (a coding agent, a build script) that run in
   them: `split`, `tab` and `window` start a terminal and ask the app where its pane
-  goes, and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `focus`, `zoom`,
+  goes (a program they start keeps the terminal's questions for that pane for a
+  second and a half, so it is the pane that answers it), and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `focus`, `zoom`,
   `swap`, `rename`, `close`, `move` and `resize` drive the others (`kablo bateri
   --help`). What needs the app's windows is one text message of the `kablo-bateri`
   crate, which the app reads with the same code, over the mailbox above; the

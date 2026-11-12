@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use kablo_bateri::message::{Extent, Frame, Home, Place, Request, Spot, WindowHome, hex_word};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
+use kablo_proto::v1::OFFSET_END;
 use stage::{Pane, Run, Stage, parse_told};
 
 const PLACED: &str = "bateri 2\nok placed\nlanded as_asked\nnext-to p40\nsqueezed no\nhidden no\n";
@@ -1323,6 +1324,92 @@ fn a_split_with_no_pane_to_go_beside_prints_the_number_and_waits_with_the_progra
     let said = stage.run(&["split", "--wait", "--", "/bin/sh", "-c", "exit 3"]);
     assert_eq!(said.status, 3, "{}", said.err);
     assert_eq!(said.out, "p1\n");
+}
+
+/// A program that asks where the cursor is the moment it starts and says what it was told, as
+/// hex: `got:<first answer>:<a second one, if any>`. It waits long for the first, so that a busy
+/// machine cannot make it give up.
+const ASK_FOR_THE_CURSOR: &str = "stty raw -echo min 0 time 100; printf '\\033[6n'; \
+     got=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+     stty min 0 time 5; \
+     more=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+     stty sane; echo \"got:$got:$more\"";
+
+/// Waits until terminal `id` has read the question of [`ASK_FOR_THE_CURSOR`], and then long
+/// enough for it to have answered, had it meant to.
+fn asked(stage: &Stage, id: &str) {
+    let mut control = stage.env.connect(id);
+    let start = Instant::now();
+    while control.status().offset < 4 {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the program asked nothing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Attaches to terminal `id` as the pane the bateri app makes for a terminal that runs already
+/// does (from now on, with a picture of the screen first), answers the question it is shown
+/// with a place of its own, and says what the program heard.
+fn pane_answers(stage: &Stage, id: &str) {
+    let mut pane = stage.env.connect(id);
+    assert_eq!(pane.attach_with_picture(OFFSET_END, 80, 24), (0, false));
+    assert_eq!(pane.answered, 0, "nothing was answered for the pane");
+    pane.wait_for("\x1b[6n", 0);
+    pane.type_in("\x1b[9;9R");
+    pane.wait_for("got:1b5b393b3952:\r\n", 0);
+}
+
+/// The program of a split is started before the app is asked for its pane, and asks its terminal
+/// at once. The terminal keeps the question for that pane: the pane that attaches a moment later
+/// is told that nothing was answered, sees the question after its picture, and its answer is the
+/// only one the program hears (the terminal's own would have come first, and told the program of
+/// a terminal that the pane is not).
+#[test]
+fn the_program_of_a_split_is_answered_by_the_pane_that_was_asked_for() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let said = stage.run_in("p40", &["split", "--", "/bin/sh", "-c", ASK_FOR_THE_CURSOR]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p1\n");
+    asked(&stage, "p1");
+    pane_answers(&stage, "p1");
+}
+
+/// So is the program of a split that the app of another machine carried here (`-S`): the
+/// command that asked is told the number and asks that app for the pane, and this one, which
+/// has no pane to go beside, keeps the question for it all the same.
+#[test]
+fn the_program_of_a_split_an_app_carried_here_is_answered_by_the_pane_that_follows() {
+    for carried in ["--hex", "--hex-here"] {
+        let mut stage = stage();
+        stage.in_pane(Pane::Bare);
+        let mut args = vec![carried.to_owned()];
+        args.extend(["split", "--", "/bin/sh", "-c", ASK_FOR_THE_CURSOR].map(hex_word));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let said = stage.run(&args);
+        assert_eq!(said.status, 0, "{carried}: {}", said.err);
+        assert_eq!(said.out, "p1\n");
+        asked(&stage, "p1");
+        pane_answers(&stage, "p1");
+    }
+}
+
+/// A terminal with no pane to go beside has nobody to keep its questions for: it answers its
+/// program itself, as a terminal nobody watches does, and a client that comes later is told so.
+#[test]
+fn the_program_of_a_split_with_no_pane_is_answered_by_its_terminal() {
+    let mut stage = stage();
+    stage.in_pane(Pane::Bare);
+    let said = stage.run(&["split", "--", "/bin/sh", "-c", ASK_FOR_THE_CURSOR]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "p1\n");
+    let mut late = stage.env.connect("p1");
+    late.attach(0);
+    late.wait_for("got:1b5b313b3152:\r\n", 0);
+    assert!(late.answered >= 4, "the question was the terminal's");
 }
 
 // ─── who starts it: the bateri app says ─────────────────────────────────────────

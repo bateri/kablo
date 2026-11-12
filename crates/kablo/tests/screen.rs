@@ -380,13 +380,51 @@ fn a_session_whose_client_did_not_come_in_time_answers_the_program_itself() {
     late.wait_for("got:1b5b313b3152:\r\n", 0);
 }
 
-/// A client that comes for a picture, or for the end of the stream, is not shown the
-/// question that was kept: the session answers it first, as it does when nobody comes.
+/// A client that comes for a picture is the one the question was kept for all the same: a
+/// pane that is made for a terminal that runs already asks for the screen and what follows
+/// it. The picture is of the screen as it stood before the question, at the client's size,
+/// and the question follows it as bytes; the client's answer is the one the program hears.
 #[test]
-fn a_question_kept_for_a_client_that_wants_no_bytes_is_answered_by_the_session() {
+fn a_question_kept_for_a_client_that_comes_for_a_picture_follows_the_picture() {
+    // From now on, as a pane asks, and from the first byte.
+    for (name, offset) in [("for-a-picture", OFFSET_END), ("for-a-picture-0", 0)] {
+        let mut env = Env::new();
+        let id = env.start(
+            name,
+            &[
+                "--wait-for-client",
+                "8000",
+                "--",
+                "/bin/sh",
+                "-c",
+                ASK_FOR_THE_CURSOR,
+            ],
+        );
+        wait_for_output(&env, &id, 4);
+        std::thread::sleep(Duration::from_millis(300));
+        let mut client = env.connect(&id);
+        assert_eq!(client.attach_with_picture(offset, 100, 30), (0, false));
+        assert_eq!(client.answered, 0, "nothing was answered for it");
+        let picture = client.pictures.last().expect("a picture");
+        assert_eq!(
+            (picture.offset, picture.cols, picture.rows),
+            (0, 100, 30),
+            "the screen before the question, at the client's size"
+        );
+        client.wait_for("\x1b[6n", 0);
+        client.type_in("\x1b[9;9R");
+        // Exactly the client's answer, and not the screen's before or after it.
+        client.wait_for("got:1b5b393b3952:\r\n", 0);
+    }
+}
+
+/// A client that comes for the end of the stream alone is not shown the question that was
+/// kept: the session answers it first, as it does when nobody comes.
+#[test]
+fn a_question_kept_for_a_client_that_wants_nothing_of_the_past_is_answered_by_the_session() {
     let mut env = Env::new();
     let id = env.start(
-        "for-a-picture",
+        "for-the-end",
         &[
             "--wait-for-client",
             "8000",
@@ -398,7 +436,7 @@ fn a_question_kept_for_a_client_that_wants_no_bytes_is_answered_by_the_session()
     );
     wait_for_output(&env, &id, 4);
     let mut client = env.connect(&id);
-    client.attach_with_picture(0, 80, 24);
+    client.attach(OFFSET_END);
     client.wait_for("got:1b5b313b3152:\r\n", 0);
 }
 

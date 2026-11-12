@@ -706,11 +706,15 @@ session can have attached, and would so be answered by the server and not by
 the terminal it was started for (a program that tells terminals apart by the
 answer takes that terminal for another). A `new` with a `wait` says that a client
 is coming: until one has attached, or the wait has passed, the server answers
-nothing; the client that then attaches for the bytes is told that nothing was
-answered (`attached`'s `answered`) and answers what it is shown. A client that
-attaches for the end of the stream or for a picture is not shown the questions,
-so for it the server answers them first, as it does when the wait passes with
-nobody there. The wait is the session's first moments and no more: what is left
+nothing; the client that then attaches is told that nothing was answered
+(`attached`'s `answered`) and answers what it is shown. It is shown the bytes
+from the offset it asks for or, when it asks for a picture (a pane made for a
+session that runs already asks for the screen and what follows), a picture of
+the screen as it stood before the questions were kept, at the client's size, and
+then the bytes that were kept, from the picture's offset. A client that attaches
+for the end of the stream with no picture is not shown the questions, so for it
+the server answers them first, as it does when the wait passes with nobody
+there. The wait is the session's first moments and no more: what is left
 of it is told to a relay that starts within it, and a keeper that is renewed
 forgets it.
 Colour, clipboard and pixel-size questions are never answered by the server;

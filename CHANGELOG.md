@@ -26,6 +26,14 @@ section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **A client that attaches for a picture is shown the questions a session kept for its first client.** A session started with a `wait` (`NewSession::wait_for_client`) kept its terminal's questions only for a client that attached for the bytes; one that attached for a picture had them answered by the session first, as if nobody had come. A pane that an app makes for a session that runs already attaches from now on with a picture of the screen, so it was never the one that answered. Such a client is now sent a picture of the screen as it stood before the questions were kept, at its own size, and then the bytes that were kept, from the picture's offset; `attached`'s `answered` says where the keeping began, and the client answers what it is shown. A client that attaches for the end of the stream with no picture is still not shown them. Nothing changes for a session started without a `wait`, or once its wait has passed.
+
+### Fixed
+
+- **A program that `bateri split`, `tab` or `window` starts is answered by its pane, not by its terminal.** The program is started before the app is asked for its pane and asks its terminal the moment it starts; with nobody attached yet the session answered, as a plain terminal, and a program that shows a view in its pane took the pane for one that shows none (`bateri split -- textpen FILE` opened a plain editor). The command now starts the terminal of a program with a `wait` of 1500 ms when a pane is asked for: by the command itself, beside the pane it has to go beside, or by the command of another machine whose app carried the words here (`-S`, `--hex`, `--hex-here`). A terminal with no pane to go beside and the shell of a pane with no program are started as before.
+
 ## [0.9.0] - 2026-11-12
 
 ### Added

@@ -32,7 +32,9 @@
 //! (`NewSession::wait_for_client`) answers nothing until that client has attached
 //! or the wait has passed: a program started with its session asks before anybody
 //! can have attached, and is to hear the answer of the terminal it was started
-//! for, not the screen's. A client whose terminal answers what it is shown and cannot hold
+//! for, not the screen's. That client is shown what was kept: from the offset it
+//! asks for, or after a picture of the screen as it stood before. A client whose
+//! terminal answers what it is shown and cannot hold
 //! its answers back says so in its view, and is sent a picture rather than
 //! bytes that hold a question already answered (`last_reply`); any other
 //! client is told how far the questions were answered (`answered`) and keeps
@@ -504,7 +506,8 @@ struct Relay {
     /// Until when the terminal's questions are kept for the session's first client
     /// (`NewSession::wait_for_client`): while it stands and no client has attached, the
     /// screen is given nothing, so it answers no question and counts none as answered, and
-    /// the client that comes for the bytes is told so and answers them itself. `None` for a
+    /// the client that comes for the bytes, or for a picture and what follows it, is told so
+    /// and answers them itself. `None` for a
     /// session that keeps none, and from the first attach or the end of the time on.
     wait_for_client: Option<Instant>,
     /// This relay is the one that serves (it was told `Go`): it accepts
@@ -1304,6 +1307,35 @@ impl Relay {
         }
     }
 
+    /// A picture of the screen as it stood when the terminal's questions began to be kept,
+    /// at the size of the client they were kept for: nothing of what was kept is in it, and
+    /// the stream goes on from where it stands, so the client is sent the bytes that were
+    /// kept after it and answers what they ask. The screen is then given those bytes, as
+    /// ones that are not its to answer. (It takes the client's size before them, as the
+    /// client's own terminal reads them at that size.)
+    fn picture_before_what_was_kept(&mut self, size: Option<Size>) -> Picture {
+        let picture = {
+            let mut state = self.core.lock();
+            if let Some(size) = size
+                && size.cols > 0
+                && size.rows > 0
+                && state.screen.size() != (size.cols, size.rows)
+            {
+                state.screen.resize(size.cols, size.rows);
+            }
+            let (cols, rows) = state.screen.size();
+            Picture {
+                offset: state.at,
+                cols,
+                rows,
+                bytes: state.screen.image(),
+                sent: 0,
+            }
+        };
+        self.feed_screen(Feed::Spent);
+        picture
+    }
+
     /// Nothing is left for this relay to do: the warden is gone (nobody can
     /// tell it to quit, or keep the session for a client that comes later),
     /// the program's side of the terminal is closed and every client has what
@@ -1669,29 +1701,52 @@ impl Relay {
         if view.is_some_and(|view| !view.size.fits()) {
             return self.too_big(i);
         }
-        // A client that comes for the bytes while the terminal's questions are kept for it is
-        // the one that answers them, and is told how far the session answered, which is where
-        // the keeping began. The screen is given what was kept before anything else of this
-        // attach reads it (the client's size does), as bytes that are not its to answer: it
-        // answers none of them, and they do not count as answered already, which would have a
-        // terminal that answers what it is shown sent a picture in their place. A client that
-        // comes for the end, for a picture or for bytes the ring no longer holds is not shown
-        // the questions: for it the screen answers them first, as it does when nobody comes.
-        let kept = (self.keeps_questions(Instant::now())
-            && offset != OFFSET_END
-            && offset >= self.journal.retained_from()
-            && !view.is_some_and(|view| view.picture))
-        .then(|| self.journal.answered())
-        .flatten()
-        .filter(|answered| offset <= *answered);
+        // A client that comes while the terminal's questions are kept for it is the one that
+        // answers them, and is told how far the session answered, which is where the keeping
+        // began. It comes for the bytes from there, or for a picture, as a pane does that is
+        // made for a terminal that runs already: the picture is then of the screen as it stood
+        // when the keeping began, and the bytes that were kept follow it. Either way the
+        // screen is given what was kept before anything else of this attach reads it (the
+        // client's size does), as bytes that are not its to answer: it answers none of them,
+        // and they do not count as answered already, which would have a terminal that
+        // answers what it is shown sent a picture in their place. Whether they were kept is
+        // decided here, once: the wait may end while this attach is made. A client that
+        // comes for the end alone, or for bytes the ring no longer holds, is not shown the
+        // questions: for it the screen answers them first, as it does when nobody comes.
+        let wants_picture = view.is_some_and(|view| view.picture);
+        let kept = self
+            .keeps_questions(Instant::now())
+            .then(|| self.journal.answered())
+            .flatten()
+            .filter(|answered| {
+                if wants_picture {
+                    // The screen stands where the keeping began, and the ring holds the
+                    // stream from there.
+                    *answered >= self.journal.retained_from()
+                        && self.core.lock().at == *answered
+                        && (offset == OFFSET_END || offset <= self.journal.total())
+                } else {
+                    offset != OFFSET_END
+                        && offset >= self.journal.retained_from()
+                        && offset <= *answered
+                }
+            });
         self.wait_for_client = None;
         // The screen has all that was read, and `last_reply` says what was answered of it,
         // before a client is added: it is told by them.
-        if kept.is_some() {
-            self.feed_screen(Feed::Spent);
-        } else {
-            self.catch_up();
-        }
+        let picture_before = match kept {
+            Some(_) if wants_picture => {
+                Some(self.picture_before_what_was_kept(view.map(|view| view.size)))
+            }
+            Some(_) => {
+                self.feed_screen(Feed::Spent);
+                None
+            }
+            None => {
+                self.catch_up();
+                None
+            }
+        };
         let total = self.journal.total();
         if offset != OFFSET_END && offset > total {
             return self.error(
@@ -1718,7 +1773,8 @@ impl Relay {
             && view.is_some_and(|view| view.picture_if_answered);
         let truncated =
             (offset != OFFSET_END && offset < self.journal.retained_from()) || answered_twice;
-        let picture = (truncated || view.is_some_and(|view| view.picture)).then(|| self.picture());
+        let picture =
+            picture_before.or_else(|| (truncated || wants_picture).then(|| self.picture()));
         let start = match &picture {
             Some(picture) => picture.offset,
             None if offset == OFFSET_END => total,
