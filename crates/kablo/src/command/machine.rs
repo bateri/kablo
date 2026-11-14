@@ -135,7 +135,7 @@ pub fn carry(ctx: &Ctx, io: &mut Io<'_>, via: &str, words: &[String]) -> Done {
             let ran = remote(ctx, io, via, words, Output::Print)?;
             if ran.status == 255 {
                 io.say(&format!(
-                    "could not reach {via}, or kablo had trouble there"
+                    "could not reach {via}, or bateri had trouble there"
                 ));
             }
             finish(ran.status)

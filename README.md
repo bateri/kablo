@@ -86,7 +86,7 @@ The binary is one file. Put it where your shell finds it, on a server too. The
 program a terminal app runs over ssh is `kablo attach`, and ssh runs it in a
 non-interactive shell, whose `PATH` often leaves out `~/.local/bin`; apps
 therefore give ssh the path itself
-(`ssh host .local/share/kablo/0.1.0/kablo attach`, see *For apps that drive
+(`ssh host .local/share/bateri/kablo/0.1.0/kablo attach`, see *For apps that drive
 kablo*).
 
 ## How bateri uses it
@@ -418,14 +418,16 @@ memory of where its relay comes from (see *Limits*).
   // `ssh host uname -s -m` (install::UNAME_COMMAND) printed `output`
   let target = Target::from_uname_output(&output).ok_or("no kablo for this server")?;
   install::artifact_name("0.1.0", target)?;        // kablo-0.1.0-x86_64-unknown-linux-musl
-  install::install_path("0.1.0")?;                 // .local/share/kablo/0.1.0/kablo
+  install::install_path("0.1.0")?;                 // .local/share/bateri/kablo/0.1.0/kablo
   install::install_path_in("/home/ada", "0.1.0")?; // the same, for `kablo upgrade`
   ```
 
   The binary of a release is listed with its SHA-256 in `SHA256SUMS`; check
   it before it goes to the server. A version has a directory of its own below
   the home directory and a new version never overwrites an old one, so a relay
-  that runs from the old file is not disturbed.
+  that runs from the old file is not disturbed. Versions put there before
+  `install::ROOT` moved into bateri's folder are under `install::FORMER_ROOT`
+  (`install::former_install_path`).
 
 ## License
 

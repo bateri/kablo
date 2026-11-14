@@ -12,12 +12,6 @@
 //! ask at, it is refused. A program whose newer release came with another key stops where it is, once
 //! told to the person, until `update NAME` is answered at a terminal.
 //!
-//! **A Production server starts with updating off.** When the app says the machine it answers for
-//! is a Production server (`production` in the offer) and the first program is installed on a
-//! machine that has none, `auto-off` is written before the program goes in (and taken back if it
-//! does not, unless it was there), so that nothing there changes on its own until a person says so
-//! (`bateri package auto on`, which stays). A later install does not touch it.
-//!
 //! **A watch that looks at nothing still asks something.** With updating off, or nothing to look
 //! at, a round tells the app what the machine has instead, which is how it learns the app has gone
 //! and ends (69) rather than resting for ever.
@@ -299,39 +293,8 @@ impl Machine<'_> {
         let Way::Go(approved) = self.way(&release, trust, true)? else {
             return Err(unread());
         };
-        // The first program of a Production server: read from the folder before it is put in.
-        // Updating is left off before the program goes in and taken back if it does not, so that
-        // an install that goes in never finds the note unwritten.
-        let first_on_production = offered.production
-            && self
-                .store
-                .names()
-                .map_err(|error| Exit::failed(clean(&error.to_string())))?
-                .is_empty();
-        let was_on = self.store.auto();
-        if first_on_production {
-            self.store.set_auto(false).map_err(|error| {
-                Exit::failed(format!(
-                    "could not leave updating off on this Production server: {}",
-                    clean(&error.to_string())
-                ))
-            })?;
-        }
-        if let Err(exit) = self.bring(&offered, &release, approved.as_deref()) {
-            if first_on_production && was_on {
-                // Nothing came in, so what was off for it is on again; if that cannot be written it
-                // stays off, the safe side.
-                let _ = self.store.set_auto(true);
-            }
-            return Err(exit);
-        }
+        self.bring(&offered, &release, approved.as_deref())?;
         let _ = writeln!(io.out, "{} {} installed", release.name, release.version);
-        if first_on_production {
-            let _ = writeln!(
-                io.out,
-                "programs are not updated on their own on this server, which bateri keeps as Production; `bateri package auto on` turns it on"
-            );
-        }
         Ok(())
     }
 
@@ -1021,8 +984,10 @@ mod tests {
     }
 
     #[test]
-    fn the_first_program_of_a_production_server_leaves_updating_off_and_says_so() {
-        let mut rig = Rig::trusting_a("production", &["textpen-1.0.0"]);
+    fn an_offer_that_says_production_does_not_change_how_updating_starts() {
+        // What a bateri from before says of a machine it kept as Production: it is read, and the
+        // first program there is installed like any other, with updating on.
+        let mut rig = Rig::trusting_a("production-said", &["textpen-1.0.0"]);
         rig.fake.production.set(true);
         assert!(
             rig.store.auto(),
@@ -1030,59 +995,11 @@ mod tests {
         );
         let (done, out, _) = rig.install(&["textpen"]);
         assert_eq!(code(&done), 0, "{}", text(&done));
-        assert!(!rig.store.auto());
-        assert!(out.starts_with("textpen 1.0.0 installed\n"), "{out}");
-        assert!(out.contains("bateri package auto on"), "{out}");
-    }
-
-    #[test]
-    fn a_machine_that_is_not_a_production_server_keeps_updating_on() {
-        let mut rig = Rig::trusting_a("not-production", &["textpen-1.0.0"]);
-        let (done, out, _) = rig.install(&["textpen"]);
-        assert_eq!(code(&done), 0, "{}", text(&done));
         assert!(rig.store.auto());
         assert_eq!(out, "textpen 1.0.0 installed\n");
-    }
-
-    #[test]
-    fn a_later_install_on_a_production_server_leaves_what_the_person_chose() {
-        let mut rig = Rig::trusting_a("production-later", &["textpen-1.0.0"]);
-        rig.fake.production.set(true);
-        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
-        assert!(!rig.store.auto());
-        // The person turns updating on; the next install, of the same program or another, is not
-        // the first and does not take that back.
-        rig.store.set_auto(true).unwrap();
-        rig.fake.catalog.borrow_mut().push("textpen-1.1.0");
-        let (done, out, _) = rig.install(&["textpen"]);
-        assert_eq!(code(&done), 0, "{}", text(&done));
-        assert_eq!(out, "textpen 1.1.0 installed\n");
-        assert!(rig.store.auto());
-        *rig.fake.catalog.borrow_mut() = vec!["other-1.0.0"];
-        let (done, _, _) = rig.install(&["other"]);
-        assert_eq!(code(&done), 0, "{}", text(&done));
-        assert!(rig.store.auto());
-        // And a person who turned it off on purpose keeps it off, of course.
+        // A person who turned it off on purpose keeps it off.
         rig.store.set_auto(false).unwrap();
-        *rig.fake.catalog.borrow_mut() = vec!["textpen-1.2.0"];
-        assert_eq!(code(&rig.install(&["textpen"]).0), 0);
-        assert!(!rig.store.auto());
-    }
-
-    #[test]
-    fn an_install_that_fails_on_a_production_server_leaves_it_as_it_was() {
-        let mut rig = Rig::trusting_a("production-fails", &["textpen-1.0.0"]);
-        rig.fake.production.set(true);
-        rig.fake.wrong_file.set(true);
-        let (done, _, _) = rig.install(&["textpen"]);
-        assert_ne!(code(&done), 0);
-        assert_eq!(rig.current("textpen"), None);
-        assert!(
-            rig.store.auto(),
-            "nothing was installed, nothing is switched"
-        );
-        // The machine is still empty, so the install that works is its first.
-        rig.fake.wrong_file.set(false);
+        rig.fake.catalog.borrow_mut().push("textpen-1.1.0");
         assert_eq!(code(&rig.install(&["textpen"]).0), 0);
         assert!(!rig.store.auto());
     }
@@ -1192,40 +1109,6 @@ mod tests {
         });
         assert_eq!(code(&done), 0);
         assert_eq!(rounds, 3);
-    }
-
-    #[test]
-    fn a_production_server_whose_note_cannot_be_written_gets_nothing_installed() {
-        let mut rig = Rig::trusting_a("production-unwritable", &["textpen-1.0.0"]);
-        rig.fake.production.set(true);
-        // `auto-off` stands where a directory is, so it cannot be written as a note.
-        fs::create_dir_all(rig.dir.join("apps").join("auto-off")).unwrap();
-        let (done, _, _) = rig.install(&["textpen"]);
-        assert_ne!(code(&done), 0);
-        assert!(
-            text(&done).contains("could not leave updating off"),
-            "{}",
-            text(&done)
-        );
-        assert_eq!(rig.current("textpen"), None);
-        assert_eq!(
-            rig.fake.told_verbs(),
-            ["package offer"],
-            "no file was fetched"
-        );
-    }
-
-    #[test]
-    fn a_person_who_was_off_before_stays_off_when_the_first_install_on_production_fails() {
-        let mut rig = Rig::trusting_a("production-was-off", &["textpen-1.0.0"]);
-        rig.fake.production.set(true);
-        rig.store.set_auto(false).unwrap();
-        rig.fake.wrong_file.set(true);
-        assert_ne!(code(&rig.install(&["textpen"]).0), 0);
-        assert!(
-            !rig.store.auto(),
-            "what the person left off is not turned on"
-        );
     }
 
     #[test]

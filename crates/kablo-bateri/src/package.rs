@@ -38,7 +38,8 @@
 //!   `app.json` and its signature, each as `x` and the hex of its bytes ([`crate::message::hex_word`]),
 //!   and `production yes` when the app keeps this machine as a Production server (the line is left
 //!   out otherwise, so an answer that is not for a Production machine is the same text it always
-//!   was). The file is not in it. A reply is read leaving out a line it does not know, so that the
+//!   was). The line is read and nothing on the machine depends on it: a bateri from before the
+//!   machine stopped acting on Production still says it. The file is not in it. A reply is read leaving out a line it does not know, so that the
 //!   app may say more later; a request is read strictly.
 //! * `package fetch` asks the app to bring the file of the release (`name`, `version`, `target`,
 //!   `source`) to the machine, into the directory `.<version>.part-<part>` of the program's folder.
@@ -141,8 +142,9 @@ pub struct Offered {
     pub manifest: String,
     /// Its signature, as it is in `app.json.sig`.
     pub signature: String,
-    /// The app keeps this machine as a Production server: a machine that has no program yet leaves
-    /// updating on its own off when this is the first it installs.
+    /// The app keeps this machine as a Production server. It is read and kept so that an answer
+    /// from an app that says it parses and writes back the same; the machine behaves the same
+    /// either way.
     pub production: bool,
 }
 
@@ -598,7 +600,8 @@ mod tests {
 
     #[test]
     fn an_offer_without_the_production_line_is_not_for_a_production_machine() {
-        // What a bateri from before the line says: the machine is no Production one.
+        // What a bateri from before the line says: the machine is no Production one. The line is
+        // still read when it is there.
         let Reply::Package(Answer::Offered(offered)) = Reply::parse(V2_OFFERED).unwrap() else {
             panic!("an offer");
         };

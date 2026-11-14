@@ -546,7 +546,7 @@ pub fn rename(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     io.check_id("rename", kind, id)?;
     if id.contains('@') {
         return Err(Exit::mistake(format!(
-            "a pane's label is kablo's own on its machine: rename the pane there ({id} is on another machine)"
+            "a pane's label is bateri's own on its machine: rename the pane there ({id} is on another machine)"
         )));
     }
     if label.is_empty() {

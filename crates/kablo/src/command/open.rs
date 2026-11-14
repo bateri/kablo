@@ -641,12 +641,12 @@ impl Job<'_> {
                 Started::Taken if tries + 1 < TRIES => tries += 1,
                 Started::Taken => {
                     return Err(Exit::failed(format!(
-                        "kablo could not start {id}: a session called {id} exists already"
+                        "bateri could not start {id}: a session called {id} exists already"
                     )));
                 }
                 Started::Failed(text) => {
                     return Err(Exit::failed(format!(
-                        "kablo could not start {id}: {}",
+                        "bateri could not start {id}: {}",
                         clean(&text)
                     )));
                 }
@@ -777,10 +777,10 @@ impl Job<'_> {
         match self.start(id, cwd, shell, &self.bootstrap(), None) {
             Started::Ready => Ok(()),
             Started::Taken => Err(Exit::failed(format!(
-                "kablo could not start {id}: a session called {id} exists already"
+                "bateri could not start {id}: a session called {id} exists already"
             ))),
             Started::Failed(text) => Err(Exit::failed(format!(
-                "kablo could not start {id}: {}",
+                "bateri could not start {id}: {}",
                 clean(&text)
             ))),
         }

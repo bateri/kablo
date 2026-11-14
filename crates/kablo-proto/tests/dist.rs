@@ -97,7 +97,7 @@ fn the_suffix_of_a_development_build_is_a_version_a_server_keeps() {
     let version = format!("0.2.0{suffix}");
     assert_eq!(
         install::install_dir(&version).unwrap(),
-        format!(".local/share/kablo/{version}")
+        format!(".local/share/bateri/kablo/{version}")
     );
 }
 

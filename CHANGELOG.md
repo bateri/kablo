@@ -26,6 +26,12 @@ section is not released.
 
 ## [Unreleased]
 
+### Changed
+
+- **kablo installs inside bateri's folder.** `kablo_proto::install::ROOT` is now `.local/share/bateri/kablo`, so a version is at `.local/share/bateri/kablo/<version>/kablo`. The old place stays as `FORMER_ROOT` (`.local/share/kablo`), with `former_install_dir`, `former_install_path` and `former_install_path_in` for a version installed there.
+- **A Production server no longer starts with updating off.** The first program installed on a machine leaves updating on whatever the app says about the machine. The `production` line of an offer is still read.
+- **`bateri` commands say bateri where they said kablo.** The lines of `bateri new`, `split`, `tab`, `window`, `rename` and of a command sent to another machine that name who failed.
+
 ## [0.9.1] - 2026-11-12
 
 ### Changed

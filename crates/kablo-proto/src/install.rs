@@ -39,8 +39,14 @@ pub const UNAME_COMMAND: &str = "uname -s -m";
 pub const CHECKSUMS: &str = "SHA256SUMS";
 
 /// The directory, relative to the user's home, that holds one directory per
-/// installed version.
-pub const ROOT: &str = ".local/share/kablo";
+/// installed version. It is inside bateri's own directory, so that everything
+/// bateri keeps on a machine is in one place.
+pub const ROOT: &str = ".local/share/bateri/kablo";
+
+/// Where [`ROOT`] was before kablo moved into bateri's directory. A version
+/// installed there keeps running from there until nothing uses it; nothing
+/// installs there any more.
+pub const FORMER_ROOT: &str = ".local/share/kablo";
 
 /// The name of the binary inside a version's directory.
 pub const BINARY: &str = "kablo";
@@ -124,7 +130,7 @@ impl fmt::Display for Target {
 }
 
 /// The directory of a version, relative to the user's home:
-/// `.local/share/kablo/<version>`.
+/// `.local/share/bateri/kablo/<version>`.
 ///
 /// A version is 1 to [`MAX_VERSION_LEN`] bytes of `[A-Za-z0-9._+-]` that starts
 /// with a letter or a digit (`0.3.1`, `0.4.0-rc.1`): a name that can only be a
@@ -136,7 +142,7 @@ pub fn install_dir(version: &str) -> Result<String> {
 
 /// The installed binary of a version, relative to the user's home. A command
 /// run over ssh starts in the home directory, so this is also the command:
-/// `ssh host .local/share/kablo/0.3.1/kablo attach`.
+/// `ssh host .local/share/bateri/kablo/0.3.1/kablo attach`.
 pub fn install_path(version: &str) -> Result<String> {
     Ok(format!("{}/{BINARY}", install_dir(version)?))
 }
@@ -146,14 +152,33 @@ pub fn install_path(version: &str) -> Result<String> {
 /// path is read by the server's own processes, which do not start in the home
 /// directory.
 pub fn install_path_in(home: &str, version: &str) -> Result<String> {
+    under_home(home, &install_path(version)?)
+}
+
+/// The directory of a version under [`FORMER_ROOT`], relative to the user's
+/// home: `.local/share/kablo/<version>`. The same rules as [`install_dir`].
+pub fn former_install_dir(version: &str) -> Result<String> {
+    check_version(version)?;
+    Ok(format!("{FORMER_ROOT}/{version}"))
+}
+
+/// The binary of a version under [`FORMER_ROOT`], relative to the user's home:
+/// what a terminal started before the move still runs.
+pub fn former_install_path(version: &str) -> Result<String> {
+    Ok(format!("{}/{BINARY}", former_install_dir(version)?))
+}
+
+/// [`former_install_path`] under a known home directory, as
+/// [`install_path_in`] gives for the current root.
+pub fn former_install_path_in(home: &str, version: &str) -> Result<String> {
+    under_home(home, &former_install_path(version)?)
+}
+
+fn under_home(home: &str, relative: &str) -> Result<String> {
     if !home.starts_with('/') || home.contains('\0') {
         return Err(Error::Malformed("home directory"));
     }
-    Ok(format!(
-        "{}/{}",
-        home.trim_end_matches('/'),
-        install_path(version)?
-    ))
+    Ok(format!("{}/{relative}", home.trim_end_matches('/')))
 }
 
 /// The name of a version's binary for a target in a release (and in `dist/`):
@@ -273,27 +298,55 @@ mod tests {
 
     #[test]
     fn a_version_has_a_directory_of_its_own_under_the_root() {
-        assert_eq!(install_dir("0.3.1").unwrap(), ".local/share/kablo/0.3.1");
+        assert_eq!(
+            install_dir("0.3.1").unwrap(),
+            ".local/share/bateri/kablo/0.3.1"
+        );
         assert_eq!(
             install_path("0.3.1").unwrap(),
-            ".local/share/kablo/0.3.1/kablo"
+            ".local/share/bateri/kablo/0.3.1/kablo"
         );
         assert_eq!(
             install_path("0.4.0-rc.1+build_5").unwrap(),
-            ".local/share/kablo/0.4.0-rc.1+build_5/kablo"
+            ".local/share/bateri/kablo/0.4.0-rc.1+build_5/kablo"
         );
         assert_eq!(
             install_path_in("/home/ada", "0.3.1").unwrap(),
-            "/home/ada/.local/share/kablo/0.3.1/kablo"
+            "/home/ada/.local/share/bateri/kablo/0.3.1/kablo"
         );
         assert_eq!(
             install_path_in("/home/ada/", "0.3.1").unwrap(),
-            "/home/ada/.local/share/kablo/0.3.1/kablo"
+            "/home/ada/.local/share/bateri/kablo/0.3.1/kablo"
         );
         assert_eq!(
             install_path_in("/", "0.3.1").unwrap(),
-            "/.local/share/kablo/0.3.1/kablo"
+            "/.local/share/bateri/kablo/0.3.1/kablo"
         );
+    }
+
+    #[test]
+    fn a_version_installed_before_the_move_has_its_directory_under_the_former_root() {
+        assert_eq!(FORMER_ROOT, ".local/share/kablo");
+        assert_eq!(
+            former_install_dir("0.3.1").unwrap(),
+            ".local/share/kablo/0.3.1"
+        );
+        assert_eq!(
+            former_install_path("0.3.1").unwrap(),
+            ".local/share/kablo/0.3.1/kablo"
+        );
+        assert_eq!(
+            former_install_path_in("/home/ada", "0.3.1").unwrap(),
+            "/home/ada/.local/share/kablo/0.3.1/kablo"
+        );
+        assert_eq!(
+            former_install_path_in("/home/ada/", "0.4.0-rc.1+build_5").unwrap(),
+            "/home/ada/.local/share/kablo/0.4.0-rc.1+build_5/kablo"
+        );
+        assert!(former_install_path("../1").is_err());
+        assert!(former_install_path_in("home/ada", "0.3.1").is_err());
+        // The two roots are two places: neither is below the other.
+        assert!(!ROOT.starts_with(FORMER_ROOT) && !FORMER_ROOT.starts_with(ROOT));
     }
 
     #[test]
@@ -318,6 +371,8 @@ mod tests {
             assert!(install_dir(bad).is_err(), "{bad:?}");
             assert!(install_path(bad).is_err(), "{bad:?}");
             assert!(install_path_in("/home/ada", bad).is_err(), "{bad:?}");
+            assert!(former_install_dir(bad).is_err(), "{bad:?}");
+            assert!(former_install_path_in("/home/ada", bad).is_err(), "{bad:?}");
             assert!(artifact_name(bad, Target::LinuxX86_64).is_err(), "{bad:?}");
         }
         assert!(install_dir(&"1".repeat(MAX_VERSION_LEN)).is_ok());
@@ -327,6 +382,7 @@ mod tests {
     fn a_home_that_is_not_an_absolute_path_is_refused() {
         for bad in ["", "home/ada", "~", "~/ada", "./ada", "/home/\0ada"] {
             assert!(install_path_in(bad, "0.3.1").is_err(), "{bad:?}");
+            assert!(former_install_path_in(bad, "0.3.1").is_err(), "{bad:?}");
         }
     }
 
