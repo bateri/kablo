@@ -21,10 +21,19 @@
 //! the warden has renewed; a development build is named by its commit as well
 //! (`0.2.0-dev+3f2a9c1d0b44`), and is told apart from the release and from
 //! another commit.
+//!
+//! **A session's kablo only goes forward.** The warden of a release does not give
+//! its session's place to the binary of an *older* release ([`forward_only`]): the session
+//! stays as it is and the request says why. Two computers that share a server
+//! and bring different releases would otherwise move its terminals back and
+//! forth, each to its own, and a computer that is behind is one that is simply
+//! asked again, with a release that is not behind, by whoever is ahead. A build
+//! for development is exempt both ways.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
@@ -43,6 +52,73 @@ pub const RENEWAL_WAIT: Duration = Duration::from_secs(3);
 /// How long a relay has to answer the handshake of the request: a socket
 /// that takes the connection and says nothing has nobody serving it.
 const OPEN_WAIT: Duration = Duration::from_secs(3);
+
+/// How long the binary named by a request has to say which release it is. It answers in a few
+/// milliseconds; one that does not (a machine that is struggling) is not waited for longer, and
+/// the rule is not applied to it.
+const VERSION_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether the session of release `ours` may give its place to the binary `exe` (one the warden
+/// has found fit to run, [`crate::warden`]): `Err` says why not. Only a binary that says it is a
+/// **release older than** `ours` is refused; one that is a build for development, or one that
+/// says nothing, is not.
+pub fn forward_only(exe: &Path, ours: &str) -> Result<(), String> {
+    let Some(theirs) = release_of(exe) else {
+        return Ok(());
+    };
+    if older_release(&theirs, ours) {
+        return Err(format!(
+            "{theirs} is older than the {ours} this terminal runs; a terminal's kablo only goes forward"
+        ));
+    }
+    Ok(())
+}
+
+/// The release the binary `exe` says it is (`kablo version`), when it says one in time.
+fn release_of(exe: &Path) -> Option<String> {
+    let mut child = Command::new(exe)
+        .arg("version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let by = Instant::now() + VERSION_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if Instant::now() < by => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut said = String::new();
+    child.stdout.take()?.read_to_string(&mut said).ok()?;
+    said.split_whitespace()
+        .find_map(|word| word.strip_prefix("version="))
+        .map(str::to_owned)
+}
+
+/// A release's numbers: `0.9.1` is `[0, 9, 1]`. `None` for a build for development
+/// (`0.9.1-dev+3f2a9c1d0b44`) and for a name that is not one.
+fn numbers(release: &str) -> Option<[u64; 3]> {
+    let mut parts = release.split('.');
+    let found = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    parts.next().is_none().then_some(found)
+}
+
+/// Whether `theirs` is a release older than the release `ours`. A build for development on either
+/// side is not one.
+fn older_release(theirs: &str, ours: &str) -> bool {
+    matches!((numbers(theirs), numbers(ours)), (Some(theirs), Some(ours)) if theirs < ours)
+}
 
 /// Replaces the relay of the session `id` and says how it went. Returns the
 /// exit status: 0 when it was replaced, 1 otherwise.
@@ -251,6 +327,26 @@ mod tests {
         status.version = version.to_owned();
         status.warden_version = warden.to_owned();
         status
+    }
+
+    #[test]
+    fn only_a_release_older_than_ours_is_refused() {
+        // Older releases: by any of the three numbers, and as numbers (`0.10` is after `0.9`).
+        assert!(older_release("0.9.0", "0.9.1"));
+        assert!(older_release("0.8.9", "0.9.1"));
+        assert!(older_release("0.9.9", "1.0.0"));
+        assert!(!older_release("0.10.0", "0.9.1"));
+        // The same and newer ones go.
+        assert!(!older_release("0.9.1", "0.9.1"));
+        assert!(!older_release("0.9.2", "0.9.1"));
+        // A build for development is exempt, whichever side it is on, and so is a name that is not
+        // a release.
+        assert!(!older_release("0.8.0-dev+3f2a9c1d0b44", "0.9.1"));
+        assert!(!older_release("0.8.0", "0.9.1-dev+3f2a9c1d0b44"));
+        assert!(!older_release("0.9.1", "0.9.1-dev+3f2a9c1d0b44"));
+        assert!(!older_release("old", "0.9.1"));
+        assert!(!older_release("0.8", "0.9.1"));
+        assert!(!older_release("0.8.0.1", "0.9.1"));
     }
 
     #[test]

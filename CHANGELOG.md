@@ -28,6 +28,7 @@ section is not released.
 
 ### Changed
 
+- **A session's kablo only goes forward.** `kablo upgrade` is refused when the binary is a release older than the one the session runs: `not replaced: 0.9.0 is older than the 0.9.1 this terminal runs`, and the session stays as it is. A build for development is exempt, whichever side it is on. Two computers that bring different releases to one server no longer carry its terminals back and forth.
 - **kablo installs inside bateri's folder.** `kablo_proto::install::ROOT` is now `.local/share/bateri/kablo`, so a version is at `.local/share/bateri/kablo/<version>/kablo`. The old place stays as `FORMER_ROOT` (`.local/share/kablo`), with `former_install_dir`, `former_install_path` and `former_install_path_in` for a version installed there.
 - **A Production server no longer starts with updating off.** The first program installed on a machine leaves updating on whatever the app says about the machine. The `production` line of an offer is still read.
 - **`bateri` commands say bateri where they said kablo.** The lines of `bateri new`, `split`, `tab`, `window`, `rename` and of a command sent to another machine that name who failed.
