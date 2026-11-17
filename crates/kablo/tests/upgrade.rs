@@ -435,13 +435,29 @@ fn a_renewed_warden_restarts_a_relay_hangs_up_on_terminate_and_cleans_up() {
     env.wait_gone(&id);
 }
 
-/// A script that runs this build and says it is the release `version`.
-fn says(env: &Env, name: &str, version: &str) -> PathBuf {
+/// A binary that runs this build, says it is the release `version`, and is installed the way
+/// bateri installs one (`.../kablo/<version>/kablo`), so that its place says so too.
+fn installed_as(env: &Env, version: &str) -> PathBuf {
     let real = env!("CARGO_BIN_EXE_kablo");
-    env.script(
-        name,
-        &format!("#!/bin/sh\nKABLO_TEST_VERSION={version} exec '{real}' \"$@\"\n"),
+    let dir = env.dir.join("home").join("kablo").join(version);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("kablo");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nKABLO_TEST_VERSION={version} exec '{real}' \"$@\"\n"),
     )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn upgrade_to(env: &Env, id: &str, binary: &Path) -> std::process::Output {
+    env.kablo()
+        .arg("upgrade")
+        .arg(id)
+        .arg(binary)
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -454,14 +470,7 @@ fn a_relay_is_not_replaced_by_an_older_release_but_is_by_a_build_for_development
     a.attach(0);
 
     // An older release is refused, and says why; nothing is touched.
-    let older = says(&env, "older", "0.0.1");
-    let said = env
-        .kablo()
-        .arg("upgrade")
-        .arg(&id)
-        .arg(&older)
-        .output()
-        .unwrap();
+    let said = upgrade_to(&env, &id, &installed_as(&env, "0.0.1"));
     let stderr = String::from_utf8_lossy(&said.stderr).into_owned();
     assert!(!said.status.success(), "{stderr}");
     assert!(
@@ -473,14 +482,7 @@ fn a_relay_is_not_replaced_by_an_older_release_but_is_by_a_build_for_development
     assert_eq!(env.find("relay", &id), Some(relay), "the relay stays");
 
     // A build for development is exempt: it takes the place, whatever number it carries.
-    let dev = says(&env, "dev", "0.0.1-dev+3f2a9c1d0b44");
-    let said = env
-        .kablo()
-        .arg("upgrade")
-        .arg(&id)
-        .arg(&dev)
-        .output()
-        .unwrap();
+    let said = upgrade_to(&env, &id, &installed_as(&env, "0.0.1-dev+3f2a9c1d0b44"));
     assert!(
         said.status.success(),
         "{}",
@@ -491,14 +493,7 @@ fn a_relay_is_not_replaced_by_an_older_release_but_is_by_a_build_for_development
     assert_eq!(b.status().pid, shell, "the shell was never touched");
 
     // A release goes where the build for development was, whatever it is.
-    let newer = says(&env, "newer", "9.9.9");
-    let said = env
-        .kablo()
-        .arg("upgrade")
-        .arg(&id)
-        .arg(&newer)
-        .output()
-        .unwrap();
+    let said = upgrade_to(&env, &id, &installed_as(&env, "9.9.9"));
     assert!(
         said.status.success(),
         "{}",
@@ -508,16 +503,25 @@ fn a_relay_is_not_replaced_by_an_older_release_but_is_by_a_build_for_development
     assert_eq!(c.status().version, "9.9.9");
 
     // And now that it is a release, one older than it is refused.
-    let again = says(&env, "again", "9.9.8");
-    let said = env
-        .kablo()
-        .arg("upgrade")
-        .arg(&id)
-        .arg(&again)
-        .output()
-        .unwrap();
+    let said = upgrade_to(&env, &id, &installed_as(&env, "9.9.8"));
     assert!(!said.status.success());
     assert_eq!(c.status().version, "9.9.9");
+
+    // A binary that is not installed in a folder of a version says nothing of its release and
+    // is not held to the rule.
+    let elsewhere = env.script(
+        "elsewhere",
+        &format!(
+            "#!/bin/sh\nKABLO_TEST_VERSION=0.0.2 exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_kablo")
+        ),
+    );
+    let said = upgrade_to(&env, &id, &elsewhere);
+    assert!(
+        said.status.success(),
+        "{}",
+        String::from_utf8_lossy(&said.stderr)
+    );
 }
 
 #[test]
@@ -574,11 +578,7 @@ fn assert_the_warden_stays(label: &str, spoil: &str) {
     let real = env!("CARGO_BIN_EXE_kablo");
     let once = env.script(
         "once",
-        // The relay is started from the file; asking it which release it is (`version`) leaves it
-        // as it was.
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" != version ]; then {spoil}; fi\nKABLO_TEST_VERSION=9.9.9 exec '{real}' \"$@\"\n"
-        ),
+        &format!("#!/bin/sh\n{spoil}\nKABLO_TEST_VERSION=9.9.9 exec '{real}' \"$@\"\n"),
     );
     let said = env
         .kablo()

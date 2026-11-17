@@ -971,12 +971,6 @@ impl Warden {
             Ok(exe) => exe,
             Err(why) => return self.upgrade_failed(&why),
         };
-        // A session's kablo only goes forward: the warden is never newer than the relay it
-        // serves (it renews right after it), so a release older than the warden's is older
-        // than the relay's too.
-        if let Err(why) = crate::upgrade::forward_only(&exe, &crate::release()) {
-            return self.upgrade_failed(&why);
-        }
         if let Some(waiting) = self.next.take() {
             if waiting.stage == Stage::Standby {
                 self.next = Some(waiting);

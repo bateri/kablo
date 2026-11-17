@@ -22,21 +22,22 @@
 //! (`0.2.0-dev+3f2a9c1d0b44`), and is told apart from the release and from
 //! another commit.
 //!
-//! **A session's kablo only goes forward.** The warden of a release does not give
-//! its session's place to the binary of an *older* release ([`forward_only`]): the session
+//! **A session's kablo only goes forward.** The relay of a release does not give
+//! its place to the binary of an *older* release ([`forward_only`]): the session
 //! stays as it is and the request says why. Two computers that share a server
 //! and bring different releases would otherwise move its terminals back and
-//! forth, each to its own, and a computer that is behind is one that is simply
-//! asked again, with a release that is not behind, by whoever is ahead. A build
-//! for development is exempt both ways.
+//! forth, each to its own. The release is the one the binary's place names
+//! (`.../kablo/0.9.1/kablo`, where bateri installs it); a build for development,
+//! and a binary anywhere else, are not held to it.
 
-use std::io::{Read, Write};
+use std::ffi::OsStr;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kablo_proto::SessionId;
+use kablo_proto::install;
 use kablo_proto::v1::{ErrorCode, Message, Packet, Status};
 
 use crate::peer::{Gone, Peer};
@@ -53,53 +54,32 @@ pub const RENEWAL_WAIT: Duration = Duration::from_secs(3);
 /// that takes the connection and says nothing has nobody serving it.
 const OPEN_WAIT: Duration = Duration::from_secs(3);
 
-/// How long the binary named by a request has to say which release it is. It answers in a few
-/// milliseconds; one that does not (a machine that is struggling) is not waited for longer, and
-/// the rule is not applied to it.
-const VERSION_WAIT: Duration = Duration::from_secs(3);
-
-/// Whether the session of release `ours` may give its place to the binary `exe` (one the warden
-/// has found fit to run, [`crate::warden`]): `Err` says why not. Only a binary that says it is a
-/// **release older than** `ours` is refused; one that is a build for development, or one that
-/// says nothing, is not.
-pub fn forward_only(exe: &Path, ours: &str) -> Result<(), String> {
-    let Some(theirs) = release_of(exe) else {
-        return Ok(());
-    };
-    if older_release(&theirs, ours) {
-        return Err(format!(
+/// Whether the relay of release `ours` may give its place to the binary at `path`: `Err` says
+/// why not. Only a binary that is **a release older than** `ours` is refused. Which release it is
+/// comes from where it is installed ([`installed_release`]), not from running it: the relay does
+/// not wait for a program it did not write. A build for development, and a binary that is not
+/// in a folder of a version, are not held to it.
+pub fn forward_only(path: &[u8], ours: &str) -> Result<(), String> {
+    let path = Path::new(OsStr::from_bytes(path));
+    match installed_release(path) {
+        Some(theirs) if older_release(theirs, ours) => Err(format!(
             "{theirs} is older than the {ours} this terminal runs; a terminal's kablo only goes forward"
-        ));
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-/// The release the binary `exe` says it is (`kablo version`), when it says one in time.
-fn release_of(exe: &Path) -> Option<String> {
-    let mut child = Command::new(exe)
-        .arg("version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let by = Instant::now() + VERSION_WAIT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(None) if Instant::now() < by => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+/// The release the place of an installed binary names: `<version>` of
+/// `…/kablo/<version>/kablo`, the layout `kablo_proto::install` makes under both its roots.
+/// `None` for a binary anywhere else.
+fn installed_release(path: &Path) -> Option<&str> {
+    if path.file_name()? != install::BINARY {
+        return None;
     }
-    let mut said = String::new();
-    child.stdout.take()?.read_to_string(&mut said).ok()?;
-    said.split_whitespace()
-        .find_map(|word| word.strip_prefix("version="))
-        .map(str::to_owned)
+    let folder = path.parent()?;
+    let version = folder.file_name()?.to_str()?;
+    let under = folder.parent()?.file_name()?;
+    (under == "kablo" && install::install_dir(version).is_ok()).then_some(version)
 }
 
 /// A release's numbers: `0.9.1` is `[0, 9, 1]`. `None` for a build for development
@@ -327,6 +307,49 @@ mod tests {
         status.version = version.to_owned();
         status.warden_version = warden.to_owned();
         status
+    }
+
+    #[test]
+    fn a_binary_names_its_release_by_the_folder_it_is_installed_in() {
+        let release = |path: &str| installed_release(Path::new(path)).map(str::to_owned);
+        for path in [
+            "/home/u/.local/share/bateri/kablo/0.9.1/kablo",
+            "/home/u/.local/share/kablo/0.9.1/kablo",
+            ".local/share/bateri/kablo/0.9.1/kablo",
+        ] {
+            assert_eq!(release(path).as_deref(), Some("0.9.1"), "{path}");
+        }
+        assert_eq!(
+            release("/h/.local/share/bateri/kablo/0.9.1-dev+3f2a9c1d0b44/kablo").as_deref(),
+            Some("0.9.1-dev+3f2a9c1d0b44")
+        );
+        // Anywhere else it says nothing: another file name, a folder that is no version, a
+        // folder that is not under `kablo`.
+        for path in [
+            "/usr/local/bin/kablo",
+            "/h/kablo/0.9.1/other",
+            "/h/kablo/.hidden/kablo",
+            "/h/bin/0.9.1/kablo",
+            "kablo",
+            "/",
+        ] {
+            assert_eq!(release(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_request_names_the_release_it_comes_from_and_only_an_older_one_is_refused() {
+        let from = |path: &str, ours: &str| forward_only(path.as_bytes(), ours);
+        assert!(from("/h/.local/share/bateri/kablo/0.9.0/kablo", "0.9.1").is_err());
+        let said = from("/h/.local/share/kablo/0.9.0/kablo", "0.9.1").unwrap_err();
+        assert!(said.contains("0.9.0 is older than the 0.9.1"), "{said}");
+        assert!(from("/h/kablo/0.9.1/kablo", "0.9.1").is_ok());
+        assert!(from("/h/kablo/0.9.2/kablo", "0.9.1").is_ok());
+        // A build for development on either side, a place that names nothing, and a relay that
+        // is a build for development are not held to it.
+        assert!(from("/h/kablo/0.8.0-dev+3f2a9c1d0b44/kablo", "0.9.1").is_ok());
+        assert!(from("/h/kablo/0.8.0/kablo", "0.9.1-dev+3f2a9c1d0b44").is_ok());
+        assert!(from("/opt/kablo", "0.9.1").is_ok());
     }
 
     #[test]

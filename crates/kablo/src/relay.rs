@@ -1675,6 +1675,13 @@ impl Relay {
                 if !self.chan_alive {
                     return self.error(i, ErrorCode::UNAVAILABLE, "the session's warden is gone");
                 }
+                // A session's kablo only goes forward. Not asked again while a change is under
+                // way: the warden answers that one.
+                if !self.replacing
+                    && let Err(why) = crate::upgrade::forward_only(&path, &crate::release())
+                {
+                    return self.error(i, ErrorCode::UPGRADE_FAILED, &why);
+                }
                 if let Some(client) = self.clients.get_mut(i) {
                     client.upgrading = true;
                 }

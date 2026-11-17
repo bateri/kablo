@@ -169,12 +169,14 @@ exits 1 (the file is not one to run, the program has ended, the new relay
 stopped before it took over, the binary is a release older than the session's),
 and the old relay keeps serving.
 
-A session's kablo only goes forward: the binary is asked for its release
-(`kablo version`) and one that is **older** than the session's is refused
-(`not replaced: 0.9.0 is older than the 0.9.1 this terminal runs`). A build for
-development is exempt, whichever side it is on. Without it, two computers that
-bring different releases to one server would carry its terminals back and
-forth.
+A session's kablo only goes forward: the relay refuses a binary that is a
+release **older** than its own
+(`not replaced: 0.9.0 is older than the 0.9.1 this terminal runs`). The release
+is the one the binary's place names, `.../kablo/0.9.0/kablo` (where bateri
+installs it; the binary is not run to ask). A build for development is exempt,
+whichever side it is on, and so is a binary anywhere else: the rule is a
+courtesy between releases, not a lock. Without it, two computers that bring
+different releases to one server would carry its terminals back and forth.
 
 The warden stays as it was when it cannot follow: the new relay does not say it
 reads what a renewing warden leaves for it, the program ended before the
