@@ -339,6 +339,210 @@ fn a_program_kept_open_is_followed_by_the_login_shell_in_its_terminal() {
     );
 }
 
+/// The `start` bateri keeps beside the command, as the bootstrap writes it: it is given whether the
+/// terminal carries on with the login shell (1 or 0) and the program, says what it was given, and
+/// starts the program.
+fn install_start(stage: &Stage) {
+    let dir = stage.state().join("shell");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("start"),
+        format!(
+            "keep=$1\nshift\nprintf '%s\\n' \"$keep\" \"$@\" > '{0}/start.args'\nif [ \"$keep\" = 1 ]; then\n  \"$@\"\n  exec \"${{SHELL:-/bin/sh}}\" -l\nfi\nexec \"$@\"\n",
+            stage.home.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// What `start` was given, once it has said.
+fn start_was_given(stage: &Stage) -> Option<String> {
+    std::fs::read_to_string(stage.home.join("start.args")).ok()
+}
+
+/// Programs that cannot run, each as it can be asked for.
+fn unrunnable(stage: &Stage) -> Vec<(&'static str, String)> {
+    let plain = stage.home.join("plain");
+    std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+    let folder = stage.home.join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    vec![
+        ("a name nobody has", "no-such-program-here".to_owned()),
+        (
+            "a path nobody has",
+            stage.home.join("missing").display().to_string(),
+        ),
+        ("a path from the directory", "./missing".to_owned()),
+        ("a path below it", "folder/missing".to_owned()),
+        ("a file that cannot run", plain.display().to_string()),
+        ("a folder", folder.display().to_string()),
+        (
+            "a path through a file",
+            format!("{}/inside", plain.display()),
+        ),
+    ]
+}
+
+#[test]
+fn a_program_that_cannot_run_starts_no_terminal_and_fails_as_it_does_without_the_command() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    for (what, program) in unrunnable(&stage) {
+        // What the keeper says of it when `kablo new` starts it: the words to say the same.
+        let plain = stage
+            .env
+            .kablo()
+            .current_dir(&stage.home)
+            .env("HOME", &stage.home)
+            .args(["new", "--cwd"])
+            .arg(&stage.home)
+            .args(["--", &program])
+            .output()
+            .unwrap();
+        assert_eq!(plain.status.code(), Some(1), "{what}");
+        let said = String::from_utf8_lossy(&plain.stderr).into_owned();
+        let why = said.trim_end().strip_prefix("kablo: ").unwrap().to_owned();
+        assert!(
+            why.starts_with("cannot start the program: "),
+            "{what}: {why}"
+        );
+        for keep in [false, true] {
+            let mut args = vec!["split"];
+            if keep {
+                args.push("--keep-open");
+            }
+            args.extend(["--", &program]);
+            let said = stage.run_in("p40", &args);
+            assert_eq!(said.status, 1, "{what} (keep {keep}): {}", said.err);
+            assert!(
+                said.err.contains(&why),
+                "{what} (keep {keep}): {:?} does not say {why:?}",
+                said.err
+            );
+            assert_eq!(said.out, "", "{what} (keep {keep})");
+        }
+    }
+    // Nothing was started, nobody was told of a pane, and no terminal was written down.
+    assert!(stage.told.is_empty());
+    assert_eq!(stage.running(), ["p40"]);
+    let written = std::fs::read_dir(stage.state().join("terminals"))
+        .map(|dir| dir.count())
+        .unwrap_or(0);
+    assert_eq!(written, 0);
+}
+
+#[test]
+fn a_program_is_looked_for_on_the_path_of_the_terminal_it_is_started_in() {
+    // The command's own directory is on the terminal's `PATH` though the caller's has none of it,
+    // so a program there is found by its name; one that is not on any is not.
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let bin = stage.state().join("shell/bin");
+    let found = bin.join("only-here");
+    std::fs::write(&found, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&found, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for keep in [false, true] {
+        let mut args = vec!["split"];
+        if keep {
+            args.push("--keep-open");
+        }
+        args.extend(["--", "only-here"]);
+        let said = stage.run_in("p40", &args);
+        assert_eq!(said.status, 0, "{}", said.err);
+    }
+}
+
+#[test]
+fn with_a_start_a_program_that_was_asked_for_is_started_through_it() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    install_start(&stage);
+    let program = recorder(&stage).display().to_string();
+    let out = stage.env.dir.join("st1");
+    let out_name = out.display().to_string();
+    let said = stage.run_in(
+        "p40",
+        &["split", "--", &program, &out_name, "npm", "run", "dev"],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    // The program has its words as they were written, and `start` was told the terminal is not
+    // kept open.
+    assert_eq!(recorded(&out).args, ["npm", "run", "dev"]);
+    assert_eq!(
+        start_was_given(&stage).unwrap(),
+        format!("0\n{program}\n{out_name}\nnpm\nrun\ndev\n")
+    );
+    // Kept open, it says so, and what follows the program is the login shell.
+    let shell = stage.env.script(
+        "login.sh",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/login.args'\nexec cat\n",
+            stage.home.display()
+        ),
+    );
+    let said = stage.go(&Run {
+        here: Some("p40"),
+        args: &["split", "--keep-open", "--", "true"],
+        input: None,
+        turns: &[],
+        vars: &[("SHELL", &shell.display().to_string())],
+    });
+    assert_eq!(said.status, 0, "{}", said.err);
+    let file = stage.home.join("login.args");
+    let start = Instant::now();
+    while !file.exists() {
+        assert!(start.elapsed() < Duration::from_secs(20), "no login shell");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "-l\n");
+    assert_eq!(start_was_given(&stage).unwrap(), "1\ntrue\n");
+}
+
+#[test]
+fn a_terminal_that_is_not_a_program_asked_for_is_not_started_through_start() {
+    let mut stage = stage();
+    install_start(&stage);
+    // A terminal made with `kablo new` (whatever it runs) says nothing of a
+    // program, and a `start` that is there is not its business.
+    let program = recorder(&stage).display().to_string();
+    let out = stage.env.dir.join("st2");
+    let made = stage
+        .env
+        .kablo()
+        .current_dir(&stage.home)
+        .env("HOME", &stage.home)
+        .args(["new", "--cwd"])
+        .arg(&stage.home)
+        .args(["--", &program, &out.display().to_string(), "a", "b"])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{:?}", made);
+    stage
+        .env
+        .track_named_alike(String::from_utf8_lossy(&made.stdout).trim());
+    assert_eq!(recorded(&out).args, ["a", "b"]);
+    assert_eq!(start_was_given(&stage), None);
+}
+
+#[test]
+fn with_a_start_the_bootstrap_of_a_servers_terminal_is_started_through_it_and_never_kept_open() {
+    let mut stage = stage();
+    stage.in_pane(Pane::Carried);
+    stage.install_bootstrap();
+    install_start(&stage);
+    stage.set_var("LC_TERMINAL_VERSION", VERSION);
+    let said = stage.run_in("p40", &["split", "--keep-open"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    bootstrap_ran(&stage, "with a start");
+    let boot = stage.state().join("shell/boot.sh").display().to_string();
+    assert_eq!(
+        start_was_given(&stage).unwrap(),
+        format!("0\nsh\n{boot}\n\n\n{VERSION}\n-\n")
+    );
+    let (args, _) = stage.bootstrap_saw().unwrap();
+    assert_eq!(args, format!("||{VERSION}|-|"));
+}
+
 #[test]
 fn without_an_app_the_message_waits_on_the_machine_and_the_command_still_answers() {
     // A server: its bootstrap starts what has no program, and the message waits for the bateri app.

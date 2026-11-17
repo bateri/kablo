@@ -23,17 +23,35 @@
 //! `KillUserProcesses` is `no` (the usual default). A `systemd-run` that does
 //! not start anything (no bus, an old version) is not an error: the warden is
 //! started again, without it.
+//!
+//! **A program that was asked for.** A request that says so
+//! ([`NewSession::program`]: everything the `bateri` command starts, the bootstrap
+//! of a server's shell included, and the programs the app starts) is looked at
+//! before anything starts: the program must be there and be executable, or the
+//! request is refused with what the warden would have said, and no terminal is
+//! made for it. Only that is looked at: a program that is there and then fails
+//! to run (a script with no interpreter, a binary for another processor) is
+//! started all the same. Then bateri's `start`, if the machine
+//! has one (`~/.local/share/bateri/shell/start`), is what starts it, and without
+//! one a program that is to stay open is followed by the login shell by a line of
+//! `sh`. This is here, in the one function that every start passes, and not in
+//! the warden, which does what its request says and nothing else. A request that
+//! does not say it is a program (the app's plain shell pane, its ssh keeper,
+//! `kablo new`) is started as it is.
 
+use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use kablo_bateri::paths;
 use kablo_proto::SessionId;
-use kablo_proto::v1::{Message, NewSession, Packet};
+use kablo_proto::v1::{Message, NewSession, Packet, ProgramEnd};
 
 use crate::{sockdir, sys};
 
@@ -111,6 +129,7 @@ pub fn launch_without(
     request: &NewSession,
     unset: &[&str],
 ) -> Result<(), Failure> {
+    let request = &as_asked(request, start_file)?;
     start(dir, id, request, unset)?;
     // The session is new, which is what only this knows: the file of a label
     // that an earlier session of the same name left behind (a relay that was
@@ -123,6 +142,113 @@ pub fn launch_without(
     let label = request.label.as_deref().unwrap_or_default();
     let _ = sockdir::write_label(dir, id, label);
     Ok(())
+}
+
+/// The error the warden gives when the program of a session cannot be started, whatever the
+/// reason: the words of `warden`'s own, so that a request refused here reads as one it refused.
+const CANNOT_START: &str = "cannot start the program: ";
+
+/// Where a program is looked for when neither the request nor this process has a `PATH`.
+const DEFAULT_PATH: &[u8] = b"/usr/bin:/bin";
+
+/// What `sh` runs to follow a program with the login shell when there is no `start` to do it.
+const FOLLOW_ON: &str = "\"$@\"; exec \"${SHELL:-/bin/sh}\" -l";
+
+/// bateri's `start`, when this machine has one that can be read.
+fn start_file() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if !home.is_absolute() {
+        return None;
+    }
+    let file = home.join(paths::DIR).join(paths::SHELL).join(paths::START);
+    sys::readable(&file).then_some(file)
+}
+
+/// The request a keeper is given for `request`: itself when it does not say it is for a program
+/// somebody asked for; else, after finding that the program is there and may be executed (not
+/// that it then runs), the request that has it started by `start` (`sh start KEEP PROGRAM...`,
+/// `KEEP` being `1` when the terminal carries on with the login shell after it), or, with no
+/// `start`, by the line of `sh` that follows a program that stays open with the login shell, or
+/// the program alone. `start` is looked for only once the program is found.
+fn as_asked(
+    request: &NewSession,
+    start: impl FnOnce() -> Option<PathBuf>,
+) -> Result<NewSession, Failure> {
+    let (Some(end), Some(program)) = (request.program, request.argv.first()) else {
+        return Ok(request.clone());
+    };
+    find_program(request, program).map_err(|e| Failure::Other(format!("{CANNOT_START}{e}")))?;
+    let keep = matches!(end, ProgramEnd::StaysOpen);
+    let mut asked = request.clone();
+    asked.program = None;
+    let mut argv: Vec<Vec<u8>> = match start() {
+        Some(start) => vec![
+            b"sh".to_vec(),
+            start.as_os_str().as_bytes().to_vec(),
+            if keep { b"1".to_vec() } else { b"0".to_vec() },
+        ],
+        None if keep => vec![
+            b"sh".to_vec(),
+            b"-c".to_vec(),
+            FOLLOW_ON.as_bytes().to_vec(),
+            b"sh".to_vec(),
+        ],
+        None => return Ok(asked),
+    };
+    argv.extend(request.argv.iter().cloned());
+    asked.argv = argv;
+    Ok(asked)
+}
+
+/// Whether `program` can be run for `request`, as `exec` would find it: a word with a `/` is a
+/// path, from the directory the request starts in when it is not absolute; any other is looked for
+/// in the `:`-separated directories of the `PATH` the program is given (the request's, else this
+/// process's), an empty one being the directory it starts in. The error is the one `exec` gives;
+/// that the file may be executed is all that is known of it, not that it runs.
+fn find_program(request: &NewSession, program: &[u8]) -> io::Result<()> {
+    let not_there = || io::Error::from_raw_os_error(libc::ENOENT);
+    if program.is_empty() {
+        return Err(not_there());
+    }
+    let cwd = request
+        .cwd
+        .as_deref()
+        .map(|cwd| Path::new(OsStr::from_bytes(cwd)));
+    let from_cwd = |path: PathBuf| match cwd {
+        Some(cwd) if path.is_relative() => cwd.join(path),
+        _ => path,
+    };
+    if program.contains(&b'/') {
+        return sys::executable(&from_cwd(PathBuf::from(OsStr::from_bytes(program))));
+    }
+    let path = request
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == b"PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH").map(|path| path.as_bytes().to_vec()))
+        .unwrap_or_else(|| DEFAULT_PATH.to_vec());
+    let mut denied = false;
+    let mut last = not_there();
+    for dir in path.split(|byte| *byte == b':') {
+        let candidate = Path::new(OsStr::from_bytes(dir)).join(OsStr::from_bytes(program));
+        match sys::executable(&from_cwd(candidate)) {
+            Ok(()) => return Ok(()),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::EACCES) => denied = true,
+                Some(
+                    libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT,
+                ) => last = e,
+                _ => return Err(e),
+            },
+        }
+    }
+    Err(if denied {
+        io::Error::from_raw_os_error(libc::EACCES)
+    } else {
+        last
+    })
 }
 
 /// Starts the warden of session `id`; the label is not looked at.
@@ -400,6 +526,141 @@ mod tests {
             !lingers(&dir.join("not-there"), b"ada"),
             "no directory, no lingering"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn asking(words: &[&str], end: Option<ProgramEnd>) -> NewSession {
+        let mut request = NewSession::default();
+        request.argv = words.iter().map(|w| w.as_bytes().to_vec()).collect();
+        request.program = end;
+        request
+    }
+
+    fn words(request: &NewSession) -> Vec<String> {
+        request
+            .argv
+            .iter()
+            .map(|w| String::from_utf8_lossy(w).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_program_that_was_asked_for_is_started_by_start_when_there_is_one() {
+        let start = Path::new("/home/u/.local/share/bateri/shell/start");
+        for (end, keep) in [(ProgramEnd::Closes, "0"), (ProgramEnd::StaysOpen, "1")] {
+            let asked = as_asked(&asking(&["/bin/sh", "-c", "x"], Some(end)), || {
+                Some(start.to_path_buf())
+            })
+            .unwrap();
+            let start = start.display().to_string();
+            assert_eq!(words(&asked), ["sh", &start, keep, "/bin/sh", "-c", "x"]);
+            assert_eq!(asked.program, None, "the keeper is not told");
+        }
+    }
+
+    #[test]
+    fn without_a_start_only_a_program_that_stays_open_is_followed_by_the_login_shell() {
+        let asked = as_asked(
+            &asking(&["/bin/sh", "-c", "x"], Some(ProgramEnd::StaysOpen)),
+            || None,
+        )
+        .unwrap();
+        assert_eq!(
+            words(&asked),
+            [
+                "sh",
+                "-c",
+                "\"$@\"; exec \"${SHELL:-/bin/sh}\" -l",
+                "sh",
+                "/bin/sh",
+                "-c",
+                "x"
+            ]
+        );
+        let closes = as_asked(&asking(&["/bin/sh"], Some(ProgramEnd::Closes)), || None).unwrap();
+        assert_eq!(words(&closes), ["/bin/sh"]);
+    }
+
+    #[test]
+    fn a_request_that_does_not_say_it_is_a_program_is_started_as_it_is() {
+        // Where `start` is is not even looked at for one.
+        let never = || -> Option<PathBuf> { panic!("`start` was looked for") };
+        let plain = asking(&["no-such-program-here"], None);
+        assert_eq!(as_asked(&plain, never).unwrap(), plain);
+        // A program with no words is a shell, whatever else is said.
+        let shell = asking(&[], Some(ProgramEnd::StaysOpen));
+        assert_eq!(as_asked(&shell, never).unwrap(), shell);
+    }
+
+    #[test]
+    fn a_program_that_is_not_there_is_refused_before_start_is_looked_for() {
+        let never = || -> Option<PathBuf> { panic!("`start` was looked for") };
+        for end in [ProgramEnd::Closes, ProgramEnd::StaysOpen] {
+            let why = as_asked(&asking(&["no-such-program-here"], Some(end)), never)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                why,
+                "cannot start the program: No such file or directory (os error 2)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_is_looked_for_as_exec_looks_for_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kt-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        // A file that cannot run, ahead of one that can, with the same name.
+        std::fs::write(first.join("tool"), "#!/bin/sh\n").unwrap();
+        std::fs::write(second.join("tool"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(second.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(dir.join("plain"), "").unwrap();
+        let mut request = NewSession::default();
+        request.cwd = Some(dir.as_os_str().as_bytes().to_vec());
+        let on = |path: &str| {
+            let mut request = request.clone();
+            request.env = vec![(b"PATH".to_vec(), path.as_bytes().to_vec())];
+            request
+        };
+        let both = format!("{}:{}", first.display(), second.display());
+        let errno = |result: io::Result<()>| result.map_err(|e| e.raw_os_error());
+        assert_eq!(errno(find_program(&on(&both), b"tool")), Ok(()));
+        // The one that cannot run is no program, and is what is said when nothing else is.
+        let only = first.display().to_string();
+        assert_eq!(
+            errno(find_program(&on(&only), b"tool")),
+            Err(Some(libc::EACCES))
+        );
+        assert_eq!(
+            errno(find_program(&on(&only), b"nothing")),
+            Err(Some(libc::ENOENT))
+        );
+        // An empty directory of the path is the one the program starts in, a relative one is
+        // below it, and the last `PATH` of the request is the one that counts.
+        assert_eq!(errno(find_program(&on("second"), b"tool")), Ok(()));
+        assert_eq!(
+            errno(find_program(&on(":second"), b"plain")),
+            Err(Some(libc::EACCES))
+        );
+        let mut twice = on("/nowhere");
+        twice.env.push((b"PATH".to_vec(), both.into_bytes()));
+        assert_eq!(errno(find_program(&twice, b"tool")), Ok(()));
+        // A word with a slash is a path, from the directory the program starts in.
+        assert_eq!(errno(find_program(&request, b"second/tool")), Ok(()));
+        assert_eq!(
+            errno(find_program(&request, b"second/")),
+            Err(Some(libc::EACCES))
+        );
+        assert_eq!(
+            errno(find_program(&request, b"second/tool/inside")),
+            Err(Some(libc::ENOTDIR))
+        );
+        assert_eq!(errno(find_program(&request, b"")), Err(Some(libc::ENOENT)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

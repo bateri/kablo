@@ -544,6 +544,16 @@ fn messages() -> Vec<(&'static str, Packet)> {
             ),
         ),
         (
+            "new_program",
+            Packet::about(
+                id("build-1"),
+                Message::New(with(NewSession::default(), |n| {
+                    n.argv = vec![b"/bin/sh".to_vec()];
+                    n.program = Some(v1::ProgramEnd::StaysOpen);
+                })),
+            ),
+        ),
+        (
             "status_reply_label",
             work(Message::StatusReply(with(Status::new(id("work")), |s| {
                 s.pid = 4242;
@@ -3351,6 +3361,65 @@ fn a_new_waits_for_its_client_no_longer_than_a_session_may() {
             panic!("{name} is not a new");
         };
         assert_eq!(new.wait_for_client, None, "{name}");
+    }
+}
+
+/// A `new` says whether its command is a program somebody asked to run and what becomes of the
+/// terminal after it, by a key of its own: either ending is read back, a `new` without the key
+/// reads as one that does not say, a value this version does not know is read as not said (as a
+/// reader from before the key reads the whole key), and a `new` written before the key was is one
+/// that says nothing.
+#[test]
+fn a_new_says_what_becomes_of_the_terminal_after_the_program_it_asked_for() {
+    let asking = |end: Option<v1::ProgramEnd>| {
+        Packet::about(
+            id("build-1"),
+            Message::New(with(NewSession::default(), |n| {
+                n.argv = vec![b"/bin/sh".to_vec()];
+                n.program = end;
+            })),
+        )
+    };
+    for end in [v1::ProgramEnd::Closes, v1::ProgramEnd::StaysOpen] {
+        let packet = asking(Some(end));
+        let mut wire = Vec::new();
+        write_packet(&mut wire, &packet).unwrap();
+        assert_eq!(read_packet(&mut wire.as_slice()).unwrap(), Some(packet));
+    }
+    // Closing is not the key's absence: the two are different words.
+    let mut closes = Vec::new();
+    write_packet(&mut closes, &asking(Some(v1::ProgramEnd::Closes))).unwrap();
+    let mut silent = Vec::new();
+    write_packet(&mut silent, &asking(None)).unwrap();
+    assert_ne!(closes, silent);
+    assert_eq!(closes.len(), silent.len() + 7);
+    // A value of this key that this version does not know says nothing, and the rest of the `new`
+    // is read as it is.
+    for value in [0, 3, 255] {
+        let mut unknown = closes.clone();
+        let last = unknown.len() - 1;
+        unknown[last] = value;
+        assert_eq!(
+            read_packet(&mut unknown.as_slice()).unwrap(),
+            Some(asking(None)),
+            "{value}"
+        );
+    }
+    // What was written before the key says nothing.
+    for name in [
+        "new_empty",
+        "new_full",
+        "new_history",
+        "new_label",
+        "new_wait",
+    ] {
+        let Some(Message::New(new)) = read_packet(&mut fixture(name).as_slice())
+            .unwrap()
+            .map(|packet| packet.message)
+        else {
+            panic!("{name} is not a new");
+        };
+        assert_eq!(new.program, None, "{name}");
     }
 }
 

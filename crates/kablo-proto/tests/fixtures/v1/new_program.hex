@@ -1,0 +1,12 @@
+# new session "build-1" with a command that a program was asked for, which is followed by the login shell
+09                                                        # kind 0x09: new
+00                                                        # channel 0: terminal session
+07                                                        # session id length 7
+00 00 00 14                                               # payload length 20
+62 75 69 6c 64 2d 31                                      # session id "build-1"
+00 01                                                     # tlv key 1
+00 00 00 07                                               #   length 7
+2f 62 69 6e 2f 73 68                                      #   argument 0
+00 09                                                     # tlv key 9
+00 00 00 01                                               #   length 1
+02                                                        #   the program stays open (1 closes)

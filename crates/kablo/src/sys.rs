@@ -89,6 +89,33 @@ pub fn exec(path: &Path, args: &[OsString]) -> io::Error {
     io::Error::last_os_error()
 }
 
+/// `access(2)` of `path` for `mode`, with the error it gives.
+fn access(path: &Path, mode: libc::c_int) -> io::Result<()> {
+    let name = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `name` is NUL-terminated and outlives the call; `access` only reads it.
+    cvt(unsafe { libc::access(name.as_ptr(), mode) }).map(drop)
+}
+
+/// Whether `exec` would run the file at `path`, and the error it would give if not: `ENOENT` for
+/// what is not there, `ENOTDIR` for a path that goes through a file, `EACCES` for a file that
+/// cannot be run by whoever this is and for anything that is not a file (`execve` says that of a
+/// directory). Only the file's permission is looked at: whether it then runs (an interpreter that
+/// is not there, a binary for another processor) is for `exec` to say.
+pub fn executable(path: &Path) -> io::Result<()> {
+    access(path, libc::X_OK)?;
+    if std::fs::metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(libc::EACCES))
+    }
+}
+
+/// Whether `path` is a file that whoever this is can read.
+pub fn readable(path: &Path) -> bool {
+    access(path, libc::R_OK).is_ok() && std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
 /// Puts `fd` in non-blocking mode.
 pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: `F_GETFL`/`F_SETFL` change only the open file's flags.

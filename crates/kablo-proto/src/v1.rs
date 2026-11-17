@@ -754,6 +754,38 @@ fn check_label(label: &str) -> Result<()> {
     Ok(())
 }
 
+/// What becomes of the pane of a terminal when the program it was started for ends: the program is
+/// what somebody asked to run ([`NewSession::program`]).
+///
+/// Not exhaustive, so that an ending can be added without breaking whoever matches on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProgramEnd {
+    /// The terminal ends with its program.
+    Closes,
+    /// The terminal carries on with the user's login shell after its program.
+    StaysOpen,
+}
+
+impl ProgramEnd {
+    fn to_byte(self) -> u8 {
+        match self {
+            ProgramEnd::Closes => 1,
+            ProgramEnd::StaysOpen => 2,
+        }
+    }
+
+    /// A value this version does not know says nothing: a reader from before the key skips the
+    /// whole key, so the command it is given is started as any other.
+    fn from_byte(byte: u8) -> Option<ProgramEnd> {
+        match byte {
+            1 => Some(ProgramEnd::Closes),
+            2 => Some(ProgramEnd::StaysOpen),
+            _ => None,
+        }
+    }
+}
+
 /// What a `new` asks for. Every field is optional: an empty request starts
 /// the user's login shell at the server's default size.
 ///
@@ -787,6 +819,13 @@ pub struct NewSession {
     /// asked before the first client attaches is that client's to answer, and the session
     /// answers it only when no client has come in this long. `None`: answered at once.
     pub wait_for_client: Option<u32>,
+    /// That the argument vector is a program somebody asked for, and what becomes of the terminal
+    /// when it ends. What the machine does about such a program (finding it before anything
+    /// starts, the files bateri keeps for it) is done only for a `new` that says so: the
+    /// `bateri` command says it of everything it starts (the bootstrap of a server's shell too),
+    /// and the bateri app of a program it starts; the app's plain shell pane and its ssh keeper
+    /// do not. `None`: not said, as before, and so is a value this version does not know.
+    pub program: Option<ProgramEnd>,
 }
 
 mod new_key {
@@ -798,6 +837,7 @@ mod new_key {
     pub const HISTORY: u16 = 6;
     pub const LABEL: u16 = 7;
     pub const WAIT_FOR_CLIENT: u16 = 8;
+    pub const PROGRAM: u16 = 9;
 }
 
 impl NewSession {
@@ -864,6 +904,9 @@ impl NewSession {
         if let Some(wait) = self.wait_for_client.filter(|wait| *wait > 0) {
             w.put_u32(new_key::WAIT_FOR_CLIENT, wait);
         }
+        if let Some(end) = self.program {
+            w.put_u8(new_key::PROGRAM, end.to_byte());
+        }
         Ok(w.finish())
     }
 
@@ -889,6 +932,9 @@ impl NewSession {
                 new_key::WAIT_FOR_CLIENT => {
                     new.wait_for_client =
                         Some(tlv::read_u32(value, "wait for client")?).filter(|wait| *wait > 0)
+                }
+                new_key::PROGRAM => {
+                    new.program = ProgramEnd::from_byte(tlv::read_u8(value, "program")?)
                 }
                 _ => {}
             }

@@ -31,6 +31,11 @@ pub const COMMAND: &str = "bateri";
 /// The bootstrap of a server's terminal, in [`SHELL`].
 pub const BOOT: &str = "boot.sh";
 
+/// What starts a program that was asked for (bateri writes it, on a computer and on a server
+/// alike), in [`SHELL`]: `sh start KEEP PROGRAM [ARGUMENT]...`, where `KEEP` is `1` when the
+/// terminal carries on with the login shell after the program and `0` when it ends with it.
+pub const START: &str = "start";
+
 /// The programs the machine has (`apps/<name>/<version>/<name>`), in [`DIR`]: kablo is the only
 /// one that writes it, on a computer and on a server alike.
 pub const APPS: &str = "apps";
@@ -69,8 +74,10 @@ mod tests {
     #[test]
     fn the_layout_is_the_one_the_writer_uses() {
         let boot = format!("{DIR}/{SHELL}/{BOOT}");
+        let start = format!("{DIR}/{SHELL}/{START}");
         let command = format!("{DIR}/{SHELL}/{BIN}/{COMMAND}");
         assert_eq!(boot, ".local/share/bateri/shell/boot.sh");
+        assert_eq!(start, ".local/share/bateri/shell/start");
         assert_eq!(command, ".local/share/bateri/shell/bin/bateri");
         assert_eq!(
             [COUNTER, TERMINALS, PLACING],

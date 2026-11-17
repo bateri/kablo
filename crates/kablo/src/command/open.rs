@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use kablo_bateri::message::{Extent, Frame, Home, Placed, Reach, Reply, Request, Spot, WindowHome};
 use kablo_bateri::{Anchor, Id, Landed, Side, Terminal, is_machine, paths};
 use kablo_proto::SessionId;
-use kablo_proto::v1::NewSession;
+use kablo_proto::v1::{NewSession, ProgramEnd};
 
 use super::state::State;
 use super::words::{check_label, clean, is_name, is_terminal};
@@ -596,6 +596,15 @@ impl Job<'_> {
         let pane_wait = (!program.is_empty()
             && (self.anchor.is_some() || self.ctx.words() != Words::Own))
             .then_some(PANE_WAIT_MS);
+        // No bateri app pipe holds this terminal after its program, on any machine: the terminal
+        // itself carries on with the user's login shell, which the start of the terminal sees to
+        // (`launch`). Only a program of the caller's is followed by one: the bootstrap of a
+        // terminal with none is a shell already.
+        let end = if wants.keep && !program.is_empty() {
+            ProgramEnd::StaysOpen
+        } else {
+            ProgramEnd::Closes
+        };
         if program.is_empty() {
             if askable {
                 return self.ask_first(io, &cwd, shell_asked.as_deref());
@@ -618,17 +627,6 @@ impl Job<'_> {
                 ));
             }
             program = self.bootstrap();
-        } else if wants.keep {
-            // No bateri app pipe holds this terminal after its program, on any machine: the terminal itself
-            // carries on with the user's login shell.
-            let mut wrapped = vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "\"$@\"; exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
-                "sh".to_owned(),
-            ];
-            wrapped.append(&mut program);
-            program = wrapped;
         }
 
         // The number, and the terminal. A hand-made terminal can hold the number
@@ -636,7 +634,7 @@ impl Job<'_> {
         let mut tries = 0;
         let id = loop {
             let id = self.number()?;
-            match self.start(&id, &cwd, shell_asked.as_deref(), &program, pane_wait) {
+            match self.start(&id, &cwd, shell_asked.as_deref(), &program, pane_wait, end) {
                 Started::Ready => break id,
                 Started::Taken if tries + 1 < TRIES => tries += 1,
                 Started::Taken => {
@@ -774,7 +772,7 @@ impl Job<'_> {
     }
 
     fn start_bootstrap(&self, id: &str, cwd: &str, shell: Option<&str>) -> Result<(), Exit> {
-        match self.start(id, cwd, shell, &self.bootstrap(), None) {
+        match self.start(id, cwd, shell, &self.bootstrap(), None, ProgramEnd::Closes) {
             Started::Ready => Ok(()),
             Started::Taken => Err(Exit::failed(format!(
                 "bateri could not start {id}: a session called {id} exists already"
@@ -802,7 +800,8 @@ impl Job<'_> {
     /// Starts terminal `id`, in `cwd`, running `program`. It gets the umask and the environment of
     /// the caller, but for the tab the caller stands in, the `PATH` with the command on it, and the
     /// shell it was asked for. `pane_wait` is how long it keeps the terminal's questions for the
-    /// pane that is asked for next ([`PANE_WAIT_MS`]).
+    /// pane that is asked for next ([`PANE_WAIT_MS`]). `end` is what becomes of the terminal when
+    /// the program does ([`launch`] sees to it).
     fn start(
         &self,
         id: &str,
@@ -810,6 +809,7 @@ impl Job<'_> {
         shell: Option<&str>,
         program: &[String],
         pane_wait: Option<u32>,
+        end: ProgramEnd,
     ) -> Started {
         let dir = match sockdir::socket_dir() {
             Ok(dir) => dir,
@@ -825,6 +825,9 @@ impl Job<'_> {
             .collect();
         request.label = self.wants.pane_label().map(str::to_owned);
         request.wait_for_client = pane_wait;
+        // Everything this starts is a program that somebody asked for, a server's shell by its
+        // bootstrap included: what the machine does about such a program is `launch`'s.
+        request.program = Some(end);
         let absolute = std::path::absolute(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
         request.cwd = Some(absolute.as_os_str().as_encoded_bytes().to_vec());
         request
@@ -1119,13 +1122,15 @@ fn work_shell(program: &[String]) -> Option<String> {
         [flag] if matches!(flag.as_str(), "-l" | "-i" | "-il" | "-li" | "--login") => {}
         _ => return None,
     }
-    let found = find_program(first)?;
+    let found = shell_lookup(first)?;
     // A path with a control character in it is no path to hand to a window.
     (found.starts_with('/') && clean(&found) == found).then_some(found)
 }
 
-/// Where `name` is: as the shell finds a program, along `PATH`; a name with a slash is the file.
-fn find_program(name: &str) -> Option<String> {
+/// Where `name` is, as a shell finds a program along this process's `PATH` (a name with a slash is the
+/// file): the path to hand to a window. Not `launch`'s `find_program`, which asks whether a request's
+/// own `PATH` and directory can run a program.
+fn shell_lookup(name: &str) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     let runs = |path: &Path| {
         path.metadata()

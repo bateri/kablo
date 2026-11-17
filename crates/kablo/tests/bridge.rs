@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use common::{Bridge, Env, PATIENCE};
 use kablo::link::{self, Link};
-use kablo_proto::v1::{ErrorCode, Message, NewSession, Packet, PacketDecoder, Size, State};
+use kablo_proto::v1::{
+    ErrorCode, Message, NewSession, Packet, PacketDecoder, ProgramEnd, Size, State,
+};
 use kablo_proto::{SessionId, WIRE};
 
 const SH: [&str; 2] = ["--", "/bin/sh"];
@@ -120,6 +122,66 @@ fn a_session_the_bridge_starts_takes_the_program_the_directory_and_the_size() {
     bridge.attach(&id, 0);
     bridge.wait_for(&id, "hello from the client\r\n");
     assert!(String::from_utf8_lossy(&bridge.seen(&id).data).contains("/usr\r\n"));
+}
+
+#[test]
+fn a_new_that_says_it_is_a_program_is_found_first_and_started_through_the_start_bateri_keeps() {
+    let mut env = Env::new();
+    let home = env.dir.join("home");
+    let shell = home.join(".local/share/bateri/shell");
+    std::fs::create_dir_all(&shell).unwrap();
+    env.set_var("HOME", &home.display().to_string());
+    let given = home.join("start.args");
+    std::fs::write(
+        shell.join("start"),
+        format!(
+            "printf '%s|' \"$@\" > '{}'\nshift\nexec \"$@\"\n",
+            given.display()
+        ),
+    )
+    .unwrap();
+    let mut bridge = Bridge::start(&env);
+    let program = |words: &[&str], end: Option<ProgramEnd>| {
+        let mut request = NewSession::default();
+        request.argv = words.iter().map(|w| w.as_bytes().to_vec()).collect();
+        request.program = end;
+        request
+    };
+    // A program that is not there is refused as the keeper would refuse it, and starts nothing.
+    let missing = env.name("missing");
+    let (code, text) = bridge
+        .try_new_with(
+            Some(&missing),
+            program(&["/nonexistent/program"], Some(ProgramEnd::Closes)),
+        )
+        .unwrap_err();
+    assert_eq!(code, ErrorCode::UNAVAILABLE, "{text}");
+    assert!(text.contains("cannot start the program"), "{text}");
+    assert!(!env.socket(&missing).exists() && !given.exists());
+    // One that is there starts through `start`, which is told it does not stay open.
+    let asked = env.name("asked");
+    env.track(&asked);
+    let words = ["/bin/sh", "-c", "echo asked-for; sleep 60"];
+    bridge
+        .try_new_with(Some(&asked), program(&words, Some(ProgramEnd::Closes)))
+        .unwrap();
+    bridge.attach(&asked, 0);
+    bridge.wait_for(&asked, "asked-for");
+    assert_eq!(
+        std::fs::read_to_string(&given).unwrap(),
+        "0|/bin/sh|-c|echo asked-for; sleep 60|"
+    );
+    // The same words of a request that does not say it is a program are the program alone.
+    std::fs::remove_file(&given).unwrap();
+    let plain = env.name("plain");
+    env.track(&plain);
+    let words = ["/bin/sh", "-c", "echo plain-one; sleep 60"];
+    bridge
+        .try_new_with(Some(&plain), program(&words, None))
+        .unwrap();
+    bridge.attach(&plain, 0);
+    bridge.wait_for(&plain, "plain-one");
+    assert!(!given.exists());
 }
 
 #[test]

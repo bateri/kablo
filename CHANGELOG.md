@@ -26,8 +26,13 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **A `new` can say that its command is a program somebody asked to run.** `program`, key 9 of `new` (`NewSession::program`, `ProgramEnd`): the terminal ends with the program (1) or carries on with the login shell after it (2). Such a program is looked for before anything starts, and is run through bateri's `start` (`.local/share/bateri/shell/start`, `kablo_bateri::paths::START`) when the machine has one. A server from before this skips the key and starts the command as it did.
+
 ### Changed
 
+- **A program that is not there, or is not executable, starts no terminal, with `--keep-open` too.** `bateri split`, `tab` and `window` say the program could not be started and exit 1; with `--keep-open` they opened a pane that showed the error in a shell. Only whether the program is there and may be executed is looked at: one that fails when it runs (a script with no interpreter, a binary for another processor) is started all the same.
 - **A session's kablo only goes forward.** `kablo upgrade` is refused when the binary is installed as a release older than the one the relay runs (`.../kablo/0.9.0/kablo`): `not replaced: 0.9.0 is older than the 0.9.1 this terminal runs`, and the session stays as it is. A build for development is exempt, whichever side it is on. Two computers that bring different releases to one server no longer carry its terminals back and forth.
 - **kablo installs inside bateri's folder.** `kablo_proto::install::ROOT` is now `.local/share/bateri/kablo`, so a version is at `.local/share/bateri/kablo/<version>/kablo`. The old place stays as `FORMER_ROOT` (`.local/share/kablo`), with `former_install_dir`, `former_install_path` and `former_install_path_in` for a version installed there.
 - **A Production server no longer starts with updating off.** The first program installed on a machine leaves updating on whatever the app says about the machine. The `production` line of an offer is still read.
