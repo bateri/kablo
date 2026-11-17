@@ -40,6 +40,9 @@
 //! stands alone, with no `beside`, `side`, `tab` or line of a new tab. `at X,Y` is the corner and
 //! `size W,H` the size, in whole percents of the tab from 0 to 100 (`at 10,20`, `size 50,40`); what a
 //! `float` leaves out is the bateri app's to choose, and a card that would not fit is held inside the tab.
+//! A `place` with `float yes` and `minimized yes` opens its pane as a capsule: the card is never seen, and
+//! the app attaches the terminal at the size the card would have. It goes with `float` and with no
+//! `focus`, since the keyboard opens a capsule; `minimized no` is no line, as `focus no` is.
 //!
 //! A pane for a terminal that runs on another machine than the caller's is a `place` with the
 //! `server` line (`server prod`: the name `ssh` takes), and the `ssh` verb asks how to reach that
@@ -101,6 +104,9 @@ const RELAY_WORDS: usize = 256;
 
 /// The most lines of stderr a reply carries; what a command says on stderr is a line or two.
 const STDERR_LINES: usize = 20;
+
+/// Why a `place` is not `minimized` and `focus` both: the keyboard opens a capsule.
+const MINIMIZED_FOCUS: &str = "`minimized` goes with no `focus`: the keyboard opens a capsule";
 
 /// The most of one line of stderr a reply carries.
 const STDERR_WIDTH: usize = 400;
@@ -303,6 +309,14 @@ impl Frame {
     }
 }
 
+/// A pane that floats: where and how big its card is, and whether it is born as a capsule, its card
+/// never seen. A capsule goes with no `focus` (the keyboard opens it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Floating {
+    pub frame: Frame,
+    pub minimized: bool,
+}
+
 /// A pane for a terminal the server has started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
@@ -321,8 +335,9 @@ pub struct Place {
     /// The pane takes the keyboard.
     pub focus: bool,
     /// The pane floats over the tab it opens in (the anchor's, or the one `home.tab` names), where
-    /// and as big as this says. It is no split: it goes with no `side` and no `ratio`.
-    pub float: Option<Frame>,
+    /// and as big as `frame` says, and is born as a capsule when `minimized`. It is no split: it goes
+    /// with no `side` and no `ratio`.
+    pub float: Option<Floating>,
     /// Where else than beside the anchor, and the label.
     pub home: Home,
     /// The terminal is not started: the bateri app opens an ordinary pane of this computer, its shell started
@@ -732,14 +747,20 @@ impl Request {
                 if place.focus {
                     push(&mut out, "focus", "yes")?;
                 }
-                if let Some(frame) = &place.float {
+                if let Some(floating) = &place.float {
                     if place.side.is_some() || place.ratio.is_some() {
                         return Err(Failure::usage(
                             "`float` is no split: it goes with no `side` and no `ratio`",
                         ));
                     }
                     push(&mut out, "float", "yes")?;
-                    frame.push(&mut out)?;
+                    floating.frame.push(&mut out)?;
+                    if floating.minimized {
+                        if place.focus {
+                            return Err(Failure::usage(MINIMIZED_FOCUS));
+                        }
+                        push(&mut out, "minimized", "yes")?;
+                    }
                 }
                 if let Some(directory) = &place.fresh {
                     if !directory.starts_with('/') {
@@ -1226,6 +1247,7 @@ fn read_request<'a>(
                     "float",
                     "at",
                     "size",
+                    "minimized",
                     "fresh",
                     "shell",
                     "server",
@@ -1276,15 +1298,25 @@ fn read_request<'a>(
                     "`server` and `fresh` do not go together: a terminal on a server is started",
                 ));
             }
+            let focus = fields.flag("focus")?;
+            let minimized = fields.flag("minimized")?;
             let float = if fields.flag("float")? {
                 if side.is_some() || ratio.is_some() {
                     return Err(Failure::usage(
                         "`float` is no split: it goes with no `side` and no `ratio`",
                     ));
                 }
-                Some(Frame::of(&fields)?)
+                if minimized && focus {
+                    return Err(Failure::usage(MINIMIZED_FOCUS));
+                }
+                Some(Floating {
+                    frame: Frame::of(&fields)?,
+                    minimized,
+                })
             } else if fields.get("at").is_some() || fields.get("size").is_some() {
                 return Err(Failure::usage("`at` and `size` go with `float`"));
+            } else if minimized {
+                return Err(Failure::usage("`minimized` goes with `float`"));
             } else {
                 None
             };
@@ -1297,7 +1329,7 @@ fn read_request<'a>(
                 side,
                 ratio,
                 keep_open: fields.flag("keep-open")?,
-                focus: fields.flag("focus")?,
+                focus,
                 float,
                 home,
                 fresh: fields
@@ -3266,6 +3298,27 @@ mod tests {
     const FLOAT_REFRAME_AT: &str = "bateri 2\nmove\nterminal p9@prod\nat 5,5\n";
     const FLOAT_REFRAME_SIZE: &str = "bateri 2\nmove\nterminal p9\nsize 60,70\n";
 
+    // `minimized` came after the keys above, in the same version; frozen the same way.
+    const FLOAT_PLACE_MINIMIZED: &str =
+        "bateri 2\nplace\nterminal p9\nanchor p4\nkeep-open yes\nfloat yes\nminimized yes\n";
+    const FLOAT_PLACE_MINIMIZED_AT: &str = "bateri 2\nplace\nterminal p9\nanchor p4\nfloat yes\nat 10,20\nsize 50,40\nminimized yes\ntab t3\n";
+
+    /// A card that is seen, where `frame` says.
+    fn card(frame: Frame) -> Floating {
+        Floating {
+            frame,
+            minimized: false,
+        }
+    }
+
+    /// A capsule whose card would be where `frame` says.
+    fn capsule(frame: Frame) -> Floating {
+        Floating {
+            frame,
+            minimized: true,
+        }
+    }
+
     fn floating(at: Option<(u8, u8)>, size: Option<(u8, u8)>) -> Frame {
         Frame {
             at: at.map(|(x, y)| Spot { x, y }),
@@ -3279,7 +3332,7 @@ mod tests {
             (
                 FLOAT_PLACE,
                 Request::Place(Place {
-                    float: Some(Frame::default()),
+                    float: Some(Floating::default()),
                     ..bare_with_anchor()
                 }),
             ),
@@ -3287,7 +3340,7 @@ mod tests {
                 FLOAT_PLACE_AT,
                 Request::Place(Place {
                     focus: true,
-                    float: Some(floating(Some((10, 20)), Some((50, 40)))),
+                    float: Some(card(floating(Some((10, 20)), Some((50, 40))))),
                     home: Home {
                         tab: Id::parse("t3"),
                         ..Home::default()
@@ -3338,6 +3391,88 @@ mod tests {
             Request::parse("bateri 2\nmove\nterminal p9\ndock no\nfloat yes\n"),
             Request::parse(FLOAT_MOVE)
         );
+    }
+
+    #[test]
+    fn a_pane_born_as_a_capsule_is_read_and_written_byte_for_byte() {
+        let cases = [
+            (
+                FLOAT_PLACE_MINIMIZED,
+                Place {
+                    keep_open: true,
+                    float: Some(capsule(Frame::default())),
+                    ..bare_with_anchor()
+                },
+            ),
+            (
+                FLOAT_PLACE_MINIMIZED_AT,
+                Place {
+                    float: Some(capsule(floating(Some((10, 20)), Some((50, 40))))),
+                    home: Home {
+                        tab: Id::parse("t3"),
+                        ..Home::default()
+                    },
+                    ..bare_with_anchor()
+                },
+            ),
+        ];
+        for (text, place) in cases {
+            let request = Request::Place(place);
+            assert_eq!(Request::parse(text).as_ref(), Ok(&request), "{text}");
+            assert_eq!(request.encode().as_deref(), Ok(text), "{text}");
+        }
+        // `no` is the same as no line, and a card that is seen is what a float was before the key.
+        assert_eq!(
+            Request::parse("bateri 2\nplace\nterminal p9\nanchor p4\nfloat yes\nminimized no\n"),
+            Request::parse(FLOAT_PLACE)
+        );
+    }
+
+    #[test]
+    fn a_capsule_goes_with_a_float_and_no_focus() {
+        let place = "bateri 2\nplace\nterminal p9\nanchor p4\n";
+        for (extra, word) in [
+            ("minimized yes\n", "goes with `float`"),
+            ("float no\nminimized yes\n", "goes with `float`"),
+            ("float yes\nminimized maybe\n", "yes or no"),
+            ("float yes\nminimized yes\nminimized yes\n", "given twice"),
+            ("float yes\nfocus yes\nminimized yes\n", "no `focus`"),
+        ] {
+            let failure = usage(&format!("{place}{extra}"));
+            assert_eq!(failure.kind, Kind::Usage, "{extra:?}");
+            assert!(failure.text.contains(word), "{extra:?}: {}", failure.text);
+        }
+        // `minimized no` is no line, with a float or without, and a card that is seen may take the focus.
+        assert_eq!(
+            Request::parse("bateri 2\nplace\nterminal p9\nanchor p4\nminimized no\n"),
+            Ok(Request::Place(bare_with_anchor()))
+        );
+        assert_eq!(
+            Request::parse(
+                "bateri 2\nplace\nterminal p9\nanchor p4\nfocus yes\nfloat yes\nminimized no\n"
+            ),
+            Ok(Request::Place(Place {
+                focus: true,
+                float: Some(Floating::default()),
+                ..bare_with_anchor()
+            }))
+        );
+        // Other verbs take no `minimized`.
+        for verb in ["move\nterminal p9\nfloat yes\n", "minimize\n", "zoom\n"] {
+            let failure = usage(&format!("bateri 2\n{verb}minimized yes\n"));
+            assert!(
+                failure.text.contains("takes no `minimized`"),
+                "{verb:?}: {}",
+                failure.text
+            );
+        }
+        // What the other end could not read back is not written.
+        let focused = Place {
+            focus: true,
+            float: Some(capsule(Frame::default())),
+            ..bare_with_anchor()
+        };
+        assert!(Request::Place(focused).encode().is_err());
     }
 
     #[test]
@@ -3461,18 +3596,18 @@ mod tests {
     fn what_cannot_be_read_back_is_not_written() {
         let split_and_float = Place {
             side: Some(Side::Right),
-            float: Some(Frame::default()),
+            float: Some(Floating::default()),
             ..bare_with_anchor()
         };
         assert!(Request::Place(split_and_float).encode().is_err());
         let sized_and_ratioed = Place {
             ratio: Some(30),
-            float: Some(Frame::default()),
+            float: Some(Floating::default()),
             ..bare_with_anchor()
         };
         assert!(Request::Place(sized_and_ratioed).encode().is_err());
         let in_a_group = Place {
-            float: Some(Frame::default()),
+            float: Some(Floating::default()),
             home: Home {
                 group: Id::parse("g1"),
                 ..Home::default()
@@ -3488,7 +3623,7 @@ mod tests {
         ] {
             assert!(
                 Request::Place(Place {
-                    float: Some(frame),
+                    float: Some(card(frame)),
                     ..bare_with_anchor()
                 })
                 .encode()

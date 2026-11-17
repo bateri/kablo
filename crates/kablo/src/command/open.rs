@@ -15,7 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use kablo_bateri::message::{Extent, Frame, Home, Placed, Reach, Reply, Request, Spot, WindowHome};
+use kablo_bateri::message::{
+    Extent, Floating, Frame, Home, Placed, Reach, Reply, Request, Spot, WindowHome,
+};
 use kablo_bateri::{Anchor, Id, Landed, Side, Terminal, is_machine, paths};
 use kablo_proto::SessionId;
 use kablo_proto::v1::{NewSession, ProgramEnd};
@@ -117,6 +119,9 @@ struct Wants {
     float: bool,
     at: Option<Spot>,
     size: Option<Extent>,
+    /// `--minimized`: the floating pane is born as a capsule, its card never seen. It keeps the pane
+    /// open (`keep`) when the program ends: nobody is looking at it.
+    minimized: bool,
     cwd: Option<String>,
     keep: bool,
     wait: bool,
@@ -178,6 +183,7 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
         float: false,
         at: None,
         size: None,
+        minimized: false,
         cwd: None,
         keep: false,
         wait: false,
@@ -249,6 +255,14 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
                     )));
                 }
                 wants.float = true;
+            }
+            "--minimized" => {
+                if mode != Mode::Split {
+                    return Err(Exit::mistake(format!(
+                        "{word} takes no --minimized: a pane floats as a capsule (split --float --minimized)"
+                    )));
+                }
+                wants.minimized = true;
             }
             _ if name == "--at" || name == "--size" => {
                 if mode != Mode::Split {
@@ -387,6 +401,19 @@ fn parse(mode: Mode, args: &[String]) -> Result<Wants, Exit> {
         return Err(Exit::mistake(
             "--at and --size go with --float (split --float --at 10,20 --size 50,40)",
         ));
+    }
+    if wants.minimized {
+        if !wants.float {
+            return Err(Exit::mistake(
+                "--minimized goes with --float (split --float --minimized)",
+            ));
+        }
+        if wants.focus {
+            return Err(Exit::mistake(
+                "--minimized goes with no --focus: the keyboard opens a capsule",
+            ));
+        }
+        wants.keep = true;
     }
     if mode != Mode::Split {
         wants.side = Some(Side::Tab);
@@ -887,9 +914,12 @@ impl Job<'_> {
             ratio: wants.ratio,
             keep_open: wants.keep,
             focus: wants.focus,
-            float: wants.float.then_some(Frame {
-                at: wants.at,
-                size: wants.size,
+            float: wants.float.then_some(Floating {
+                frame: Frame {
+                    at: wants.at,
+                    size: wants.size,
+                },
+                minimized: wants.minimized,
             }),
             home: Home {
                 tab: wants.tab,

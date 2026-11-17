@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kablo_bateri::message::{Extent, Frame, Home, Place, Request, Spot, WindowHome, hex_word};
+use kablo_bateri::message::{
+    Extent, Floating, Frame, Home, Place, Request, Spot, WindowHome, hex_word,
+};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
 use kablo_proto::v1::OFFSET_END;
 use stage::{Pane, Run, Stage, parse_told};
@@ -169,12 +171,15 @@ fn a_split_that_floats_asks_for_a_pane_over_the_tab_and_no_split() {
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "p1\n");
     let wanted = Place {
-        float: Some(Frame {
-            at: Some(Spot { x: 10, y: 20 }),
-            size: Some(Extent {
-                width: 50,
-                height: 40,
-            }),
+        float: Some(Floating {
+            frame: Frame {
+                at: Some(Spot { x: 10, y: 20 }),
+                size: Some(Extent {
+                    width: 50,
+                    height: 40,
+                }),
+            },
+            minimized: false,
         }),
         home: Home {
             tab: Id::parse("t3"),
@@ -191,11 +196,122 @@ fn a_split_that_floats_asks_for_a_pane_over_the_tab_and_no_split() {
     let said = stage.run_in("p40", &["split", "p7", "--float"]);
     assert_eq!(said.status, 0, "{}", said.err);
     let wanted = Place {
-        float: Some(Frame::default()),
+        float: Some(Floating::default()),
         fresh: Some(stage.home.display().to_string()),
         ..place(2, 7)
     };
     assert_eq!(stage.told, [encoded(wanted)]);
+}
+
+#[test]
+fn a_float_asked_as_a_capsule_says_so_in_the_place_and_nothing_else_does() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let said = stage.run_in(
+        "p40",
+        &[
+            "split",
+            "--float",
+            "--minimized",
+            "--keep-open",
+            "--tab",
+            "t3",
+        ],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    let wanted = Place {
+        keep_open: true,
+        float: Some(Floating {
+            frame: Frame::default(),
+            minimized: true,
+        }),
+        fresh: Some(stage.home.display().to_string()),
+        home: Home {
+            tab: Id::parse("t3"),
+            ..Home::default()
+        },
+        ..place(1, 40)
+    };
+    assert_eq!(stage.told, [encoded(wanted.clone())]);
+    assert_eq!(parse_told(&stage.told[0]), Request::Place(wanted));
+    assert!(stage.told[0].contains("float yes\nminimized yes\n"));
+    // A float that is not asked to be a capsule says nothing of it, as before the flag.
+    stage.forget_told();
+    stage.app_says(PLACED);
+    let said = stage.run_in("p40", &["split", "--float", "--at", "10,20"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(!stage.told[0].contains("minimized"), "{}", stage.told[0]);
+}
+
+#[test]
+fn a_capsule_keeps_its_pane_open_when_the_program_ends_though_it_is_not_asked_to() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    let shell = stage.env.script(
+        "login.sh",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/login.args'\nexec cat\n",
+            stage.home.display()
+        ),
+    );
+    let said = stage.go(&Run {
+        here: Some("p40"),
+        args: &["split", "--float", "--minimized", "--", "true"],
+        input: None,
+        turns: &[],
+        vars: &[("SHELL", &shell.display().to_string())],
+    });
+    assert_eq!(said.status, 0, "{}", said.err);
+    let file = stage.home.join("login.args");
+    let start = Instant::now();
+    while !file.exists() {
+        assert!(start.elapsed() < Duration::from_secs(20), "no login shell");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "-l\n");
+    assert_eq!(
+        parse_told(&stage.told[0]),
+        Request::Place(Place {
+            keep_open: true,
+            float: Some(Floating {
+                frame: Frame::default(),
+                minimized: true,
+            }),
+            ..place(1, 40)
+        })
+    );
+    assert_eq!(
+        stage.record("p1").as_deref(),
+        Some("opener p40\nkeep-open yes\n")
+    );
+}
+
+#[test]
+fn a_capsule_that_goes_with_no_float_or_with_the_focus_is_64_before_anything_starts() {
+    let mut stage = stage();
+    stage.app_says(PLACED);
+    for args in [
+        &["split", "--minimized"][..],
+        &["split", "p7", "--minimized"],
+        &["split", "--left", "--minimized"],
+        &["split", "--ratio", "30", "--minimized"],
+        &["split", "--tab", "t3", "--minimized"],
+        &["split", "--float", "--minimized", "--focus"],
+        &["split", "--focus", "--float", "--minimized"],
+        &["split", "--float", "--minimized=yes"],
+        &["tab", "--minimized"],
+        &["window", "--minimized"],
+    ] {
+        let said = stage.run_in("p40", args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+        assert!(said.err.contains("minimized"), "{args:?}: {}", said.err);
+    }
+    assert!(stage.told.is_empty(), "{:?}", stage.told);
+    assert!(
+        stage.running().iter().all(|id| id == "p40"),
+        "nothing was started: {:?}",
+        stage.running()
+    );
 }
 
 #[test]

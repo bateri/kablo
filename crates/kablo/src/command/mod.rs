@@ -220,8 +220,9 @@ pub fn unread() -> Exit {
 const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--above|--below] [--ratio PERCENT]
                     [--label TEXT] [--cwd DIR] [--keep-open] [--wait] [--focus] [--json]
                     [-S SERVER] [-- PROGRAM [ARG]...]
-       bateri split [PANE | --tab TAB] --float [--at X,Y] [--size W,H] [--label TEXT] [--cwd DIR]
-                    [--keep-open] [--wait] [--focus] [--json] [-S SERVER] [-- PROGRAM [ARG]...]
+       bateri split [PANE | --tab TAB] --float [--at X,Y] [--size W,H] [--minimized] [--label TEXT]
+                    [--cwd DIR] [--keep-open] [--wait] [--focus] [--json] [-S SERVER]
+                    [-- PROGRAM [ARG]...]
        bateri tab [PANE] [--group GROUP | --window WINDOW] [--new-group NAME] [--label TEXT]
                   [--cwd DIR] [--keep-open] [--wait] [--focus] [--json] [-S SERVER]
                   [-- PROGRAM [ARG]...]
@@ -262,7 +263,8 @@ An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; ba
 A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
 sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
 tab, 0 to 100, from its top left corner. minimize shrinks a floating pane to a capsule, or opens
-it again.
+it again; split --float --minimized opens one as a capsule that stays open when its program ends,
+with no --focus (the keyboard opens a capsule).
 message hands the last thing an agent said to the app, which shows it beside the terminal this
 runs in: TEXT, or with --json-field the string member FIELD of the JSON on standard input, as an
 agent's hook is given it (nothing is sent, and the status is 0, when the input has no such text).

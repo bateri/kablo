@@ -29,6 +29,7 @@ section is not released.
 ### Added
 
 - **A `new` can say that its command is a program somebody asked to run.** `program`, key 9 of `new` (`NewSession::program`, `ProgramEnd`): the terminal ends with the program (1) or carries on with the login shell after it (2). Such a program is looked for before anything starts, and is run through bateri's `start` (`.local/share/bateri/shell/start`, `kablo_bateri::paths::START`) when the machine has one. A server from before this skips the key and starts the command as it did.
+- **`bateri split --float --minimized` opens the floating pane as a capsule.** Its card is never seen, and the pane stays open when its program ends, so a dev server or a watcher runs without covering the tab. In the app channel (`kablo-bateri`, still version 2) a `place` takes the key `minimized`, and `Place::float` is now an `Option<Floating>` (`frame` and `minimized`) in place of an `Option<Frame>`.
 
 ### Changed
 
