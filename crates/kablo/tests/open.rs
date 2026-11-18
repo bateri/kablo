@@ -1719,6 +1719,8 @@ fn the_program_of_a_split_an_app_carried_here_is_answered_by_the_pane_that_follo
 
 /// A terminal with no pane to go beside has nobody to keep its questions for: it answers its
 /// program itself, as a terminal nobody watches does, and a client that comes later is told so.
+/// The client comes once the program has asked: one that is attached when the question is read
+/// is the one to answer it, and this one answers nothing.
 #[test]
 fn the_program_of_a_split_with_no_pane_is_answered_by_its_terminal() {
     let mut stage = stage();
@@ -1726,6 +1728,7 @@ fn the_program_of_a_split_with_no_pane_is_answered_by_its_terminal() {
     let said = stage.run(&["split", "--", "/bin/sh", "-c", ASK_FOR_THE_CURSOR]);
     assert_eq!(said.status, 0, "{}", said.err);
     assert_eq!(said.out, "p1\n");
+    asked(&stage, "p1");
     let mut late = stage.env.connect("p1");
     late.attach(0);
     late.wait_for("got:1b5b313b3152:\r\n", 0);
