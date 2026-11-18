@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+
 ### Added
 
 - **A `new` can mark its command as a program somebody asked for.** Key 9 of `new` (`NewSession::program`, `ProgramEnd`) says whether the terminal ends with the program or keeps a login shell after it. Such a program is looked for before the terminal starts, and runs through bateri's `start` (`kablo_bateri::paths::START`) when the machine has one. An older kablo skips the key.
