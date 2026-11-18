@@ -259,6 +259,11 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri package remove NAME
        bateri package auto [on|off]
        bateri package not-here [NAME]...
+       bateri config list [--changed] [WORD]
+       bateri config get KEY
+       bateri config set KEY VALUE
+       bateri config reset KEY
+       bateri config path
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
 sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
@@ -280,6 +285,11 @@ approve where there is none), update looks for newer releases, watch does that o
 while the app that started it is connected, remove takes one away, auto says whether they are
 updated on their own, not-here names what is not to be brought here. Only install, update and watch
 need a bateri app.
+config reads and changes the settings of this computer's bateri, in the file the app reads:
+list shows each setting and its value (--changed only those not at their default, WORD those
+whose name has it), get prints one value, set checks a value and writes it, reset takes a setting
+back to its default, path prints where the file is. KEY is section.key (appearance.theme), or the
+key alone where one section has it. A terminal on a server cannot change them.
 ";
 
 /// `kablo bateri VERB ARGS...`: returns the status.
@@ -397,6 +407,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "capture" => verbs::capture(ctx, io, rest, &words),
         "wait" => verbs::wait(ctx, io, rest, &words),
         "package" => package::package(ctx, io, &words),
+        "config" => verbs::config(ctx, io, &words),
         "help" | "-h" | "--help" => {
             let _ = write!(io.out, "{USAGE}");
             Ok(())

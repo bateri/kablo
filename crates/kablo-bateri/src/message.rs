@@ -56,6 +56,11 @@
 //! stderr that follow, and the rest as stdout (text: a byte that is none is replaced). Only a server given `full` is
 //! relayed for, and only `split`, `send`, `send-key`, `capture`, `wait` and `close`.
 //!
+//! **`config`** hands the app the words of a `bateri config` command (`words`, each as `x` and the
+//! hex of its bytes, as a `relay`'s are): the settings are the app's, which reads and writes them,
+//! and it answers `ok relayed` as a relayed command does — what to print and the status. Only a
+//! terminal of the computer the app runs on asks; the app refuses a server.
+//!
 //! **A reply** starts with `bateri 2` too and then says `ok` (`ok placed` and the lines that
 //! tell how and where, `ok text` and the rest of the message as the text to print, `ok start`:
 //! this terminal is not the bateri app's to start, start it and ask again) or `error KIND TEXT`
@@ -387,6 +392,9 @@ pub enum Request {
     Relay(Relay),
     /// Something about the programs a machine has ([`crate::package`]).
     Package(Package),
+    /// The words of a `bateri config` command, for the app that keeps the settings: it answers
+    /// what to print and the status, as for a relayed command ([`Reply::Relayed`]).
+    Config(Vec<String>),
 }
 
 /// A `bateri` command the window runs on another machine for a program on a server.
@@ -822,6 +830,14 @@ impl Request {
             }
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
             Request::Package(package) => package.encode_into(&mut out)?,
+            Request::Config(words) => {
+                if words.is_empty() {
+                    return Err(Failure::usage("`config` carries the words of the command"));
+                }
+                out.push_str("config\n");
+                let words: Vec<String> = words.iter().map(|word| hex_word(word)).collect();
+                push(&mut out, "words", &words.join(" "))?;
+            }
         }
         let limit = if matches!(self, Request::Relay(_)) {
             RELAY_MAX_BYTES
@@ -1422,8 +1438,17 @@ fn read_request<'a>(
         "package state" | "package offer" | "package fetch" | "package key-changed" => {
             crate::package::read(verb, lines).map(Request::Package)
         }
+        "config" => {
+            let fields = Fields::read(verb, lines, &["words"])?;
+            let words = fields
+                .need("words")?
+                .split(' ')
+                .map(word_of_hex)
+                .collect::<Result<Vec<String>, Failure>>()?;
+            Ok(Request::Config(words))
+        }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch or package key-changed"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed or config"
         ))),
     }
 }
@@ -3010,6 +3035,27 @@ mod tests {
     /// The words that reach a server and the pane for a terminal that runs on one are written and
     /// read byte for byte, and what `ssh` could take for an option, or for two hosts, is no name.
     const V2_RELAY: &str = "bateri 2\nrelay\nserver prod\nwords x73656e64 x7039 x710a\n";
+
+    /// `bateri config set font.family Kode Mono`, as the format freezes it.
+    const V2_CONFIG: &str =
+        "bateri 2\nconfig\nwords x736574 x666f6e742e66616d696c79 x4b6f6465204d6f6e6f\n";
+
+    #[test]
+    fn the_words_of_config_go_whole_as_hex_so_a_value_with_spaces_stays_one_word() {
+        let asked = Request::Config(vec![
+            "set".to_owned(),
+            "font.family".to_owned(),
+            "Kode Mono".to_owned(),
+        ]);
+        assert_eq!(Request::parse(V2_CONFIG), Ok(asked.clone()));
+        assert_eq!(asked.encode().as_deref(), Ok(V2_CONFIG));
+        let odd = Request::Config(vec!["set".to_owned(), "a\nb".to_owned(), String::new()]);
+        let text = odd.encode().expect("encoded");
+        assert_eq!(Request::parse(&text), Ok(odd));
+        assert!(Request::Config(Vec::new()).encode().is_err());
+        assert!(Request::parse("bateri 2\nconfig\n").is_err());
+        assert!(Request::parse("bateri 2\nconfig\nwords set\n").is_err());
+    }
     const V2_REPLY_RELAYED: &str =
         "bateri 2\nok relayed\nstatus 3\nstderr 1\nkablo: no such session\nfirst\nsecond\n";
 

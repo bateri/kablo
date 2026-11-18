@@ -307,6 +307,45 @@ fn ls_prints_what_the_app_says_and_without_one_what_the_server_has() {
 }
 
 #[test]
+fn config_hands_its_words_to_the_app_and_says_what_it_answered() {
+    let mut stage = Stage::new();
+    let said = stage.run_in("p4", &["config", "get", "theme"]);
+    assert_eq!(said.status, 69);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected: it keeps the settings\n"
+    );
+    stage.app_says("bateri 2\nok relayed\nstatus 0\nstderr 0\nfont.family = \"Kode Mono\"\n");
+    let said = stage.run_in("p4", &["config", "set", "font.family", "Kode Mono"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "font.family = \"Kode Mono\"\n");
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        Request::Config(vec![
+            "set".to_owned(),
+            "font.family".to_owned(),
+            "Kode Mono".to_owned()
+        ])
+    );
+    // What the app refuses is its words and its status.
+    stage.app_says(
+        "bateri 2\nok relayed\nstatus 64\nstderr 1\nbateri: split_style takes cards or lines\n",
+    );
+    let said = stage.run_in("p4", &["config", "set", "split_style", "dots"]);
+    assert_eq!(said.status, 64);
+    assert_eq!(said.err, "bateri: split_style takes cards or lines\n");
+    assert_eq!(said.out, "");
+    // A server is refused by the app; a bateri from before the verb is told to be updated.
+    stage.app_says("bateri 2\nerror refused the settings are this computer's\n");
+    assert_eq!(stage.run_in("p4", &["config", "path"]).status, 77);
+    stage.app_says("bateri 2\nerror usage `config` is no verb: place, ls, close\n");
+    let said = stage.run_in("p4", &["config", "path"]);
+    assert_eq!(said.status, 1);
+    assert!(said.err.contains("update bateri"), "{}", said.err);
+    assert_eq!(stage.run_in("p4", &["config"]).status, 64);
+}
+
+#[test]
 fn notify_needs_an_app_and_sends_one_line() {
     let mut stage = Stage::new();
     let said = stage.run_in("p4", &["notify", "the build is done"]);

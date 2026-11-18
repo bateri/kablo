@@ -1246,3 +1246,30 @@ pub fn wait(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> 
     }
     finish(drive::wait(rest, io.err))
 }
+
+/// `bateri config`: the settings of this computer's bateri, which the app reads and writes. The
+/// words go to it whole; what it says is printed, and its status is this command's. A terminal on a
+/// server is refused by the app: the settings are not the server's.
+pub fn config(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
+    if words.is_empty() {
+        return Err(Exit::mistake("config takes list, get, set, reset or path"));
+    }
+    match ctx.ask(&Request::Config(words.to_vec()))? {
+        Asked::Reply(Reply::Relayed(done)) => {
+            for line in &done.stderr {
+                let _ = writeln!(io.err, "{line}");
+            }
+            let _ = io.out.write_all(done.stdout.as_bytes());
+            finish(done.status)
+        }
+        Asked::Reply(Reply::Failed(failed)) if kablo_bateri::package::is_old(&failed) => Err(
+            Exit::failed("this bateri does not read its settings from here yet; update bateri"),
+        ),
+        Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
+        Asked::Reply(_) | Asked::Unreadable => Err(unread()),
+        Asked::NoApp | Asked::Silent => Err(Exit::new(
+            69,
+            "the bateri app is not connected: it keeps the settings",
+        )),
+    }
+}

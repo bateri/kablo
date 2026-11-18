@@ -30,6 +30,7 @@ section is not released.
 
 - **A `new` can mark its command as a program somebody asked for.** Key 9 of `new` (`NewSession::program`, `ProgramEnd`) says whether the terminal ends with the program or keeps a login shell after it. Such a program is looked for before the terminal starts, and runs through bateri's `start` (`kablo_bateri::paths::START`) when the machine has one. An older kablo skips the key.
 - **`bateri split --float --minimized` opens the floating pane as a capsule.** The card never shows and the pane stays open when its program ends. In the app channel (still version 2) `place` takes the key `minimized`, and `Place::float` is now an `Option<Floating>`.
+- **`bateri config` reads and changes the settings of this computer's bateri.** `list`, `get`, `set`, `reset` and `path`; the bateri app checks and writes the value and says what to print. In the app channel (still version 2) the verb is `config`, with the command's `words` as hex, and the answer is `ok relayed`.
 
 ### Changed
 
