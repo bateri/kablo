@@ -259,18 +259,19 @@ fn way_of(word: &str) -> Result<Way, Exit> {
         })
 }
 
-/// The text of standard input, for `fill` and `type`: all of it, a last line break too.
-fn input() -> Result<String, Exit> {
+/// The text of standard input, for `fill` and `type` (of `view` and of `browser`): all of it, a
+/// last line break too, and at most `most` bytes (a multiple of 1 KiB, which the mistake says).
+pub(super) fn input(most: u64) -> Result<String, Exit> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
-        .take(TEXT_BYTES + 1)
+        .take(most + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| Exit::failed(format!("cannot read standard input: {e}")))?;
-    if bytes.len() as u64 > TEXT_BYTES {
+    if bytes.len() as u64 > most {
         return Err(Exit::mistake(format!(
             "the text on standard input is at most {} KiB",
-            TEXT_BYTES / 1024
+            most / 1024
         )));
     }
     String::from_utf8(bytes).map_err(|_| Exit::mistake("the text on standard input is not text"))
@@ -309,7 +310,7 @@ pub fn view(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         return Err(unread());
     };
     if from_input {
-        let text = input()?;
+        let text = input(TEXT_BYTES)?;
         match action {
             Action::Type(at) | Action::Fill { text: at, .. } => *at = text,
             _ => {}

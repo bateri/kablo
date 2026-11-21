@@ -23,8 +23,10 @@
 //!   with none, the pane's only browser, or the one that has the keyboard. `ls` takes none.
 //! * `target` is what `snapshot` names an element by, or `X,Y`, a point of the page in pixels;
 //!   `click` clicks it. `text` is what `type` types, and `into` is a target it clicks first, so that
-//!   the keys go there. `url` is where `open` goes. What a word means is the app's to read: a
-//!   target it does not know is its `error usage`.
+//!   the keys go there. `url` is where `open` goes: an `http://` or `https://` address, a `data:`
+//!   one or `about:blank`, and nothing else (`file:`, `javascript:` and the rest are a usage
+//!   error). What a word means is the app's to read: a target it does not know is its
+//!   `error usage`.
 //! * Free words (`element`, `target`, `text`, `into`, `url`) are `x` and the hex of their bytes, as
 //!   a `relay`'s words are ([`crate::message::hex_word`]), so that a line break or a space in a
 //!   page's text stays in the word.
@@ -288,7 +290,29 @@ fn check_url(url: &str) -> Result<(), Failure> {
             "an address is 1 to {URL_MAX} bytes with no control character"
         )));
     }
+    if !is_openable(url) {
+        return Err(Failure::usage(
+            "`open` goes to an http:// or https:// address, a data: address or about:blank"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+/// Whether `url` is of the kinds `open` takes: `http` and `https` (with a host after the `://`),
+/// `data:` and `about:blank`, the scheme in any case. Every reader of a request applies this, the
+/// command to fail early and plainly, the app and the helper to hold what they are told to nothing
+/// more than the command lets through.
+fn is_openable(url: &str) -> bool {
+    let starts = |prefix: &str| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let to_a_host = |prefix: &str| starts(prefix) && url.len() > prefix.len();
+    to_a_host("http://")
+        || to_a_host("https://")
+        || starts("data:")
+        || url.eq_ignore_ascii_case("about:blank")
 }
 
 fn check_typed(text: &str) -> Result<(), Failure> {
@@ -571,6 +595,28 @@ mod tests {
             ),
             ("bateri 2\nbrowser open\npane p9\nurl x6\n", "even number"),
             ("bateri 2\nbrowser open\npane p9\nurl xff\n", "not text"),
+            // An address is of the kinds `open` takes: `example.com`, `ftp://a`, `file:///a`,
+            // `javascript:1` and `http://` alone are not.
+            (
+                "bateri 2\nbrowser open\npane p9\nurl x6578616d706c652e636f6d\n",
+                "http:// or https://",
+            ),
+            (
+                "bateri 2\nbrowser open\npane p9\nurl x6674703a2f2f61\n",
+                "http:// or https://",
+            ),
+            (
+                "bateri 2\nbrowser open\npane p9\nurl x66696c653a2f2f2f61\n",
+                "http:// or https://",
+            ),
+            (
+                "bateri 2\nbrowser open\npane p9\nurl x6a6176617363726970743a31\n",
+                "http:// or https://",
+            ),
+            (
+                "bateri 2\nbrowser open\npane p9\nurl x687474703a2f2f\n",
+                "http:// or https://",
+            ),
             (
                 "bateri 2\nbrowser open\npane p9\nurl x\n",
                 "1 to 2048 bytes",
@@ -657,6 +703,59 @@ mod tests {
     }
 
     #[test]
+    fn open_goes_to_http_https_data_and_about_blank_only() {
+        let write = |url: &str| {
+            Request::Browser(Browser {
+                pane: pane("p9"),
+                element: None,
+                action: Action::Open {
+                    url: url.to_owned(),
+                },
+            })
+            .encode()
+        };
+        for url in [
+            "http://localhost:3000/",
+            "https://example.com/a?b=1#c",
+            "HTTPS://Example.com",
+            "data:text/html,<p>hi</p>",
+            "about:blank",
+            "ABOUT:blank",
+        ] {
+            let text = write(url).unwrap_or_else(|failed| panic!("{url}: {}", failed.text));
+            assert_eq!(
+                Request::parse(&text),
+                Ok(Request::Browser(Browser {
+                    pane: pane("p9"),
+                    element: None,
+                    action: Action::Open {
+                        url: url.to_owned()
+                    },
+                })),
+                "{url}"
+            );
+        }
+        for url in [
+            "example.com",
+            "//example.com",
+            "ftp://example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "chrome://settings",
+            "about:config",
+            "about:blank#x",
+            "http://",
+            "https:/a",
+            "xhttp://a",
+            " http://a",
+        ] {
+            let failed = write(url).expect_err(url);
+            assert_eq!(failed.kind, crate::message::Kind::Usage, "{url}");
+            assert!(failed.text.contains("http:// or https://"), "{url}");
+        }
+    }
+
+    #[test]
     fn the_largest_words_fit_a_request() {
         let most = Request::Browser(Browser {
             pane: pane(&format!("p9@{}", "h".repeat(253))),
@@ -673,7 +772,7 @@ mod tests {
             pane: pane("p9"),
             element: Some("e".repeat(ELEMENT_MAX)),
             action: Action::Open {
-                url: "u".repeat(URL_MAX),
+                url: format!("https://{}", "u".repeat(URL_MAX - 8)),
             },
         });
         assert!(url.encode().expect("fits").len() <= MAX_BYTES);
@@ -681,7 +780,7 @@ mod tests {
             pane: pane("p9"),
             element: None,
             action: Action::Open {
-                url: "u".repeat(URL_MAX + 1),
+                url: format!("https://{}", "u".repeat(URL_MAX - 7)),
             },
         });
         assert!(over.encode().is_err());

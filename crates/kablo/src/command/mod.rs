@@ -287,7 +287,7 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri browser ls PANE
        bateri browser text|snapshot|shot|back|reload PANE [--element ID]
        bateri browser click PANE TARGET [--element ID]
-       bateri browser type PANE [--into TARGET] [--element ID] [--] TEXT
+       bateri browser type PANE [--into TARGET] [--element ID] [--] TEXT | -
        bateri browser open PANE URL [--element ID]
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
@@ -333,11 +333,12 @@ browser drives a browser that a pane's page shows, which the bateri app and its 
 machine the program runs on: ls lists the pane's browsers (id, address, title), text prints what the
 page says, snapshot what it is made of, one line for each element that a click can take and the name
 it goes by (TARGET), shot takes a picture of it, click clicks a TARGET or a point X,Y of the page in
-pixels, type types TEXT (after a click on --into TARGET), open goes to an address, back and reload
-do what they say. --element ID says which browser of the pane (the only one, or the one that has the
-keyboard, when it is left out). A text too long to print and every picture are a file on this
-machine, in ~/.local/share/bateri/browser, and the command prints its path; the files are kept for
-a day. TEXT that starts with - follows a --.
+pixels, type types TEXT (after a click on --into TARGET; - reads the text from standard input), open
+goes to an http:// or https:// address, a data: one or about:blank, back and reload do what they
+say. --element ID says which browser of the pane (the only one, or the one that has the keyboard,
+when it is left out). A text too long to print and every picture are a file on this machine, in
+~/.local/share/bateri/browser, and the command prints its path; the next text, snapshot or shot
+removes the files there that are more than a day old. TEXT that starts with - follows a --.
 ";
 
 /// `kablo bateri VERB ARGS...`: returns the status.
