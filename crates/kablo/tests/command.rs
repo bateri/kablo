@@ -580,9 +580,32 @@ fn view_ends_with_the_status_of_what_the_app_said_and_a_bateri_from_before_it_is
         said.err,
         "bateri: this bateri does not read views yet; update bateri\n"
     );
+    // One that reads the length of a request before its verb says it is too long to take.
+    stage.app_says("bateri 2\nerror usage the message is over 8192 bytes\n");
+    let said = stage.run_in("p4", &["view", "p9", "type", "text"]);
+    assert_eq!(said.status, 1);
+    assert_eq!(
+        said.err,
+        "bateri: this bateri does not read views yet; update bateri\n"
+    );
     // Something that is no reply at all.
     stage.app_says("bateri 2\nok placed\n");
     assert_eq!(stage.run_in("p4", &["view", "p9"]).status, 1);
+}
+
+#[test]
+fn view_prints_what_a_page_said_without_what_a_terminal_would_act_on() {
+    let said = "  k3f9qa  button  Save\n\tnote: a\u{1b}]52;c;AAAA\u{7}b\u{1b}[2Jc \u{9b}31m\n";
+    let mut stage = Stage::with_app(&Reply::Text(said.to_owned()).encode());
+    let out = stage.run_in("p4", &["view", "p9"]);
+    assert_eq!(out.status, 0, "{}", out.err);
+    assert_eq!(
+        out.out,
+        "  k3f9qa  button  Save\n\tnote: a]52;c;AAAAb[2Jc 31m\n"
+    );
+    let out = stage.run_in("p4", &["view", "p9", "text", "k3f9qa", "--json"]);
+    assert_eq!(out.status, 0, "{}", out.err);
+    assert!(!out.out.contains('\u{1b}'), "{:?}", out.out);
 }
 
 #[test]
@@ -594,6 +617,7 @@ fn view_with_a_word_that_is_wrong_is_64_and_asks_the_app_nothing() {
         vec!["view", "p9", "click"],
         vec!["view", "p9", "click", "K3F9QA"],
         vec!["view", "p9", "click", "abc"],
+        vec!["view", "p9", "fill", "K3F9QA", "-"],
         vec!["view", "p9", "fill", "k3f9qa"],
         vec!["view", "p9", "scroll", "k3f9qa", "sideways"],
         vec!["view", "p9", "wait", "Done", "--for", "121"],

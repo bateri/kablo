@@ -21,7 +21,7 @@
 //! The answer is `ok text` (the reading, or for `text` the text asked for) or, for `shot`,
 //! `ok picture` and the hex of a PNG ([`crate::message::Reply::Picture`]).
 
-use crate::message::{Failure, Fields, Format, hex_word, push, word_of_hex};
+use crate::message::{Failure, Fields, Format, Kind, hex_word, push, word_of_hex};
 use crate::terminal::Anchor;
 
 /// The longest a `wait` waits for, in seconds, and how long it waits where it is told no more.
@@ -218,13 +218,30 @@ impl View {
     }
 }
 
+/// Whether a refusal is of a bateri that does not know the `view` verb: it says there is no such
+/// verb, or, for a request over what it takes of any verb, that the message is too long (it reads
+/// the limit before the verb, and a `view` may be longer than it allows).
+pub fn is_old(failure: &Failure) -> bool {
+    failure.kind == Kind::Usage
+        && (failure.text.contains("is no verb")
+            || failure.text.contains(&format!(
+                "the message is over {} bytes",
+                crate::message::MAX_BYTES
+            )))
+}
+
 /// A name of an element as the bateri app writes it: six letters and digits, or a whole id of 16
 /// hexadecimal digits; lower case.
 fn check_ref(name: &str) -> Result<(), Failure> {
-    let plain = matches!(name.len(), 6 | 16)
-        && name
+    let plain = match name.len() {
+        6 => name
             .bytes()
-            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
+        16 => name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')),
+        _ => false,
+    };
     if plain {
         Ok(())
     } else {
@@ -562,6 +579,10 @@ mod tests {
             ("bateri 2\nview\naction click\nref K3F9QA\n", "a `ref` is"),
             ("bateri 2\nview\naction click\nref abc\n", "a `ref` is"),
             (
+                "bateri 2\nview\naction click\nref ghijklmnopqrstuv\n",
+                "a `ref` is",
+            ),
+            (
                 "bateri 2\nview\naction click\nref k3f9qa\ntext x61\n",
                 "takes no `text`",
             ),
@@ -675,5 +696,25 @@ mod tests {
         };
         assert_eq!(wait(None).waits(), WAIT_DEFAULT);
         assert_eq!(wait(Some(30)).waits(), 30);
+    }
+
+    #[test]
+    fn a_bateri_that_does_not_know_the_verb_is_told_from_one_that_found_a_mistake() {
+        // What a bateri from before `view` says: it does not know the verb, or the request is
+        // longer than any request of its own is allowed to be (it reads the length first).
+        for old in [
+            Failure::usage("`view` is no verb"),
+            Failure::usage("the message is over 8192 bytes"),
+        ] {
+            assert!(is_old(&old), "{}", old.text);
+        }
+        // What one that knows it says: a mistake in the request, or the length of its own limit.
+        for new in [
+            Failure::usage("`ref` is six letters and digits"),
+            Failure::usage("the message is over 131072 bytes"),
+            Failure::new(Kind::Failed, "the message is over 8192 bytes"),
+        ] {
+            assert!(!is_old(&new), "{}", new.text);
+        }
     }
 }

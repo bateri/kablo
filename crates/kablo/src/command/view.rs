@@ -1,14 +1,15 @@
 //! `bateri view`: what a pane shows when it shows a view and not a terminal, read and driven by an
 //! agent. The bateri app does it all (`kablo-bateri`'s `view` is the request); this reads the words,
 //! takes the text from standard input where it is told to, and prints what the app answers: a
-//! reading as it is, or for `shot` the bytes of a PNG, to a file or to standard output.
+//! reading (cleaned of what a terminal would act on), or for `shot` the bytes of a PNG of any pane,
+//! to a file or to standard output.
 
-use std::io::Read;
+use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
 use kablo_bateri::Anchor;
 use kablo_bateri::message::{Format, Reply, Request};
-use kablo_bateri::view::{Action, KEYS_MOST, View, WAIT_MOST, Way};
+use kablo_bateri::view::{Action, KEYS_MOST, SCROLL_MOST, View, WAIT_MOST, Way, is_old};
 
 use super::words::{address, clean};
 use super::{Asked, Ctx, Done, Exit, Io, failure, unread};
@@ -37,6 +38,13 @@ const TEXT_BYTES: u64 = 60 * 1024;
 /// How much longer than a `wait` waits the command waits for the app's answer.
 const WAIT_SLACK: u64 = 5;
 
+/// Where the picture of a `shot` goes: a file, or standard output where the word is a bare `-`.
+#[derive(Debug, PartialEq, Eq)]
+enum Shot {
+    Stdout,
+    File(String),
+}
+
 /// What the command line says, read.
 #[derive(Debug, PartialEq, Eq)]
 struct Asking {
@@ -44,8 +52,8 @@ struct Asking {
     pane: Option<String>,
     format: Format,
     action: Action,
-    /// Where a `shot` goes: a file, or `-` for standard output.
-    shot: Option<String>,
+    /// Where a `shot` goes.
+    shot: Option<Shot>,
     /// Whether the text of the action is to be read from standard input (`-`).
     from_input: bool,
 }
@@ -180,7 +188,7 @@ fn parse(words: &[String]) -> Result<Asking, Exit> {
                 way: way_of(way)?,
                 count: match args.get(2) {
                     None => None,
-                    Some((value, _)) => Some(count("the number of screens", value, 1000)?),
+                    Some((value, _)) => Some(count("the number of screens", value, SCROLL_MOST)?),
                 },
             },
             _ => {
@@ -190,7 +198,12 @@ fn parse(words: &[String]) -> Result<Asking, Exit> {
             }
         },
         Some("shot") => {
-            shot = Some(text("the file to write, or - for standard output")?);
+            let (file, dash) = one("the file to write, or - for standard output")?;
+            shot = Some(if dash {
+                Shot::Stdout
+            } else {
+                Shot::File(file.to_owned())
+            });
             Action::Shot { full }
         }
         Some(other) => return Err(Exit::mistake(format!("'{}' is no action", clean(other)))),
@@ -263,47 +276,59 @@ fn input() -> Result<String, Exit> {
     String::from_utf8(bytes).map_err(|_| Exit::mistake("the text on standard input is not text"))
 }
 
+/// Writes `bytes` whole to standard output. A reader that has gone is no mistake of this command
+/// (`| head`), a write that fails for any other reason is: the picture would be cut.
+fn put(out: &mut dyn Write, bytes: &[u8]) -> Done {
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != ErrorKind::BrokenPipe => {
+            Err(Exit::failed(format!("cannot write the output: {e}")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `bateri view [PANE] [ACTION]...`.
 pub fn view(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     let mut asking = parse(words)?;
-    if asking.from_input {
-        let text = input()?;
-        match &mut asking.action {
-            Action::Type(at) | Action::Fill { text: at, .. } => *at = text,
-            _ => {}
-        }
-    }
     let terminal = match &asking.pane {
         Some(pane) => Anchor::address(pane),
         // The caller's own terminal, under whatever name it has: nobody wrote it.
         None => Anchor::address(&ctx.need_here("name the pane to read (view p4)")?),
     };
-    let request = Request::View(View {
+    let from_input = asking.from_input;
+    let mut request = Request::View(View {
         terminal,
         format: asking.format,
-        action: asking.action,
+        action: std::mem::replace(&mut asking.action, Action::Read),
     });
-    let Request::View(View { action, .. }) = &request else {
+    // What is wrong with the request is said before standard input is waited for.
+    if let Err(wrong) = request.encode() {
+        return Err(failure(&wrong));
+    }
+    let Request::View(View { action, .. }) = &mut request else {
         return Err(unread());
     };
+    if from_input {
+        let text = input()?;
+        match action {
+            Action::Type(at) | Action::Fill { text: at, .. } => *at = text,
+            _ => {}
+        }
+    }
     let patience = patience(action);
     match ctx.ask_patiently(&request, patience)? {
         Asked::Reply(Reply::Text(text)) if asking.shot.is_none() => {
-            let _ = io.out.write_all(text.as_bytes());
-            Ok(())
+            put(io.out, clean(&text).as_bytes())
         }
-        Asked::Reply(Reply::Picture(png)) => match asking.shot.as_deref() {
-            Some("-") => {
-                let _ = io.out.write_all(&png);
-                Ok(())
-            }
-            Some(file) => std::fs::write(file, &png)
+        Asked::Reply(Reply::Picture(png)) => match &asking.shot {
+            Some(Shot::Stdout) => put(io.out, &png),
+            Some(Shot::File(file)) => std::fs::write(file, &png)
                 .map_err(|e| Exit::failed(format!("cannot write {}: {e}", clean(file)))),
             None => Err(unread()),
         },
-        Asked::Reply(Reply::Failed(failed)) if kablo_bateri::package::is_old(&failed) => Err(
-            Exit::failed("this bateri does not read views yet; update bateri"),
-        ),
+        Asked::Reply(Reply::Failed(failed)) if is_old(&failed) => Err(Exit::failed(
+            "this bateri does not read views yet; update bateri",
+        )),
         Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
         Asked::NoApp | Asked::Silent => Err(Exit::new(
@@ -394,8 +419,16 @@ mod tests {
         for (line, action) in cases {
             assert_eq!(read(line).unwrap().action, action, "{line}");
         }
-        assert_eq!(read("shot a.png").unwrap().shot.as_deref(), Some("a.png"));
-        assert_eq!(read("shot -").unwrap().shot.as_deref(), Some("-"));
+        assert_eq!(
+            read("shot a.png").unwrap().shot,
+            Some(Shot::File("a.png".into()))
+        );
+        assert_eq!(read("shot -").unwrap().shot, Some(Shot::Stdout));
+        // After `--` a dash is a name like any other: a file called `-`.
+        assert_eq!(
+            read("shot -- -").unwrap().shot,
+            Some(Shot::File("-".into()))
+        );
     }
 
     #[test]

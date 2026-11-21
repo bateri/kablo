@@ -672,7 +672,8 @@ pub enum Reply {
     Relayed(Relayed),
     /// The answer to a `package offer` or a `package fetch`.
     Package(Answer),
-    /// A picture of a pane's view: the bytes of a PNG.
+    /// A picture of a pane's view: the bytes of a PNG. A picture has bytes: one of none is written
+    /// as it is and read as a mistake.
     Picture(Vec<u8>),
     Failed(Failure),
 }
@@ -1817,9 +1818,11 @@ impl Reply {
 
 /// The lower case hex of `bytes`.
 fn hex_of(bytes: &[u8]) -> String {
+    let digit = |nibble: u8| char::from_digit(u32::from(nibble), 16).unwrap_or('0');
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        out.push(digit(byte >> 4));
+        out.push(digit(byte & 15));
     }
     out
 }
