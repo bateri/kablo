@@ -66,6 +66,12 @@ pub const AUTO_OFF: &str = "auto-off";
 /// The programs the person said not to bring here, one name a line, in [`APPS`].
 pub const NOT_HERE: &str = "not-here";
 
+/// What an answer of `bateri browser` that is a file is written in (a picture of a page, a text
+/// too long for a reply), in [`DIR`]: `<part>.png` or `<part>.txt`, one file for each answer, on
+/// the machine of the terminal that asked. Mode 0700, made by the command before it asks; the bateri
+/// app writes the files and the command sweeps the ones more than a day old.
+pub const BROWSER: &str = "browser";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +93,12 @@ mod tests {
 
     // The folder of the programs is written by kablo and read by every kablo of every version
     // that has been on the machine, and bateri's older build wrote the first two levels.
+    // The app writes into it and the command reads from it: the place is a contract.
+    #[test]
+    fn the_folder_of_the_answers_of_a_browser_is_the_one_the_app_writes() {
+        assert_eq!(format!("{DIR}/{BROWSER}"), ".local/share/bateri/browser");
+    }
+
     #[test]
     fn the_folder_of_the_programs_is_the_one_bateri_started() {
         let bin = format!("{DIR}/{APPS}/{APPS_BIN}");

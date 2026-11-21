@@ -1892,3 +1892,217 @@ fn install_asks_nobody_at_a_pipe_and_refuses_what_it_cannot_ask_about() {
         "nothing is put in"
     );
 }
+
+/// What the last message to the bateri app asked of a browser.
+fn browsed(stage: &Stage) -> kablo_bateri::browser::Browser {
+    match parse_told(stage.told.last().expect("the app was told something")) {
+        Request::Browser(browser) => browser,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn browser_asks_the_app_of_the_browser_and_prints_what_it_says() {
+    use kablo_bateri::browser::Action;
+    let mut stage = Stage::new();
+    // No bateri app: the browsers are its.
+    let said = stage.run_in("p4", &["browser", "ls", "p9"]);
+    assert_eq!(said.status, 69);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected: it keeps the browsers\n"
+    );
+    stage.app_says("bateri 2\nok text\nmain  http://localhost:3000/  Home\n");
+    let said = stage.run_in("p4", &["browser", "ls", "p9@prod"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "main  http://localhost:3000/  Home\n");
+    let asked = browsed(&stage);
+    assert_eq!(asked.pane, Anchor::address("p9@prod").unwrap());
+    assert_eq!((asked.element, asked.action), (None, Action::Ls));
+    // The page's text is told to a terminal as text, with no control character in it.
+    stage.app_says("bateri 2\nok text\nhello\u{1b}[31m\nworld\n");
+    let said = stage.run_in("p4", &["browser", "text", "p9", "--element", "main"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "hello[31m\nworld\n");
+    let asked = browsed(&stage);
+    assert_eq!(asked.element.as_deref(), Some("main"));
+    // The asker names the file an answer may be, and no two asks name the same.
+    let Action::Text { part } = asked.action else {
+        panic!("{asked:?}")
+    };
+    assert!(!part.is_empty());
+    stage.run_in("p4", &["browser", "snapshot", "p9"]);
+    let Action::Snapshot { part: other } = browsed(&stage).action else {
+        panic!("a snapshot")
+    };
+    assert_ne!(part, other);
+    // What has nothing to say says `ok`.
+    stage.app_says(OK);
+    for (args, want) in [
+        (
+            vec!["browser", "click", "p9", "e12"],
+            Action::Click {
+                target: "e12".to_owned(),
+            },
+        ),
+        (
+            vec!["browser", "click", "p9", "40,120"],
+            Action::Click {
+                target: "40,120".to_owned(),
+            },
+        ),
+        (
+            vec!["browser", "open", "p9", "http://localhost:3000/a b"],
+            Action::Open {
+                url: "http://localhost:3000/a b".to_owned(),
+            },
+        ),
+        (vec!["browser", "back", "p9"], Action::Back),
+        (
+            vec!["browser", "reload", "p9", "--element", "tab-2"],
+            Action::Reload,
+        ),
+        (
+            vec![
+                "browser",
+                "type",
+                "p9",
+                "--into",
+                "e3",
+                "two words\nand a line",
+            ],
+            Action::Type {
+                text: "two words\nand a line".to_owned(),
+                into: Some("e3".to_owned()),
+            },
+        ),
+        // After `--` it is the text, whatever it looks like.
+        (
+            vec!["browser", "type", "p9", "--", "-h"],
+            Action::Type {
+                text: "-h".to_owned(),
+                into: None,
+            },
+        ),
+    ] {
+        let said = stage.run_in("p4", &args);
+        assert_eq!(said.status, 0, "{args:?}: {}", said.err);
+        assert_eq!(said.out, "", "{args:?}");
+        assert_eq!(browsed(&stage).action, want, "{args:?}");
+    }
+    assert_eq!(browsed(&stage).element, None);
+    // Not a verb to relay: what a server runs reaches the app of its terminal and no other machine.
+    assert!(!kablo_bateri::message::RELAYED.contains(&"browser"));
+}
+
+#[test]
+fn browser_says_what_the_app_refused_and_what_it_did_not_read() {
+    let mut stage = Stage::with_app("bateri 2\nerror refused this server may not see a browser\n");
+    let said = stage.run_in("p4", &["browser", "text", "p9"]);
+    assert_eq!(said.status, 77);
+    assert_eq!(said.err, "bateri: this server may not see a browser\n");
+    stage.app_says("bateri 2\nerror usage no browser in p9\n");
+    assert_eq!(stage.run_in("p4", &["browser", "back", "p9"]).status, 64);
+    stage.app_says("bateri 2\nerror failed the helper is not running\n");
+    assert_eq!(stage.run_in("p4", &["browser", "back", "p9"]).status, 1);
+    // A bateri from before the verb is told to be updated.
+    stage.app_says("bateri 2\nerror usage `browser back` is no verb: place, ls, close\n");
+    let said = stage.run_in("p4", &["browser", "back", "p9"]);
+    assert_eq!(said.status, 1);
+    assert!(said.err.contains("update bateri"), "{}", said.err);
+    // An answer the verb does not take is not read: the text of a `click`, a bare `ok` for a `text`,
+    // a picture for a `text` and a text for a `shot`.
+    stage.app_says("bateri 2\nok text\nclicked\n");
+    assert_eq!(
+        stage.run_in("p4", &["browser", "click", "p9", "e1"]).status,
+        1
+    );
+    stage.app_says(OK);
+    assert_eq!(stage.run_in("p4", &["browser", "text", "p9"]).status, 1);
+    stage.app_says("bateri 2\nok filed\nkind png\nbytes 3\n");
+    assert_eq!(stage.run_in("p4", &["browser", "text", "p9"]).status, 1);
+    stage.app_says("bateri 2\nok text\nnot a picture\n");
+    assert_eq!(stage.run_in("p4", &["browser", "shot", "p9"]).status, 1);
+}
+
+#[test]
+fn browser_is_a_mistake_before_it_asks_anybody_when_it_is_not_written_right() {
+    let mut stage = Stage::with_app(OK);
+    for args in [
+        vec!["browser"],
+        vec!["browser", "dance", "p9"],
+        vec!["browser", "forward", "p9"],
+        vec!["browser", "text"],
+        vec!["browser", "text", "9"],
+        vec!["browser", "text", "t3"],
+        vec!["browser", "text", "p9@"],
+        vec!["browser", "text", "p9", "p10"],
+        vec!["browser", "click", "p9"],
+        vec!["browser", "click", "p9", "two", "words"],
+        vec!["browser", "click", "p9", "two words"],
+        vec!["browser", "open", "p9"],
+        vec!["browser", "type", "p9"],
+        vec!["browser", "type", "p9", ""],
+        vec!["browser", "text", "p9", "--element"],
+        vec!["browser", "text", "p9", "--element", ""],
+        vec!["browser", "text", "p9", "--element", "a", "--element", "b"],
+        vec!["browser", "ls", "p9", "--element", "main"],
+        vec!["browser", "text", "p9", "--into", "e1"],
+        vec!["browser", "text", "p9", "--bogus"],
+        vec!["browser", "open", "p9", &"u".repeat(3000)],
+        vec!["browser", "type", "p9", &"t".repeat(3000)],
+    ] {
+        let said = stage.run_in("p4", &args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+    }
+    assert_eq!(stage.told.len(), 0, "{:?}", stage.told);
+    // The help is not a mistake, and it lists the verb.
+    let said = stage.run_in("p4", &["browser", "--help"]);
+    assert_eq!(said.status, 0);
+    assert!(
+        said.out.contains("bateri browser type PANE"),
+        "{}",
+        said.out
+    );
+}
+
+#[test]
+fn a_picture_or_a_long_text_is_a_file_on_this_machine_and_the_command_says_where() {
+    let mut stage = Stage::with_app("bateri 2\nok filed\nkind png\nbytes 3\n");
+    let folder = stage.state().join("browser");
+    // The app writes it as the asker named it, so that is not here yet: the command does not say
+    // a path to nothing.
+    let said = stage.run_in("p4", &["browser", "shot", "p9"]);
+    assert_eq!(said.status, 1);
+    assert!(said.err.contains("is not there"), "{}", said.err);
+    assert_eq!(said.out, "");
+    let kablo_bateri::browser::Action::Shot { part } = browsed(&stage).action else {
+        panic!("a shot")
+    };
+    // The folder is the person's alone: it may hold what they signed in to.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&folder).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    assert!(!folder.join(format!("{part}.png")).exists());
+    // What is old in it goes; what is not ours stays, and so does what is new.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 3600);
+    let make = |name: &str, age: Option<std::time::SystemTime>| {
+        let path = folder.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        if let Some(age) = age {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(age)
+                .unwrap();
+        }
+    };
+    make("old-1.png", Some(old));
+    make("old-2.txt", Some(old));
+    make("old.keep", Some(old));
+    make("new-1.png", None);
+    stage.run_in("p4", &["browser", "shot", "p9"]);
+    assert!(!folder.join("old-1.png").exists() && !folder.join("old-2.txt").exists());
+    assert!(folder.join("old.keep").exists() && folder.join("new-1.png").exists());
+}

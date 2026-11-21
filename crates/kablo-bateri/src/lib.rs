@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod ids;
 pub mod keys;
 pub mod message;

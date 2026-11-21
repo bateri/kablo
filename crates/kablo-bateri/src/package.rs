@@ -458,7 +458,7 @@ fn check_version(version: &str) -> Result<(), Failure> {
     }
 }
 
-fn check_part(part: &str) -> Result<(), Failure> {
+pub(crate) fn check_part(part: &str) -> Result<(), Failure> {
     let fine = !part.is_empty()
         && part.len() <= NAME_MAX
         && part

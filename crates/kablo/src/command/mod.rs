@@ -12,6 +12,7 @@
 //! kablo's trouble.
 
 mod bring;
+mod browser;
 mod json;
 mod machine;
 mod open;
@@ -283,6 +284,11 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri config set KEY VALUE
        bateri config reset KEY
        bateri config path
+       bateri browser ls PANE
+       bateri browser text|snapshot|shot|back|reload PANE [--element ID]
+       bateri browser click PANE TARGET [--element ID]
+       bateri browser type PANE [--into TARGET] [--element ID] [--] TEXT
+       bateri browser open PANE URL [--element ID]
 An id is a letter and a number: p9 a pane, t3 a tab, g1 a group, w1 a window; bateri ls shows them.
 A pane that floats lies over its tab: --float opens one (split) or lifts one (move pane), --dock
 sets it back in the tab, --at and --size move and resize it. X,Y and W,H are whole percents of the
@@ -323,6 +329,15 @@ list shows each setting and its value (--changed only those not at their default
 whose name has it), get prints one value, set checks a value and writes it, reset takes a setting
 back to its default, path prints where the file is. KEY is section.key (appearance.theme), or the
 key alone where one section has it. A terminal on a server cannot change them.
+browser drives a browser that a pane's page shows, which the bateri app and its helper keep, whichever
+machine the program runs on: ls lists the pane's browsers (id, address, title), text prints what the
+page says, snapshot what it is made of, one line for each element that a click can take and the name
+it goes by (TARGET), shot takes a picture of it, click clicks a TARGET or a point X,Y of the page in
+pixels, type types TEXT (after a click on --into TARGET), open goes to an address, back and reload
+do what they say. --element ID says which browser of the pane (the only one, or the one that has the
+keyboard, when it is left out). A text too long to print and every picture are a file on this
+machine, in ~/.local/share/bateri/browser, and the command prints its path; the files are kept for
+a day. TEXT that starts with - follows a --.
 ";
 
 /// `kablo bateri VERB ARGS...`: returns the status.
@@ -442,6 +457,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "package" => package::package(ctx, io, &words),
         "config" => verbs::config(ctx, io, &words),
         "view" => view::view(ctx, io, &words),
+        "browser" => browser::browser(ctx, io, &words),
         "help" | "-h" | "--help" => {
             let _ = write!(io.out, "{USAGE}");
             Ok(())

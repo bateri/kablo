@@ -66,7 +66,7 @@ impl Person for AtTerminal {
 }
 
 /// A name for the directory a file is brought to, new at every call.
-fn fresh_part() -> String {
+pub(super) fn fresh_part() -> String {
     static SERIAL: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

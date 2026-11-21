@@ -403,6 +403,12 @@ memory of where its relay comes from (see *Limits*).
   bootstrap and the command count with the same file, so no number is given twice),
   and the exit status is `0`, `1`, `64` (a mistake in the command), `69` (no app) or
   `77` (the app refused).
+  `kablo bateri browser VERB PANE` (`ls`, `text`, `snapshot`, `shot`, `click`, `type`,
+  `open`, `back`, `reload`) drives a browser that a pane's page holds, which the app's
+  helper draws on the computer the app runs on: the command is one message to the app of
+  its own terminal and is never run on another machine. A picture, and a text too long for
+  an answer, are a file on the machine the command runs on
+  (`~/.local/share/bateri/browser`, kept for a day), and the command prints its path.
 - **Taking a terminal** is bit 3 of the view an app attaches with (`take` in
   `kablo-proto`): the other clients attached to the session are let go, each with
   the error `TAKEN` (code 9) whose text is the name the app gave itself in its

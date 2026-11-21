@@ -61,6 +61,11 @@
 //! and it answers `ok relayed` as a relayed command does — what to print and the status. Only a
 //! terminal of the computer the app runs on asks; the app refuses a server.
 //!
+//! **`browser`** and a word (`browser text`, `browser click`, ...) asks something of a browser that
+//! a pane's page holds, which the app asks of the helper that draws it ([`crate::browser`]: the
+//! words, the keys, and the answer that is a file, `ok filed`). It is not relayed: the browser is
+//! on the computer the app runs on, and a program on a server asks the app of its own terminal.
+//!
 //! **A reply** starts with `bateri 2` too and then says `ok` (`ok placed` and the lines that
 //! tell how and where, `ok text` and the rest of the message as the text to print, `ok start`:
 //! this terminal is not the bateri app's to start, start it and ask again) or `error KIND TEXT`
@@ -79,6 +84,7 @@
 //! changing the format adds a version and its fixtures, it does not rewrite these. (Version 1 had
 //! no names for a window, a group or a tab, and went with `bateri new`.)
 
+use crate::browser::{self, Browser, Filed};
 use crate::ids::{Id, Kind as IdKind};
 use crate::package::{Answer, Package};
 use crate::place::{Landed, Side};
@@ -399,6 +405,9 @@ pub enum Request {
     /// Read the view a pane shows, or drive it ([`crate::view`]): the app answers with a reading
     /// ([`Reply::Text`]), or for a `shot` with a picture ([`Reply::Picture`]).
     View(View),
+    /// Something asked of a browser a pane holds ([`crate::browser`]): the app asks the helper that
+    /// draws it. Never relayed.
+    Browser(Browser),
 }
 
 /// A `bateri` command the window runs on another machine for a program on a server.
@@ -675,6 +684,8 @@ pub enum Reply {
     /// A picture of a pane's view: the bytes of a PNG. A picture has bytes: one of none is written
     /// as it is and read as a mistake.
     Picture(Vec<u8>),
+    /// The answer to a `browser` that is a file the app wrote on the asker's machine.
+    Filed(Filed),
     Failed(Failure),
 }
 
@@ -847,6 +858,7 @@ impl Request {
                 let words: Vec<String> = words.iter().map(|word| hex_word(word)).collect();
                 push(&mut out, "words", &words.join(" "))?;
             }
+            Request::Browser(browser) => browser.encode_into(&mut out)?,
         }
         let limit = if matches!(self, Request::Relay(_) | Request::View(_)) {
             RELAY_MAX_BYTES
@@ -1457,8 +1469,12 @@ fn read_request<'a>(
                 .collect::<Result<Vec<String>, Failure>>()?;
             Ok(Request::Config(words))
         }
+        "browser ls" | "browser text" | "browser snapshot" | "browser shot" | "browser click"
+        | "browser type" | "browser open" | "browser back" | "browser reload" => {
+            browser::read(verb, lines).map(Request::Browser)
+        }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config or view"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back or browser reload"
         ))),
     }
 }
@@ -1773,6 +1789,7 @@ impl Reply {
                 out.push_str(&hex_of(bytes));
                 out.push('\n');
             }
+            Reply::Filed(filed) => filed.encode_into(&mut out),
             Reply::Failed(failure) => {
                 // One line, whatever the words held.
                 let text: String = failure
@@ -1807,6 +1824,7 @@ impl Reply {
             "ok text" => Ok(Reply::Text(body.to_owned())),
             "ok relayed" => read_relayed(body),
             "ok picture" => read_picture(body),
+            "ok filed" => Filed::read(body).map(Reply::Filed),
             "ok placed" => read_placed(body),
             "ok current" | "ok offered" | "ok brought" => {
                 Answer::read(status, body).map(Reply::Package)
