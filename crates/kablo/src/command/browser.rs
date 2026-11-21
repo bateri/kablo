@@ -19,7 +19,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use kablo_bateri::browser::{Action, Browser, FileKind, Filed, TYPED_MAX};
+use kablo_bateri::browser::{Action, Browser, FileKind, Filed, TYPED_MAX, complete_address};
 use kablo_bateri::message::{Reply, Request};
 use kablo_bateri::{Anchor, package, paths};
 
@@ -315,7 +315,10 @@ fn read(
                 into,
             }
         }
-        "open" => Action::Open { url: word(0) },
+        // An address as an address bar reads it (`pencere.dev`, `3000`): the app is sent it whole.
+        "open" => Action::Open {
+            url: complete_address(&word(0)).unwrap_or_else(|| word(0)),
+        },
         "back" => Action::Back,
         _ => Action::Reload,
     };
@@ -451,9 +454,18 @@ mod tests {
 
     #[test]
     fn an_address_that_open_does_not_take_is_a_mistake_before_the_app_is_asked() {
-        let said = read_words("open p9 example.com").unwrap_err();
+        let said = read_words("open p9 rust lifetimes").unwrap_err();
+        assert_eq!(said.code, 64);
+        let said = read_words("open p9 myhost").unwrap_err();
         assert_eq!(said.code, 64);
         assert!(said.text.unwrap().contains("http:// or https://"));
+        // A bare address goes to the app whole, as an address bar reads it.
+        let opened = |text: &str| match read_words(text).expect("an address").action {
+            Action::Open { url } => url,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(opened("open p9 example.com"), "https://example.com");
+        assert_eq!(opened("open p9 3000"), "http://localhost:3000");
         assert_eq!(
             read_words("open p9 file:///etc/passwd").unwrap_err().code,
             64

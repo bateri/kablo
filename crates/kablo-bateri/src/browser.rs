@@ -315,6 +315,80 @@ fn is_openable(url: &str) -> bool {
         || url.eq_ignore_ascii_case("about:blank")
 }
 
+/// The address `open` is given, whole, as an address bar reads what is typed in it: an address
+/// with its scheme (or `about:blank`, `data:`) as it is; a port alone (`3000`, `:3000`, and a path
+/// after it) on this machine's `localhost`; a host a developer is at over `http` (`localhost`,
+/// `*.localhost`, `[::1]`, an IPv4 address, or a name with no dot and a port, `myhost:8080`); and
+/// any other name with a dot over `https` (`pencere.dev`). `None` for words that are no address
+/// (a space in them, a name with no dot and no port): `open` does not search.
+#[must_use]
+pub fn complete_address(words: &str) -> Option<String> {
+    let words = words.trim();
+    if words.is_empty() || words.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let lower = words.to_ascii_lowercase();
+    let has_scheme = lower.split_once("://").is_some_and(|(scheme, _)| {
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    if has_scheme || lower == "about:blank" || lower.starts_with("data:") {
+        return Some(words.to_owned());
+    }
+    let (authority, rest) = match words.find(['/', '?', '#']) {
+        Some(at) => words.split_at(at),
+        None => (words, ""),
+    };
+    let port_ok = |port: &str| {
+        !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u32>().is_ok_and(|n| (1..=65_535).contains(&n))
+    };
+    let bare = authority.strip_prefix(':').unwrap_or(authority);
+    if port_ok(bare) {
+        return Some(format!(
+            "http://localhost:{}{rest}",
+            bare.parse::<u32>().ok()?
+        ));
+    }
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (inner, after) = inner.split_once(']')?;
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':')?),
+        };
+        (format!("[{inner}]"), port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host.to_owned(), Some(port)),
+            None => (authority.to_owned(), None),
+        }
+    };
+    if host.is_empty() || port.is_some_and(|port| !port_ok(port)) {
+        return None;
+    }
+    let host_lower = host.to_ascii_lowercase();
+    let ipv4 = host_lower.split('.').count() == 4
+        && host_lower
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    let local = matches!(host_lower.as_str(), "localhost" | "[::1]" | "0.0.0.0")
+        || host_lower.ends_with(".localhost")
+        || ipv4;
+    if local || (port.is_some() && !host.contains('.')) {
+        return Some(format!("http://{authority}{rest}"));
+    }
+    if host.contains('.') && !host.starts_with('.') && !host.ends_with('.') {
+        return Some(format!("https://{authority}{rest}"));
+    }
+    None
+}
+
 fn check_typed(text: &str) -> Result<(), Failure> {
     if text.is_empty() || text.len() > TYPED_MAX || text.contains('\0') {
         return Err(Failure::usage(format!(
@@ -404,6 +478,48 @@ mod tests {
 
     fn pane(text: &str) -> Anchor {
         Anchor::address(text).expect("a pane")
+    }
+
+    #[test]
+    fn a_bare_address_is_completed_as_an_address_bar_reads_it() {
+        for (typed, whole) in [
+            ("3000", "http://localhost:3000"),
+            (":5173/about", "http://localhost:5173/about"),
+            ("localhost:3000/a?b=1", "http://localhost:3000/a?b=1"),
+            ("app.localhost", "http://app.localhost"),
+            ("192.168.1.5:8080", "http://192.168.1.5:8080"),
+            ("[::1]:4000", "http://[::1]:4000"),
+            ("myhost:8080", "http://myhost:8080"),
+            ("pencere.dev", "https://pencere.dev"),
+            ("Pencere.dev/docs#x", "https://Pencere.dev/docs#x"),
+            ("https://pencere.dev", "https://pencere.dev"),
+            ("HTTP://localhost:1", "HTTP://localhost:1"),
+            ("about:blank", "about:blank"),
+            ("data:text/plain,hi", "data:text/plain,hi"),
+            ("  example.com  ", "https://example.com"),
+        ] {
+            assert_eq!(complete_address(typed).as_deref(), Some(whole), "{typed}");
+        }
+        for typed in [
+            "",
+            "rust lifetimes",
+            "myhost",
+            ".dev",
+            "example.",
+            "70000",
+            "host:99999",
+            "[::1",
+        ] {
+            assert_eq!(complete_address(typed), None, "{typed}");
+        }
+        // What is completed is what `open` takes, and what it does not take stays refused: a scheme
+        // other than the four is passed through whole and refused by the rule every reader applies.
+        assert!(is_openable(
+            &complete_address("pencere.dev").expect("an address")
+        ));
+        assert!(!is_openable(
+            &complete_address("file:///etc/passwd").expect("as it is")
+        ));
     }
 
     /// Every request the format has, with the text it is frozen as.
