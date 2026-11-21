@@ -430,7 +430,29 @@ impl Stage {
                         .map(|reply| (*reply).to_owned())
                         .or_else(|| self.reply.clone())
                         .unwrap_or_default();
-                    app.stream_send(a, reply.as_bytes(), 4096);
+                    // Within the window the command gives, as an app is: a reply of megabytes
+                    // goes in the pieces it has room for.
+                    let bytes = reply.as_bytes();
+                    let mut sent = 0;
+                    let sending = Instant::now();
+                    while sent < bytes.len() {
+                        assert!(
+                            sending.elapsed() < LIMIT,
+                            "the command did not take the reply"
+                        );
+                        let flow = app.flow(a);
+                        let room = (u64::from(flow.opened.unwrap_or(0)) + flow.credit)
+                            .saturating_sub(flow.sent);
+                        let room = usize::try_from(room)
+                            .unwrap_or(usize::MAX)
+                            .min(bytes.len() - sent)
+                            .min(96 * 1024);
+                        if room > 0 {
+                            app.stream_send(a, &bytes[sent..sent + room], 4096);
+                            sent += room;
+                        }
+                        app.pump(Duration::from_millis(5));
+                    }
                     app.stream_close(a);
                     self.served += 1;
                     turn += 1;

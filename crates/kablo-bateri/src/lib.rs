@@ -19,6 +19,7 @@ pub mod paths;
 pub mod place;
 pub mod shell;
 pub mod terminal;
+pub mod view;
 
 pub use ids::{Id, Kind as IdKind};
 pub use place::{Landed, Side};

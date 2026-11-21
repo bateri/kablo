@@ -101,8 +101,23 @@ pub fn converse(message: &[u8]) -> (u8, Vec<u8>) {
 /// started for the app it carries (`bateri package watch`) talks to that app and to no other one
 /// that is connected to the same server.
 pub fn converse_at(message: &[u8], bridge: Option<u32>) -> (u8, Vec<u8>) {
+    converse_patiently(message, bridge, Patience::STANDARD)
+}
+
+/// [`converse_at`], with `patience` for the waits: a question that is itself about waiting
+/// (`bateri view wait`) gives the app as long to take the conversation as it may wait.
+pub fn converse_patiently(
+    message: &[u8],
+    bridge: Option<u32>,
+    patience: Patience,
+) -> (u8, Vec<u8>) {
     let signals_pipe = sys::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]).ok();
-    let (status, said) = converse_with(message, bridge, signals_pipe.as_ref().map(AsFd::as_fd));
+    let (status, said) = converse_with(
+        message,
+        bridge,
+        patience,
+        signals_pipe.as_ref().map(AsFd::as_fd),
+    );
     sys::release_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
     (status, said)
 }
@@ -121,6 +136,7 @@ pub fn started_by_bridge() -> Option<u32> {
 fn converse_with(
     message: &[u8],
     bridge: Option<u32>,
+    patience: Patience,
     signals: Option<BorrowedFd<'_>>,
 ) -> (u8, Vec<u8>) {
     let mut unsaid = Vec::new();
@@ -151,14 +167,7 @@ fn converse_with(
         scope.spawn(move || {
             let _ = io::copy(&mut std::fs::File::from(errors_read), &mut io::sink());
         });
-        let status = talk_with(
-            &dir,
-            local,
-            signals,
-            Patience::STANDARD,
-            bridge,
-            &mut unsaid,
-        );
+        let status = talk_with(&dir, local, signals, patience, bridge, &mut unsaid);
         (status, reading.join().unwrap_or_default())
     })
 }

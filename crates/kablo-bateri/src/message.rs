@@ -84,6 +84,7 @@ use crate::package::{Answer, Package};
 use crate::place::{Landed, Side};
 use crate::shell::ShellKind;
 use crate::terminal::{Anchor, LOCAL_SERVER, Terminal};
+use crate::view::View;
 
 /// The version this build writes, and the only one it reads.
 pub const VERSION: u32 = 2;
@@ -185,7 +186,7 @@ pub enum Format {
 }
 
 impl Format {
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Format::Text => "text",
             Format::Json => "json",
@@ -395,6 +396,9 @@ pub enum Request {
     /// The words of a `bateri config` command, for the app that keeps the settings: it answers
     /// what to print and the status, as for a relayed command ([`Reply::Relayed`]).
     Config(Vec<String>),
+    /// Read the view a pane shows, or drive it ([`crate::view`]): the app answers with a reading
+    /// ([`Reply::Text`]), or for a `shot` with a picture ([`Reply::Picture`]).
+    View(View),
 }
 
 /// A `bateri` command the window runs on another machine for a program on a server.
@@ -668,6 +672,8 @@ pub enum Reply {
     Relayed(Relayed),
     /// The answer to a `package offer` or a `package fetch`.
     Package(Answer),
+    /// A picture of a pane's view: the bytes of a PNG.
+    Picture(Vec<u8>),
     Failed(Failure),
 }
 
@@ -706,7 +712,8 @@ impl Reach {
 impl Request {
     /// The request `text` says.
     pub fn parse(text: &str) -> Result<Request, Failure> {
-        let limit = if text.starts_with(&format!("{GREETING} {VERSION}\nrelay\n")) {
+        let long = |verb: &str| text.starts_with(&format!("{GREETING} {VERSION}\n{verb}\n"));
+        let limit = if long("relay") || long("view") {
             RELAY_MAX_BYTES
         } else {
             MAX_BYTES
@@ -830,6 +837,7 @@ impl Request {
             }
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
             Request::Package(package) => package.encode_into(&mut out)?,
+            Request::View(view) => view.encode_into(&mut out)?,
             Request::Config(words) => {
                 if words.is_empty() {
                     return Err(Failure::usage("`config` carries the words of the command"));
@@ -839,7 +847,7 @@ impl Request {
                 push(&mut out, "words", &words.join(" "))?;
             }
         }
-        let limit = if matches!(self, Request::Relay(_)) {
+        let limit = if matches!(self, Request::Relay(_) | Request::View(_)) {
             RELAY_MAX_BYTES
         } else {
             MAX_BYTES
@@ -1438,6 +1446,7 @@ fn read_request<'a>(
         "package state" | "package offer" | "package fetch" | "package key-changed" => {
             crate::package::read(verb, lines).map(Request::Package)
         }
+        "view" => crate::view::read(verb, lines).map(Request::View),
         "config" => {
             let fields = Fields::read(verb, lines, &["words"])?;
             let words = fields
@@ -1448,7 +1457,7 @@ fn read_request<'a>(
             Ok(Request::Config(words))
         }
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed or config"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config or view"
         ))),
     }
 }
@@ -1758,6 +1767,11 @@ impl Reply {
                 out.push_str(&relayed.stdout);
             }
             Reply::Package(answer) => answer.encode_into(&mut out),
+            Reply::Picture(bytes) => {
+                out.push_str("ok picture\n");
+                out.push_str(&hex_of(bytes));
+                out.push('\n');
+            }
             Reply::Failed(failure) => {
                 // One line, whatever the words held.
                 let text: String = failure
@@ -1791,6 +1805,7 @@ impl Reply {
             "ok start" => Err(Failure::usage("an `ok start` reply has nothing after it")),
             "ok text" => Ok(Reply::Text(body.to_owned())),
             "ok relayed" => read_relayed(body),
+            "ok picture" => read_picture(body),
             "ok placed" => read_placed(body),
             "ok current" | "ok offered" | "ok brought" => {
                 Answer::read(status, body).map(Reply::Package)
@@ -1798,6 +1813,39 @@ impl Reply {
             other => Err(Failure::usage(format!("`{other}` is no status"))),
         }
     }
+}
+
+/// The lower case hex of `bytes`.
+fn hex_of(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// The picture an `ok picture` reply carries: one line of hex, at least one byte.
+fn read_picture(body: &str) -> Result<Reply, Failure> {
+    let digits = body.strip_suffix('\n').unwrap_or(body);
+    if digits.is_empty()
+        || !digits.len().is_multiple_of(2)
+        || !digits.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(Failure::usage(
+            "a picture reply is the hex of the bytes of a PNG: an even number of hex digits, on one line",
+        ));
+    }
+    let bytes = digits
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .unwrap_or(0)
+        })
+        .collect();
+    Ok(Reply::Picture(bytes))
 }
 
 fn read_relayed(body: &str) -> Result<Reply, Failure> {

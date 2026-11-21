@@ -26,6 +26,10 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`bateri view` reads a pane that shows a view and drives it, for an agent.** With no action it prints what the pane shows (`bateri view p9 --json` for the same as JSON); `command`, `click`, `double-click`, `fill`, `type`, `press`, `scroll`, `menu`, `pick`, `text` and `wait` do something and print the view again, and `shot FILE` (or `-` for standard output) writes a PNG of any pane. `fill` and `type` read their text from standard input with `-`; `wait` takes `--gone` and `--for SECONDS` (10 by default, at most 120). It exits 64 for a wrong word, 69 with no bateri app, 77 when the app refuses, and 1 for what could not be done; a bateri that does not know the verb is told to update. In the app channel (still version 2) the verb is `view`, up to 128 KiB like `relay`, and a picture comes back as `ok picture` and the PNG's bytes in hex (`Reply::Picture`).
+
 ## [0.10.0] - 2026-11-18
 
 ### Added

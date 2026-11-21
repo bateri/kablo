@@ -14,8 +14,10 @@ mod common;
 mod stage;
 
 use kablo_bateri::message::{
-    Arrange, Extent, Frame, Home, Request, Spot, Subject, TabHome, WindowHome,
+    Arrange, Extent, Failure, Format, Frame, Home, Kind, Reply, Request, Spot, Subject, TabHome,
+    WindowHome,
 };
+use kablo_bateri::view::{Action, View};
 use kablo_bateri::{Anchor, Id, IdKind, Side, Terminal};
 use stage::{Run, Stage, parse_told};
 
@@ -343,6 +345,268 @@ fn config_hands_its_words_to_the_app_and_says_what_it_answered() {
     assert_eq!(said.status, 1);
     assert!(said.err.contains("update bateri"), "{}", said.err);
     assert_eq!(stage.run_in("p4", &["config"]).status, 64);
+}
+
+/// `bateri ARGS` in the terminal p4, with `input` on its standard input.
+fn view_with(stage: &mut Stage, args: &[&str], input: &[u8]) -> stage::Said {
+    stage.go(&Run {
+        here: Some("p4"),
+        args,
+        input: Some(input),
+        turns: &[],
+        vars: &[],
+    })
+}
+
+fn viewing(terminal: Option<&str>, format: Format, action: Action) -> Request {
+    Request::View(View {
+        terminal: terminal.and_then(Anchor::address),
+        format,
+        action,
+    })
+}
+
+#[test]
+fn view_prints_the_reading_the_app_answers_and_asks_for_the_pane_named_or_the_callers_own() {
+    let mut stage = Stage::new();
+    let said = stage.run_in("p4", &["view", "p9"]);
+    assert_eq!(said.status, 69);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected: it shows the views\n"
+    );
+    let reading = "view  Query console\nk3f9qa  button  Run\n  \u{2026} and more\n";
+    stage.app_says(&Reply::Text(reading.to_owned()).encode());
+    let said = stage.run_in("p4", &["view", "p9"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, reading);
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        viewing(Some("p9"), Format::Text, Action::Read)
+    );
+    // No pane named: the terminal it runs in. Outside every terminal there is none to ask for.
+    let said = stage.run_in("p4", &["view", "--json"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(
+        parse_told(&stage.told[1]),
+        viewing(Some("p4"), Format::Json, Action::Read)
+    );
+    let said = stage.run(&["view"]);
+    assert_eq!(said.status, 64);
+    assert!(said.err.contains("name the pane to read"), "{}", said.err);
+    assert_eq!(stage.told.len(), 2);
+}
+
+#[test]
+fn view_actions_reach_the_app_as_their_frozen_text_and_a_pane_of_another_machine_as_it_is() {
+    let mut stage = Stage::with_app(&Reply::Text("ok\n".to_owned()).encode());
+    for (args, frozen) in [
+        (
+            vec!["view", "p9@prod", "click", "k3f9qa"],
+            "bateri 2\nview\nterminal p9@prod\naction click\nref k3f9qa\n",
+        ),
+        (
+            vec!["view", "p9", "command", "Restart api"],
+            "bateri 2\nview\nterminal p9\naction command\ntext x5265737461727420617069\n",
+        ),
+        (
+            vec!["view", "p9", "press", "cmd+enter", "tab", "--json"],
+            "bateri 2\nview\nterminal p9\nformat json\naction press\nkeys x636d642b656e746572 x746162\n",
+        ),
+        (
+            vec!["view", "p9", "scroll", "k3f9qa", "down", "3"],
+            "bateri 2\nview\nterminal p9\naction scroll\nref k3f9qa\nway down\ncount 3\n",
+        ),
+        (
+            vec!["view", "p9", "wait", "Done", "--gone", "--for", "30"],
+            "bateri 2\nview\nterminal p9\naction wait\ntext x446f6e65\ngone yes\nfor 30\n",
+        ),
+        (
+            vec!["view", "p9", "text", "0123456789abcdef"],
+            "bateri 2\nview\nterminal p9\naction text\nref 0123456789abcdef\n",
+        ),
+    ] {
+        stage.forget_told();
+        let said = stage.run_in("p4", &args);
+        assert_eq!(said.status, 0, "{args:?}: {}", said.err);
+        assert_eq!(said.out, "ok\n");
+        assert_eq!(told_one(&stage), frozen, "{args:?}");
+    }
+}
+
+#[test]
+fn view_takes_the_text_of_fill_and_type_from_standard_input_whole() {
+    let mut stage = Stage::with_app(&Reply::Text("ok\n".to_owned()).encode());
+    let text = "select 1\n  from t \u{2014} \u{e9}\n";
+    let said = view_with(
+        &mut stage,
+        &["view", "p9", "fill", "k3f9qa", "-", "--json"],
+        text.as_bytes(),
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        viewing(
+            Some("p9"),
+            Format::Json,
+            Action::Fill {
+                target: "k3f9qa".to_owned(),
+                text: text.to_owned()
+            }
+        )
+    );
+    stage.forget_told();
+    let said = view_with(&mut stage, &["view", "p9", "type", "-"], b"ab");
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        viewing(Some("p9"), Format::Text, Action::Type("ab".to_owned()))
+    );
+    // What is no text, and what is more than a request holds, is a mistake and asks nothing.
+    stage.forget_told();
+    let said = view_with(&mut stage, &["view", "p9", "type", "-"], &[0xff, 0xfe]);
+    assert_eq!(said.status, 64);
+    assert!(said.err.contains("is not text"), "{}", said.err);
+    let said = view_with(
+        &mut stage,
+        &["view", "p9", "type", "-"],
+        &vec![b'a'; 61 * 1024],
+    );
+    assert_eq!(said.status, 64);
+    assert!(said.err.contains("at most 60 KiB"), "{}", said.err);
+    assert!(stage.told.is_empty(), "{:?}", stage.told);
+}
+
+#[test]
+fn view_shot_writes_the_bytes_of_the_picture_as_they_came_to_a_file_or_to_standard_output() {
+    let mut stage = Stage::new();
+    let png: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+    stage.app_says(&Reply::Picture(png.clone()).encode());
+    let file = stage.env.dir.join("shot.png");
+    let said = stage.run_in(
+        "p4",
+        &["view", "p9", "shot", file.to_str().unwrap(), "--full"],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "");
+    assert!(
+        std::fs::read(&file).unwrap() == png,
+        "the file is the picture"
+    );
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        viewing(Some("p9"), Format::Text, Action::Shot { full: true })
+    );
+    // To standard output (a picture that is text keeps this test's reader whole).
+    stage.app_says(&Reply::Picture(b"PNG-as-text".to_vec()).encode());
+    let said = stage.run_in("p4", &["view", "p9", "shot", "-"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "PNG-as-text");
+    // A file that cannot be written is 1, and a reading where a picture was asked for is no answer.
+    let said = stage.run_in("p4", &["view", "p9", "shot", "/no/such/dir/shot.png"]);
+    assert_eq!(said.status, 1);
+    assert!(
+        said.err.contains("cannot write /no/such/dir/shot.png"),
+        "{}",
+        said.err
+    );
+    stage.app_says(&Reply::Text("not a picture".to_owned()).encode());
+    let other = stage.env.dir.join("other.png");
+    let said = stage.run_in("p4", &["view", "p9", "shot", other.to_str().unwrap()]);
+    assert_eq!(said.status, 1);
+    assert!(!other.exists());
+}
+
+#[test]
+fn view_prints_a_reading_and_writes_a_picture_of_four_megabytes_whole() {
+    let mut stage = Stage::new();
+    let reading: String = (0..4 * 1024 * 1024)
+        .map(|n: usize| char::from(b'a' + u8::try_from(n % 26).unwrap()))
+        .collect();
+    stage.app_says(&Reply::Text(reading.clone()).encode());
+    let said = stage.run_in("p4", &["view", "p9"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert!(said.out == reading, "the reading is what the app said");
+    let png: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|n: usize| (n % 251) as u8)
+        .collect();
+    stage.app_says(&Reply::Picture(png.clone()).encode());
+    let file = stage.env.dir.join("big.png");
+    let said = stage.run_in(
+        "p4",
+        &["view", "p9", "shot", file.to_str().unwrap(), "--full"],
+    );
+    assert_eq!(said.status, 0, "{}", said.err);
+    let written = std::fs::read(&file).unwrap();
+    assert_eq!(written.len(), png.len(), "the length of the picture");
+    let first = written.iter().zip(&png).position(|(a, b)| a != b);
+    assert_eq!(first, None, "where the file first differs from the picture");
+}
+
+#[test]
+fn view_ends_with_the_status_of_what_the_app_said_and_a_bateri_from_before_it_is_told_to_update() {
+    let mut stage = Stage::new();
+    for (reply, status) in [
+        (
+            Reply::Failed(Failure::new(
+                Kind::Refused,
+                "p9 is not this computer's to read",
+            )),
+            77,
+        ),
+        (Reply::Failed(Failure::new(Kind::Usage, "no such ref")), 64),
+        (
+            Reply::Failed(Failure::new(
+                Kind::Failed,
+                "that pane shows a terminal; bateri capture p9 reads it",
+            )),
+            1,
+        ),
+        (Reply::Failed(Failure::new(Kind::Unknown, "no pane p9")), 1),
+    ] {
+        stage.app_says(&reply.encode());
+        let said = stage.run_in("p4", &["view", "p9", "click", "k3f9qa"]);
+        assert_eq!(said.status, status, "{reply:?}: {}", said.err);
+        assert_eq!(said.out, "");
+        let Reply::Failed(failed) = reply else {
+            unreachable!()
+        };
+        assert_eq!(said.err, format!("bateri: {}\n", failed.text));
+    }
+    stage.app_says("bateri 2\nerror usage `view` is no verb: place, ls, close\n");
+    let said = stage.run_in("p4", &["view", "p9"]);
+    assert_eq!(said.status, 1);
+    assert_eq!(
+        said.err,
+        "bateri: this bateri does not read views yet; update bateri\n"
+    );
+    // Something that is no reply at all.
+    stage.app_says("bateri 2\nok placed\n");
+    assert_eq!(stage.run_in("p4", &["view", "p9"]).status, 1);
+}
+
+#[test]
+fn view_with_a_word_that_is_wrong_is_64_and_asks_the_app_nothing() {
+    let mut stage = Stage::with_app(&Reply::Text("ok\n".to_owned()).encode());
+    for args in [
+        vec!["view", "p9", "dance"],
+        vec!["view", "build", "click", "k3f9qa"],
+        vec!["view", "p9", "click"],
+        vec!["view", "p9", "click", "K3F9QA"],
+        vec!["view", "p9", "click", "abc"],
+        vec!["view", "p9", "fill", "k3f9qa"],
+        vec!["view", "p9", "scroll", "k3f9qa", "sideways"],
+        vec!["view", "p9", "wait", "Done", "--for", "121"],
+        vec!["view", "p9", "shot"],
+        vec!["view", "p9", "shot", "a.png", "--json"],
+        vec!["view", "p9", "click", "k3f9qa", "--bogus"],
+        vec!["view", "p9", "press"],
+    ] {
+        let said = stage.run_in("p4", &args);
+        assert_eq!(said.status, 64, "{args:?}: {}", said.err);
+        assert!(said.err.starts_with("bateri: "), "{args:?}: {}", said.err);
+    }
+    assert!(stage.told.is_empty(), "{:?}", stage.told);
 }
 
 #[test]

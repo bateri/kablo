@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use common::{Bridge, Env, PATIENCE, signal};
 use kablo::app::{self, Patience};
 use kablo::streams::Local;
+use kablo_bateri::Anchor;
+use kablo_bateri::message::{Format, Reply, Request};
+use kablo_bateri::view::{Action, View};
 use kablo_proto::v1::Message;
 use kablo_proto::v1::stream::FailCode;
 
@@ -264,6 +267,79 @@ fn megabytes_go_both_ways_whole() {
     let output = reader.join().unwrap();
     assert_eq!(output.status, 0, "{}", said(&output.stderr));
     assert!(output.stdout == down, "what the app said");
+}
+
+/// A `view` is asked and the app says `reply`: it comes out of the command as the app wrote it, and
+/// is read back as the reply it was.
+fn a_view_is_answered_whole(reply: &Reply) {
+    let env = Env::new();
+    let mut app = app_that_takes_mail(&env);
+    let asked = Request::View(View {
+        terminal: Anchor::address("p9"),
+        format: Format::Json,
+        action: Action::Read,
+    })
+    .encode()
+    .unwrap();
+    let down = reply.encode().into_bytes();
+
+    let mut child = spawn(&env);
+    let mut stdin = child.stdin.take().unwrap();
+    let input = asked.clone().into_bytes();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&input).unwrap();
+    });
+    let reader = std::thread::spawn(move || child.wait_with_output());
+
+    let a = app.take_ticket(0, 64 * 1024);
+    let mut sent = 0;
+    let start = Instant::now();
+    while sent < down.len() {
+        assert!(start.elapsed() < PATIENCE, "timed out");
+        let flow = app.flow(a);
+        let room = (u64::from(flow.opened.unwrap()) + flow.credit).saturating_sub(flow.sent);
+        let room = usize::try_from(room)
+            .unwrap()
+            .min(down.len() - sent)
+            .min(96 * 1024);
+        if room > 0 {
+            app.stream_send(a, &down[sent..sent + room], 8 * 1024);
+            sent += room;
+        }
+        app.pump(Duration::from_millis(5));
+    }
+    writer.join().unwrap();
+    app.until("the eof", |b| b.flows[&a].eof);
+    assert_eq!(
+        app.flows[&a].data,
+        asked.as_bytes(),
+        "what the program asked"
+    );
+    app.stream_close(a);
+    let output = reader.join().unwrap();
+    assert_eq!(output.status, 0, "{}", said(&output.stderr));
+    assert!(output.stdout == down, "what the app said");
+    assert_eq!(
+        Reply::parse(&String::from_utf8(output.stdout).unwrap()).as_ref(),
+        Ok(reply)
+    );
+}
+
+#[test]
+fn a_reading_of_four_megabytes_comes_whole_from_the_app() {
+    let text = String::from_utf8(
+        common::pattern(4 * 1024 * 1024, 5)
+            .into_iter()
+            .map(|byte| b'a' + byte % 26)
+            .collect(),
+    )
+    .unwrap();
+    a_view_is_answered_whole(&Reply::Text(text));
+}
+
+#[test]
+fn a_picture_of_four_megabytes_comes_whole_from_the_app_as_eight_of_hex() {
+    a_view_is_answered_whole(&Reply::Picture(common::pattern(4 * 1024 * 1024, 9)));
 }
 
 // --- where it comes from -----------------------------------------------------------
