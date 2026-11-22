@@ -420,12 +420,14 @@ them. It is spoken over its standard input and output ([docs/PROTOCOL.md](docs/P
   and the exit status is `0`, `1`, `64` (a mistake in the command), `69` (no app) or
   `77` (the app refused).
   `kablo bateri browser VERB PANE` (`ls`, `text`, `snapshot`, `shot`, `click`, `type`,
-  `open`, `back`, `reload`) drives a browser that a pane's page holds, which the app's
+  `open`, `back`, `reload`, `clear --cache|--site`, `console`) drives a browser that a pane's page holds, which the app's
   helper draws on the computer the app runs on: the command is one message to the app of
   its own terminal and is never run on another machine. A picture, and a text too long for
   an answer, are a file on the machine the command runs on
-  (`~/.local/share/bateri/browser`; the next `text`, `snapshot` or `shot` removes the files there
-  more than a day old), and the command prints its path.
+  (`~/.local/share/bateri/browser`; the next `text`, `snapshot`, `shot` or `console` removes the files there
+  more than a day old), and the command prints its path. `clear --cache` empties what the
+  browser keeps to load pages faster and `clear --site` what the sites of its address keep (it signs
+  the person out); `console` prints the last lines of the page's console and only reads.
 - **Taking a terminal** is bit 3 of the view an app attaches with (`take` in
   `kablo-proto`): the other clients attached to the session are let go, each with
   the error `TAKEN` (code 9) whose text is the name the app gave itself in its

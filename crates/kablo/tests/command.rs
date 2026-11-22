@@ -1936,6 +1936,16 @@ fn browser_asks_the_app_of_the_browser_and_prints_what_it_says() {
         panic!("a snapshot")
     };
     assert_ne!(part, other);
+    // The console is read as a text: printed as it is told, with no control character in it, and a
+    // file when it is too long, which is not a `text` but is asked and answered as one.
+    stage.app_says("bateri 2\nok text\n[error] boom\u{1b}[31m\n[log] hi\n");
+    let said = stage.run_in("p4", &["browser", "console", "p9"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "[error] boom[31m\n[log] hi\n");
+    let Action::Console { part: console } = browsed(&stage).action else {
+        panic!("a console")
+    };
+    assert!(!console.is_empty() && console != other);
     // What has nothing to say says `ok`.
     stage.app_says(OK);
     for (args, want) in [
@@ -1961,6 +1971,18 @@ fn browser_asks_the_app_of_the_browser_and_prints_what_it_says() {
         (
             vec!["browser", "reload", "p9", "--element", "tab-2"],
             Action::Reload,
+        ),
+        (
+            vec!["browser", "clear", "p9", "--cache"],
+            Action::Clear {
+                what: kablo_bateri::browser::Clearing::Cache,
+            },
+        ),
+        (
+            vec!["browser", "clear", "--site", "p9", "--element", "tab-2"],
+            Action::Clear {
+                what: kablo_bateri::browser::Clearing::Site,
+            },
         ),
         (
             vec![
@@ -2010,6 +2032,25 @@ fn browser_says_what_the_app_refused_and_what_it_did_not_read() {
     let said = stage.run_in("p4", &["browser", "back", "p9"]);
     assert_eq!(said.status, 1);
     assert!(said.err.contains("update bateri"), "{}", said.err);
+    // One that drives browsers and does not know `clear` and `console` says which it does not know.
+    stage.app_says("bateri 2\nerror usage `browser clear` is no verb: place, ls, browser back\n");
+    let said = stage.run_in("p4", &["browser", "clear", "p9", "--site"]);
+    assert_eq!(said.status, 1);
+    assert!(
+        said.err
+            .contains("does not know `browser clear` yet; update bateri"),
+        "{}",
+        said.err
+    );
+    stage.app_says("bateri 2\nerror usage `browser console` is no verb: place, ls\n");
+    let said = stage.run_in("p4", &["browser", "console", "p9"]);
+    assert_eq!(said.status, 1);
+    assert!(
+        said.err
+            .contains("does not know `browser console` yet; update bateri"),
+        "{}",
+        said.err
+    );
     // An answer the verb does not take is not read: the text of a `click`, a bare `ok` for a `text`,
     // a picture for a `text` and a text for a `shot`.
     stage.app_says("bateri 2\nok text\nclicked\n");
@@ -2049,6 +2090,13 @@ fn browser_is_a_mistake_before_it_asks_anybody_when_it_is_not_written_right() {
         vec!["browser", "ls", "p9", "--element", "main"],
         vec!["browser", "text", "p9", "--into", "e1"],
         vec!["browser", "text", "p9", "--bogus"],
+        // `clear` is told what to empty, by one word.
+        vec!["browser", "clear", "p9"],
+        vec!["browser", "clear", "p9", "--cache", "--site"],
+        vec!["browser", "clear", "p9", "--all"],
+        vec!["browser", "clear", "p9", "cache"],
+        vec!["browser", "text", "p9", "--cache"],
+        vec!["browser", "console", "p9", "--site"],
         vec!["browser", "open", "p9", &"u".repeat(3000)],
         vec!["browser", "type", "p9", &"t".repeat(3000)],
     ] {

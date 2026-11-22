@@ -7,7 +7,7 @@
 //! computer the app runs on. The command names the file (`part`, new at every ask), makes the
 //! folder the app writes it in ([`paths::BROWSER`]) and sets it to mode 0700 each time, whatever it
 //! was (a page may hold what a person signed in to), sweeps the files in it that are more than a
-//! day old (at the next `text`, `snapshot` or `shot`, the asks that may leave one), and when the app
+//! day old (at the next `text`, `snapshot`, `shot` or `console`, the asks that may leave one), and when the app
 //! says it wrote one, checks that it is there whole and prints its path, which is the one thing a
 //! program is to be told of it: a path that cannot be told as it is, is an error.
 
@@ -19,7 +19,9 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use kablo_bateri::browser::{Action, Browser, FileKind, Filed, TYPED_MAX, complete_address};
+use kablo_bateri::browser::{
+    Action, Browser, Clearing, FileKind, Filed, TYPED_MAX, complete_address,
+};
 use kablo_bateri::message::{Reply, Request};
 use kablo_bateri::{Anchor, package, paths};
 
@@ -30,11 +32,11 @@ use super::words::{address, clean};
 use super::{Asked, Ctx, Done, Exit, Io, failure, unread};
 use crate::sys;
 
-/// How old a file of an answer is when the next `text`, `snapshot` or `shot` sweeps it away.
+/// How old a file of an answer is when the next `text`, `snapshot`, `shot` or `console` sweeps it away.
 const KEPT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What each sub-verb takes after the pane, for the mistake of one that gets another count.
-const TAKES: [(&str, &[&str]); 9] = [
+const TAKES: [(&str, &[&str]); 11] = [
     ("ls", &[]),
     ("text", &[]),
     ("snapshot", &[]),
@@ -44,6 +46,8 @@ const TAKES: [(&str, &[&str]); 9] = [
     ("open", &["URL"]),
     ("back", &[]),
     ("reload", &[]),
+    ("clear", &[]),
+    ("console", &[]),
 ];
 
 /// `bateri browser VERB PANE ...`.
@@ -55,9 +59,15 @@ pub fn browser(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
     }
     let reply = match ctx.ask(&Request::Browser(asked.clone()))? {
         Asked::Reply(Reply::Failed(failed)) if package::is_old(&failed) => {
-            return Err(Exit::failed(
-                "this bateri does not drive browsers yet; update bateri",
-            ));
+            // `clear` and `console` came after the other verbs: a bateri that drives browsers may
+            // not know them, and the one that does not drive any is as much to be updated.
+            return Err(Exit::failed(match asked.action {
+                Action::Clear { .. } | Action::Console { .. } => format!(
+                    "this bateri does not know `browser {}` yet; update bateri",
+                    asked.action.word()
+                ),
+                _ => "this bateri does not drive browsers yet; update bateri".to_owned(),
+            }));
         }
         Asked::Reply(Reply::Failed(failed)) => return Err(failure(&failed)),
         Asked::Reply(reply) => reply,
@@ -75,13 +85,19 @@ pub fn browser(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
 /// What the app said, if it is what the sub-verb takes for an answer.
 fn answer(io: &mut Io<'_>, folder: &Path, action: &Action, reply: Reply) -> Done {
     match (action, reply) {
-        (Action::Ls | Action::Text { .. } | Action::Snapshot { .. }, Reply::Text(body)) => {
+        (
+            Action::Ls | Action::Text { .. } | Action::Snapshot { .. } | Action::Console { .. },
+            Reply::Text(body),
+        ) => {
             // A page's words: nothing in them moves the cursor of the terminal they are printed in.
             let _ = io.out.write_all(clean(&body).as_bytes());
             Ok(())
         }
         (
-            Action::Text { part } | Action::Snapshot { part } | Action::Shot { part },
+            Action::Text { part }
+            | Action::Snapshot { part }
+            | Action::Shot { part }
+            | Action::Console { part },
             Reply::Filed(filed),
         ) if action.file() == Some(filed.kind) => say_file(io, folder, part, &filed),
         (
@@ -89,7 +105,8 @@ fn answer(io: &mut Io<'_>, folder: &Path, action: &Action, reply: Reply) -> Done
             | Action::Type { .. }
             | Action::Open { .. }
             | Action::Back
-            | Action::Reload,
+            | Action::Reload
+            | Action::Clear { .. },
             Reply::Done,
         ) => Ok(()),
         _ => Err(unread()),
@@ -248,6 +265,7 @@ fn read(
     let mut positional: Vec<(&str, bool)> = Vec::new();
     let mut element: Option<String> = None;
     let mut into: Option<String> = None;
+    let mut clearing: Vec<Clearing> = Vec::new();
     let mut options_end = false;
     let mut at = rest.iter();
     while let Some(word) = at.next() {
@@ -256,6 +274,12 @@ fn read(
             positional.push((word, !options_end && word == "-"));
         } else if word == "--" {
             options_end = true;
+        } else if verb == "clear" && (word == "--cache" || word == "--site") {
+            clearing.push(if word == "--cache" {
+                Clearing::Cache
+            } else {
+                Clearing::Site
+            });
         } else if word == "--element" || (word == "--into" && verb == "type") {
             let Some(value) = at.next() else {
                 return Err(Exit::mistake(format!(
@@ -297,6 +321,22 @@ fn read(
         return Err(Exit::mistake(usage));
     }
     let pane = Anchor::address(pane).ok_or_else(|| not_a_terminal(io, pane, ""))?;
+    // What `clear` empties is said by exactly one of two options: one that is both would empty more
+    // than either, and one that is neither would empty nothing the person named.
+    let what = match clearing.as_slice() {
+        [one] => Some(*one),
+        [] if verb == "clear" => {
+            return Err(Exit::mistake(
+                "browser clear takes --cache (the files the browser keeps) or --site (what the site keeps: it signs out)",
+            ));
+        }
+        [] => None,
+        _ => {
+            return Err(Exit::mistake(
+                "browser clear takes --cache or --site, one of them",
+            ));
+        }
+    };
     let word = |at: usize| {
         args.get(at)
             .map(|(word, _)| (*word).to_owned())
@@ -307,6 +347,10 @@ fn read(
         "text" => Action::Text { part: part() },
         "snapshot" => Action::Snapshot { part: part() },
         "shot" => Action::Shot { part: part() },
+        "console" => Action::Console { part: part() },
+        "clear" => Action::Clear {
+            what: what.unwrap_or(Clearing::Cache),
+        },
         "click" => Action::Click { target: word(0) },
         "type" => {
             let dash = args.first().is_some_and(|(_, dash)| *dash);
@@ -490,10 +534,28 @@ mod tests {
         assert_eq!(
             mistake("dance p9").text.as_deref(),
             Some(
-                "browser takes ls, text, snapshot, shot, click, type, open, back, reload, not 'dance'"
+                "browser takes ls, text, snapshot, shot, click, type, open, back, reload, clear, console, not 'dance'"
             )
         );
         assert_eq!(mistake("ls p9 --element a").code, 64);
+        // `clear` says what it empties, by one option.
+        assert_eq!(
+            mistake("clear p9").text.as_deref(),
+            Some(
+                "browser clear takes --cache (the files the browser keeps) or --site (what the site keeps: it signs out)"
+            )
+        );
+        assert_eq!(mistake("clear p9 --cache --site").code, 64);
+        assert_eq!(mistake("clear p9 --cache --cache").code, 64);
+        assert_eq!(mistake("text p9 --site").code, 64);
+        let asked = read_words("clear p9 --site --element main").unwrap();
+        assert_eq!(
+            asked.action,
+            Action::Clear {
+                what: Clearing::Site
+            }
+        );
+        assert_eq!(asked.element.as_deref(), Some("main"));
         assert_eq!(mistake("text p9 --into e1").code, 64);
         assert_eq!(mistake("text p9 --element a --element b").code, 64);
     }
@@ -697,6 +759,43 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_console_is_printed_when_it_fits_and_is_a_file_when_it_does_not() {
+        let dir = folder("console");
+        let console = Action::Console {
+            part: "c-1".to_owned(),
+        };
+        // What fits is printed as it is told, the page's own words cleaned of what moves a cursor.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let told = Reply::Text("[log] hi\n[error] boom\u{1b}[31m\n".to_owned());
+        answer(&mut io_of(&mut out, &mut err), &dir, &console, told).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "[log] hi\n[error] boom[31m\n"
+        );
+        // What does not is a text file named by the part, whose path is told once it is there whole.
+        fs::write(dir.join("c-1.txt"), b"12345").unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let filed = Reply::Filed(Filed {
+            kind: FileKind::Text,
+            bytes: 5,
+        });
+        answer(&mut io_of(&mut out, &mut err), &dir, &console, filed).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(said, format!("{}\n", dir.join("c-1.txt").display()));
+        assert!(String::from_utf8(err).unwrap().contains("too long"));
+        // A picture is not what a console is, and `ok` alone is not what it says.
+        let picture = Reply::Filed(Filed {
+            kind: FileKind::Png,
+            bytes: 5,
+        });
+        for wrong in [picture, Reply::Done] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert!(answer(&mut io_of(&mut out, &mut err), &dir, &console, wrong).is_err());
         }
         fs::remove_dir_all(&dir).unwrap();
     }

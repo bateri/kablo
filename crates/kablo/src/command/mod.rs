@@ -287,7 +287,8 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri config reset KEY
        bateri config path
        bateri browser ls PANE
-       bateri browser text|snapshot|shot|back|reload PANE [--element ID]
+       bateri browser text|snapshot|shot|console|back|reload PANE [--element ID]
+       bateri browser clear PANE --cache|--site [--element ID]
        bateri browser click PANE TARGET [--element ID]
        bateri browser type PANE [--into TARGET] [--element ID] [--] TEXT | -
        bateri browser open PANE URL [--element ID]
@@ -339,9 +340,13 @@ it goes by (TARGET), shot takes a picture of it, click clicks a TARGET or a poin
 pixels, type types TEXT (after a click on --into TARGET; - reads the text from standard input), open
 goes to an http:// or https:// address, a data: one or about:blank (a bare one is read as an address
 bar reads it: 3000 is http://localhost:3000, a local host http://, a name with a dot https://), back
-and reload do what they say. --element ID says which browser of the pane (the only one, or the one that has the keyboard,
+and reload do what they say. console prints the last lines the page wrote to its console (log, warning, error, and
+an uncaught error), oldest first; it only reads. clear --cache empties the files the browser keeps to load pages
+faster (of every site, and the service workers of the one it is at); clear --site deletes what the sites of the name
+the browser is at keep, at every port (cookies, local storage, databases, service workers), which signs the person
+out of them: ask first. --element ID says which browser of the pane (the only one, or the one that has the keyboard,
 when it is left out). A text too long to print and every picture are a file on this machine, in
-~/.local/share/bateri/browser, and the command prints its path; the next text, snapshot or shot
+~/.local/share/bateri/browser, and the command prints its path; the next text, snapshot, shot or console
 removes the files there that are more than a day old. TEXT that starts with - follows a --.
 ";
 

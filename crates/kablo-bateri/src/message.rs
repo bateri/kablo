@@ -1470,11 +1470,10 @@ fn read_request<'a>(
             Ok(Request::Config(words))
         }
         "browser ls" | "browser text" | "browser snapshot" | "browser shot" | "browser click"
-        | "browser type" | "browser open" | "browser back" | "browser reload" => {
-            browser::read(verb, lines).map(Request::Browser)
-        }
+        | "browser type" | "browser open" | "browser back" | "browser reload" | "browser clear"
+        | "browser console" => browser::read(verb, lines).map(Request::Browser),
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back or browser reload"
+            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back, browser reload, browser clear or browser console"
         ))),
     }
 }

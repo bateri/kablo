@@ -17,7 +17,8 @@
 //! * The verb line is `browser` and a word: `ls` (the browsers of the pane: each one's id, address
 //!   and title), `text` (what the page says), `snapshot` (what the page is made of, as the
 //!   accessibility tree, each element named in a way `click` takes), `shot` (a picture of the room
-//!   of the browser), `click`, `type`, `open`, `back` and `reload`.
+//!   of the browser), `click`, `type`, `open`, `back`, `reload`, `clear` (empties what the browser
+//!   keeps: its `what` is `cache` or `site`) and `console` (the last lines of the page's console).
 //! * `pane` is the pane that holds the browser, as the other verbs write one (`p9`, or `p9@prod` for
 //!   one of another machine). `element` is the id of the browser in that pane's page (hex, below);
 //!   with none, the pane's only browser, or the one that has the keyboard. `ls` takes none.
@@ -30,12 +31,15 @@
 //! * Free words (`element`, `target`, `text`, `into`, `url`) are `x` and the hex of their bytes, as
 //!   a `relay`'s words are ([`crate::message::hex_word`]), so that a line break or a space in a
 //!   page's text stays in the word.
+//! * `what` is what `clear` empties: `cache` (the files the browser keeps of the sites it has been
+//!   to, and the service workers of the one it is at) or `site` (what the sites of the name it is at
+//!   keep: the person is signed out of them). A word the app does not know is its `error usage`.
 //! * `part` is a name the asker makes (letters, digits, `-` and `_`, at most 64) for the answers
-//!   that may not fit a reply: `text`, `snapshot` and `shot` carry one.
+//!   that may not fit a reply: `text`, `snapshot`, `shot` and `console` carry one.
 //!
 //! **The answer.** `ok` for a verb that has nothing to say (`click`, `type`, `open`, `back`,
-//! `reload`); `ok text` and the text, byte for byte, for `ls`, and for `text` and `snapshot` when
-//! the text fits a reply ([`TEXT_MAX`]); and, when it does not, and always for `shot`, the answer
+//! `reload`, `clear`); `ok text` and the text, byte for byte, for `ls`, and for `text`, `snapshot`
+//! and `console` when the text fits a reply ([`TEXT_MAX`]); and, when it does not, and always for `shot`, the answer
 //! is a file on the machine of the one who asked, since a program on a server cannot open a path
 //! of the computer the app runs on:
 //!
@@ -46,7 +50,7 @@
 //! bytes 48213
 //! ```
 //!
-//! `kind` is `png` (a `shot`) or `txt` (a `text` or a `snapshot`), and `bytes` how long the file
+//! `kind` is `png` (a `shot`) or `txt` (a `text`, a `snapshot` or a `console`), and `bytes` how long the file
 //! is. The app writes it as `<part>.<kind>` in [`crate::paths::BROWSER`] below the asker's
 //! [`crate::paths::DIR`], on the asker's machine, whose `HOME` is not the app's to know; the
 //! command, which made the folder (mode 0700: a page may hold what a person signed in to), checks
@@ -106,12 +110,46 @@ pub enum Action {
     Back,
     /// Load the page again.
     Reload,
+    /// Empty what the browser keeps: its cache or the data of its site.
+    Clear { what: Clearing },
+    /// The last lines of the page's console (log, warning, error, uncaught error), oldest first.
+    /// `part` names the file the text goes to when it is too long for a reply.
+    Console { part: String },
+}
+
+/// What `clear` empties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clearing {
+    /// The files the browser keeps to load pages faster (of every site: the engine keeps them
+    /// together) and the service workers and cache storage of the site it is at. Sessions and what
+    /// a page saved stay.
+    Cache,
+    /// What the sites of the name the browser is at keep, at every port: cookies, local storage,
+    /// databases, service workers. The person is signed out of them.
+    Site,
+}
+
+impl Clearing {
+    /// The word the request says.
+    pub fn word(self) -> &'static str {
+        match self {
+            Clearing::Cache => "cache",
+            Clearing::Site => "site",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Clearing> {
+        [Clearing::Cache, Clearing::Site]
+            .into_iter()
+            .find(|what| what.word() == word)
+    }
 }
 
 impl Action {
     /// The words a sub-verb is written as, in the order the command lists them.
-    pub const WORDS: [&'static str; 9] = [
-        "ls", "text", "snapshot", "shot", "click", "type", "open", "back", "reload",
+    pub const WORDS: [&'static str; 11] = [
+        "ls", "text", "snapshot", "shot", "click", "type", "open", "back", "reload", "clear",
+        "console",
     ];
 
     /// The sub-verb's word.
@@ -126,6 +164,8 @@ impl Action {
             Action::Open { .. } => "open",
             Action::Back => "back",
             Action::Reload => "reload",
+            Action::Clear { .. } => "clear",
+            Action::Console { .. } => "console",
         }
     }
 
@@ -133,7 +173,9 @@ impl Action {
     /// answer is never a file.
     pub fn file(&self) -> Option<FileKind> {
         match self {
-            Action::Text { .. } | Action::Snapshot { .. } => Some(FileKind::Text),
+            Action::Text { .. } | Action::Snapshot { .. } | Action::Console { .. } => {
+                Some(FileKind::Text)
+            }
             Action::Shot { .. } => Some(FileKind::Png),
             _ => None,
         }
@@ -155,10 +197,14 @@ impl Browser {
         }
         match &self.action {
             Action::Ls | Action::Back | Action::Reload => {}
-            Action::Text { part } | Action::Snapshot { part } | Action::Shot { part } => {
+            Action::Text { part }
+            | Action::Snapshot { part }
+            | Action::Shot { part }
+            | Action::Console { part } => {
                 check_part(part)?;
                 push(out, "part", part)?;
             }
+            Action::Clear { what } => push(out, "what", what.word())?,
             Action::Click { target } => {
                 check_target(target)?;
                 push(out, "target", &hex_word(target))?;
@@ -188,14 +234,15 @@ pub(crate) fn read<'a>(
     let word = verb.strip_prefix("browser ").unwrap_or_default();
     let allowed: &[&str] = match word {
         "ls" => &["pane"],
-        "text" | "snapshot" | "shot" => &["pane", "element", "part"],
+        "text" | "snapshot" | "shot" | "console" => &["pane", "element", "part"],
+        "clear" => &["pane", "element", "what"],
         "click" => &["pane", "element", "target"],
         "type" => &["pane", "element", "text", "into"],
         "open" => &["pane", "element", "url"],
         "back" | "reload" => &["pane", "element"],
         other => {
             return Err(Failure::usage(format!(
-                "`browser {other}` is no verb: browser ls, text, snapshot, shot, click, type, open, back or reload"
+                "`browser {other}` is no verb: browser ls, text, snapshot, shot, click, type, open, back, reload, clear or console"
             )));
         }
     };
@@ -230,6 +277,15 @@ pub(crate) fn read<'a>(
         "shot" => Action::Shot {
             part: part(&fields)?,
         },
+        "console" => Action::Console {
+            part: part(&fields)?,
+        },
+        "clear" => {
+            let what = fields.need("what")?;
+            let what = Clearing::from_word(what)
+                .ok_or_else(|| Failure::usage(format!("`what` is cache or site, not `{what}`")))?;
+            Action::Clear { what }
+        }
         "click" => {
             let target = word_of_hex(fields.need("target")?)?;
             check_target(&target)?;
@@ -474,6 +530,8 @@ mod tests {
     const V2_OPEN: &str = "bateri 2\nbrowser open\npane p9\nurl x68747470733a2f2f6c6f63616c686f73743a333030302f613f623d31\n";
     const V2_CLICK: &str = "bateri 2\nbrowser click\npane p4\ntarget x3431322c3838\n";
     const V2_LS: &str = "bateri 2\nbrowser ls\npane p9@local\n";
+    const V2_CLEAR: &str = "bateri 2\nbrowser clear\npane p9\nwhat site\n";
+    const V2_CONSOLE: &str = "bateri 2\nbrowser console\npane p9\npart 1a2b-3c-1\n";
     const V2_FILED: &str = "bateri 2\nok filed\nkind png\nbytes 48213\n";
 
     fn pane(text: &str) -> Anchor {
@@ -574,6 +632,26 @@ mod tests {
                 V2_CLICK,
             ),
             (browser("p9@local", None, Action::Ls), V2_LS),
+            (
+                browser(
+                    "p9",
+                    None,
+                    Action::Clear {
+                        what: Clearing::Site,
+                    },
+                ),
+                V2_CLEAR,
+            ),
+            (
+                browser(
+                    "p9",
+                    None,
+                    Action::Console {
+                        part: "1a2b-3c-1".to_owned(),
+                    },
+                ),
+                V2_CONSOLE,
+            ),
         ]
     }
 
@@ -588,6 +666,7 @@ mod tests {
     #[test]
     fn every_sub_verb_goes_round_with_and_without_an_element() {
         let part = "p-1".to_owned();
+        let part2 = part.clone();
         let actions = [
             Action::Ls,
             Action::Text { part: part.clone() },
@@ -605,6 +684,10 @@ mod tests {
             },
             Action::Back,
             Action::Reload,
+            Action::Clear {
+                what: Clearing::Cache,
+            },
+            Action::Console { part: part2 },
         ];
         assert_eq!(
             actions.iter().map(Action::word).collect::<Vec<_>>(),
@@ -684,6 +767,17 @@ mod tests {
                 "takes no `part`",
             ),
             ("bateri 2\nbrowser text\npane p9\n", "needs a `part`"),
+            ("bateri 2\nbrowser console\npane p9\n", "needs a `part`"),
+            // What `clear` empties is one of two words.
+            ("bateri 2\nbrowser clear\npane p9\n", "needs a `what`"),
+            (
+                "bateri 2\nbrowser clear\npane p9\nwhat all\n",
+                "`what` is cache or site, not `all`",
+            ),
+            (
+                "bateri 2\nbrowser clear\npane p9\nwhat cache\npart a\n",
+                "takes no `part`",
+            ),
             (
                 "bateri 2\nbrowser text\npane p9\ntarget x61\npart a\n",
                 "takes no `target`",
