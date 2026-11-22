@@ -1,0 +1,11 @@
+# put_deleted: a deletion: no value
+02                                   # kind 0x02
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 37                          # payload length 55
+00 01 00 00 00 04 00 00 00 0c        # key 1, length 4
+00 0a 00 00 00 01 01                 # key 10, length 1
+00 0b 00 00 00 04 67 6f 6e 65        # key 11, length 4
+00 0e 00 00 00 01 01                 # key 14, length 1
+00 0f 00 00 00 01 00                 # key 15, length 1
+00 0c 00 00 00 08 00 00 00 00 00 00 00 05 # key 12, length 8

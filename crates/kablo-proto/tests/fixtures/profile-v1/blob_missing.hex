@@ -1,0 +1,6 @@
+# blob_missing: the blob asked for is not here
+88                                   # kind 0x88
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 26                          # payload length 38
+00 01 00 00 00 20 bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb # key 1, length 32

@@ -1,0 +1,9 @@
+# blob: a part of a blob of 5 bytes: bytes 2 to 4
+04                                   # kind 0x04
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 4b                          # payload length 75
+00 01 00 00 00 20 aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa # key 1, length 32
+00 02 00 00 00 08 00 00 00 00 00 00 00 05 # key 2, length 8
+00 03 00 00 00 08 00 00 00 00 00 00 00 02 # key 3, length 8
+00 04 00 00 00 03 63 64 65           # key 4, length 3

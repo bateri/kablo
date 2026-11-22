@@ -1,0 +1,6 @@
+# caught_up: the records that bring the client up to date are done
+83                                   # kind 0x83
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 0e                          # payload length 14
+00 01 00 00 00 08 00 00 00 00 00 00 00 32 # key 1, length 8

@@ -1,0 +1,6 @@
+# blob_ok: every part of a blob came and its sum held
+87                                   # kind 0x87
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 26                          # payload length 38
+00 01 00 00 00 20 aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa # key 1, length 32

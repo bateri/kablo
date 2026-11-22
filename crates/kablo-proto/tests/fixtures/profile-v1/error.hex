@@ -1,0 +1,7 @@
+# error: the server turns the open down (this server keeps no profiles) and ends
+8f                                   # kind 0x8f
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 30                          # payload length 48
+00 01 00 00 00 02 00 03              # key 1, length 2
+00 02 00 00 00 22 74 68 69 73 20 73 65 72 76 65 72 20 64 6f 65 73 20 6e 6f 74 20 6b 65 65 70 20 70 72 6f 66 69 6c 65 73 # key 2, length 34

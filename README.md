@@ -195,6 +195,22 @@ Put each version in a directory of its own and leave the old one where it is.
 Overwriting the binary of a running session in place costs the warden its
 memory of where its relay comes from (see *Limits*).
 
+## Browser profiles
+
+`kablo profile` keeps a browser profile (cookies, Local Storage, IndexedDB) for the bateri apps that
+connect to this machine, so that a person's computers share one profile and are signed in on all of
+them. It is spoken over its standard input and output ([docs/PROTOCOL.md](docs/PROTOCOL.md), section
+8), by an app; it is not a user interface.
+
+- A profile is a folder under `~/.local/share/bateri/browser/profiles`, mode 0700, its files 0600.
+  What the browser keeps in it is kept **as it is, not encrypted**: whoever can read your files can read
+  your sign-ins, as they can with the browser's own profile.
+- `kablo profile off` deletes every profile on the machine and leaves a mark that none is kept (an app
+  that connects is told so and keeps its own); `kablo profile on` removes the mark. A profile that was
+  written by a newer kablo is not touched: the open is refused.
+- A deletion is remembered for 30 days; a computer that was away longer takes the profile whole and drops
+  what the others deleted. A file bigger than 256 MiB is not kept.
+
 ## Security
 
 - Sessions live in a directory only you can use: `/tmp/kablo-<uid>/`, mode

@@ -1,0 +1,3 @@
+# state_entry: an entry of the state file: the length (u32) and the payload of a record
+00 00 00 77                          # length of the payload
+00 0d 00 00 00 08 00 00 00 00 00 00 00 2a 00 0a 00 00 00 01 01 00 0b 00 00 00 12 00 01 00 00 00 0c 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d 00 0f 00 00 00 01 00 00 10 00 00 00 0b 73 65 73 73 69 6f 6e 3d 61 62 63 00 14 00 00 00 08 00 00 01 a3 18 5c 50 00 00 12 00 00 00 10 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 00 13 00 00 00 08 00 00 01 8b cf e5 68 00 # the payload of a record: a block of entries

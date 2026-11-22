@@ -1,0 +1,12 @@
+# put: a cookie record written over the one it saw (`base` 7)
+02                                   # kind 0x02
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 5d                          # payload length 93
+00 01 00 00 00 04 00 00 00 09        # key 1, length 4
+00 0a 00 00 00 01 01                 # key 10, length 1
+00 0b 00 00 00 12 00 01 00 00 00 0c 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d # key 11, length 18
+00 0f 00 00 00 01 00                 # key 15, length 1
+00 10 00 00 00 0b 73 65 73 73 69 6f 6e 3d 61 62 63 # key 16, length 11
+00 14 00 00 00 08 00 00 01 a3 18 5c 50 00 # key 20, length 8
+00 0c 00 00 00 08 00 00 00 00 00 00 00 07 # key 12, length 8

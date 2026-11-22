@@ -1,0 +1,12 @@
+# record_deleted: a deletion as the server has it
+82                                   # kind 0x82
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 51                          # payload length 81
+00 0d 00 00 00 08 00 00 00 00 00 00 00 2c # key 13, length 8
+00 0a 00 00 00 01 01                 # key 10, length 1
+00 0b 00 00 00 04 67 6f 6e 65        # key 11, length 4
+00 0e 00 00 00 01 01                 # key 14, length 1
+00 0f 00 00 00 01 00                 # key 15, length 1
+00 12 00 00 00 10 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 # key 18, length 16
+00 13 00 00 00 08 00 00 01 8b cf e5 68 00 # key 19, length 8

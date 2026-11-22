@@ -4,7 +4,8 @@ This describes the bytes a kablo client and a kablo relay exchange. The
 `kablo-proto` crate is a reference implementation of everything below, and its
 tests read the byte-for-byte examples in `crates/kablo-proto/tests/fixtures/v1/`
 (annotated hex, one file per message): when this text and a fixture disagree,
-the fixture is right and this text has a bug.
+the fixture is right and this text has a bug. Section 8 is a protocol of its own (the profile
+of a browser), with its own signature and fixtures.
 
 The protocol runs over **any ordered byte stream**: a unix socket, the standard
 input and output of `ssh host kablo attach`, a pipe. It does not care where the
@@ -1175,3 +1176,124 @@ and the app. The program is the *sender*, the app is the bridge's *client*.
 - Anything else is a new version. The bytes of every message of every shipped
   version are kept as fixtures that a test reads and compares in both
   directions; a fixture is never edited.
+
+## 8. The profile protocol (`kablo profile`)
+
+A browser profile (cookies, Local Storage, IndexedDB) that an app keeps on a server, so that every
+computer of the same person that connects to the server has the whole profile and sees the changes of
+the others as they happen. It is **not** the protocol above: it has its own signature, version range
+and channel, and it is spoken with a program of its own, `kablo profile`, over the program's standard
+input and output (an app opens it as a command, `ssh host .local/share/bateri/kablo/<version>/kablo
+profile`, or through the command stream of a session). The `kablo-proto` crate implements it as
+`kablo_proto::profile`; its tests read the byte-for-byte examples in
+`crates/kablo-proto/tests/fixtures/profile-v1/` (annotated hex, one file per message and per head of
+a file), and when this text and a fixture disagree the fixture is right.
+
+The server **does not read** what a record holds: a record is a kind, a key and a value that the writer
+makes and reads (it is the writer's own format), plus the few things the server needs: that it is a
+deletion, which blobs it keeps alive and when it runs out. A value is in an envelope (v1: 0, open), so
+that an app can one day wrap it in encryption without the format changing.
+
+### Connection
+
+`hello` of section 1 with the signature `KABLO-PROFILE\0` (14 bytes, a NUL at the end) and versions
+`1..=1`. Then **frames** of section 2 on **channel 2**, with no session id, whose payload is a TLV block
+(section 3); a frame's kind has its high bit set when the server sent it. A kind or key a reader does not
+know is skipped, as everywhere in this protocol. One connection is one profile, and one `kablo profile`
+process; any number of processes serve the same profile at once.
+
+### From the client
+
+| kind | name | keys |
+|---|---|---|
+| 0x01 | `open` | 1 app (text, `[a-z0-9-]{1,32}`), 2 profile name (text, the same), 3 client id (16 bytes, random, made once per computer and profile), 4 `since` (u64: the newest `seq` it has seen; 0 when it never joined), 5 depot id it knew (16 bytes; absent when none) |
+| 0x02 | `put` | 1 request number (u32), the record fields below, 12 `base` (u64: the `seq` the record had when the client last saw it; 0 when it was not there) |
+| 0x03 | `have` | 1 sha256 (32 bytes, repeated): which of these blobs does the server lack? |
+| 0x04 | `blob` | 1 sha256 of the whole blob, 2 total length (u64), 3 start (u64), 4 bytes (at most 512 KiB) |
+| 0x05 | `get_blob` | 1 sha256 |
+
+### From the server
+
+| kind | name | keys |
+|---|---|---|
+| 0x81 | `opened` | 1 `head` (u64), 2 `horizon` (u64), 3 mode (u8, below), 4 depot id (16 bytes) |
+| 0x82 | `record` | 13 `seq` (u64), the record fields, 18 writer (16 bytes: the client id), 19 the server's time (u64, milliseconds) |
+| 0x83 | `caught_up` | 1 `head`; the `record`s after it are live |
+| 0x84 | `put_reply` | 1 request number, 2 result (u8: 0 done, 1 conflict, 2 missing blob, 3 too large, 4 bad), 3 the new `seq` (done) or the current one (conflict) |
+| 0x85 | `have_reply` | 1 sha256 (repeated): the ones it lacks |
+| 0x86 | `blob` | the keys of the client's `blob` |
+| 0x87 | `blob_ok` | 1 sha256: every part came and the sum held |
+| 0x88 | `blob_missing` | 1 sha256: answers a `get_blob`; the connection goes on |
+| 0x8f | `error` | 1 code (u16: 1 version, 2 not a name, 3 this server keeps no profiles, 4 internal, 5 the profile was written by a newer kablo), 2 text; the connection ends after it |
+
+**Record fields:** 10 kind (u8: 1 cookie, 2 Local Storage, 3 detached (session storage), 4 IndexedDB);
+11 key (bytes, opaque to the server; a record is **identified by its kind and key together**); 14 deleted
+(u8, when present there is no value); 15 envelope (u8, 0); 16 value (bytes, at most 64 KiB, inside the
+envelope); 17 linked blob (sha256 and length u64, repeated: every blob the value points at, for instance
+the files of an IndexedDB; the server keeps them as long as a record points at them); 21 value in a blob
+(sha256 and length u64, in the place of 16, for a value over 64 KiB); 20 runs out (u64, milliseconds;
+absent when never). A blob is named by the sha256 of the bytes it is kept as.
+
+### How a conversation goes
+
+1. The client sends `open`. The server answers `opened`, then the records that bring the client up to
+   date, then `caught_up`, and from then on every record that is written by any connection, oldest
+   first, as it is. The client's own writes come back as records too, with its own client id as
+   the writer: that is how it knows them.
+2. **Mode** (`opened`, key 3) is the server's choice: 1 (the whole profile, deletions not sent: the first
+   join) when the open names no depot or another one than the server's (the profile was deleted and made
+   again), or `since` is 0 or more than `head`; 2 (the whole profile, and **what the client has that
+   the server lacks is to be deleted, not uploaded**) when `since` is more than 0 and less than
+   `horizon`, a client that was away longer than deletions are remembered; 0 (the records newer than
+   `since`, deletions included) otherwise.
+3. A `put` is written when the `seq` the record has now equals its `base`; it gets the next number
+   (`head` + 1) and the answer is `done` with it. A record that is not there is the same as `base` 0,
+   and also as any `base` up to `horizon` (a deletion that was let go of). Otherwise the answer is
+   `conflict` with the record's number now, and nothing is written: the client gets the newer record
+   from the stream. A conflict whose number is **0** says there is no such record (it ran out and was
+   let go of, which does not move `horizon`), and nothing follows on the stream: the client sends the
+   record again with `base` 0. A `put` whose answer was lost is sent again: if the answer is a conflict, and the
+   record that is there was written by this client and holds the value it sent, it was written.
+4. A record that points at a blob (17, 21) the server does not have is answered `missing blob`: the
+   client asks with `have`, sends the ones that are lacking, each in parts of at most 512 KiB starting at
+   0 and in order (`blob`; the last part is answered `blob_ok`), and then the record. A blob that is there
+   is answered `blob_ok` at its first part and the rest of it is ignored. A sum that does not hold is
+   an `error` and the end of the connection.
+5. `get_blob` is answered with `blob` parts, or `blob_missing`.
+6. `kablo profile off` deletes every profile of the machine and leaves the file
+   `~/.local/share/bateri/browser/profiles-off`; while it is there an `open` is answered `error` 3 and
+   nothing is made, and a connection that is open to a profile that was deleted is ended with it. `kablo
+   profile on` removes the file. Neither is spoken over the wire.
+
+### What the server keeps
+
+`~/.local/share/bateri/browser/profiles/<app>-<name>-<sum>/` (mode 0700; the files 0600), `<sum>` being
+the first 16 hexadecimal digits of the sha256 of the app, a NUL byte and the name (so `a-b` + `c` and
+`a` + `b-c` are two folders):
+
+- `state`: `KABLO-PROFILE-STATE\0`, the format (u8, 1), the depot id (16 bytes), `head` (u64),
+  `horizon` (u64), then the records, each a length (u32) and the payload of a `record`; written whole
+  by a compaction.
+- `log`: `KABLO-PROFILE-LOG\0`, the format (u8, 1), the generation (u64), then a `record` frame for
+  every record written since `state`, appended under a lock.
+- `blobs/<sha256>`, and `lock`, the file the locks are taken on (a writer holds it exclusively, a reader
+  of the log shared).
+
+Every process serving the profile keeps its picture of it and brings it up to date from the `log` every 200
+milliseconds, by `seq` and not by position; when the generation of the log changed (a compaction) it
+reads `state` and `log` again and goes on from where it was. A compaction happens when the log has
+2000 records or 4 MiB, or when a record has run out (key 20) or a deletion is older than 30 days: they are
+let go of (`horizon` becomes the number of the newest deletion let go of), `state` is written whole, the
+log starts again with the next generation, and a blob that no record points at and is older than 10
+minutes is deleted (as is a part of an upload that never ended, after an hour). Files of a format newer
+than this build's are **never written to**: the open is answered `error` 5.
+
+### Limits
+
+| what | limit |
+|---|---|
+| a value | 64 KiB (bigger is a blob, key 21) |
+| a key | 4 KiB |
+| a blob | 256 MiB (a bigger one is not uploaded) |
+| the bytes of one `blob` | 512 KiB |
+| a name | `[a-z0-9-]`, 1 to 32 |

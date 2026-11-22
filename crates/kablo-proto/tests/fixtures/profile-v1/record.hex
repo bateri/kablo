@@ -1,0 +1,13 @@
+# record: a record as the server has it
+82                                   # kind 0x82
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 77                          # payload length 119
+00 0d 00 00 00 08 00 00 00 00 00 00 00 2a # key 13, length 8
+00 0a 00 00 00 01 01                 # key 10, length 1
+00 0b 00 00 00 12 00 01 00 00 00 0c 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d # key 11, length 18
+00 0f 00 00 00 01 00                 # key 15, length 1
+00 10 00 00 00 0b 73 65 73 73 69 6f 6e 3d 61 62 63 # key 16, length 11
+00 14 00 00 00 08 00 00 01 a3 18 5c 50 00 # key 20, length 8
+00 12 00 00 00 10 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 # key 18, length 16
+00 13 00 00 00 08 00 00 01 8b cf e5 68 00 # key 19, length 8

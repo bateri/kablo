@@ -43,6 +43,30 @@ pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
     cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }).map(drop)
 }
 
+/// Takes an advisory lock on an open file, waiting for it: exclusive, or shared with the others
+/// that hold it shared. It goes when the file is closed or with [`unlock`].
+pub fn flock(fd: RawFd, exclusive: bool) -> io::Result<()> {
+    let operation = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    loop {
+        // SAFETY: `flock` takes a descriptor and an operation and touches no memory.
+        match cvt(unsafe { libc::flock(fd, operation) }) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Lets go of what [`flock`] took.
+pub fn unlock(fd: RawFd) -> io::Result<()> {
+    // SAFETY: as `flock`.
+    cvt(unsafe { libc::flock(fd, libc::LOCK_UN) }).map(drop)
+}
+
 /// Whether `fd` is an open descriptor of this process.
 pub fn is_open(fd: RawFd) -> bool {
     // SAFETY: `F_GETFD` only reads the descriptor's flags.

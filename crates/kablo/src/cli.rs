@@ -36,6 +36,8 @@ commands:
             programs (`ssh host kablo attach`), not for people
   upgrade   run a session's relay and warden from another kablo binary,
             without ending the session or dropping the clients
+  profile   keep a browser profile for the bateri apps that connect to this
+            machine, over this program's input and output (`off`: keep none)
   version   print the version and the protocol versions this build speaks
   help      print this text
 
@@ -52,6 +54,7 @@ kablo end ID [--force]
 kablo here
 kablo attach
 kablo upgrade ID PATH
+kablo profile [off | on]
 ";
 
 /// The line `kablo version` prints: `key=value` tokens, to which keys may be
@@ -86,6 +89,7 @@ where
             Some("here") => return drive::here(rest, out, err),
             Some("attach") => return command_attach(rest, err),
             Some("bateri") => return command::run(rest, out, err),
+            Some("profile") => return command::profile::run(rest, err),
             Some("upgrade") => return command_upgrade(rest, out, err),
             // The two halves of a session; `kablo new` starts the first and the
             // first starts the second. Not for people.

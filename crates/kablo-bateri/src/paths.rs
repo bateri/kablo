@@ -73,6 +73,16 @@ pub const NOT_HERE: &str = "not-here";
 /// old at the next `text`, `snapshot` or `shot`.
 pub const BROWSER: &str = "browser";
 
+/// The profiles of the browser panes that the person's other computers keep here, one folder for
+/// each (`<app>-<name>-<sum>`), in [`BROWSER`]: only `kablo profile` writes it. Mode 0700, and
+/// the files in it 0600.
+pub const PROFILES: &str = "profiles";
+
+/// Present when this server keeps no profiles ([`PROFILES`] is deleted and none is made): the
+/// computers that connect keep theirs to themselves. Written by `kablo profile off`, removed by
+/// `kablo profile on`, in [`BROWSER`].
+pub const PROFILES_OFF: &str = "profiles-off";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +105,18 @@ mod tests {
     #[test]
     fn the_folder_of_the_answers_of_a_browser_is_the_one_the_app_writes() {
         assert_eq!(format!("{DIR}/{BROWSER}"), ".local/share/bateri/browser");
+    }
+
+    #[test]
+    fn the_profiles_and_their_switch_are_in_the_folder_of_the_browser() {
+        assert_eq!(
+            format!("{DIR}/{BROWSER}/{PROFILES}"),
+            ".local/share/bateri/browser/profiles"
+        );
+        assert_eq!(
+            format!("{DIR}/{BROWSER}/{PROFILES_OFF}"),
+            ".local/share/bateri/browser/profiles-off"
+        );
     }
 
     // The folder of the programs is written by kablo and read by every kablo of every version

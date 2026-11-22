@@ -1,0 +1,10 @@
+# open: the client opens a profile it has seen before
+01                                   # kind 0x01
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 50                          # payload length 80
+00 01 00 00 00 06 62 61 74 65 72 69  # key 1, length 6
+00 02 00 00 00 04 6d 61 69 6e        # key 2, length 4
+00 03 00 00 00 10 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 # key 3, length 16
+00 04 00 00 00 08 00 00 00 00 00 00 00 29 # key 4, length 8
+00 05 00 00 00 10 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 # key 5, length 16

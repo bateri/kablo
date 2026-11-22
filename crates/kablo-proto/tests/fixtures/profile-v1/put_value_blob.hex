@@ -1,0 +1,11 @@
+# put_value_blob: a record whose value is in a blob
+02                                   # kind 0x02
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 5d                          # payload length 93
+00 01 00 00 00 04 00 00 00 0b        # key 1, length 4
+00 0a 00 00 00 01 02                 # key 10, length 1
+00 0b 00 00 00 03 62 69 67           # key 11, length 3
+00 0f 00 00 00 01 00                 # key 15, length 1
+00 15 00 00 00 28 aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa 00 00 00 00 00 01 86 a0 # key 21, length 40
+00 0c 00 00 00 08 00 00 00 00 00 00 00 03 # key 12, length 8

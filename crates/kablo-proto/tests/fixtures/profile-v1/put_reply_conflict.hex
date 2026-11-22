@@ -1,0 +1,8 @@
+# put_reply_conflict: the record changed since the base: its number now
+84                                   # kind 0x84
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 1f                          # payload length 31
+00 01 00 00 00 04 00 00 00 09        # key 1, length 4
+00 02 00 00 00 01 01                 # key 2, length 1
+00 03 00 00 00 08 00 00 00 00 00 00 00 31 # key 3, length 8

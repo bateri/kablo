@@ -17,6 +17,7 @@ mod json;
 mod machine;
 mod open;
 mod package;
+pub mod profile;
 mod state;
 mod verbs;
 mod view;

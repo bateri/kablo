@@ -1,0 +1,6 @@
+# get_blob: the client asks for a blob
+05                                   # kind 0x05
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 26                          # payload length 38
+00 01 00 00 00 20 bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb # key 1, length 32

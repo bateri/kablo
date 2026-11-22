@@ -1,0 +1,4 @@
+# log_header: the head of the log: signature, format 1, generation 7
+4b 41 42 4c 4f 2d 50 52 4f 46 49 4c 45 2d 4c 4f 47 00 # signature KABLO-PROFILE-LOG, then a zero
+01                                   # format 1
+00 00 00 00 00 00 00 07              # generation 7

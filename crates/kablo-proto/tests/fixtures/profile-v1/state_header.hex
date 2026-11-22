@@ -1,0 +1,6 @@
+# state_header: the head of the state file: signature, format 1, depot, head, horizon
+4b 41 42 4c 4f 2d 50 52 4f 46 49 4c 45 2d 53 54 41 54 45 00 # signature KABLO-PROFILE-STATE, then a zero
+01                                   # format 1
+d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 # depot
+00 00 00 00 00 00 00 32              # head 50
+00 00 00 00 00 00 00 0c              # horizon 12

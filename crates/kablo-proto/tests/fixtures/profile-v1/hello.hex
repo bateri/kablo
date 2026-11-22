@@ -1,0 +1,4 @@
+# hello: the client's hello: signature, lowest version, highest version
+4b 41 42 4c 4f 2d 50 52 4f 46 49 4c 45 00 # signature KABLO-PROFILE, then a zero
+01                                   # lowest version
+01                                   # highest version

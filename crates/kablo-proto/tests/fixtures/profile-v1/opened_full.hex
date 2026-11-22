@@ -1,0 +1,9 @@
+# opened_full: the server answers with the whole profile (mode 1)
+81                                   # kind 0x81
+02                                   # channel 2
+00                                   # session id length 0
+00 00 00 39                          # payload length 57
+00 01 00 00 00 08 00 00 00 00 00 00 00 32 # key 1, length 8
+00 02 00 00 00 08 00 00 00 00 00 00 00 0c # key 2, length 8
+00 03 00 00 00 01 01                 # key 3, length 1
+00 04 00 00 00 10 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 d0 # key 4, length 16
