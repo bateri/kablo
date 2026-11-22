@@ -427,7 +427,8 @@ them. It is spoken over its standard input and output ([docs/PROTOCOL.md](docs/P
   (`~/.local/share/bateri/browser`; the next `text`, `snapshot`, `shot` or `console` removes the files there
   more than a day old), and the command prints its path. `clear --cache` empties what the
   browser keeps to load pages faster and `clear --site` what the sites of its address keep (it signs
-  the person out); `console` prints the last lines of the page's console and only reads.
+  the person out); `console` prints the last lines of the page's console and only reads (it starts to read when first
+  asked: reload the page to see its log from the start).
 - **Taking a terminal** is bit 3 of the view an app attaches with (`take` in
   `kablo-proto`): the other clients attached to the session are let go, each with
   the error `TAKEN` (code 9) whose text is the name the app gave itself in its

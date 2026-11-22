@@ -341,7 +341,8 @@ pixels, type types TEXT (after a click on --into TARGET; - reads the text from s
 goes to an http:// or https:// address, a data: one or about:blank (a bare one is read as an address
 bar reads it: 3000 is http://localhost:3000, a local host http://, a name with a dot https://), back
 and reload do what they say. console prints the last lines the page wrote to its console (log, warning, error, and
-an uncaught error), oldest first; it only reads. clear --cache empties the files the browser keeps to load pages
+an uncaught error), oldest first; it only reads, and it starts to read when it is first asked: what the page wrote before
+that may be missing or less detailed, so reload the page to see its log from the start. clear --cache empties the files the browser keeps to load pages
 faster (of every site, and the service workers of the one it is at); clear --site deletes what the sites of the name
 the browser is at keep, at every port (cookies, local storage, databases, service workers), which signs the person
 out of them: ask first. --element ID says which browser of the pane (the only one, or the one that has the keyboard,

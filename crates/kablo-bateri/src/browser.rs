@@ -112,7 +112,8 @@ pub enum Action {
     Reload,
     /// Empty what the browser keeps: its cache or the data of its site.
     Clear { what: Clearing },
-    /// The last lines of the page's console (log, warning, error, uncaught error), oldest first.
+    /// The last lines of the page's console (log, warning, error, uncaught error), oldest first. The
+    /// console is read from the first request for it on: what the page logged before may be missing or less detailed.
     /// `part` names the file the text goes to when it is too long for a reply.
     Console { part: String },
 }
