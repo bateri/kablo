@@ -461,10 +461,13 @@ fn a_deletion_is_a_record_and_comes_to_those_who_ask_for_what_is_newer() {
     assert_eq!(mode(&b), Mode::Diff);
     assert_eq!(seqs(&b.records), [2]);
     assert!(b.records[0].body.deleted);
-    // Whoever has seen nothing is told what there is, not what there was.
+    // Whoever has seen nothing is told of the deletion too: a record of theirs that was deleted
+    // here would otherwise be put back (a put over a deletion is a conflict, and the answer to a
+    // conflict is the newer record from the stream).
     let c = join(&home, open(3, 0, Some(depot)));
     assert_eq!(mode(&c), Mode::Full);
-    assert!(c.records.is_empty());
+    assert_eq!(seqs(&c.records), [2]);
+    assert!(c.records[0].body.deleted);
     assert_eq!(c.opened.head, 2);
 }
 
@@ -642,7 +645,7 @@ fn deletions_that_are_old_are_let_go_of_by_the_compaction_and_the_horizon_says_s
     // it cannot be told what was deleted.
     assert_eq!((a.opened.head, a.opened.horizon), (6, 4));
     assert_eq!(mode(&a), Mode::FullReplace);
-    assert_eq!(keys(&a.records), ["kept"]);
+    assert_eq!(keys(&a.records), ["fresh-stone", "kept"]);
     // From after it, what is newer: the stone that is fresh is still told of.
     let b = join(&home, open(2, 4, Some(DEPOT)));
     assert_eq!(mode(&b), Mode::Diff);

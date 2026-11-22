@@ -1240,7 +1240,7 @@ absent when never). A blob is named by the sha256 of the bytes it is kept as.
    date, then `caught_up`, and from then on every record that is written by any connection, oldest
    first, as it is. The client's own writes come back as records too, with its own client id as
    the writer: that is how it knows them.
-2. **Mode** (`opened`, key 3) is the server's choice: 1 (the whole profile, deletions not sent: the first
+2. **Mode** (`opened`, key 3) is the server's choice: 1 (the whole profile, the deletions that are remembered included: the first
    join) when the open names no depot or another one than the server's (the profile was deleted and made
    again), or `since` is 0 or more than `head`; 2 (the whole profile, and **what the client has that
    the server lacks is to be deleted, not uploaded**) when `since` is more than 0 and less than

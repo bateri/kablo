@@ -397,15 +397,18 @@ impl Store {
         self.pending.drain(..).collect()
     }
 
-    /// The records that bring a client up to date: with `full`, every record that is there, and
-    /// otherwise every one (a deletion included) newer than `since`; oldest first. What was
-    /// waiting to be told is dropped: it is in what this returns or after it.
+    /// The records that bring a client up to date: with `full`, every record there is and every
+    /// deletion that is remembered, and otherwise every one newer than `since`; oldest first. A
+    /// client that joins whole is told of the deletions too: a record it has that the home has
+    /// deleted would otherwise be put back (its `put` is a conflict with the deletion's number,
+    /// and the answer to a conflict is the newer record from the stream). What was waiting to be
+    /// told is dropped: it is in what this returns or after it.
     pub fn catch_up(&mut self, since: u64, full: bool) -> Vec<Entry> {
         self.pending.clear();
         let mut out: Vec<Entry> = self
             .entries
             .values()
-            .filter(|e| if full { !e.body.deleted } else { e.seq > since })
+            .filter(|e| full || e.seq > since)
             .cloned()
             .collect();
         out.sort_by_key(|e| e.seq);
@@ -559,13 +562,19 @@ impl Store {
         total: u64,
         client: &[u8; 16],
     ) -> io::Result<Upload> {
-        let path =
-            self.blob_dir()
-                .join(format!("{PART_PREFIX}{}-{}", hex(&digest), hex_of(client)));
+        // The name is this process's own: a connection that was let go of may not have ended when
+        // the same computer's next one comes, and two writers of one file would mix its bytes.
+        let path = self.blob_dir().join(format!(
+            "{PART_PREFIX}{}-{}-{}",
+            hex(&digest),
+            hex_of(client),
+            std::process::id()
+        ));
+        // A part that is there is an upload this connection began before: it starts again.
+        let _ = fs::remove_file(&path);
         let file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&path)?;
         Ok(Upload {

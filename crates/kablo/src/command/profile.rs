@@ -166,6 +166,14 @@ fn serve(browser: &std::path::Path, err: &mut dyn Write) -> u8 {
             return 1;
         }
     };
+    // `kablo profile off` may have run between the look at the mark and the folder being made: it
+    // deleted what was there and the folder is the open's own. The mark wins.
+    if browser.join(paths::PROFILES_OFF).exists() {
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        out.fail(code::OFF, "this server does not keep profiles");
+        return 0;
+    }
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         loop {
