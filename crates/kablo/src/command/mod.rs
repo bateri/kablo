@@ -250,7 +250,8 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri wait PANE [--for TIME]
        bateri view [PANE] [--json]
        bateri view [PANE] click|double-click|menu|text REF [--json]
-       bateri view [PANE] command TITLE [--json]
+       bateri view [PANE] command [REF] TITLE [--json]
+       bateri view [PANE] reveal REF [ROW] [--json]
        bateri view [PANE] fill REF TEXT | - [--json]
        bateri view [PANE] type TEXT | - [--json]
        bateri view [PANE] press KEY... [--json]
@@ -314,8 +315,9 @@ need a bateri app.
 view reads what a pane shows when it shows a view and not a terminal (a pen) and drives it, through
 the bateri app: with no action it prints the elements with their names (REF, six letters), the
 fields, the editors' lines, the commands and what is waited for; every action does something and
-prints the view again. command runs the page's command of that title, click and double-click press
-an element, fill replaces the text of a field or an editor and type types into the one with the
+prints the view again. command runs the page's command of that title, or, with the REF of an
+element, the command of that title that the element lists, reveal scrolls an element into view
+(or row ROW, from 1, of a list, a table or an outline), click and double-click press an element, fill replaces the text of a field or an editor and type types into the one with the
 keyboard (- reads the text from standard input), press sends keys (cmd+enter), scroll moves a box
 (N screens), menu asks an element for its context menu and pick chooses a line of it (title or
 number), text prints the whole text of a field or an editor, wait waits for TEXT to show (--gone:

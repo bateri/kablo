@@ -9,15 +9,16 @@ use std::time::Duration;
 
 use kablo_bateri::Anchor;
 use kablo_bateri::message::{Format, Reply, Request};
-use kablo_bateri::view::{Action, KEYS_MOST, SCROLL_MOST, View, WAIT_MOST, Way, is_old};
+use kablo_bateri::view::{Action, KEYS_MOST, SCROLL_MOST, View, WAIT_MOST, Way, is_old, is_older};
 
 use super::words::{address, clean};
 use super::{Asked, Ctx, Done, Exit, Io, failure, unread};
 use crate::app::Patience;
 
 /// The words that start an action; any other first word is the pane.
-const ACTIONS: [&str; 12] = [
+const ACTIONS: [&str; 13] = [
     "command",
+    "reveal",
     "click",
     "double-click",
     "fill",
@@ -141,7 +142,33 @@ fn parse(words: &[String]) -> Result<Asking, Exit> {
             }
             Action::Read
         }
-        Some("command") => Action::Command(text("the title of the command")?),
+        Some("command") => match args.as_slice() {
+            [(title, _)] => Action::Command((*title).to_owned()),
+            [(target, _), (title, _)] => Action::CommandOn {
+                target: (*target).to_owned(),
+                title: (*title).to_owned(),
+            },
+            _ => {
+                return Err(Exit::mistake(
+                    "command takes the title of a command of the page, or the REF of an element and the title of one of its commands: put a title that has spaces in quotes",
+                ));
+            }
+        },
+        Some("reveal") => match args.as_slice() {
+            [(target, _)] => Action::Reveal {
+                target: (*target).to_owned(),
+                index: None,
+            },
+            [(target, _), (row, _)] => Action::Reveal {
+                target: (*target).to_owned(),
+                index: Some(row_of(row)?),
+            },
+            _ => {
+                return Err(Exit::mistake(
+                    "reveal takes the REF of an element, or of a list, a table or an outline and the number of a row (from 1)",
+                ));
+            }
+        },
         Some("click") => Action::Click(text("the REF of an element")?),
         Some("double-click") => Action::DoubleClick(text("the REF of an element")?),
         Some("menu") => Action::Menu(text("the REF of an element")?),
@@ -247,6 +274,20 @@ fn count(what: &str, value: &str, most: u32) -> Result<u32, Exit> {
         })
 }
 
+/// A row from 1, written plainly.
+fn row_of(value: &str) -> Result<u32, Exit> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|number| number.to_string() == value && *number >= 1)
+        .ok_or_else(|| {
+            Exit::mistake(format!(
+                "a row is a whole number from 1, not '{}'",
+                clean(value)
+            ))
+        })
+}
+
 fn way_of(word: &str) -> Result<Way, Exit> {
     [Way::Up, Way::Down, Way::Top, Way::Bottom]
         .into_iter()
@@ -330,6 +371,9 @@ pub fn view(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
         Asked::Reply(Reply::Failed(failed)) if is_old(&failed) => Err(Exit::failed(
             "this bateri does not read views yet; update bateri",
         )),
+        Asked::Reply(Reply::Failed(failed)) if is_older(&failed) => Err(Exit::failed(
+            "this bateri does not do that on a view yet (a command of an element, or reveal); update bateri",
+        )),
         Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
         Asked::NoApp | Asked::Silent => Err(Exit::new(
@@ -374,6 +418,27 @@ mod tests {
     fn every_action_is_read() {
         let cases = [
             ("command Restart", Action::Command("Restart".into())),
+            (
+                "command k3f9qa Restart",
+                Action::CommandOn {
+                    target: "k3f9qa".into(),
+                    title: "Restart".into(),
+                },
+            ),
+            (
+                "reveal k3f9qa",
+                Action::Reveal {
+                    target: "k3f9qa".into(),
+                    index: None,
+                },
+            ),
+            (
+                "reveal k3f9qa 248",
+                Action::Reveal {
+                    target: "k3f9qa".into(),
+                    index: Some(248),
+                },
+            ),
             ("double-click k3f9qa", Action::DoubleClick("k3f9qa".into())),
             ("menu k3f9qa", Action::Menu("k3f9qa".into())),
             ("text k3f9qa", Action::Text("k3f9qa".into())),
@@ -470,6 +535,12 @@ mod tests {
             ("dance", "neither a pane"),
             ("pp9 click k3f9qa", "neither a pane"),
             ("click", "REF of an element"),
+            ("command", "command takes"),
+            ("command a b c", "command takes"),
+            ("reveal", "reveal takes"),
+            ("reveal k3f9qa 0", "from 1"),
+            ("reveal k3f9qa 07", "from 1"),
+            ("reveal k3f9qa 2 3", "reveal takes"),
             ("click k3f9qa k3f9qb", "one word"),
             ("fill k3f9qa", "fill takes"),
             ("fill k3f9qa a b", "fill takes"),

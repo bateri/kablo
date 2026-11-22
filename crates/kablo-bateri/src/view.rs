@@ -12,7 +12,10 @@
 //!
 //! `terminal` is the pane, as for `close` (`p9`, `p9@prod`); with none it is the caller's own. With
 //! no `action` the request is a reading; otherwise `action` is one of [`Action::word`] and the lines
-//! it takes follow. What a person typed is free text and travels as `x` and the hex of its bytes (a
+//! it takes follow. `command` takes the title of a command of the page, and with a `ref` the title of a
+//! command of that element (what the reading lists under it); `reveal` takes a `ref` and, for a list,
+//! a table or an outline, the `index` of the row (from 1) to bring into view. A bateri that is older
+//! than these says so ([`is_older`]). What a person typed is free text and travels as `x` and the hex of its bytes (a
 //! line break survives the line that frames it); a name (`ref`) is as the bateri app wrote it,
 //! lower case. `format` is how the reading that every answer ends with is written (`text` is the
 //! default). A `view` may be as long as a `relay` ([`crate::message::RELAY_MAX_BYTES`]): what is
@@ -66,6 +69,18 @@ pub enum Action {
     Read,
     /// Do the command the page lists under this title.
     Command(String),
+    /// Do the command that an element lists (`actions` in its reading) under this title: its
+    /// name (a `ref`, or a whole id) and the title.
+    CommandOn {
+        target: String,
+        title: String,
+    },
+    /// Bring an element into view, or the `index`th row (from 1) of the list, the table or the
+    /// outline it names: the page scrolls, loads what it has not built, and moves its cursor there.
+    Reveal {
+        target: String,
+        index: Option<u32>,
+    },
     /// Click an element: its name (a `ref`, or a whole id).
     Click(String),
     DoubleClick(String),
@@ -107,7 +122,8 @@ impl Action {
     pub fn word(&self) -> Option<&'static str> {
         Some(match self {
             Action::Read => return None,
-            Action::Command(_) => "command",
+            Action::Command(_) | Action::CommandOn { .. } => "command",
+            Action::Reveal { .. } => "reveal",
             Action::Click(_) => "click",
             Action::DoubleClick(_) => "double-click",
             Action::Fill { .. } => "fill",
@@ -142,8 +158,9 @@ pub struct View {
 }
 
 /// The words a view's action is, in the order the lines of a request carry them.
-const KEYS: [&str; 11] = [
+const KEYS: [&str; 12] = [
     "terminal", "format", "action", "ref", "text", "keys", "way", "count", "gone", "for", "full",
+    "index",
 ];
 
 impl View {
@@ -163,6 +180,19 @@ impl View {
         match &self.action {
             Action::Read => {}
             Action::Command(title) => push(out, "text", &hex_word(title))?,
+            Action::CommandOn { target, title } => {
+                check_ref(target)?;
+                push(out, "ref", target)?;
+                push(out, "text", &hex_word(title))?;
+            }
+            Action::Reveal { target, index } => {
+                check_ref(target)?;
+                push(out, "ref", target)?;
+                if let Some(index) = index {
+                    check_index(*index)?;
+                    push(out, "index", &index.to_string())?;
+                }
+            }
             Action::Click(target)
             | Action::DoubleClick(target)
             | Action::Menu(target)
@@ -230,6 +260,16 @@ pub fn is_old(failure: &Failure) -> bool {
             )))
 }
 
+/// Whether a refusal is of a bateri that does not know what a newer `view` asks: the `reveal`
+/// action, or a `command` or a `reveal` with the lines they take now. An older reader refuses a
+/// word it does not know as it refuses an action, and a line it does not take by its key.
+pub fn is_older(failure: &Failure) -> bool {
+    failure.kind == Kind::Usage
+        && (failure.text.contains("is no action")
+            || failure.text == "`command` takes no `ref`"
+            || failure.text == "`view` takes no `index`")
+}
+
 /// A name of an element as the bateri app writes it: six letters and digits, or a whole id of 16
 /// hexadecimal digits; lower case.
 fn check_ref(name: &str) -> Result<(), Failure> {
@@ -258,6 +298,14 @@ fn check_count(count: u32) -> Result<(), Failure> {
         Err(Failure::usage(format!(
             "`count` is from 1 to {SCROLL_MOST}, not {count}"
         )))
+    }
+}
+
+fn check_index(index: u32) -> Result<(), Failure> {
+    if index >= 1 {
+        Ok(())
+    } else {
+        Err(Failure::usage("`index` is a row from 1, not 0"))
     }
 }
 
@@ -319,7 +367,9 @@ pub(crate) fn read<'a>(
     // The lines each action takes: any other is a mistake, as a key twice is.
     let takes: &[&str] = match word {
         None => &[],
-        Some("command" | "type" | "pick") => &["text"],
+        Some("command") => &["text", "ref"],
+        Some("type" | "pick") => &["text"],
+        Some("reveal") => &["ref", "index"],
         Some("click" | "double-click" | "menu" | "text") => &["ref"],
         Some("fill") => &["ref", "text"],
         Some("press") => &["keys"],
@@ -328,7 +378,7 @@ pub(crate) fn read<'a>(
         Some("shot") => &["full"],
         Some(other) => {
             return Err(Failure::usage(format!(
-                "`{other}` is no action: command, click, double-click, fill, type, press, scroll, menu, pick, text, wait or shot"
+                "`{other}` is no action: command, reveal, click, double-click, fill, type, press, scroll, menu, pick, text, wait or shot"
             )));
         }
     };
@@ -342,7 +392,23 @@ pub(crate) fn read<'a>(
     }
     let action = match word {
         None => Action::Read,
-        Some("command") => Action::Command(free(&fields, "text")?),
+        Some("command") => match fields.get("ref") {
+            None => Action::Command(free(&fields, "text")?),
+            Some(_) => Action::CommandOn {
+                target: named(&fields)?,
+                title: free(&fields, "text")?,
+            },
+        },
+        Some("reveal") => Action::Reveal {
+            target: named(&fields)?,
+            index: fields
+                .get("index")
+                .map(|value| {
+                    let index = plain("index", value)?;
+                    check_index(index).map(|()| index)
+                })
+                .transpose()?,
+        },
         Some("click") => Action::Click(named(&fields)?),
         Some("double-click") => Action::DoubleClick(named(&fields)?),
         Some("menu") => Action::Menu(named(&fields)?),
@@ -417,6 +483,10 @@ mod tests {
     const V2_VIEW_PANE_JSON: &str = "bateri 2\nview\nterminal p9@prod\nformat json\n";
     const V2_VIEW_COMMAND: &str =
         "bateri 2\nview\naction command\ntext x526573746172742061706921\n";
+    const V2_VIEW_COMMAND_ON: &str =
+        "bateri 2\nview\naction command\nref k3f9qa\ntext x52657374617274\n";
+    const V2_VIEW_REVEAL: &str = "bateri 2\nview\naction reveal\nref k3f9qa\n";
+    const V2_VIEW_REVEAL_ROW: &str = "bateri 2\nview\naction reveal\nref k3f9qa\nindex 248\n";
     const V2_VIEW_CLICK: &str = "bateri 2\nview\nterminal p9\naction click\nref k3f9qa\n";
     const V2_VIEW_DOUBLE_CLICK: &str = "bateri 2\nview\naction double-click\nref k3f9qa\n";
     const V2_VIEW_FILL: &str =
@@ -463,6 +533,27 @@ mod tests {
             (
                 V2_VIEW_COMMAND,
                 plain_view(Action::Command("Restart api!".into())),
+            ),
+            (
+                V2_VIEW_COMMAND_ON,
+                plain_view(Action::CommandOn {
+                    target: "k3f9qa".into(),
+                    title: "Restart".into(),
+                }),
+            ),
+            (
+                V2_VIEW_REVEAL,
+                plain_view(Action::Reveal {
+                    target: "k3f9qa".into(),
+                    index: None,
+                }),
+            ),
+            (
+                V2_VIEW_REVEAL_ROW,
+                plain_view(Action::Reveal {
+                    target: "k3f9qa".into(),
+                    index: Some(248),
+                }),
             ),
             (
                 V2_VIEW_CLICK,
@@ -633,6 +724,31 @@ mod tests {
             ("bateri 2\nview\nterminal p9@\n", "names a pane"),
             ("bateri 2\nview\nformat json\nformat json\n", "given twice"),
             ("bateri 2\nview\nbogus x\n", "takes no `bogus`"),
+            (
+                "bateri 2\nview\naction command\nref K3F9QA\ntext x61\n",
+                "a `ref` is",
+            ),
+            (
+                "bateri 2\nview\naction command\nref k3f9qa\n",
+                "needs a `text`",
+            ),
+            ("bateri 2\nview\naction reveal\n", "needs a `ref`"),
+            (
+                "bateri 2\nview\naction reveal\nref k3f9qa\nindex 0\n",
+                "a row from 1",
+            ),
+            (
+                "bateri 2\nview\naction reveal\nref k3f9qa\nindex 07\n",
+                "whole number",
+            ),
+            (
+                "bateri 2\nview\naction reveal\nref k3f9qa\ntext x61\n",
+                "takes no `text`",
+            ),
+            (
+                "bateri 2\nview\naction click\nref k3f9qa\nindex 2\n",
+                "takes no `index`",
+            ),
         ] {
             let failure = Request::parse(text).expect_err(text);
             assert_eq!(failure.kind, Kind::Usage, "{text}");
@@ -651,6 +767,26 @@ mod tests {
             .encode()
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_bateri_that_is_older_is_told_from_what_it_refuses() {
+        // What the readers of before `command` with a `ref` and `reveal` say to them: the texts are
+        // the ones those readers wrote (this module before the change), and `is_older` reads them.
+        for says in [
+            "`reveal` is no action: command, click, double-click, fill, type, press, scroll, menu, pick, text, wait or shot",
+            "`command` takes no `ref`",
+            "`view` takes no `index`",
+        ] {
+            assert!(is_older(&Failure::usage(says)), "{says}");
+        }
+        assert!(!is_older(&Failure::usage("`format` is text or json")));
+        assert!(!is_older(&Failure::usage("a `ref` is six letters")));
+        assert!(!is_older(&Failure::new(Kind::Failed, "it is no action")));
+        // A reader that is as new as this one refuses neither.
+        for text in [V2_VIEW_COMMAND_ON, V2_VIEW_REVEAL, V2_VIEW_REVEAL_ROW] {
+            assert!(Request::parse(text).is_ok(), "{text}");
+        }
     }
 
     const V2_REPLY_PICTURE: &str = "bateri 2\nok picture\n89504e470d0a1a0a00ff\n";
