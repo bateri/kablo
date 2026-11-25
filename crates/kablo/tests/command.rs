@@ -655,6 +655,69 @@ fn notify_needs_an_app_and_sends_one_line() {
     assert_eq!(stage.told.len(), 1, "nothing else reached the bateri app");
 }
 
+#[test]
+fn haptic_and_sound_ask_the_app_for_a_name_and_print_what_it_says() {
+    for verb in ["haptic", "sound"] {
+        let asked = |name: Option<&str>| {
+            let name = name.map(str::to_owned);
+            if verb == "haptic" {
+                Request::Haptic(name)
+            } else {
+                Request::Sound(name)
+            }
+        };
+        let mut stage = Stage::new();
+        let said = stage.run_in("p4", &[verb, "tick"]);
+        assert_eq!(said.status, 69);
+        assert_eq!(
+            said.err,
+            "bateri: the bateri app is not connected to play it\n"
+        );
+        // A name goes as it is written, and what the app says is what is printed.
+        stage.app_says(&Reply::Text("played tick\n".to_owned()).encode());
+        let said = stage.run_in("p4", &[verb, "tick"]);
+        assert_eq!(said.status, 0, "{}", said.err);
+        assert_eq!(said.out, "played tick\n");
+        assert_eq!(parse_told(told_one(&stage)), asked(Some("tick")));
+        // With none the app is asked for the names there are.
+        stage.app_says(&Reply::Text("tick tap thud\n".to_owned()).encode());
+        let said = stage.run_in("p4", &[verb]);
+        assert_eq!(said.status, 0, "{}", said.err);
+        assert_eq!(said.out, "tick tap thud\n");
+        assert_eq!(parse_told(&stage.told[1]), asked(None));
+        // A name the app does not know is its error, which says the ones there are.
+        stage.app_says(
+            &Reply::Failed(Failure::new(
+                Kind::Usage,
+                "`nope` is not a ready name: tick tap",
+            ))
+            .encode(),
+        );
+        let said = stage.run_in("p4", &[verb, "nope"]);
+        assert_eq!(said.status, 64);
+        assert_eq!(said.err, "bateri: `nope` is not a ready name: tick tap\n");
+        // A bateri that does not know the verb says so, and what to do.
+        stage.app_says(&format!(
+            "bateri 2\nerror usage `{verb}` is no verb: place, ls, close\n"
+        ));
+        let said = stage.run_in("p4", &[verb, "tick"]);
+        assert_eq!(said.status, 1);
+        assert_eq!(
+            said.err,
+            "bateri: this bateri does not play these yet; update bateri\n"
+        );
+        // More than one name, and a name that is nothing, are asked of no one.
+        let before = stage.told.len();
+        assert_eq!(stage.run_in("p4", &[verb, "a", "b"]).status, 64);
+        assert_eq!(stage.run_in("p4", &[verb, ""]).status, 64);
+        assert_eq!(
+            stage.told.len(),
+            before,
+            "nothing else reached the bateri app"
+        );
+    }
+}
+
 /// `bateri message ARGS` in the terminal p4, with `input` on its standard input.
 fn message_with(stage: &mut Stage, args: &[&str], input: &[u8]) -> stage::Said {
     stage.go(&Run {

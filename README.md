@@ -408,7 +408,7 @@ them. It is spoken over its standard input and output ([docs/PROTOCOL.md](docs/P
   terminals it opens, for the programs (a coding agent, a build script) that run in
   them: `split`, `tab` and `window` start a terminal and ask the app where its pane
   goes (a program they start keeps the terminal's questions for that pane for a
-  second and a half, so it is the pane that answers it), and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `focus`, `zoom`,
+  second and a half, so it is the pane that answers it), and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `haptic`, `sound`, `focus`, `zoom`,
   `swap`, `rename`, `close`, `move` and `resize` drive the others (`kablo bateri
   --help`). What needs the app's windows is one text message of the `kablo-bateri`
   crate, which the app reads with the same code, over the mailbox above; the

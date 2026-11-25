@@ -83,7 +83,7 @@ fn app_moves(ctx: &Ctx, arrange: Arrange) -> Result<Placed, Exit> {
     }
 }
 
-// ─── close, ls, notify, message ──────────────────────────────────────────
+// ─── close, ls, notify, message, haptic, sound ───────────────────────────
 
 /// `close pane|tab|group|window [ID]`: the kind is written, never guessed (`close p9` and a bare
 /// `close` are mistakes that say what to write).
@@ -303,6 +303,41 @@ pub fn notify(ctx: &Ctx, words: &[String]) -> Done {
         Asked::Reply(_) | Asked::Unreadable => Err(unread()),
         Asked::NoApp | Asked::Silent => {
             Err(Exit::new(69, "the bateri app is not connected to show it"))
+        }
+    }
+}
+
+/// `haptic [NAME]` and `sound [NAME]`: one of the ready vibrations is played on the trackpad of
+/// the computer the bateri app is on, or one of the ready sounds on its speaker. The names are the
+/// app's, and so is what comes of them: with none it says which there are, and a name it does not
+/// know is an error that says them too. What it says is printed as it is. On a server the app is
+/// still the one on the person's computer; where none is connected the command is 69, as `notify` is.
+pub fn feel(ctx: &Ctx, io: &mut Io<'_>, verb: &str, words: &[String]) -> Done {
+    let name = match words {
+        [] => None,
+        [name] => Some(clean(name)),
+        _ => return Err(Exit::mistake(format!("{verb} takes one name"))),
+    };
+    if name.as_deref() == Some("") {
+        return Err(Exit::mistake(format!("{verb} takes a name, or none")));
+    }
+    let request = if verb == "haptic" {
+        Request::Haptic(name)
+    } else {
+        Request::Sound(name)
+    };
+    match ctx.ask(&request)? {
+        Asked::Reply(Reply::Text(body)) => {
+            let _ = io.out.write_all(clean(&body).as_bytes());
+            Ok(())
+        }
+        Asked::Reply(Reply::Failed(failed)) if kablo_bateri::package::is_old(&failed) => Err(
+            Exit::failed("this bateri does not play these yet; update bateri"),
+        ),
+        Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
+        Asked::Reply(_) | Asked::Unreadable => Err(unread()),
+        Asked::NoApp | Asked::Silent => {
+            Err(Exit::new(69, "the bateri app is not connected to play it"))
         }
     }
 }

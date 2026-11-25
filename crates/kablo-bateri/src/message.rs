@@ -1,6 +1,6 @@
 //! The text the `bateri` command and the bateri app say to each other on kablo's app channel.
 //!
-//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `message`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
+//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `message`, `haptic`, `sound`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
 //! line, verbatim. A value has no line break (nor any control character) because the line is
 //! the frame. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
@@ -390,6 +390,14 @@ pub enum Request {
     /// text is one line like `notify`'s; what the verb is told is the agent's own business, the
     /// app only keeps it for the terminal that sent it.
     Message(String),
+    /// Play one of the ready vibrations on the trackpad of the person's computer (`haptic`), or one of
+    /// the ready sounds on its speaker (`sound`), the kit's own by its name; with no name the app
+    /// says which there are. The names are the app's: they are carried as they are written, and
+    /// what comes of them (played, not played because no finger is on the glass, no such name)
+    /// is the app's to say ([`Reply::Text`], or a [`Reply::Failed`] that names the ones there are).
+    Haptic(Option<String>),
+    /// See [`Request::Haptic`].
+    Sound(Option<String>),
     /// Move the keyboard or the layout.
     Arrange(Arrange),
     /// How to reach the server a terminal is to be started on: the `ssh` arguments (`-S`); to a
@@ -846,6 +854,16 @@ impl Request {
             Request::Message(text) => {
                 out.push_str("message\n");
                 push(&mut out, "text", text)?;
+            }
+            Request::Haptic(name) | Request::Sound(name) => {
+                out.push_str(if matches!(self, Request::Haptic(_)) {
+                    "haptic\n"
+                } else {
+                    "sound\n"
+                });
+                if let Some(name) = name {
+                    push(&mut out, "name", name)?;
+                }
             }
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
             Request::Package(package) => package.encode_into(&mut out)?,
@@ -1453,6 +1471,15 @@ fn read_request<'a>(
             let fields = Fields::read(verb, lines, &["text"])?;
             Ok(Request::Message(fields.need("text")?.to_owned()))
         }
+        "haptic" | "sound" => {
+            let fields = Fields::read(verb, lines, &["name"])?;
+            let name = fields.get("name").map(str::to_owned);
+            Ok(if verb == "haptic" {
+                Request::Haptic(name)
+            } else {
+                Request::Sound(name)
+            })
+        }
         "focus" | "zoom" | "minimize" | "swap" | "move" | "resize" | "rename" => {
             read_arrange(verb, lines).map(Request::Arrange)
         }
@@ -1473,7 +1500,7 @@ fn read_request<'a>(
         | "browser type" | "browser open" | "browser back" | "browser reload" | "browser clear"
         | "browser console" => browser::read(verb, lines).map(Request::Browser),
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back, browser reload, browser clear or browser console"
+            "`{other}` is no verb: place, ls, close, notify, message, haptic, sound, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back, browser reload, browser clear or browser console"
         ))),
     }
 }
@@ -2074,6 +2101,11 @@ mod tests {
     const V2_RESIZE_OWN: &str = "bateri 2\nresize\nside below\nsteps 1\n";
     // Another verb added to version 2 after it was frozen: one `text` line, as `notify`'s.
     const V2_MESSAGE: &str = "bateri 2\nmessage\ntext Done: 3 tests failed, the fix is in\n";
+    // Two verbs added to version 2 after it was frozen: one optional `name` line.
+    const V2_HAPTIC: &str = "bateri 2\nhaptic\n";
+    const V2_HAPTIC_NAMED: &str = "bateri 2\nhaptic\nname heartbeat\n";
+    const V2_SOUND: &str = "bateri 2\nsound\n";
+    const V2_SOUND_NAMED: &str = "bateri 2\nsound\nname success\n";
 
     fn pane(number: u64) -> Anchor {
         Anchor::of(Terminal(number))
@@ -2163,6 +2195,43 @@ mod tests {
         );
         // A message is not a thing another machine is asked to run: the app of the terminal gets it.
         assert!(!RELAYED.contains(&"message"));
+    }
+
+    #[test]
+    fn haptic_and_sound_are_read_and_written_byte_for_byte() {
+        for (text, request) in [
+            (V2_HAPTIC, Request::Haptic(None)),
+            (
+                V2_HAPTIC_NAMED,
+                Request::Haptic(Some("heartbeat".to_owned())),
+            ),
+            (V2_SOUND, Request::Sound(None)),
+            (V2_SOUND_NAMED, Request::Sound(Some("success".to_owned()))),
+        ] {
+            assert_eq!(Request::parse(text).as_ref(), Ok(&request), "{text:?}");
+            assert_eq!(request.encode().as_deref(), Ok(text), "{request:?}");
+        }
+        // Each is its own verb, and a name is one value on one line: nothing else is taken.
+        assert_ne!(Request::parse(V2_HAPTIC), Request::parse(V2_SOUND));
+        assert_ne!(
+            Request::parse(V2_HAPTIC_NAMED),
+            Request::parse("bateri 2\nsound\nname heartbeat\n")
+        );
+        assert!(
+            usage("bateri 2\nhaptic\nname a\nname b\n")
+                .text
+                .contains("twice")
+        );
+        assert!(
+            usage("bateri 2\nsound\nvolume 3\n")
+                .text
+                .contains("takes no `volume`")
+        );
+        assert!(Request::Haptic(Some("a\nb".to_owned())).encode().is_err());
+        // They are for the app of the terminal that asks, not for another machine to run.
+        assert!(!RELAYED.contains(&"haptic") && !RELAYED.contains(&"sound"));
+        // The app that does not know them says so in the words that tell an old bateri.
+        assert!(usage("bateri 2\nvibrate\n").text.contains("haptic, sound"));
     }
 
     const V2_CLOSE_TAB: &str = "bateri 2\nclose\nsubject tab\nid t3\n";
@@ -2678,6 +2747,9 @@ mod tests {
             Request::Close(Anchor::parse("b-0123456789abcdef0123456789abcdef").expect("a name")),
             Request::Notify("two  spaces, and a trailing one ".to_owned()),
             Request::Message("two  spaces, and a trailing one ".to_owned()),
+            Request::Haptic(None),
+            Request::Haptic(Some("two  spaces ".to_owned())),
+            Request::Sound(Some("tap".to_owned())),
         ];
         for request in requests {
             let text = request.encode().expect("a request that can be written");
@@ -2900,6 +2972,8 @@ mod tests {
             V2_CLOSE,
             V2_NOTIFY,
             V2_MESSAGE,
+            V2_HAPTIC_NAMED,
+            V2_SOUND,
             V2_FOCUS_TAB,
             V2_MOVE,
             V2_RESIZE,

@@ -244,6 +244,8 @@ const USAGE: &str = "usage: bateri split [PANE | --tab TAB] [--left|--right|--ab
        bateri ls [--json]
        bateri notify TEXT...
        bateri message [--] TEXT... | --json-field FIELD
+       bateri haptic [NAME]
+       bateri sound [NAME]
        bateri send [PANE] [TEXT | -]
        bateri send-key [PANE] KEY...
        bateri capture [PANE] [--history ROWS] [--unwrap] [--trim] [--vt]
@@ -461,6 +463,7 @@ fn dispatch_with(ctx: &Ctx, args: &[OsString], io: &mut Io<'_>) -> Done {
         "ls" => verbs::ls(ctx, io, &words),
         "notify" => verbs::notify(ctx, &words),
         "message" => verbs::message(ctx, &words),
+        "haptic" | "sound" => verbs::feel(ctx, io, &verb, &words),
         "send" => verbs::send(ctx, io, rest, &words),
         "send-key" => verbs::send_key(ctx, io, rest, &words),
         "capture" => verbs::capture(ctx, io, rest, &words),
