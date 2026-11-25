@@ -61,8 +61,9 @@
 //!
 //! The terminal answers some questions by itself (device attributes, the cursor position,
 //! mode reports); [`Screen::take_replies`] hands those bytes to whoever should write them
-//! to the program. Questions that need the terminal's owner (colours, the clipboard, the
-//! size in pixels) get no answer.
+//! to the program. It says it is the terminal bateri is ([`PRIMARY_DEVICE_ATTRIBUTES`]).
+//! Questions that need the terminal's owner (colours, the clipboard, the size in pixels,
+//! pictures) get no answer.
 
 mod image;
 mod kept;
@@ -107,6 +108,12 @@ impl Timeout for NoSync {
         false
     }
 }
+
+/// What the screen answers a program that asks the terminal who it is (DA1, `CSI c`, and DECID):
+/// bateri's own answer (`PRIMARY_DEVICE_ATTRIBUTES` in bateri's `bt-core`), a VT220 with ANSI
+/// colour. kablo is bateri's: a program that asked while no bateri was attached takes the
+/// terminal for the one it runs in, not for a VT102 that has less than bateri has.
+pub const PRIMARY_DEVICE_ATTRIBUTES: &str = "\x1b[?62;22c";
 
 /// What the terminal said through its listener: the title and the answers it gives.
 #[derive(Default)]
@@ -179,11 +186,12 @@ impl Screen {
 
     /// The terminal itself. The kitty keyboard protocol is on: the screen follows what
     /// the stream says whether or not anyone asked about support, and an image carries
-    /// the stacks.
+    /// the stacks. It says it is bateri ([`PRIMARY_DEVICE_ATTRIBUTES`]).
     fn term(heard: &Recorder, columns: usize, rows: usize, history: usize) -> Term<Recorder> {
         let config = Config {
             scrolling_history: history,
             kitty_keyboard: true,
+            primary_device_attributes: Some(PRIMARY_DEVICE_ATTRIBUTES.to_owned()),
             ..Config::default()
         };
         let size = Size {

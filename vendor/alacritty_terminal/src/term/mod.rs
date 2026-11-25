@@ -2,8 +2,10 @@
 // `Term::hidden_primary_grid` was added, and a test for it; a full keyboard mode stack drops
 // its own bottom entry, not the title stack's (upstream's later fix), and a test for it;
 // `Handler::input_ascii` and `input_text` were implemented for `Term` (a run of printable
-// ASCII, or of text, written in one go), and the module `input_ascii_tests` was added. Nothing
-// else in this file differs from the release; FORK.md lists the changes of the whole package.
+// ASCII, or of text, written in one go), and the module `input_ascii_tests` was added;
+// `Config::primary_device_attributes` was added, the answer `identify_terminal` gives when it is
+// set, and a test for it. Nothing else in this file differs from the release; FORK.md lists the
+// changes of the whole package.
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
@@ -359,6 +361,10 @@ pub struct Config {
     /// Whether to enable kitty keyboard protocol.
     pub kitty_keyboard: bool,
 
+    /// What the terminal answers a request for its primary device attributes with (DA1,
+    /// `CSI c`, and DECID, `ESC Z`), the whole reply. `None` is the VT102 answer, `CSI ? 6 c`.
+    pub primary_device_attributes: Option<String>,
+
     /// OSC52 support mode.
     pub osc52: Osc52,
 }
@@ -371,6 +377,7 @@ impl Default for Config {
             default_cursor_style: Default::default(),
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
+            primary_device_attributes: None,
             osc52: Default::default(),
         }
     }
@@ -1473,7 +1480,11 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                let text = self
+                    .config
+                    .primary_device_attributes
+                    .clone()
+                    .unwrap_or_else(|| String::from("\x1b[?6c"));
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {
@@ -3504,6 +3515,33 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn the_primary_device_attributes_are_what_the_config_says() {
+        #[derive(Clone, Default)]
+        struct Heard(Arc<std::sync::Mutex<Vec<String>>>);
+        impl EventListener for Heard {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+        let size = TermSize::new(10, 3);
+        let answer = |config: Config| {
+            let heard = Heard::default();
+            let mut term = Term::new(config, &size, heard.clone());
+            term.identify_terminal(None);
+            let text = heard.0.lock().unwrap().join("");
+            text
+        };
+        assert_eq!(answer(Config::default()), "\x1b[?6c");
+        let config = Config {
+            primary_device_attributes: Some("\x1b[?62;22c".into()),
+            ..Config::default()
+        };
+        assert_eq!(answer(config), "\x1b[?62;22c");
     }
 
     #[test]

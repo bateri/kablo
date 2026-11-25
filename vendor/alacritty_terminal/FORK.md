@@ -53,6 +53,15 @@ below) and with its default features, so upstream's reference tests run too.
   `src/term/mod.rs`. Test: `a_full_keyboard_mode_stack_drops_its_own_bottom_entry` in the
   same file.
 
+- **The answer to a request for the primary device attributes can be set.**
+  `Config::primary_device_attributes: Option<String>` is the whole reply `identify_terminal`
+  gives to DA1 (`CSI c`) and DECID (`ESC Z`); `None`, the default, is upstream's VT102 answer
+  `CSI ? 6 c`. kablo's relay answers a program that asks while nobody is attached, and it
+  answers as bateri does (`kablo-screen`'s `PRIMARY_DEVICE_ATTRIBUTES`), so that a program that
+  asked before bateri came takes the terminal for the one it runs in. It only adds: with the
+  default nothing changes. Touches `src/term/mod.rs`. Test:
+  `the_primary_device_attributes_are_what_the_config_says` in the same file.
+
 - **A run of printable ASCII is written in one go.** `Term` implements
   `ansi::Handler::input_ascii(&str)`, the method the `vte` fork added (`vendor/vte`, its
   `FORK.md`; upstream's `vte` has no such method, so this fork no longer builds against the

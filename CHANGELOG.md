@@ -30,6 +30,10 @@ section is not released.
 
 - **`bateri haptic [NAME]` and `bateri sound [NAME]`.** Play one of the ready vibrations on your computer's trackpad, or one of the ready sounds on its speaker, from a terminal here or on a server. With no name the app says which there are. A bateri that does not have them yet says so and asks you to update.
 
+### Changed
+
+- **A session that answers for itself says it is bateri.** A program that asks its terminal who it is while nobody is attached (`CSI c`, and `ESC Z`) is told what bateri tells it, a VT220 with ANSI colour (`ESC [ ? 62 ; 22 c`), not a VT102 (`ESC [ ? 6 c`), and takes the terminal for the one it runs in. What only bateri can answer (colours, sizes in pixels, pictures) still gets no answer.
+
 ## [0.11.0] - 2026-11-23
 
 ### Added

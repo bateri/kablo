@@ -887,8 +887,9 @@ fn the_questions_a_program_asks_a_terminal_are_answered() {
     };
     // Device attributes (both spellings), status, size in characters, mode reports and the
     // kitty keyboard query.
-    assert_eq!(answer("\x1b[c"), "\x1b[?6c");
-    assert_eq!(answer("\x1bZ"), "\x1b[?6c");
+    // Who it is: bateri.
+    assert_eq!(answer("\x1b[c"), "\x1b[?62;22c");
+    assert_eq!(answer("\x1bZ"), "\x1b[?62;22c");
     assert!(answer("\x1b[>c").starts_with("\x1b[>"));
     assert_eq!(answer("\x1b[5n"), "\x1b[0n");
     assert_eq!(answer("\x1b[18t"), "\x1b[8;6;20t");
