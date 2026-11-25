@@ -26,6 +26,8 @@ section is not released.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-25
+
 ### Added
 
 - **`bateri haptic [NAME]` and `bateri sound [NAME]`.** Play one of the ready vibrations on your computer's trackpad, or one of the ready sounds on its speaker, from a terminal here or on a server. With no name the app says which there are. A bateri that does not have them yet says so and asks you to update.
