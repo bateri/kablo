@@ -26,6 +26,14 @@ section is not released.
 
 ## [Unreleased]
 
+### Added
+
+- **`bateri hotkey [toggle|show|hide|pin|unpin]`.** Show, hide or toggle (the default) the hotkey window of
+  your bateri, the window that slides in from the edge of the screen on a shortcut, or keep it in front with
+  `pin` until `unpin`. It needs no terminal, so a launcher or a shortcut can run it by its full path,
+  `~/.local/share/bateri/shell/bin/bateri hotkey`. A bateri that does not have the window yet says so and
+  asks you to update.
+
 ## [0.12.0] - 2026-11-25
 
 ### Added

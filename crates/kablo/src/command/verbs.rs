@@ -6,8 +6,8 @@ use std::ffi::OsString;
 use std::io::Read;
 
 use kablo_bateri::message::{
-    Arrange, Extent, Format, Frame, Home, MAX_STEPS, Placed, Reply, Request, Spot, Subject,
-    TabHome, WindowHome,
+    Arrange, Extent, Format, Frame, Home, HotkeyAction, MAX_STEPS, Placed, Reply, Request, Spot,
+    Subject, TabHome, WindowHome,
 };
 use kablo_bateri::{Anchor, Id, IdKind, Side, paths};
 
@@ -1280,6 +1280,43 @@ pub fn wait(ctx: &Ctx, io: &mut Io<'_>, rest: &[OsString], words: &[String]) -> 
         return Err(Exit::mistake("wait takes the pane to wait for (wait p4)"));
     }
     finish(drive::wait(rest, io.err))
+}
+
+/// `hotkey [ACTION]`: the hotkey window of the bateri app on this computer is shown, hidden or
+/// toggled (none is toggle), or pinned in front and let go. It reads and writes no pane and asks
+/// for no terminal: it is the person's screen, so it works from a launcher as from a pane, and the
+/// app refuses it from a terminal on a server. Where none is connected the command is 69.
+pub fn hotkey(ctx: &Ctx, io: &mut Io<'_>, words: &[String]) -> Done {
+    let action = match words {
+        [] => HotkeyAction::Toggle,
+        [word] => HotkeyAction::parse(word).ok_or_else(|| {
+            Exit::mistake(format!(
+                "hotkey takes toggle, show, hide, pin or unpin, not `{}`",
+                clean(word)
+            ))
+        })?,
+        _ => {
+            return Err(Exit::mistake(
+                "hotkey takes one action: toggle, show, hide, pin or unpin",
+            ));
+        }
+    };
+    match ctx.ask(&Request::Hotkey(action))? {
+        Asked::Reply(Reply::Done) => Ok(()),
+        Asked::Reply(Reply::Text(body)) => {
+            let _ = io.out.write_all(clean(&body).as_bytes());
+            Ok(())
+        }
+        Asked::Reply(Reply::Failed(failed)) if kablo_bateri::package::is_old(&failed) => Err(
+            Exit::failed("this bateri has no hotkey window yet; update bateri"),
+        ),
+        Asked::Reply(Reply::Failed(failed)) => Err(failure(&failed)),
+        Asked::Reply(_) | Asked::Unreadable => Err(unread()),
+        Asked::NoApp | Asked::Silent => Err(Exit::new(
+            69,
+            "the bateri app is not connected: it keeps the hotkey window",
+        )),
+    }
 }
 
 /// `bateri config`: the settings of this computer's bateri, which the app reads and writes. The

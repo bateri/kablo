@@ -347,6 +347,64 @@ fn config_hands_its_words_to_the_app_and_says_what_it_answered() {
     assert_eq!(stage.run_in("p4", &["config"]).status, 64);
 }
 
+/// `hotkey` asks the app to show, hide, toggle, pin or unpin its hotkey window: with no action it is
+/// a toggle, from no terminal as from a pane, and a word that is no action, or more than one, is
+/// refused before anyone is asked.
+#[test]
+fn hotkey_asks_the_app_for_one_action_from_a_pane_or_from_no_terminal() {
+    use kablo_bateri::message::HotkeyAction;
+
+    let mut stage = Stage::new();
+    // Nobody to ask: 69, in the words of what it was for.
+    let said = stage.run(&["hotkey"]);
+    assert_eq!(said.status, 69);
+    assert_eq!(
+        said.err,
+        "bateri: the bateri app is not connected: it keeps the hotkey window\n"
+    );
+    // None is a toggle, and the app's `done` is a command that says nothing.
+    stage.app_says(OK);
+    let said = stage.run(&["hotkey"]);
+    assert_eq!(said.status, 0, "{}", said.err);
+    assert_eq!(said.out, "");
+    assert_eq!(
+        parse_told(told_one(&stage)),
+        Request::Hotkey(HotkeyAction::Toggle)
+    );
+    // Each action goes as it is written, from no terminal and from a pane alike.
+    for (n, action) in HotkeyAction::ALL.into_iter().enumerate() {
+        stage.forget_told();
+        stage.app_says(OK);
+        let said = if n % 2 == 0 {
+            stage.run(&["hotkey", action.word()])
+        } else {
+            stage.run_in("p4", &["hotkey", action.word()])
+        };
+        assert_eq!(said.status, 0, "{action:?}: {}", said.err);
+        assert_eq!(parse_told(told_one(&stage)), Request::Hotkey(action));
+    }
+    // What the app refuses (a terminal on a server) is its words and its status.
+    stage.app_says("bateri 2\nerror refused the hotkey window is this computer's\n");
+    let said = stage.run_in("p4", &["hotkey", "show"]);
+    assert_eq!(said.status, 77);
+    // A bateri from before the verb is told to be updated.
+    stage.app_says("bateri 2\nerror usage `hotkey` is no verb: place, ls, close\n");
+    let said = stage.run(&["hotkey", "pin"]);
+    assert_eq!(said.status, 1);
+    assert_eq!(
+        said.err,
+        "bateri: this bateri has no hotkey window yet; update bateri\n"
+    );
+    // A word that is no action, and two of them, are usage and asked of no one.
+    stage.forget_told();
+    for args in [&["hotkey", "fold"][..], &["hotkey", "show", "hide"]] {
+        let said = stage.run(args);
+        assert_eq!(said.status, 64, "{args:?}");
+        assert!(said.err.contains("hotkey takes"), "{}", said.err);
+    }
+    assert!(stage.told.is_empty(), "nothing reached the bateri app");
+}
+
 /// `bateri ARGS` in the terminal p4, with `input` on its standard input.
 fn view_with(stage: &mut Stage, args: &[&str], input: &[u8]) -> stage::Said {
     stage.go(&Run {

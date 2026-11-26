@@ -1,6 +1,6 @@
 //! The text the `bateri` command and the bateri app say to each other on kablo's app channel.
 //!
-//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `message`, `haptic`, `sound`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
+//! **A request** is lines: `bateri 2`, then the verb (`place`, `ls`, `close`, `notify`, `message`, `haptic`, `sound`, `hotkey`, `focus`, `zoom`, `minimize`, `swap`, `move`, `resize`), then one
 //! `key value` line per argument — the key up to the first space, the value the rest of the
 //! line, verbatim. A value has no line break (nor any control character) because the line is
 //! the frame. Who asks is not in it; it is the terminal kablo names on the conversation's ticket.
@@ -60,6 +60,13 @@
 //! hex of its bytes, as a `relay`'s are): the settings are the app's, which reads and writes them,
 //! and it answers `ok relayed` as a relayed command does — what to print and the status. Only a
 //! terminal of the computer the app runs on asks; the app refuses a server.
+//!
+//! **`hotkey`** and an `action` (`toggle`, `show`, `hide`, `pin` or `unpin`: five words, one of
+//! them on one line) asks the app to show, hide, toggle or pin its hotkey window. Nothing of a
+//! pane or a terminal is in it, so it is asked from no terminal as well, and, like `config`, only a
+//! terminal of the computer the app runs on asks: the app refuses a server. It is not relayed. The
+//! five actions are the protocol's version 2: a sixth is a new verb, so that an app that does not
+//! have it says "is no verb" and the command tells the person to update bateri.
 //!
 //! **`browser`** and a word (`browser text`, `browser click`, ...) asks something of a browser that
 //! a pane's page holds, which the app asks of the helper that draws it ([`crate::browser`]: the
@@ -257,6 +264,46 @@ impl std::fmt::Display for Extent {
     }
 }
 
+/// What `hotkey` asks of the hotkey window. With none written, the command asks `Toggle`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HotkeyAction {
+    /// Show it when it is away, hide it when it is in front.
+    #[default]
+    Toggle,
+    Show,
+    Hide,
+    /// Keep it in front until it is let go or bateri ends.
+    Pin,
+    Unpin,
+}
+
+impl HotkeyAction {
+    /// Every action, in the order the command's help lists them.
+    pub const ALL: [HotkeyAction; 5] = [
+        HotkeyAction::Toggle,
+        HotkeyAction::Show,
+        HotkeyAction::Hide,
+        HotkeyAction::Pin,
+        HotkeyAction::Unpin,
+    ];
+
+    /// The word the action is written with, on the command line and in the request.
+    pub fn word(self) -> &'static str {
+        match self {
+            HotkeyAction::Toggle => "toggle",
+            HotkeyAction::Show => "show",
+            HotkeyAction::Hide => "hide",
+            HotkeyAction::Pin => "pin",
+            HotkeyAction::Unpin => "unpin",
+        }
+    }
+
+    /// The action a word names.
+    pub fn parse(word: &str) -> Option<HotkeyAction> {
+        Self::ALL.into_iter().find(|action| action.word() == word)
+    }
+}
+
 /// What a floating pane is asked for: a corner and a size, each or neither. What is not asked is
 /// the bateri app's to choose.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -398,6 +445,11 @@ pub enum Request {
     Haptic(Option<String>),
     /// See [`Request::Haptic`].
     Sound(Option<String>),
+    /// Show, hide or toggle the person's hotkey window — the bateri window that slides in from the
+    /// edge of the screen on a shortcut — or pin it in front or let it go. Nothing of a terminal
+    /// is read or written: it is the person's screen, so like `config` it is for the app on this
+    /// computer and no other machine is asked.
+    Hotkey(HotkeyAction),
     /// Move the keyboard or the layout.
     Arrange(Arrange),
     /// How to reach the server a terminal is to be started on: the `ssh` arguments (`-S`); to a
@@ -868,6 +920,10 @@ impl Request {
             Request::Arrange(arrange) => encode_arrange(&mut out, arrange)?,
             Request::Package(package) => package.encode_into(&mut out)?,
             Request::View(view) => view.encode_into(&mut out)?,
+            Request::Hotkey(action) => {
+                out.push_str("hotkey\n");
+                push(&mut out, "action", action.word())?;
+            }
             Request::Config(words) => {
                 if words.is_empty() {
                     return Err(Failure::usage("`config` carries the words of the command"));
@@ -1487,6 +1543,17 @@ fn read_request<'a>(
             crate::package::read(verb, lines).map(Request::Package)
         }
         "view" => crate::view::read(verb, lines).map(Request::View),
+        "hotkey" => {
+            let fields = Fields::read(verb, lines, &["action"])?;
+            let word = fields.need("action")?;
+            HotkeyAction::parse(word)
+                .map(Request::Hotkey)
+                .ok_or_else(|| {
+                    Failure::usage(format!(
+                        "`{word}` is no action of hotkey: toggle, show, hide, pin or unpin"
+                    ))
+                })
+        }
         "config" => {
             let fields = Fields::read(verb, lines, &["words"])?;
             let words = fields
@@ -1500,7 +1567,7 @@ fn read_request<'a>(
         | "browser type" | "browser open" | "browser back" | "browser reload" | "browser clear"
         | "browser console" => browser::read(verb, lines).map(Request::Browser),
         other => Err(Failure::usage(format!(
-            "`{other}` is no verb: place, ls, close, notify, message, haptic, sound, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back, browser reload, browser clear or browser console"
+            "`{other}` is no verb: place, ls, close, notify, message, haptic, sound, hotkey, ssh, relay, focus, zoom, minimize, swap, move, resize, rename, package state, package offer, package fetch, package key-changed, config, view, browser ls, browser text, browser snapshot, browser shot, browser click, browser type, browser open, browser back, browser reload, browser clear or browser console"
         ))),
     }
 }
@@ -2106,6 +2173,7 @@ mod tests {
     const V2_HAPTIC_NAMED: &str = "bateri 2\nhaptic\nname heartbeat\n";
     const V2_SOUND: &str = "bateri 2\nsound\n";
     const V2_SOUND_NAMED: &str = "bateri 2\nsound\nname success\n";
+    const V2_HOTKEY_PIN: &str = "bateri 2\nhotkey\naction pin\n";
 
     fn pane(number: u64) -> Anchor {
         Anchor::of(Terminal(number))
@@ -2232,6 +2300,52 @@ mod tests {
         assert!(!RELAYED.contains(&"haptic") && !RELAYED.contains(&"sound"));
         // The app that does not know them says so in the words that tell an old bateri.
         assert!(usage("bateri 2\nvibrate\n").text.contains("haptic, sound"));
+    }
+
+    /// `hotkey` has five actions, each written as its word and read back as itself; an action
+    /// nobody has is usage (the command's 64), and so is none, or two.
+    #[test]
+    fn hotkey_is_read_and_written_byte_for_byte_and_takes_one_known_action() {
+        for action in HotkeyAction::ALL {
+            let text = format!("bateri 2\nhotkey\naction {}\n", action.word());
+            assert_eq!(
+                Request::parse(&text).as_ref(),
+                Ok(&Request::Hotkey(action)),
+                "{text:?}"
+            );
+            assert_eq!(
+                Request::Hotkey(action).encode().as_deref(),
+                Ok(text.as_str())
+            );
+            assert_eq!(HotkeyAction::parse(action.word()), Some(action));
+        }
+        assert_eq!(HotkeyAction::default(), HotkeyAction::Toggle);
+        assert_eq!(
+            Request::parse(V2_HOTKEY_PIN),
+            Ok(Request::Hotkey(HotkeyAction::Pin))
+        );
+        let said = usage("bateri 2\nhotkey\naction fold\n");
+        assert_eq!(said.kind, Kind::Usage);
+        assert!(
+            said.text.contains("`fold` is no action of hotkey"),
+            "{}",
+            said.text
+        );
+        assert_eq!(usage("bateri 2\nhotkey\n").kind, Kind::Usage);
+        assert!(
+            usage("bateri 2\nhotkey\naction show\naction hide\n")
+                .text
+                .contains("twice")
+        );
+        assert!(
+            usage("bateri 2\nhotkey\naction show\nname x\n")
+                .text
+                .contains("takes no `name`")
+        );
+        // The hotkey window is this computer's screen: no other machine runs it.
+        assert!(!RELAYED.contains(&"hotkey"));
+        // An app that does not know it says so in the words that tell an old bateri.
+        assert!(usage("bateri 2\nvibrate\n").text.contains("sound, hotkey"));
     }
 
     const V2_CLOSE_TAB: &str = "bateri 2\nclose\nsubject tab\nid t3\n";
@@ -2750,6 +2864,8 @@ mod tests {
             Request::Haptic(None),
             Request::Haptic(Some("two  spaces ".to_owned())),
             Request::Sound(Some("tap".to_owned())),
+            Request::Hotkey(HotkeyAction::Toggle),
+            Request::Hotkey(HotkeyAction::Unpin),
         ];
         for request in requests {
             let text = request.encode().expect("a request that can be written");
@@ -2974,6 +3090,7 @@ mod tests {
             V2_MESSAGE,
             V2_HAPTIC_NAMED,
             V2_SOUND,
+            V2_HOTKEY_PIN,
             V2_FOCUS_TAB,
             V2_MOVE,
             V2_RESIZE,

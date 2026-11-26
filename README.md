@@ -410,7 +410,9 @@ them. It is spoken over its standard input and output ([docs/PROTOCOL.md](docs/P
   goes (a program they start keeps the terminal's questions for that pane for a
   second and a half, so it is the pane that answers it), and `send`, `send-key`, `capture`, `wait`, `ls`, `notify`, `message`, `haptic`, `sound`, `focus`, `zoom`,
   `swap`, `rename`, `close`, `move` and `resize` drive the others (`kablo bateri
-  --help`). What needs the app's windows is one text message of the `kablo-bateri`
+  --help`). `hotkey` and `config` are about the app of this computer and not about a pane: they
+  need no terminal, so a launcher or a shortcut runs them too (`hotkey` shows, hides or pins the
+  hotkey window), and a terminal on a server is refused. What needs the app's windows is one text message of the `kablo-bateri`
   crate, which the app reads with the same code, over the mailbox above; the
   terminals themselves are kablo's. A pane of another machine is written `p9@prod`, and
   `-S prod` starts a terminal there: the app says how that machine is reached, and
